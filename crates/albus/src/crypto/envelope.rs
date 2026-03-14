@@ -4,7 +4,7 @@ use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::{CryptoPolicy, KdfParams},
+    config::{CryptoPolicy, KdfParams, KeySchedule},
     error::CryptoError,
 };
 
@@ -16,6 +16,8 @@ pub const LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN: &str = "macos-keychain";
 pub const LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE: &str = "linux-secret-service";
 /// The only supported persisted local binding scope in v1.
 pub const LOCAL_BINDING_SCOPE_CURRENT_USER: &str = "current-user";
+/// Persisted identifier for the current HKDF-based file key schedule.
+pub const KEY_SCHEDULE_HKDF_SHA256_V1: &str = "hkdf-sha256-v1";
 
 /// Outer container kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +71,9 @@ pub struct KdfHeader {
     pub parallelism: u32,
     /// Base64-encoded salt bytes.
     pub salt_b64: String,
+    /// Optional post-Argon2 key schedule marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_schedule: Option<String>,
 }
 
 /// Persisted AEAD settings embedded in the header.
@@ -175,6 +180,7 @@ impl EnvelopeHeader {
                 iterations: policy.kdf_params.iterations,
                 parallelism: policy.kdf_params.parallelism,
                 salt_b64: BASE64.encode(salt),
+                key_schedule: policy.key_schedule.persisted_name().map(str::to_owned),
             },
             cipher: CipherHeader {
                 algorithm: policy.aead_algorithm.as_str().to_owned(),
@@ -283,22 +289,36 @@ impl EnvelopeHeader {
         validate_kdf_parameter(
             "memory_kib",
             self.kdf.memory_kib,
-            policy.kdf_params.memory_kib,
+            policy.kdf_limits.memory_kib,
         )?;
         validate_kdf_parameter(
             "iterations",
             self.kdf.iterations,
-            policy.kdf_params.iterations,
+            policy.kdf_limits.iterations,
         )?;
         validate_kdf_parameter(
             "parallelism",
             self.kdf.parallelism,
-            policy.kdf_params.parallelism,
+            policy.kdf_limits.parallelism,
         )?;
         let _ = self.decode_salt(policy)?;
         let _ = self.decode_nonce(policy)?;
         self.validate_local_binding()?;
+        let _ = self.key_schedule()?;
         Ok(())
+    }
+
+    /// Returns the file-key schedule implied by this header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] when the persisted schedule marker is unknown.
+    pub fn key_schedule(&self) -> Result<KeySchedule, CryptoError> {
+        match self.kdf.key_schedule.as_deref() {
+            None => Ok(KeySchedule::LegacyDirect),
+            Some(KEY_SCHEDULE_HKDF_SHA256_V1) => Ok(KeySchedule::HkdfSha256V1),
+            Some(other) => Err(CryptoError::UnsupportedKeySchedule(other.to_owned())),
+        }
     }
 
     fn validate_local_binding(&self) -> Result<(), CryptoError> {
@@ -405,12 +425,12 @@ fn validate_material_lengths(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerKind, EnvelopeHeader, EnvelopeMetadata,
+        ContainerKind, EnvelopeHeader, EnvelopeMetadata, KEY_SCHEDULE_HKDF_SHA256_V1,
         LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
         LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI, LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader,
         assemble_envelope_container, build_envelope_aad,
     };
-    use crate::{CryptoError, CryptoPolicy};
+    use crate::{CryptoError, CryptoPolicy, KeySchedule};
 
     #[test]
     fn new_vault_header_uses_xchacha20poly1305_and_24_byte_nonce() -> Result<(), CryptoError> {
@@ -433,6 +453,10 @@ mod tests {
 
         assert_eq!(header.kind, ContainerKind::Vault);
         assert_eq!(header.cipher.algorithm, "xchacha20poly1305");
+        assert_eq!(
+            header.kdf.key_schedule.as_deref(),
+            Some(KEY_SCHEDULE_HKDF_SHA256_V1)
+        );
         assert_eq!(header.decode_nonce(&policy)?, nonce);
         Ok(())
     }
@@ -507,7 +531,7 @@ mod tests {
             &nonce,
             &policy,
         )?;
-        header.kdf.memory_kib = policy.kdf_params.memory_kib + 1;
+        header.kdf.memory_kib = policy.kdf_limits.memory_kib + 1;
 
         assert!(matches!(
             header.validate_crypto(&policy),
@@ -516,7 +540,8 @@ mod tests {
                 min: 1,
                 max,
                 value,
-            }) if max == policy.kdf_params.memory_kib && value == policy.kdf_params.memory_kib + 1
+            }) if max == policy.kdf_limits.memory_kib
+                && value == policy.kdf_limits.memory_kib + 1
         ));
         Ok(())
     }
@@ -628,6 +653,31 @@ mod tests {
             scope: LOCAL_BINDING_SCOPE_CURRENT_USER.to_owned(),
         });
 
+        header.validate_crypto(&policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_key_schedule_marker_is_treated_as_legacy() -> Result<(), CryptoError> {
+        let policy = CryptoPolicy::default();
+        let salt = vec![0x11; policy.kdf_params.salt_len];
+        let nonce = vec![0x22; policy.nonce_len];
+        let mut header = EnvelopeHeader::new_vault(
+            1,
+            1,
+            EnvelopeMetadata {
+                vault_id: "vault-1".to_owned(),
+                revision: 7,
+                created_at: None,
+                updated_at: None,
+            },
+            &salt,
+            &nonce,
+            &policy,
+        )?;
+        header.kdf.key_schedule = None;
+
+        assert_eq!(header.key_schedule()?, KeySchedule::LegacyDirect);
         header.validate_crypto(&policy)?;
         Ok(())
     }

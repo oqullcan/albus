@@ -4,13 +4,13 @@ use zeroize::Zeroize;
 
 /// Secret byte wrapper used for derived keys and other cryptographic material.
 #[derive(Eq, PartialEq)]
-pub struct SecretBytes(Vec<u8>);
+pub struct SecretBytes(Box<[u8]>);
 
 impl SecretBytes {
     /// Creates a new secret wrapper.
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(bytes.into_boxed_slice())
     }
 
     /// Returns the number of stored secret bytes.
@@ -28,19 +28,13 @@ impl SecretBytes {
     /// Returns the secret bytes within the crate.
     #[must_use]
     pub(crate) fn expose(&self) -> &[u8] {
-        &self.0
+        self.0.as_ref()
     }
 
     /// Returns mutable access to the secret bytes within the crate.
     #[must_use]
     pub(crate) fn expose_mut(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
-}
-
-impl Clone for SecretBytes {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
+        self.0.as_mut()
     }
 }
 

@@ -51,6 +51,7 @@ pub(crate) enum DeviceBindingPreference {
 #[derive(Debug)]
 pub(crate) struct PreparedPassphrase {
     value: Zeroizing<String>,
+    supplemental_secret: Option<Zeroizing<Vec<u8>>>,
     created_secret: bool,
 }
 
@@ -59,6 +60,12 @@ impl PreparedPassphrase {
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
         self.value.as_str()
+    }
+
+    /// Returns optional supplemental secret material for Argon2 peppering.
+    #[must_use]
+    pub(crate) fn supplemental_secret(&self) -> Option<&[u8]> {
+        self.supplemental_secret.as_deref().map(Vec::as_slice)
     }
 
     /// Returns whether this operation created a new local secret file.
@@ -127,16 +134,20 @@ impl DeviceBindingStore {
         let Some(binding) = binding else {
             return Ok(PreparedPassphrase {
                 value: Zeroizing::new(passphrase.to_owned()),
+                supplemental_secret: None,
                 created_secret: false,
             });
         };
 
         ensure_provider_available(Some(binding))?;
-        let (secret, created_secret) = self.load_or_create_secret(vault_id, binding)?;
-        Ok(PreparedPassphrase {
-            value: compose_effective_passphrase(passphrase, secret.as_slice()),
+        let (secret, composition, created_secret) =
+            self.load_or_create_secret(vault_id, binding)?;
+        Ok(compose_prepared_passphrase(
+            passphrase,
+            secret,
+            composition,
             created_secret,
-        })
+        ))
     }
 
     /// Returns a derived passphrase for an existing bound vault on this host.
@@ -149,16 +160,19 @@ impl DeviceBindingStore {
         let Some(binding) = binding else {
             return Ok(PreparedPassphrase {
                 value: Zeroizing::new(passphrase.to_owned()),
+                supplemental_secret: None,
                 created_secret: false,
             });
         };
 
         ensure_provider_available(Some(binding))?;
-        let secret = self.load_secret(vault_id, binding)?;
-        Ok(PreparedPassphrase {
-            value: compose_effective_passphrase(passphrase, secret.as_slice()),
-            created_secret: false,
-        })
+        let (secret, composition) = self.load_secret(vault_id, binding)?;
+        Ok(compose_prepared_passphrase(
+            passphrase,
+            secret,
+            composition,
+            false,
+        ))
     }
 
     /// Removes a locally persisted binding secret if present.
@@ -185,21 +199,21 @@ impl DeviceBindingStore {
         &self,
         vault_id: &str,
         binding: &LocalBindingHeader,
-    ) -> Result<(Zeroizing<Vec<u8>>, bool), AppError> {
+    ) -> Result<(Zeroizing<Vec<u8>>, DeviceBindingComposition, bool), AppError> {
         let state_file = self.state_file(vault_id);
         match read_limited_file(&state_file, MAX_BINDING_STATE_LEN) {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
-                Ok((
-                    Self::decode_state(vault_id, binding, bytes.as_slice())?,
-                    false,
-                ))
+                let (secret, composition) =
+                    Self::decode_state(vault_id, binding, bytes.as_slice())?;
+                Ok((secret, composition, false))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let secret = Zeroizing::new(random_bytes(DEVICE_SECRET_LEN)?);
                 let state = StoredBindingState {
                     provider: binding.provider.clone(),
                     scope: binding.scope.clone(),
+                    composition: Some(DeviceBindingComposition::Argon2SecretV1),
                     protected_key_b64: create_protected_state(
                         vault_id,
                         secret.as_slice(),
@@ -207,7 +221,7 @@ impl DeviceBindingStore {
                     )?,
                 };
                 Self::write_state(&state_file, &state)?;
-                Ok((secret, true))
+                Ok((secret, DeviceBindingComposition::Argon2SecretV1, true))
             }
             Err(error) => Err(AppError::Io(error)),
         }
@@ -217,7 +231,7 @@ impl DeviceBindingStore {
         &self,
         vault_id: &str,
         binding: &LocalBindingHeader,
-    ) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    ) -> Result<(Zeroizing<Vec<u8>>, DeviceBindingComposition), AppError> {
         let state_file = self.state_file(vault_id);
         let bytes = match read_limited_file(&state_file, MAX_BINDING_STATE_LEN) {
             Ok(bytes) => Zeroizing::new(bytes),
@@ -236,7 +250,7 @@ impl DeviceBindingStore {
         vault_id: &str,
         binding: &LocalBindingHeader,
         bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    ) -> Result<(Zeroizing<Vec<u8>>, DeviceBindingComposition), AppError> {
         let state: StoredBindingState =
             serde_json::from_slice(bytes).map_err(AppError::InvalidDeviceBindingState)?;
         if state.provider != binding.provider || state.scope != binding.scope {
@@ -255,7 +269,12 @@ impl DeviceBindingStore {
             });
         }
 
-        Ok(secret)
+        Ok((
+            secret,
+            state
+                .composition
+                .unwrap_or(DeviceBindingComposition::LegacyPassphraseConcat),
+        ))
     }
 
     fn write_state(state_file: &Path, state: &StoredBindingState) -> Result<(), AppError> {
@@ -276,7 +295,16 @@ impl DeviceBindingStore {
 struct StoredBindingState {
     provider: String,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    composition: Option<DeviceBindingComposition>,
     protected_key_b64: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DeviceBindingComposition {
+    LegacyPassphraseConcat,
+    Argon2SecretV1,
 }
 
 fn windows_dpapi_binding_header() -> LocalBindingHeader {
@@ -358,9 +386,29 @@ fn sanitize_vault_id(vault_id: &str) -> String {
     }
 }
 
-fn compose_effective_passphrase(passphrase: &str, secret: &[u8]) -> Zeroizing<String> {
+fn compose_legacy_effective_passphrase(passphrase: &str, secret: &[u8]) -> Zeroizing<String> {
     let encoded_secret = BASE64.encode(secret);
     Zeroizing::new(format!("{passphrase}\0albus-device:{encoded_secret}"))
+}
+
+fn compose_prepared_passphrase(
+    passphrase: &str,
+    secret: Zeroizing<Vec<u8>>,
+    composition: DeviceBindingComposition,
+    created_secret: bool,
+) -> PreparedPassphrase {
+    match composition {
+        DeviceBindingComposition::LegacyPassphraseConcat => PreparedPassphrase {
+            value: compose_legacy_effective_passphrase(passphrase, secret.as_slice()),
+            supplemental_secret: None,
+            created_secret,
+        },
+        DeviceBindingComposition::Argon2SecretV1 => PreparedPassphrase {
+            value: Zeroizing::new(passphrase.to_owned()),
+            supplemental_secret: Some(secret),
+            created_secret,
+        },
+    }
 }
 
 fn ensure_provider_available(binding: Option<&LocalBindingHeader>) -> Result<(), AppError> {
@@ -648,8 +696,9 @@ mod tests {
     #[cfg(windows)]
     use super::windows_dpapi_binding_header;
     use super::{
-        DeviceBindingPreference, DeviceBindingStore, compose_effective_passphrase,
-        platform_default_preference, preference_from_env, sanitize_vault_id,
+        DeviceBindingComposition, DeviceBindingPreference, DeviceBindingStore,
+        compose_legacy_effective_passphrase, platform_default_preference, preference_from_env,
+        sanitize_vault_id,
     };
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     use tempfile::TempDir;
@@ -694,9 +743,30 @@ mod tests {
 
     #[test]
     fn composed_passphrase_changes_when_secret_is_present() {
-        let composed = compose_effective_passphrase("passphrase", &[0x11; 4]);
+        let composed = compose_legacy_effective_passphrase("passphrase", &[0x11; 4]);
         assert_ne!(composed.as_str(), "passphrase");
         assert!(composed.as_str().starts_with("passphrase"));
+    }
+
+    #[test]
+    fn missing_composition_defaults_to_legacy_concat() -> Result<(), Box<dyn std::error::Error>> {
+        let state = super::StoredBindingState {
+            provider: "windows-dpapi".to_owned(),
+            scope: "current-user".to_owned(),
+            composition: None,
+            protected_key_b64: String::new(),
+        };
+
+        let encoded = serde_json::to_vec(&state)?;
+        let decoded: super::StoredBindingState = serde_json::from_slice(&encoded)?;
+        assert_eq!(decoded.composition, None);
+        assert_eq!(
+            decoded
+                .composition
+                .unwrap_or(DeviceBindingComposition::LegacyPassphraseConcat),
+            DeviceBindingComposition::LegacyPassphraseConcat
+        );
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -742,6 +812,7 @@ mod tests {
 
         assert!(prepared.created_secret());
         assert_eq!(prepared.as_str(), loaded.as_str());
+        assert_eq!(prepared.supplemental_secret(), loaded.supplemental_secret());
         Ok(())
     }
 

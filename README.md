@@ -29,6 +29,14 @@ Albus is built to protect:
 - routine local state with private filesystem permissions
 - optional per-user OS-native device binding
 
+Current crypto profile:
+
+- `argon2id` for passphrase hardening
+- `hkdf-sha256` key separation for new vault and backup file keys
+- `xchacha20poly1305` for authenticated encryption
+- stronger new-passphrase floor at `16` non-whitespace characters
+- upward-only Argon2 tuning for interactive app-created vaults
+
 Current host binding options:
 
 - Windows: DPAPI

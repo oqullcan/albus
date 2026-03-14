@@ -11,7 +11,7 @@ use albus::{
 };
 use albus::{
     ContainerKind, CryptoError, CryptoPolicy, EnvelopeHeader, assemble_envelope_container, decrypt,
-    derive_key, encrypt,
+    derive_envelope_key, encrypt,
 };
 use albus::{FileVaultRepository, StorageError, StoragePolicy, VaultRepository};
 use serde_json::Value;
@@ -307,13 +307,13 @@ fn short_new_passphrase_is_rejected_for_create_and_restore_replace()
 
     assert!(matches!(
         repository.create_new(&create_path, "too-short", &vault),
-        Err(StorageError::Crypto(CryptoError::PassphraseTooShort(12)))
+        Err(StorageError::Crypto(CryptoError::PassphraseTooShort(16)))
     ));
 
     repository.create_new(&replace_path, LONG_VAULT_PASSPHRASE, &empty_vault()?)?;
     assert!(matches!(
         repository.restore_replace(&replace_path, "too-short", &vault),
-        Err(StorageError::Crypto(CryptoError::PassphraseTooShort(12)))
+        Err(StorageError::Crypto(CryptoError::PassphraseTooShort(16)))
     ));
     Ok(())
 }
@@ -553,10 +553,9 @@ fn mutate_plaintext_json(
     let header: EnvelopeHeader = serde_json::from_slice(&header_json)?;
     let ciphertext = bytes[header_end..].to_vec();
     let policy = CryptoPolicy::default();
-    let salt = header.decode_salt(&policy)?;
     let nonce = header.decode_nonce(&policy)?;
     let aad = build_aad(magic, &header_json)?;
-    let key = derive_key(passphrase, &salt, &header.kdf_params()?, &policy)?;
+    let key = derive_envelope_key(passphrase, &header, &policy, None)?;
     let plaintext = decrypt(&key, &nonce, &aad, &ciphertext, &policy)?;
 
     let mut json: Value = serde_json::from_slice(&plaintext)?;
@@ -587,10 +586,9 @@ fn mutate_header_json_and_reencrypt(
     let header: EnvelopeHeader = serde_json::from_slice(&header_json)?;
     let ciphertext = bytes[header_end..].to_vec();
     let policy = CryptoPolicy::default();
-    let salt = header.decode_salt(&policy)?;
     let nonce = header.decode_nonce(&policy)?;
     let aad = build_aad(magic, &header_json)?;
-    let key = derive_key(passphrase, &salt, &header.kdf_params()?, &policy)?;
+    let key = derive_envelope_key(passphrase, &header, &policy, None)?;
     let plaintext = decrypt(&key, &nonce, &aad, &ciphertext, &policy)?;
 
     let mut json: Value = serde_json::from_slice(&header_json)?;

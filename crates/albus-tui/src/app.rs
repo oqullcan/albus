@@ -5,10 +5,11 @@ use std::{
 };
 
 use albus::{
-    AccountLabel, BackupRepository, CryptoError, Digits, EntryId, FileBackupRepository,
-    FileVaultRepository, HashAlgorithm, Issuer, LocalBindingHeader, OtpEntry, OtpSecret, Period,
-    RestoreMode, RestoreRequest, TotpGenerator, TotpParameters, Vault, VaultId, VaultRepository,
-    parse_totp_uri, validate_existing_passphrase as validate_existing_crypto_passphrase,
+    AccountLabel, BackupPolicy, BackupRepository, CryptoError, CryptoPolicy, Digits, EntryId,
+    FileBackupRepository, FileVaultRepository, HashAlgorithm, Issuer, LocalBindingHeader, OtpEntry,
+    OtpSecret, Period, RestoreMode, RestoreRequest, StoragePolicy, TotpGenerator, TotpParameters,
+    Vault, VaultId, VaultRepository, parse_totp_uri,
+    validate_existing_passphrase as validate_existing_crypto_passphrase,
     validate_new_passphrase as validate_new_crypto_passphrase,
 };
 use time::format_description::well_known::Rfc3339;
@@ -313,8 +314,9 @@ impl<C: Clock> AppController<C> {
         device_binding_store: DeviceBindingStore,
     ) -> Result<Self, AppError> {
         let trust_anchor = VaultTrustAnchor::from_config_file(remembered_path.config_file());
-        let repository = FileVaultRepository::default();
-        let backup_repository = FileBackupRepository::default();
+        let crypto_policy = CryptoPolicy::calibrated_interactive();
+        let repository = FileVaultRepository::new(StoragePolicy::default(), crypto_policy.clone());
+        let backup_repository = FileBackupRepository::new(BackupPolicy::default(), crypto_policy);
         let state = match remembered_path.load()? {
             Some(vault_path) => match repository.load_header(&vault_path) {
                 Ok(header) => {
@@ -488,7 +490,12 @@ impl<C: Clock> AppController<C> {
             .repository
             .clone()
             .with_vault_binding(local_binding.clone())
-            .create_new(&path, prepared_passphrase.as_str(), &vault);
+            .create_new_with_secret(
+                &path,
+                prepared_passphrase.as_str(),
+                prepared_passphrase.supplemental_secret(),
+                &vault,
+            );
 
         if let Err(error) = create_result {
             if prepared_passphrase.created_secret() {
@@ -578,9 +585,11 @@ impl<C: Clock> AppController<C> {
                 return self.fail(error);
             }
         };
-        let unlock_result = self
-            .repository
-            .unlock(&vault_path, prepared_passphrase.as_str());
+        let unlock_result = self.repository.unlock_with_secret(
+            &vault_path,
+            prepared_passphrase.as_str(),
+            prepared_passphrase.supplemental_secret(),
+        );
 
         match unlock_result {
             Ok(vault) => {
@@ -1000,6 +1009,7 @@ impl<C: Clock> AppController<C> {
             backup_passphrase,
             target_vault_path,
             target_vault_passphrase: prepared_passphrase.as_str(),
+            target_vault_supplemental_secret: prepared_passphrase.supplemental_secret(),
             target_local_binding: target_local_binding.clone(),
             mode,
         };
@@ -1122,9 +1132,11 @@ impl<C: Clock> AppController<C> {
             local_binding.as_ref(),
         )?;
 
-        let verification_result = self
-            .repository
-            .unlock(&persist_plan.vault_path, current_passphrase.as_str());
+        let verification_result = self.repository.unlock_with_secret(
+            &persist_plan.vault_path,
+            current_passphrase.as_str(),
+            current_passphrase.supplemental_secret(),
+        );
         if let Err(error) = verification_result {
             return self.fail(error.into());
         }
@@ -1133,9 +1145,10 @@ impl<C: Clock> AppController<C> {
             .repository
             .clone()
             .with_vault_binding(local_binding.clone())
-            .save(
+            .save_with_secret(
                 &persist_plan.vault_path,
                 new_passphrase.as_str(),
+                new_passphrase.supplemental_secret(),
                 &persist_plan.vault,
             );
 
@@ -1295,9 +1308,11 @@ impl<C: Clock> AppController<C> {
                 return self.fail(error);
             }
         };
-        let verification_result = self
-            .repository
-            .unlock(&save_plan.vault_path, prepared_passphrase.as_str());
+        let verification_result = self.repository.unlock_with_secret(
+            &save_plan.vault_path,
+            prepared_passphrase.as_str(),
+            prepared_passphrase.supplemental_secret(),
+        );
         if let Err(error) = verification_result {
             return self.fail(error.into());
         }
@@ -1306,9 +1321,10 @@ impl<C: Clock> AppController<C> {
             .repository
             .clone()
             .with_vault_binding(local_binding)
-            .save(
+            .save_with_secret(
                 &save_plan.vault_path,
                 prepared_passphrase.as_str(),
+                prepared_passphrase.supplemental_secret(),
                 &save_plan.vault,
             );
 
@@ -2048,7 +2064,7 @@ mod tests {
         let result =
             controller.create_vault(vault_path, "short-pass".to_owned(), "short-pass".to_owned());
 
-        assert!(matches!(result, Err(AppError::PassphraseTooShort(12))));
+        assert!(matches!(result, Err(AppError::PassphraseTooShort(16))));
         assert_eq!(controller.state(), AppState::NoVault);
         Ok(())
     }
@@ -2305,10 +2321,10 @@ mod tests {
 
         controller.create_vault(
             vault_path,
-            "good-passphrase".to_owned(),
-            "good-passphrase".to_owned(),
+            "good-master-passphrase".to_owned(),
+            "good-master-passphrase".to_owned(),
         )?;
-        controller.unlock("good-passphrase".to_owned())?;
+        controller.unlock("good-master-passphrase".to_owned())?;
         controller.add_entry(AddEntryInput {
             issuer: "Example".to_owned(),
             account_label: "alice@example.com".to_owned(),
@@ -2318,7 +2334,7 @@ mod tests {
             period: None,
         })?;
 
-        let save_result = controller.save_and_lock(Some("bad-passphrase".to_owned()));
+        let save_result = controller.save_and_lock(Some("bad-master-passphrase".to_owned()));
 
         assert!(save_result.is_err());
         assert_eq!(controller.state(), AppState::Unlocked);
@@ -2664,10 +2680,10 @@ mod tests {
 
         controller.create_vault(
             vault_path.clone(),
-            "old-passphrase".to_owned(),
-            "old-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
         )?;
-        controller.unlock("old-passphrase".to_owned())?;
+        controller.unlock("old-master-passphrase".to_owned())?;
         controller.add_entry(AddEntryInput {
             issuer: "Example".to_owned(),
             account_label: "alice@example.com".to_owned(),
@@ -2678,14 +2694,18 @@ mod tests {
         })?;
 
         controller.change_passphrase(ChangePassphraseInput {
-            current_passphrase: "old-passphrase".to_owned(),
-            new_passphrase: "new-passphrase".to_owned(),
-            confirmation: "new-passphrase".to_owned(),
+            current_passphrase: "old-master-passphrase".to_owned(),
+            new_passphrase: "new-master-passphrase".to_owned(),
+            confirmation: "new-master-passphrase".to_owned(),
         })?;
 
         assert_eq!(controller.state(), AppState::Locked);
-        assert!(storage.unlock(&vault_path, "old-passphrase").is_err());
-        let unlocked = storage.unlock(&vault_path, "new-passphrase")?;
+        assert!(
+            storage
+                .unlock(&vault_path, "old-master-passphrase")
+                .is_err()
+        );
+        let unlocked = storage.unlock(&vault_path, "new-master-passphrase")?;
         assert_eq!(unlocked.entries().len(), 1);
         Ok(())
     }
@@ -2699,18 +2719,18 @@ mod tests {
 
         controller.create_vault(
             vault_path,
-            "old-passphrase".to_owned(),
-            "old-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
         )?;
-        controller.unlock("old-passphrase".to_owned())?;
+        controller.unlock("old-master-passphrase".to_owned())?;
 
         let result = controller.change_passphrase(ChangePassphraseInput {
-            current_passphrase: "old-passphrase".to_owned(),
+            current_passphrase: "old-master-passphrase".to_owned(),
             new_passphrase: "too-short".to_owned(),
             confirmation: "too-short".to_owned(),
         });
 
-        assert!(matches!(result, Err(AppError::PassphraseTooShort(12))));
+        assert!(matches!(result, Err(AppError::PassphraseTooShort(16))));
         assert_eq!(controller.state(), AppState::Unlocked);
         Ok(())
     }
@@ -2725,10 +2745,10 @@ mod tests {
 
         controller.create_vault(
             vault_path,
-            "old-passphrase".to_owned(),
-            "old-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
+            "old-master-passphrase".to_owned(),
         )?;
-        controller.unlock("old-passphrase".to_owned())?;
+        controller.unlock("old-master-passphrase".to_owned())?;
         controller.add_entry(AddEntryInput {
             issuer: "Example".to_owned(),
             account_label: "alice@example.com".to_owned(),
@@ -2740,8 +2760,8 @@ mod tests {
 
         let result = controller.change_passphrase(ChangePassphraseInput {
             current_passphrase: "wrong-passphrase".to_owned(),
-            new_passphrase: "new-passphrase".to_owned(),
-            confirmation: "new-passphrase".to_owned(),
+            new_passphrase: "new-master-passphrase".to_owned(),
+            confirmation: "new-master-passphrase".to_owned(),
         });
 
         assert!(result.is_err());

@@ -7,8 +7,8 @@ use std::{
 use albus_core::Vault;
 use albus_crypto::{
     ContainerKind, CryptoPolicy, EnvelopeHeader, EnvelopeMetadata, LocalBindingHeader,
-    assemble_envelope_container, build_envelope_aad, decrypt, derive_key, encrypt, random_bytes,
-    validate_existing_passphrase, validate_new_passphrase,
+    assemble_envelope_container, build_envelope_aad, decrypt, derive_envelope_key, encrypt,
+    random_bytes, validate_existing_passphrase, validate_new_passphrase,
 };
 use tempfile::NamedTempFile;
 use zeroize::{Zeroize, Zeroizing};
@@ -232,6 +232,7 @@ impl FileVaultRepository {
         &self,
         path: &Path,
         passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
         vault: &Vault,
         mode: PersistenceMode,
         passphrase_validation: PassphraseValidation,
@@ -288,11 +289,11 @@ impl FileVaultRepository {
         let header_json = serde_json::to_vec(&header).map_err(StorageError::InvalidHeaderJson)?;
         let aad = build_envelope_aad(&self.storage_policy.magic, &header_json)
             .map_err(|_| StorageError::InvalidHeaderLength)?;
-        let key = derive_key(
+        let key = derive_envelope_key(
             passphrase,
-            &salt,
-            &header.kdf_params()?,
+            &header,
             &self.crypto_policy,
+            supplemental_secret,
         )?;
         let ciphertext = encrypt(
             &key,
@@ -320,16 +321,16 @@ impl FileVaultRepository {
         &self,
         locked: &LockedContainer,
         passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
     ) -> Result<Vault, StorageError> {
-        let salt = locked.header.decode_salt(&self.crypto_policy)?;
         let nonce = locked.header.decode_nonce(&self.crypto_policy)?;
         let aad = build_envelope_aad(&self.storage_policy.magic, &locked.header_json)
             .map_err(|_| StorageError::InvalidHeaderLength)?;
-        let key = derive_key(
+        let key = derive_envelope_key(
             passphrase,
-            &salt,
-            &locked.header.kdf_params()?,
+            &locked.header,
             &self.crypto_policy,
+            supplemental_secret,
         )?;
         let plaintext = Zeroizing::new(decrypt(
             &key,
@@ -369,6 +370,7 @@ impl VaultRepository for FileVaultRepository {
         self.persist_vault(
             path,
             passphrase,
+            None,
             vault,
             PersistenceMode::CreateNew,
             PassphraseValidation::New,
@@ -377,7 +379,7 @@ impl VaultRepository for FileVaultRepository {
 
     fn unlock(&self, path: &Path, passphrase: &str) -> Result<Vault, StorageError> {
         let locked = self.read_container(path)?;
-        self.decrypt_container(&locked, passphrase)
+        self.decrypt_container(&locked, passphrase, None)
     }
 
     fn save(&self, path: &Path, passphrase: &str, vault: &Vault) -> Result<(), StorageError> {
@@ -388,6 +390,7 @@ impl VaultRepository for FileVaultRepository {
         self.persist_vault(
             path,
             passphrase,
+            None,
             vault,
             PersistenceMode::ReplaceExisting,
             PassphraseValidation::Existing,
@@ -403,6 +406,98 @@ impl VaultRepository for FileVaultRepository {
         self.persist_vault(
             path,
             passphrase,
+            None,
+            vault,
+            PersistenceMode::ReplaceExisting,
+            PassphraseValidation::New,
+        )
+    }
+}
+
+impl FileVaultRepository {
+    /// Creates a new encrypted vault file using optional supplemental key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the target already exists or the vault
+    /// cannot be serialized and persisted safely.
+    pub fn create_new_with_secret(
+        &self,
+        path: &Path,
+        passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
+        vault: &Vault,
+    ) -> Result<(), StorageError> {
+        self.persist_vault(
+            path,
+            passphrase,
+            supplemental_secret,
+            vault,
+            PersistenceMode::CreateNew,
+            PassphraseValidation::New,
+        )
+    }
+
+    /// Unlocks and fully decrypts the vault using optional supplemental key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the file cannot be read, the passphrase is
+    /// wrong, or the decrypted payload is invalid.
+    pub fn unlock_with_secret(
+        &self,
+        path: &Path,
+        passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
+    ) -> Result<Vault, StorageError> {
+        let locked = self.read_container(path)?;
+        self.decrypt_container(&locked, passphrase, supplemental_secret)
+    }
+
+    /// Saves an updated vault using optional supplemental key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the target does not exist or the new
+    /// snapshot cannot be persisted safely.
+    pub fn save_with_secret(
+        &self,
+        path: &Path,
+        passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
+        vault: &Vault,
+    ) -> Result<(), StorageError> {
+        if !path.exists() {
+            return Err(StorageError::VaultNotFound(path.to_path_buf()));
+        }
+
+        self.persist_vault(
+            path,
+            passphrase,
+            supplemental_secret,
+            vault,
+            PersistenceMode::ReplaceExisting,
+            PassphraseValidation::Existing,
+        )
+    }
+
+    /// Replaces an existing vault path with a restored snapshot using optional supplemental key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the target does not already exist or the
+    /// new encrypted snapshot cannot be persisted safely.
+    pub fn restore_replace_with_secret(
+        &self,
+        path: &Path,
+        passphrase: &str,
+        supplemental_secret: Option<&[u8]>,
+        vault: &Vault,
+    ) -> Result<(), StorageError> {
+        self.persist_vault(
+            path,
+            passphrase,
+            supplemental_secret,
             vault,
             PersistenceMode::ReplaceExisting,
             PassphraseValidation::New,

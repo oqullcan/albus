@@ -12,7 +12,7 @@ use albus::{
 use albus::{BackupError, BackupRepository, FileBackupRepository, RestoreMode, RestoreRequest};
 use albus::{
     CryptoError, CryptoPolicy, EnvelopeHeader, FileVaultRepository, VaultRepository, decrypt,
-    derive_key, encrypt,
+    derive_envelope_key, encrypt,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -232,6 +232,7 @@ fn restore_to_a_new_target_path_succeeds() -> Result<(), Box<dyn std::error::Err
         backup_passphrase: "backup-passphrase",
         target_vault_path: &target_path,
         target_vault_passphrase: "vault-passphrase",
+        target_vault_supplemental_secret: None,
         target_local_binding: None,
         mode: RestoreMode::CreateNew,
     })?;
@@ -251,7 +252,7 @@ fn restore_with_create_new_fails_if_target_exists() -> Result<(), Box<dyn std::e
     let storage_repository = FileVaultRepository::default();
 
     backup_repository.export(&backup_path, "backup-passphrase", &sample_vault(1)?)?;
-    storage_repository.create_new(&target_path, "current-vault", &empty_vault()?)?;
+    storage_repository.create_new(&target_path, "current-vault-passphrase", &empty_vault()?)?;
 
     assert!(matches!(
         backup_repository.restore(&RestoreRequest {
@@ -259,6 +260,7 @@ fn restore_with_create_new_fails_if_target_exists() -> Result<(), Box<dyn std::e
             backup_passphrase: "backup-passphrase",
             target_vault_path: &target_path,
             target_vault_passphrase: "new-vault-passphrase",
+            target_vault_supplemental_secret: None,
             target_local_binding: None,
             mode: RestoreMode::CreateNew,
         }),
@@ -285,6 +287,7 @@ fn restore_with_replace_existing_fails_if_target_is_missing()
             backup_passphrase: "backup-passphrase",
             target_vault_path: &target_path,
             target_vault_passphrase: "new-vault-passphrase",
+            target_vault_supplemental_secret: None,
             target_local_binding: None,
             mode: RestoreMode::ReplaceExisting,
         }),
@@ -304,18 +307,19 @@ fn restore_with_replace_existing_succeeds() -> Result<(), Box<dyn std::error::Er
     let storage_repository = FileVaultRepository::default();
     let vault = sample_vault(3)?;
 
-    storage_repository.create_new(&target_path, "old-passphrase", &empty_vault()?)?;
+    storage_repository.create_new(&target_path, "old-vault-passphrase", &empty_vault()?)?;
     backup_repository.export(&backup_path, "backup-passphrase", &vault)?;
     backup_repository.restore(&RestoreRequest {
         backup_path: &backup_path,
         backup_passphrase: "backup-passphrase",
         target_vault_path: &target_path,
-        target_vault_passphrase: "new-passphrase",
+        target_vault_passphrase: "new-vault-passphrase",
+        target_vault_supplemental_secret: None,
         target_local_binding: None,
         mode: RestoreMode::ReplaceExisting,
     })?;
 
-    let unlocked = storage_repository.unlock(&target_path, "new-passphrase")?;
+    let unlocked = storage_repository.unlock(&target_path, "new-vault-passphrase")?;
     assert_eq!(unlocked, vault);
     Ok(())
 }
@@ -358,7 +362,7 @@ fn short_new_backup_passphrase_is_rejected() -> Result<(), Box<dyn std::error::E
 
     assert!(matches!(
         repository.export(&path, "too-short", &sample_vault(1)?),
-        Err(BackupError::Crypto(CryptoError::PassphraseTooShort(12)))
+        Err(BackupError::Crypto(CryptoError::PassphraseTooShort(16)))
     ));
     Ok(())
 }
@@ -392,6 +396,7 @@ fn restore_rejects_using_the_backup_path_as_the_target_vault()
             backup_passphrase: "backup-passphrase",
             target_vault_path: &backup_path,
             target_vault_passphrase: "vault-passphrase",
+            target_vault_supplemental_secret: None,
             target_local_binding: None,
             mode: RestoreMode::ReplaceExisting,
         }),
@@ -421,6 +426,7 @@ fn restore_rejects_backup_path_aliases_even_when_intermediate_components_are_mis
             backup_passphrase: "backup-passphrase",
             target_vault_path: &alias_target,
             target_vault_passphrase: "vault-passphrase",
+            target_vault_supplemental_secret: None,
             target_local_binding: None,
             mode: RestoreMode::CreateNew,
         }),
@@ -650,10 +656,9 @@ fn mutate_plaintext_json(
     let header: EnvelopeHeader = serde_json::from_slice(&header_json)?;
     let ciphertext = bytes[header_end..].to_vec();
     let policy = CryptoPolicy::default();
-    let salt = header.decode_salt(&policy)?;
     let nonce = header.decode_nonce(&policy)?;
     let aad = build_aad(magic, &header_json)?;
-    let key = derive_key(passphrase, &salt, &header.kdf_params()?, &policy)?;
+    let key = derive_envelope_key(passphrase, &header, &policy, None)?;
     let plaintext = decrypt(&key, &nonce, &aad, &ciphertext, &policy)?;
 
     let mut json: Value = serde_json::from_slice(&plaintext)?;

@@ -2,7 +2,7 @@ use crate::CryptoError;
 
 /// Minimum number of non-whitespace characters required for newly set
 /// passphrases.
-pub const MIN_NEW_PASSPHRASE_NON_WHITESPACE_CHARS: usize = 12;
+pub const MIN_NEW_PASSPHRASE_NON_WHITESPACE_CHARS: usize = 16;
 
 /// Validates a passphrase used to access an existing encrypted artifact.
 ///
@@ -65,8 +65,8 @@ mod tests {
     }
 
     #[test]
-    fn new_passphrase_accepts_twelve_non_whitespace_characters() -> Result<(), CryptoError> {
-        validate_new_passphrase("four words pass")?;
+    fn new_passphrase_accepts_sixteen_non_whitespace_characters() -> Result<(), CryptoError> {
+        validate_new_passphrase("four words passphrase")?;
         Ok(())
     }
 }

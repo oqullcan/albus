@@ -14,7 +14,7 @@ mod primitives;
 /// Secret-bearing wrapper types.
 mod secret;
 
-pub use config::{AeadAlgorithm, CryptoPolicy, KdfAlgorithm, KdfParams};
+pub use config::{AeadAlgorithm, CryptoPolicy, KdfAlgorithm, KdfParams, KeySchedule};
 pub use envelope::{
     CipherHeader, ContainerKind, EnvelopeHeader, EnvelopeMetadata, KdfHeader,
     LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
@@ -25,5 +25,7 @@ pub use error::CryptoError;
 pub use passphrase::{
     MIN_NEW_PASSPHRASE_NON_WHITESPACE_CHARS, validate_existing_passphrase, validate_new_passphrase,
 };
-pub use primitives::{decrypt, derive_key, encrypt, random_bytes};
+pub use primitives::{
+    decrypt, derive_envelope_key, derive_key, derive_key_with_secret, encrypt, random_bytes,
+};
 pub use secret::SecretBytes;

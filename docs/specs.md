@@ -49,8 +49,13 @@ protect an already compromised unlocked session.
 - TOTP: RFC 4226 / RFC 6238
 - Hashes: `SHA1`, `SHA256`, `SHA512`
 - KDF: `Argon2id`
+- Key schedule for new files: `Argon2id -> HKDF-SHA256`
 - Encryption: `XChaCha20Poly1305`
-- New vault and backup passphrases must have at least `12` non-whitespace characters
+- New vault and backup passphrases must have at least `16` non-whitespace characters
+
+New files written by the interactive app may raise Argon2 memory cost upward on
+faster hosts. Read compatibility still accepts a broader shared ceiling so
+vaults remain portable across supported machines.
 
 Vaults may optionally use OS-native local device binding:
 
@@ -59,9 +64,9 @@ Vaults may optionally use OS-native local device binding:
 - Linux: Secret Service
 
 Device binding is scoped to the current local user profile. It adds a local
-secret requirement on top of the passphrase, so moving a bound vault to another
-machine or user profile is expected to fail unless restored through a backup
-workflow.
+secret requirement alongside the passphrase in key derivation, so moving a
+bound vault to another machine or user profile is expected to fail unless
+restored through a backup workflow.
 
 ## Format
 

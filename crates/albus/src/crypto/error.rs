@@ -18,6 +18,9 @@ pub enum CryptoError {
     /// The AEAD algorithm in the file header is unsupported.
     #[error("unsupported AEAD algorithm: {0}")]
     UnsupportedAeadAlgorithm(String),
+    /// The post-Argon2 key schedule in the file header is unsupported.
+    #[error("unsupported key schedule: {0}")]
+    UnsupportedKeySchedule(String),
     /// The local binding provider in the file header is unsupported.
     #[error("unsupported local binding provider: {0}")]
     UnsupportedLocalBindingProvider(String),

@@ -7,12 +7,12 @@ use std::{
 use albus_core::Vault;
 use albus_crypto::{
     ContainerKind, CryptoPolicy, EnvelopeHeader, EnvelopeMetadata, LocalBindingHeader,
-    assemble_envelope_container, build_envelope_aad, decrypt, derive_key, encrypt, random_bytes,
-    validate_new_passphrase,
+    assemble_envelope_container, build_envelope_aad, decrypt, derive_envelope_key, encrypt,
+    random_bytes, validate_new_passphrase,
 };
 use albus_storage::{
-    FileVaultRepository, StoragePolicy, VaultRepository, ensure_non_symlink_path,
-    harden_private_directory, harden_private_file,
+    FileVaultRepository, StoragePolicy, ensure_non_symlink_path, harden_private_directory,
+    harden_private_file,
 };
 use tempfile::NamedTempFile;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -80,6 +80,8 @@ pub struct RestoreRequest<'a> {
     pub target_vault_path: &'a Path,
     /// Master passphrase for the restored vault.
     pub target_vault_passphrase: &'a str,
+    /// Optional supplemental secret for deriving the restored target vault key.
+    pub target_vault_supplemental_secret: Option<&'a [u8]>,
     /// Optional local host binding metadata for the restored vault file.
     pub target_local_binding: Option<LocalBindingHeader>,
     /// Restore mode for the target path.
@@ -238,16 +240,11 @@ impl FileBackupRepository {
         locked: &LockedBackupContainer,
         backup_passphrase: &str,
     ) -> Result<BackupSnapshot, BackupError> {
-        let salt = locked.header.decode_salt(&self.crypto_policy)?;
         let nonce = locked.header.decode_nonce(&self.crypto_policy)?;
         let aad = build_envelope_aad(&self.backup_policy.magic, &locked.header_json)
             .map_err(|_| BackupError::InvalidHeaderLength)?;
-        let key = derive_key(
-            backup_passphrase,
-            &salt,
-            &locked.header.kdf_params()?,
-            &self.crypto_policy,
-        )?;
+        let key =
+            derive_envelope_key(backup_passphrase, &locked.header, &self.crypto_policy, None)?;
         let plaintext = Zeroizing::new(decrypt(
             &key,
             &nonce,
@@ -321,12 +318,7 @@ impl BackupRepository for FileBackupRepository {
         let header_json = serde_json::to_vec(&header).map_err(BackupError::InvalidHeaderJson)?;
         let aad = build_envelope_aad(&self.backup_policy.magic, &header_json)
             .map_err(|_| BackupError::InvalidHeaderLength)?;
-        let key = derive_key(
-            backup_passphrase,
-            &salt,
-            &header.kdf_params()?,
-            &self.crypto_policy,
-        )?;
+        let key = derive_envelope_key(backup_passphrase, &header, &self.crypto_policy, None)?;
         let ciphertext = encrypt(
             &key,
             &nonce,
@@ -358,6 +350,15 @@ impl BackupRepository for FileBackupRepository {
     }
 
     fn restore(&self, request: &RestoreRequest<'_>) -> Result<Vault, BackupError> {
+        self.restore_with_target_secret(request)
+    }
+}
+
+impl FileBackupRepository {
+    fn restore_with_target_secret(
+        &self,
+        request: &RestoreRequest<'_>,
+    ) -> Result<Vault, BackupError> {
         validate_path(request.backup_path)?;
         validate_path(request.target_vault_path)?;
         if paths_conflict(request.backup_path, request.target_vault_path) {
@@ -381,9 +382,10 @@ impl BackupRepository for FileBackupRepository {
                     ));
                 }
 
-                vault_repository.create_new(
+                vault_repository.create_new_with_secret(
                     request.target_vault_path,
                     request.target_vault_passphrase,
+                    request.target_vault_supplemental_secret,
                     &snapshot.vault,
                 )?;
             }
@@ -394,9 +396,10 @@ impl BackupRepository for FileBackupRepository {
                     ));
                 }
 
-                vault_repository.restore_replace(
+                vault_repository.restore_replace_with_secret(
                     request.target_vault_path,
                     request.target_vault_passphrase,
+                    request.target_vault_supplemental_secret,
                     &snapshot.vault,
                 )?;
             }
