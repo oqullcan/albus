@@ -1,14 +1,14 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use albus::{harden_private_directory, harden_private_file};
 use serde::{Deserialize, Serialize};
 
-use crate::AppError;
+use crate::{
+    AppError,
+    private_fs::{read_limited_file, write_private_file_atomic},
+};
 
 const TRUST_ANCHOR_FILE_NAME: &str = "trusted-vault-revisions-v1.json";
+const MAX_TRUST_ANCHOR_STATE_LEN: u64 = 512 * 1024;
 
 /// Local best-effort rollback detection anchor for known vault revisions.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,7 +88,7 @@ impl VaultTrustAnchor {
     }
 
     fn load_state(&self) -> Result<TrustAnchorState, AppError> {
-        match fs::read(&self.state_file) {
+        match read_limited_file(&self.state_file, MAX_TRUST_ANCHOR_STATE_LEN) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(AppError::InvalidTrustAnchorState),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(TrustAnchorState::default())
@@ -98,16 +98,8 @@ impl VaultTrustAnchor {
     }
 
     fn write_state(&self, state: &TrustAnchorState) -> Result<(), AppError> {
-        if let Some(parent) = self.state_file.parent() {
-            let existed = parent.exists();
-            fs::create_dir_all(parent)?;
-            if !existed {
-                harden_private_directory(parent)?;
-            }
-        }
-
-        fs::write(&self.state_file, serde_json::to_vec(state)?)?;
-        harden_private_file(&self.state_file)?;
+        let encoded = serde_json::to_vec(state)?;
+        write_private_file_atomic(&self.state_file, &encoded)?;
         Ok(())
     }
 }

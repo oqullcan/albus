@@ -11,12 +11,12 @@ use albus_crypto::{
     validate_new_passphrase,
 };
 use albus_storage::{
-    FileVaultRepository, StoragePolicy, VaultRepository, harden_private_directory,
-    harden_private_file,
+    FileVaultRepository, StoragePolicy, VaultRepository, ensure_non_symlink_path,
+    harden_private_directory, harden_private_file,
 };
 use tempfile::NamedTempFile;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::format::{BackupHeader, BackupSnapshot, PlaintextBackupSnapshot};
 use crate::BackupError;
@@ -162,7 +162,10 @@ impl FileBackupRepository {
             return Err(BackupError::BackupNotFound(path.to_path_buf()));
         }
 
-        let bytes = read_limited_file(path, self.backup_policy.max_container_len)?;
+        let bytes = Zeroizing::new(read_limited_file(
+            path,
+            self.backup_policy.max_container_len,
+        )?);
 
         let prefix_len = self.backup_policy.magic.len() + 4;
         if bytes.len() < prefix_len {
@@ -271,7 +274,7 @@ impl Default for FileBackupRepository {
 
 impl BackupRepository for FileBackupRepository {
     fn load_header(&self, path: &Path) -> Result<BackupHeader, BackupError> {
-        let header = self.read_container(path)?.header;
+        let header = self.read_container(path)?.header.clone();
         BackupHeader::from_envelope(&header)
     }
 
@@ -331,9 +334,10 @@ impl BackupRepository for FileBackupRepository {
             plaintext.as_slice(),
             &self.crypto_policy,
         )?;
-        let container =
+        let container = Zeroizing::new(
             assemble_envelope_container(&self.backup_policy.magic, &header_json, &ciphertext)
-                .map_err(|_| BackupError::InvalidHeaderLength)?;
+                .map_err(|_| BackupError::InvalidHeaderLength)?,
+        );
         if u64::try_from(container.len()).unwrap_or(u64::MAX) > self.backup_policy.max_container_len
         {
             return Err(BackupError::ContainerTooLarge(
@@ -341,7 +345,7 @@ impl BackupRepository for FileBackupRepository {
             ));
         }
 
-        persist_bytes(path, &container)
+        persist_bytes(path, container.as_slice())
     }
 
     fn decrypt_snapshot(
@@ -408,11 +412,19 @@ struct LockedBackupContainer {
     ciphertext: Vec<u8>,
 }
 
+impl Drop for LockedBackupContainer {
+    fn drop(&mut self) {
+        self.header_json.zeroize();
+        self.ciphertext.zeroize();
+    }
+}
+
 fn validate_path(path: &Path) -> Result<(), BackupError> {
     if path.as_os_str().is_empty() {
         return Err(BackupError::InvalidPath);
     }
 
+    ensure_non_symlink_path(path)?;
     Ok(())
 }
 

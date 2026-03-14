@@ -11,11 +11,11 @@ use albus_crypto::{
     validate_existing_passphrase, validate_new_passphrase,
 };
 use tempfile::NamedTempFile;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     format::PlaintextVault,
-    privacy::{harden_private_directory, harden_private_file},
+    privacy::{ensure_non_symlink_path, harden_private_directory, harden_private_file},
 };
 use crate::StorageError;
 
@@ -154,7 +154,10 @@ impl FileVaultRepository {
             return Err(StorageError::VaultNotFound(path.to_path_buf()));
         }
 
-        let bytes = read_limited_file(path, self.storage_policy.max_container_len)?;
+        let bytes = Zeroizing::new(read_limited_file(
+            path,
+            self.storage_policy.max_container_len,
+        )?);
 
         let prefix_len = self.storage_policy.magic.len() + 4;
         if bytes.len() < prefix_len {
@@ -298,9 +301,10 @@ impl FileVaultRepository {
             plaintext_bytes.as_slice(),
             &self.crypto_policy,
         )?;
-        let container_bytes =
+        let container_bytes = Zeroizing::new(
             assemble_envelope_container(&self.storage_policy.magic, &header_json, &ciphertext)
-                .map_err(|_| StorageError::InvalidHeaderLength)?;
+                .map_err(|_| StorageError::InvalidHeaderLength)?,
+        );
         if u64::try_from(container_bytes.len()).unwrap_or(u64::MAX)
             > self.storage_policy.max_container_len
         {
@@ -309,7 +313,7 @@ impl FileVaultRepository {
             ));
         }
 
-        persist_bytes(path, &container_bytes, mode)
+        persist_bytes(path, container_bytes.as_slice(), mode)
     }
 
     fn decrypt_container(
@@ -358,7 +362,7 @@ impl Default for FileVaultRepository {
 
 impl VaultRepository for FileVaultRepository {
     fn load_header(&self, path: &Path) -> Result<EnvelopeHeader, StorageError> {
-        Ok(self.read_container(path)?.header)
+        Ok(self.read_container(path)?.header.clone())
     }
 
     fn create_new(&self, path: &Path, passphrase: &str, vault: &Vault) -> Result<(), StorageError> {
@@ -412,6 +416,13 @@ struct LockedContainer {
     ciphertext: Vec<u8>,
 }
 
+impl Drop for LockedContainer {
+    fn drop(&mut self) {
+        self.header_json.zeroize();
+        self.ciphertext.zeroize();
+    }
+}
+
 fn read_limited_file(path: &Path, max_len: u64) -> Result<Vec<u8>, StorageError> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -436,6 +447,7 @@ fn validate_path(path: &Path) -> Result<(), StorageError> {
         return Err(StorageError::InvalidPath);
     }
 
+    ensure_non_symlink_path(path)?;
     Ok(())
 }
 

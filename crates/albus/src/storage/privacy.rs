@@ -1,7 +1,7 @@
-use std::{io, path::Path};
-
-#[cfg(unix)]
-use std::fs;
+use std::{
+    fs, io,
+    path::{Component, Path, PathBuf},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -35,6 +35,75 @@ pub fn harden_private_directory(path: &Path) -> io::Result<()> {
 /// fails.
 pub fn harden_private_file(path: &Path) -> io::Result<()> {
     set_private_permissions(path, false)
+}
+
+/// Rejects paths whose existing components resolve through symlinks.
+///
+/// This is a best-effort safeguard against reading or writing private state
+/// through an unexpected alias. Existing components of the supplied path are
+/// checked after absolute normalization; missing trailing components are
+/// allowed because they do not exist yet.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when a path component cannot be inspected or when an
+/// existing component is a symlink.
+pub fn ensure_non_symlink_path(path: &Path) -> io::Result<()> {
+    let absolute = normalize_absolute_path(path)?;
+    let mut current = PathBuf::new();
+
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(part) => current.push(part),
+        }
+
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::other(format!(
+                    "symlink path component is not allowed: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(unix)]
@@ -139,7 +208,8 @@ fn parse_whoami_user_csv(output: &str) -> Option<String> {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::parse_whoami_user_csv;
+    use super::{ensure_non_symlink_path, parse_whoami_user_csv};
+    use tempfile::TempDir;
 
     #[test]
     fn parses_whoami_user_csv_output() {
@@ -148,5 +218,46 @@ mod tests {
             parse_whoami_user_csv(output),
             Some("S-1-5-21-1000-2000-3000-1001".to_owned())
         );
+    }
+
+    #[test]
+    fn accepts_non_symlink_private_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("state").join("vault.albus");
+
+        ensure_non_symlink_path(&path)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::io;
+    use std::os::unix::fs::symlink;
+
+    use tempfile::TempDir;
+
+    use super::ensure_non_symlink_path;
+
+    #[test]
+    fn accepts_non_symlink_private_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("state").join("vault.albus");
+
+        ensure_non_symlink_path(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_existing_symlink_path_components() -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = TempDir::new()?;
+        let real_dir = tempdir.path().join("real");
+        let link_dir = tempdir.path().join("link");
+        std::fs::create_dir(&real_dir)?;
+        symlink(&real_dir, &link_dir)?;
+
+        let error = ensure_non_symlink_path(&link_dir.join("vault.albus")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        Ok(())
     }
 }

@@ -10,6 +10,10 @@ use super::{
 
 /// The only supported persisted local binding provider in v1.
 pub const LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI: &str = "windows-dpapi";
+/// Supported persisted local binding provider for macOS Keychain.
+pub const LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN: &str = "macos-keychain";
+/// Supported persisted local binding provider for Linux Secret Service.
+pub const LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE: &str = "linux-secret-service";
 /// The only supported persisted local binding scope in v1.
 pub const LOCAL_BINDING_SCOPE_CURRENT_USER: &str = "current-user";
 
@@ -306,7 +310,12 @@ impl EnvelopeHeader {
             return Err(CryptoError::UnexpectedLocalBinding);
         }
 
-        if local_binding.provider != LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI {
+        if !matches!(
+            local_binding.provider.as_str(),
+            LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI
+                | LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN
+                | LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE
+        ) {
             return Err(CryptoError::UnsupportedLocalBindingProvider(
                 local_binding.provider.clone(),
             ));
@@ -396,9 +405,10 @@ fn validate_material_lengths(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerKind, EnvelopeHeader, EnvelopeMetadata, LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI,
-        LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader, assemble_envelope_container,
-        build_envelope_aad,
+        ContainerKind, EnvelopeHeader, EnvelopeMetadata,
+        LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
+        LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI, LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader,
+        assemble_envelope_container, build_envelope_aad,
     };
     use crate::{CryptoError, CryptoPolicy};
 
@@ -592,6 +602,60 @@ mod tests {
             Err(CryptoError::UnsupportedLocalBindingProvider(provider))
                 if provider == "unknown-provider"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_crypto_accepts_macos_keychain_local_binding() -> Result<(), CryptoError> {
+        let policy = CryptoPolicy::default();
+        let salt = vec![0x11; policy.kdf_params.salt_len];
+        let nonce = vec![0x22; policy.nonce_len];
+        let header = EnvelopeHeader::new_vault(
+            1,
+            1,
+            EnvelopeMetadata {
+                vault_id: "vault-1".to_owned(),
+                revision: 7,
+                created_at: None,
+                updated_at: None,
+            },
+            &salt,
+            &nonce,
+            &policy,
+        )?
+        .with_local_binding(LocalBindingHeader {
+            provider: LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN.to_owned(),
+            scope: LOCAL_BINDING_SCOPE_CURRENT_USER.to_owned(),
+        });
+
+        header.validate_crypto(&policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_crypto_accepts_linux_secret_service_local_binding() -> Result<(), CryptoError> {
+        let policy = CryptoPolicy::default();
+        let salt = vec![0x11; policy.kdf_params.salt_len];
+        let nonce = vec![0x22; policy.nonce_len];
+        let header = EnvelopeHeader::new_vault(
+            1,
+            1,
+            EnvelopeMetadata {
+                vault_id: "vault-1".to_owned(),
+                revision: 7,
+                created_at: None,
+                updated_at: None,
+            },
+            &salt,
+            &nonce,
+            &policy,
+        )?
+        .with_local_binding(LocalBindingHeader {
+            provider: LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE.to_owned(),
+            scope: LOCAL_BINDING_SCOPE_CURRENT_USER.to_owned(),
+        });
+
+        header.validate_crypto(&policy)?;
         Ok(())
     }
 

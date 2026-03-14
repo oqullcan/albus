@@ -15,6 +15,8 @@ Protected assets:
 - OTP secrets
 - vault and backup files
 - passphrase-derived keys
+- local rollback anchor state
+- optional per-user device-binding secrets
 
 Assumptions:
 
@@ -25,8 +27,22 @@ Assumptions:
 Out of scope:
 
 - malware resistance on an unlocked host
+- keylogging and screen capture resistance
 - secure deletion guarantees
 - cloud or multi-device conflict handling
+
+## Platform Security Parity
+
+The encrypted container format is platform-neutral.
+
+Local hardening is applied per platform where possible:
+
+- Windows: private ACL tightening, WER crash-report reduction, optional DPAPI device binding
+- macOS: private permissions, core-dump reduction, optional Keychain device binding
+- Linux: private permissions, core-dump reduction, non-dumpable process flag, optional Secret Service device binding
+
+All three platforms aim to protect locked data at rest. None of them claim to
+protect an already compromised unlocked session.
 
 ## Crypto
 
@@ -36,7 +52,16 @@ Out of scope:
 - Encryption: `XChaCha20Poly1305`
 - New vault and backup passphrases must have at least `12` non-whitespace characters
 
-Vaults may optionally use Windows DPAPI-backed local device binding.
+Vaults may optionally use OS-native local device binding:
+
+- Windows: DPAPI
+- macOS: Keychain
+- Linux: Secret Service
+
+Device binding is scoped to the current local user profile. It adds a local
+secret requirement on top of the passphrase, so moving a bound vault to another
+machine or user profile is expected to fail unless restored through a backup
+workflow.
 
 ## Format
 

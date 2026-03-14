@@ -2,27 +2,52 @@
 
 Albus is a local-first TOTP vault written in Rust.
 
-It is built for people who want OTP secrets to stay off cloud services, out of
-browser extensions, and inside a small local workflow with conservative
-security claims.
+It is for people who want OTP secrets to stay in an encrypted local file, off
+cloud platforms, and outside browser extensions.
+
+## Principles
+
+- offline by default
+- no sync
+- no cloud account
+- no telemetry
+- no browser integration
+- conservative security claims
 
 ## Privacy
 
-- no sync
-- no cloud account
-- no browser integration
-- no telemetry
-- local TOTP generation only
+Secrets stay on the machine. Vaults and backups are encrypted at rest, codes
+are generated locally, and the project keeps its scope intentionally narrow.
 
-Secrets stay on the machine. Vaults and backups are encrypted at rest.
+## Security
 
-## Security Model
+Albus is built to protect:
 
-Albus is designed to protect locked vault and backup files, keep the storage
-format simple, and reduce routine local exposure with a strong passphrase.
+- locked vault files
+- locked backup files
+- passphrase-derived file keys
+- routine local state with private filesystem permissions
+- optional per-user OS-native device binding
 
-It does not claim protection against malware, keylogging, or a host that is
-already compromised while the vault is unlocked.
+Current host binding options:
+
+- Windows: DPAPI
+- macOS: Keychain
+- Linux: Secret Service
+
+The app also applies best-effort local hardening such as private file
+permissions, anti-symlink path checks, rollback trust anchors, and process
+dump/crash-report reduction where the platform allows it.
+
+## Limits
+
+Albus does not claim protection against:
+
+- malware on an unlocked host
+- keylogging or screen capture
+- a machine that is already compromised
+- account recovery mistakes
+- secure deletion guarantees
 
 ## Status
 
@@ -38,7 +63,8 @@ already compromised while the vault is unlocked.
 - local code generation
 - passphrase rotation
 - idle auto-lock
-- optional Windows device binding
+- rollback detection
+- optional OS-native device binding
 
 ## Run
 
@@ -51,8 +77,8 @@ Rust `1.94.0` is pinned in `rust-toolchain.toml`.
 
 ## Docs
 
-- [Specification](docs/specs.md)
-- [Security Policy](SECURITY.md)
+- [specification](docs/specs.md)
+- [security policy](SECURITY.md)
 
 Release notes can live in GitHub Releases.
 

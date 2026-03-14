@@ -9,5 +9,5 @@ mod privacy;
 mod repository;
 
 pub use error::StorageError;
-pub use privacy::{harden_private_directory, harden_private_file};
+pub use privacy::{ensure_non_symlink_path, harden_private_directory, harden_private_file};
 pub use repository::{FileVaultRepository, PersistenceMode, StoragePolicy, VaultRepository};

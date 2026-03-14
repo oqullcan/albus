@@ -5,6 +5,7 @@ mod app;
 mod clock;
 mod device_binding;
 mod error;
+mod private_fs;
 #[allow(unsafe_code)]
 mod process_hardening;
 mod remembered_path;

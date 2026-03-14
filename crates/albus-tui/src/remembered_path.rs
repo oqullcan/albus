@@ -1,16 +1,19 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
-use albus::{harden_private_directory, harden_private_file};
 use directories::ProjectDirs;
 
-use crate::AppError;
+use crate::{
+    AppError,
+    private_fs::{read_limited_file, write_private_file_atomic},
+};
 
 const PROJECT_DIR_OVERRIDE_ENV: &str = "ALBUS_PROJECT_DIR";
 const CONFIG_DIR_NAME: &str = "config";
 const DATA_DIR_NAME: &str = "data";
+const MAX_REMEMBERED_PATH_FILE_LEN: u64 = 16 * 1024;
 
 /// Secret-free local helper that remembers the selected vault path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,8 +101,14 @@ impl RememberedVaultPath {
             return Ok(None);
         }
 
-        match fs::read_to_string(&self.config_file) {
-            Ok(contents) => {
+        match read_limited_file(&self.config_file, MAX_REMEMBERED_PATH_FILE_LEN) {
+            Ok(bytes) => {
+                let contents = String::from_utf8(bytes).map_err(|_| {
+                    AppError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "remembered vault path file is not valid UTF-8",
+                    ))
+                })?;
                 let normalized = contents.trim();
                 if normalized.is_empty() {
                     Ok(None)
@@ -123,16 +132,7 @@ impl RememberedVaultPath {
             return self.clear();
         }
 
-        if let Some(parent) = self.config_file.parent() {
-            let existed = parent.exists();
-            fs::create_dir_all(parent)?;
-            if !existed {
-                harden_private_directory(parent)?;
-            }
-        }
-
-        fs::write(&self.config_file, path.to_string_lossy().as_ref())?;
-        harden_private_file(&self.config_file)?;
+        write_private_file_atomic(&self.config_file, path.to_string_lossy().as_bytes())?;
         Ok(())
     }
 

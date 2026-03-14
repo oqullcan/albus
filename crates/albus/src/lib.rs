@@ -21,12 +21,14 @@ pub use core::{
 };
 pub use crypto::{
     AeadAlgorithm, CipherHeader, ContainerKind, CryptoError, CryptoPolicy, EnvelopeHeader,
-    EnvelopeMetadata, KdfAlgorithm, KdfHeader, KdfParams, LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI,
-    LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader, MIN_NEW_PASSPHRASE_NON_WHITESPACE_CHARS,
-    SecretBytes, assemble_envelope_container, build_envelope_aad, decrypt, derive_key, encrypt,
-    random_bytes, validate_existing_passphrase, validate_new_passphrase,
+    EnvelopeMetadata, KdfAlgorithm, KdfHeader, KdfParams,
+    LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
+    LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI, LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader,
+    MIN_NEW_PASSPHRASE_NON_WHITESPACE_CHARS, SecretBytes, assemble_envelope_container,
+    build_envelope_aad, decrypt, derive_key, encrypt, random_bytes, validate_existing_passphrase,
+    validate_new_passphrase,
 };
 pub use storage::{
     FileVaultRepository, PersistenceMode, StorageError, StoragePolicy, VaultRepository,
-    harden_private_directory, harden_private_file,
+    ensure_non_symlink_path, harden_private_directory, harden_private_file,
 };

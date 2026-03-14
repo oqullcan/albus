@@ -17,6 +17,7 @@ mod secret;
 pub use config::{AeadAlgorithm, CryptoPolicy, KdfAlgorithm, KdfParams};
 pub use envelope::{
     CipherHeader, ContainerKind, EnvelopeHeader, EnvelopeMetadata, KdfHeader,
+    LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
     LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI, LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader,
     assemble_envelope_container, build_envelope_aad,
 };

@@ -3,21 +3,36 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::collections::HashMap;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::OnceLock;
+
 #[cfg(windows)]
-use std::process::Command;
+use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 
 use albus::{
+    LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE, LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN,
     LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI, LOCAL_BINDING_SCOPE_CURRENT_USER, LocalBindingHeader,
-    harden_private_directory, harden_private_file, random_bytes,
+    random_bytes,
 };
 use data_encoding::BASE64;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use keyring_core::{Entry as KeyringEntry, Error as KeyringError, set_default_store};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::AppError;
+use crate::{
+    AppError,
+    private_fs::{read_limited_file, write_private_file_atomic},
+};
 
 const STATE_DIR_NAME: &str = "device-bindings-v1";
 const DEVICE_SECRET_LEN: usize = 32;
+const MAX_BINDING_STATE_LEN: u64 = 16 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const KEYRING_SERVICE_NAME: &str = "io.albus.device-binding.v1";
 
 /// Local device-binding policy for newly written vaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +41,10 @@ pub(crate) enum DeviceBindingPreference {
     Disabled,
     /// Require Windows DPAPI-backed local device binding for newly written vaults.
     WindowsDpapiCurrentUser,
+    /// Require macOS Keychain-backed local device binding for newly written vaults.
+    MacosKeychainCurrentUser,
+    /// Require Linux Secret Service-backed local device binding for newly written vaults.
+    LinuxSecretServiceCurrentUser,
 }
 
 /// Derived passphrase material plus whether a fresh local secret was created.
@@ -85,6 +104,16 @@ impl DeviceBindingStore {
                 ensure_provider_available(Some(&binding))?;
                 Ok(Some(binding))
             }
+            DeviceBindingPreference::MacosKeychainCurrentUser => {
+                let binding = macos_keychain_binding_header();
+                ensure_provider_available(Some(&binding))?;
+                Ok(Some(binding))
+            }
+            DeviceBindingPreference::LinuxSecretServiceCurrentUser => {
+                let binding = linux_secret_service_binding_header();
+                ensure_provider_available(Some(&binding))?;
+                Ok(Some(binding))
+            }
         }
     }
 
@@ -134,7 +163,18 @@ impl DeviceBindingStore {
 
     /// Removes a locally persisted binding secret if present.
     pub(crate) fn clear(&self, vault_id: &str) -> Result<(), AppError> {
-        match fs::remove_file(self.state_file(vault_id)) {
+        let state_path = self.state_file(vault_id);
+        if let Ok(bytes) = read_limited_file(&state_path, MAX_BINDING_STATE_LEN)
+            && let Ok(state) = serde_json::from_slice::<StoredBindingState>(&bytes)
+        {
+            let binding = LocalBindingHeader {
+                provider: state.provider,
+                scope: state.scope,
+            };
+            let _ = clear_provider_secret(vault_id, &binding);
+        }
+
+        match fs::remove_file(state_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AppError::Io(error)),
@@ -147,15 +187,24 @@ impl DeviceBindingStore {
         binding: &LocalBindingHeader,
     ) -> Result<(Zeroizing<Vec<u8>>, bool), AppError> {
         let state_file = self.state_file(vault_id);
-        match fs::read(&state_file) {
-            Ok(bytes) => Ok((Self::decode_state(vault_id, binding, &bytes)?, false)),
+        match read_limited_file(&state_file, MAX_BINDING_STATE_LEN) {
+            Ok(bytes) => {
+                let bytes = Zeroizing::new(bytes);
+                Ok((
+                    Self::decode_state(vault_id, binding, bytes.as_slice())?,
+                    false,
+                ))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let secret = Zeroizing::new(random_bytes(DEVICE_SECRET_LEN)?);
-                let protected = protect_bytes(secret.as_slice(), binding)?;
                 let state = StoredBindingState {
                     provider: binding.provider.clone(),
                     scope: binding.scope.clone(),
-                    protected_key_b64: BASE64.encode(protected.as_slice()),
+                    protected_key_b64: create_protected_state(
+                        vault_id,
+                        secret.as_slice(),
+                        binding,
+                    )?,
                 };
                 Self::write_state(&state_file, &state)?;
                 Ok((secret, true))
@@ -170,8 +219,8 @@ impl DeviceBindingStore {
         binding: &LocalBindingHeader,
     ) -> Result<Zeroizing<Vec<u8>>, AppError> {
         let state_file = self.state_file(vault_id);
-        let bytes = match fs::read(&state_file) {
-            Ok(bytes) => bytes,
+        let bytes = match read_limited_file(&state_file, MAX_BINDING_STATE_LEN) {
+            Ok(bytes) => Zeroizing::new(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(AppError::MissingDeviceBindingKey {
                     vault_id: vault_id.to_owned(),
@@ -180,7 +229,7 @@ impl DeviceBindingStore {
             Err(error) => return Err(AppError::Io(error)),
         };
 
-        Self::decode_state(vault_id, binding, &bytes)
+        Self::decode_state(vault_id, binding, bytes.as_slice())
     }
 
     fn decode_state(
@@ -198,11 +247,8 @@ impl DeviceBindingStore {
 
         let protected = BASE64
             .decode(state.protected_key_b64.as_bytes())
-            .map_err(|_| AppError::MissingDeviceBindingKey {
-                vault_id: vault_id.to_owned(),
-            })?;
-        let protected = Zeroizing::new(protected);
-        let secret = unprotect_bytes(protected.as_slice(), binding)?;
+            .map(Zeroizing::new);
+        let secret = load_provider_secret(vault_id, binding, protected)?;
         if secret.len() != DEVICE_SECRET_LEN {
             return Err(AppError::MissingDeviceBindingKey {
                 vault_id: vault_id.to_owned(),
@@ -213,17 +259,9 @@ impl DeviceBindingStore {
     }
 
     fn write_state(state_file: &Path, state: &StoredBindingState) -> Result<(), AppError> {
-        if let Some(parent) = state_file.parent() {
-            let existed = parent.exists();
-            fs::create_dir_all(parent)?;
-            if !existed {
-                harden_private_directory(parent)?;
-            }
-        }
-
-        let encoded = serde_json::to_vec(state).map_err(AppError::InvalidDeviceBindingState)?;
-        fs::write(state_file, encoded)?;
-        harden_private_file(state_file)?;
+        let encoded =
+            Zeroizing::new(serde_json::to_vec(state).map_err(AppError::InvalidDeviceBindingState)?);
+        write_private_file_atomic(state_file, encoded.as_slice())?;
         Ok(())
     }
 
@@ -248,15 +286,57 @@ fn windows_dpapi_binding_header() -> LocalBindingHeader {
     }
 }
 
+fn macos_keychain_binding_header() -> LocalBindingHeader {
+    LocalBindingHeader {
+        provider: LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN.to_owned(),
+        scope: LOCAL_BINDING_SCOPE_CURRENT_USER.to_owned(),
+    }
+}
+
+fn linux_secret_service_binding_header() -> LocalBindingHeader {
+    LocalBindingHeader {
+        provider: LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE.to_owned(),
+        scope: LOCAL_BINDING_SCOPE_CURRENT_USER.to_owned(),
+    }
+}
+
 fn preference_from_env(value: Option<&std::ffi::OsStr>) -> DeviceBindingPreference {
     let Some(value) = value else {
         return DeviceBindingPreference::Disabled;
     };
 
     let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" | "native" | "platform" => platform_default_preference(),
+        "windows" | "windows-dpapi" => DeviceBindingPreference::WindowsDpapiCurrentUser,
+        "macos" | "macos-keychain" | "keychain" => {
+            DeviceBindingPreference::MacosKeychainCurrentUser
+        }
+        "linux" | "linux-secret-service" | "secret-service" => {
+            DeviceBindingPreference::LinuxSecretServiceCurrentUser
+        }
+        _ => DeviceBindingPreference::Disabled,
+    }
+}
+
+fn platform_default_preference() -> DeviceBindingPreference {
+    #[cfg(windows)]
+    {
         DeviceBindingPreference::WindowsDpapiCurrentUser
-    } else {
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        DeviceBindingPreference::MacosKeychainCurrentUser
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        DeviceBindingPreference::LinuxSecretServiceCurrentUser
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
         DeviceBindingPreference::Disabled
     }
 }
@@ -288,24 +368,85 @@ fn ensure_provider_available(binding: Option<&LocalBindingHeader>) -> Result<(),
         return Ok(());
     };
 
-    if binding.provider != LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI
-        || binding.scope != LOCAL_BINDING_SCOPE_CURRENT_USER
-    {
+    if binding.scope != LOCAL_BINDING_SCOPE_CURRENT_USER {
         return Err(AppError::DeviceBindingUnavailable {
             provider: binding.provider.clone(),
         });
     }
 
-    #[cfg(windows)]
-    {
-        Ok(())
-    }
+    match binding.provider.as_str() {
+        LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI => {
+            #[cfg(windows)]
+            {
+                Ok(())
+            }
 
-    #[cfg(not(windows))]
-    {
-        Err(AppError::DeviceBindingUnavailable {
+            #[cfg(not(windows))]
+            {
+                Err(AppError::DeviceBindingUnavailable {
+                    provider: binding.provider.clone(),
+                })
+            }
+        }
+        LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN | LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE => {
+            initialize_native_keyring_store(binding)
+        }
+        _ => Err(AppError::DeviceBindingUnavailable {
             provider: binding.provider.clone(),
-        })
+        }),
+    }
+}
+
+fn create_protected_state(
+    vault_id: &str,
+    secret: &[u8],
+    binding: &LocalBindingHeader,
+) -> Result<String, AppError> {
+    match binding.provider.as_str() {
+        LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI => {
+            let protected = protect_bytes(secret, binding)?;
+            Ok(BASE64.encode(protected.as_slice()))
+        }
+        LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN | LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE => {
+            store_native_keyring_secret(vault_id, secret, binding)?;
+            Ok(String::new())
+        }
+        _ => Err(AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        }),
+    }
+}
+
+fn load_provider_secret(
+    vault_id: &str,
+    binding: &LocalBindingHeader,
+    protected: Result<Zeroizing<Vec<u8>>, data_encoding::DecodeError>,
+) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    match binding.provider.as_str() {
+        LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI => {
+            let protected = protected.map_err(|_| AppError::MissingDeviceBindingKey {
+                vault_id: vault_id.to_owned(),
+            })?;
+            unprotect_bytes(protected.as_slice(), binding)
+        }
+        LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN | LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE => {
+            load_native_keyring_secret(vault_id, binding)
+        }
+        _ => Err(AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        }),
+    }
+}
+
+fn clear_provider_secret(vault_id: &str, binding: &LocalBindingHeader) -> Result<(), AppError> {
+    match binding.provider.as_str() {
+        LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI => Ok(()),
+        LOCAL_BINDING_PROVIDER_MACOS_KEYCHAIN | LOCAL_BINDING_PROVIDER_LINUX_SECRET_SERVICE => {
+            delete_native_keyring_secret(vault_id, binding)
+        }
+        _ => Err(AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        }),
     }
 }
 
@@ -314,8 +455,20 @@ fn protect_bytes(
     binding: &LocalBindingHeader,
 ) -> Result<Zeroizing<Vec<u8>>, AppError> {
     ensure_provider_available(Some(binding))?;
-    let encoded = BASE64.encode(bytes);
-    run_windows_protected_data(encoded.as_str(), DpapiOperation::Protect)
+    #[cfg(windows)]
+    {
+        encrypt_data(bytes, Scope::User, None)
+            .map(Zeroizing::new)
+            .map_err(|error| AppError::DeviceBindingService(error.to_string()))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = bytes;
+        Err(AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        })
+    }
 }
 
 fn unprotect_bytes(
@@ -323,69 +476,185 @@ fn unprotect_bytes(
     binding: &LocalBindingHeader,
 ) -> Result<Zeroizing<Vec<u8>>, AppError> {
     ensure_provider_available(Some(binding))?;
-    let encoded = BASE64.encode(bytes);
-    run_windows_protected_data(encoded.as_str(), DpapiOperation::Unprotect)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DpapiOperation {
-    Protect,
-    Unprotect,
-}
-
-fn run_windows_protected_data(
-    input_b64: &str,
-    operation: DpapiOperation,
-) -> Result<Zeroizing<Vec<u8>>, AppError> {
     #[cfg(windows)]
     {
-        let script = match operation {
-            DpapiOperation::Protect => {
-                "Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect([Convert]::FromBase64String($env:ALBUS_DPAPI_INPUT_B64), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser))"
-            }
-            DpapiOperation::Unprotect => {
-                "Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($env:ALBUS_DPAPI_INPUT_B64), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser))"
-            }
-        };
-
-        let output = Command::new("powershell.exe")
-            .env("ALBUS_DPAPI_INPUT_B64", input_b64)
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            let detail = if stderr.is_empty() { stdout } else { stderr };
-            return Err(AppError::DeviceBindingService(detail));
-        }
-
-        let normalized = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let decoded = BASE64
-            .decode(normalized.as_bytes())
-            .map_err(|_| AppError::DeviceBindingService("unexpected DPAPI response".to_owned()))?;
-        Ok(Zeroizing::new(decoded))
+        decrypt_data(bytes, Scope::User, None)
+            .map(Zeroizing::new)
+            .map_err(|error| AppError::DeviceBindingService(error.to_string()))
     }
 
     #[cfg(not(windows))]
     {
-        let _ = input_b64;
-        let _ = operation;
+        let _ = bytes;
         Err(AppError::DeviceBindingUnavailable {
-            provider: LOCAL_BINDING_PROVIDER_WINDOWS_DPAPI.to_owned(),
+            provider: binding.provider.clone(),
         })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn initialize_native_keyring_store(binding: &LocalBindingHeader) -> Result<(), AppError> {
+    static KEYRING_STORE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    let initialized = KEYRING_STORE_INIT.get_or_init(|| {
+        let config = HashMap::new();
+
+        #[cfg(target_os = "macos")]
+        {
+            use apple_native_keyring_store::keychain::Store;
+
+            let store =
+                Store::new_with_configuration(&config).map_err(|error| error.to_string())?;
+            set_default_store(store);
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use dbus_secret_service_keyring_store::Store;
+
+            let store =
+                Store::new_with_configuration(&config).map_err(|error| error.to_string())?;
+            set_default_store(store);
+            Ok(())
+        }
+    });
+
+    match initialized {
+        Ok(()) => Ok(()),
+        Err(_) => Err(AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        }),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn initialize_native_keyring_store(binding: &LocalBindingHeader) -> Result<(), AppError> {
+    Err(AppError::DeviceBindingUnavailable {
+        provider: binding.provider.clone(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn keyring_entry(vault_id: &str, binding: &LocalBindingHeader) -> Result<KeyringEntry, AppError> {
+    initialize_native_keyring_store(binding)?;
+    KeyringEntry::new(
+        KEYRING_SERVICE_NAME,
+        format!("{}:{vault_id}", binding.provider).as_str(),
+    )
+    .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn store_native_keyring_secret(
+    vault_id: &str,
+    secret: &[u8],
+    binding: &LocalBindingHeader,
+) -> Result<(), AppError> {
+    keyring_entry(vault_id, binding)?
+        .set_secret(secret)
+        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn load_native_keyring_secret(
+    vault_id: &str,
+    binding: &LocalBindingHeader,
+) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    keyring_entry(vault_id, binding)?
+        .get_secret()
+        .map(Zeroizing::new)
+        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn delete_native_keyring_secret(
+    vault_id: &str,
+    binding: &LocalBindingHeader,
+) -> Result<(), AppError> {
+    match keyring_entry(vault_id, binding)?
+        .delete_credential()
+        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+    {
+        Ok(()) => Ok(()),
+        Err(AppError::MissingDeviceBindingKey { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn store_native_keyring_secret(
+    _vault_id: &str,
+    _secret: &[u8],
+    binding: &LocalBindingHeader,
+) -> Result<(), AppError> {
+    Err(AppError::DeviceBindingUnavailable {
+        provider: binding.provider.clone(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn load_native_keyring_secret(
+    _vault_id: &str,
+    binding: &LocalBindingHeader,
+) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    Err(AppError::DeviceBindingUnavailable {
+        provider: binding.provider.clone(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn delete_native_keyring_secret(
+    _vault_id: &str,
+    binding: &LocalBindingHeader,
+) -> Result<(), AppError> {
+    Err(AppError::DeviceBindingUnavailable {
+        provider: binding.provider.clone(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn map_keyring_error(
+    error: KeyringError,
+    binding: &LocalBindingHeader,
+    vault_id: Option<&str>,
+) -> AppError {
+    match error {
+        KeyringError::NoEntry => AppError::MissingDeviceBindingKey {
+            vault_id: vault_id.unwrap_or("vault").to_owned(),
+        },
+        KeyringError::NoStorageAccess(_)
+        | KeyringError::PlatformFailure(_)
+        | KeyringError::NoDefaultStore
+        | KeyringError::NotSupportedByStore(_) => AppError::DeviceBindingUnavailable {
+            provider: binding.provider.clone(),
+        },
+        KeyringError::BadEncoding(_)
+        | KeyringError::BadDataFormat(_, _)
+        | KeyringError::BadStoreFormat(_)
+        | KeyringError::TooLong(_, _)
+        | KeyringError::Invalid(_, _)
+        | KeyringError::Ambiguous(_) => AppError::DeviceBindingService(error.to_string()),
+        _ => AppError::DeviceBindingService(error.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::linux_secret_service_binding_header;
+    #[cfg(target_os = "macos")]
+    use super::macos_keychain_binding_header;
+    #[cfg(windows)]
+    use super::windows_dpapi_binding_header;
     use super::{
-        DeviceBindingPreference, compose_effective_passphrase, preference_from_env,
-        sanitize_vault_id,
+        DeviceBindingPreference, DeviceBindingStore, compose_effective_passphrase,
+        platform_default_preference, preference_from_env, sanitize_vault_id,
     };
-    #[cfg(windows)]
-    use super::{DeviceBindingStore, windows_dpapi_binding_header};
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     use tempfile::TempDir;
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    use uuid::Uuid;
 
     #[test]
     fn device_binding_defaults_to_disabled_without_opt_in() {
@@ -397,9 +666,25 @@ mod tests {
         for candidate in ["1", "true", "TRUE", "yes", "on"] {
             assert_eq!(
                 preference_from_env(Some(candidate.as_ref())),
-                DeviceBindingPreference::WindowsDpapiCurrentUser
+                platform_default_preference()
             );
         }
+    }
+
+    #[test]
+    fn device_binding_env_accepts_explicit_provider_values() {
+        assert_eq!(
+            preference_from_env(Some("windows-dpapi".as_ref())),
+            DeviceBindingPreference::WindowsDpapiCurrentUser
+        );
+        assert_eq!(
+            preference_from_env(Some("macos-keychain".as_ref())),
+            DeviceBindingPreference::MacosKeychainCurrentUser
+        );
+        assert_eq!(
+            preference_from_env(Some("linux-secret-service".as_ref())),
+            DeviceBindingPreference::LinuxSecretServiceCurrentUser
+        );
     }
 
     #[test]
@@ -414,6 +699,52 @@ mod tests {
         assert!(composed.as_str().starts_with("passphrase"));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn native_binding_smoke_enabled() -> bool {
+        matches!(
+            std::env::var("ALBUS_RUN_NATIVE_BINDING_SMOKE")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[derive(Clone, Debug)]
+    struct BindingSmokeGuard {
+        store: DeviceBindingStore,
+        vault_id: String,
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    impl Drop for BindingSmokeGuard {
+        fn drop(&mut self) {
+            let _ = self.store.clear(&self.vault_id);
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    fn exercise_native_binding_round_trip(
+        store: &DeviceBindingStore,
+        binding: &albus::LocalBindingHeader,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let vault_id = format!("smoke-{}", Uuid::new_v4());
+        let _cleanup = BindingSmokeGuard {
+            store: store.clone(),
+            vault_id: vault_id.clone(),
+        };
+
+        let prepared = store.prepare_for_new_vault(&vault_id, "passphrase", Some(binding))?;
+        let loaded = store.prepare_for_existing_vault(&vault_id, "passphrase", Some(binding))?;
+
+        assert!(prepared.created_secret());
+        assert_eq!(prepared.as_str(), loaded.as_str());
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_dpapi_store_round_trips_the_same_secret() -> Result<(), Box<dyn std::error::Error>> {
@@ -424,10 +755,45 @@ mod tests {
         );
         let binding = windows_dpapi_binding_header();
 
-        let prepared = store.prepare_for_new_vault("vault-1", "passphrase", Some(&binding))?;
-        let loaded = store.prepare_for_existing_vault("vault-1", "passphrase", Some(&binding))?;
+        exercise_native_binding_round_trip(&store, &binding)?;
+        Ok(())
+    }
 
-        assert_eq!(prepared.as_str(), loaded.as_str());
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keychain_store_round_trips_when_smoke_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if !native_binding_smoke_enabled() {
+            return Ok(());
+        }
+
+        let tempdir = TempDir::new()?;
+        let store = DeviceBindingStore::new(
+            tempdir.path().join("bindings"),
+            DeviceBindingPreference::MacosKeychainCurrentUser,
+        );
+        let binding = macos_keychain_binding_header();
+
+        exercise_native_binding_round_trip(&store, &binding)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_store_round_trips_when_smoke_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if !native_binding_smoke_enabled() {
+            return Ok(());
+        }
+
+        let tempdir = TempDir::new()?;
+        let store = DeviceBindingStore::new(
+            tempdir.path().join("bindings"),
+            DeviceBindingPreference::LinuxSecretServiceCurrentUser,
+        );
+        let binding = linux_secret_service_binding_header();
+
+        exercise_native_binding_round_trip(&store, &binding)?;
         Ok(())
     }
 }
