@@ -877,6 +877,12 @@ mod tests {
         if !native_binding_smoke_enabled() {
             return Ok(());
         }
+        if running_in_github_actions() {
+            eprintln!(
+                "skipping macOS native-binding smoke test in GitHub Actions: runner keychain access is not stable for unsigned test binaries"
+            );
+            return Ok(());
+        }
 
         let tempdir = TempDir::new()?;
         let store = DeviceBindingStore::new(
@@ -901,6 +907,12 @@ mod tests {
     fn linux_secret_service_store_round_trips_when_smoke_enabled()
     -> Result<(), Box<dyn std::error::Error>> {
         if !native_binding_smoke_enabled() {
+            return Ok(());
+        }
+        if running_in_github_actions() {
+            eprintln!(
+                "skipping Linux native-binding smoke test in GitHub Actions: desktop secret-service availability varies across runners"
+            );
             return Ok(());
         }
 

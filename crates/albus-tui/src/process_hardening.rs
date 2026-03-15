@@ -255,6 +255,19 @@ mod platform {
 mod tests {
     use super::hardening_enabled_from_env;
 
+    #[cfg(unix)]
+    fn running_in_github_actions() -> bool {
+        matches!(
+            std::env::var("GITHUB_ACTIONS")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
     #[test]
     fn process_hardening_defaults_to_enabled() {
         assert!(hardening_enabled_from_env(None));
@@ -284,6 +297,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_core_dump_hardening_call_completes_without_error() -> Result<(), String> {
+        if running_in_github_actions() {
+            eprintln!(
+                "skipping unix core-dump hardening test in GitHub Actions: runner policies can block rlimit and dumpability changes"
+            );
+            return Ok(());
+        }
+
         let original_limits = super::platform::current_core_limits()?;
         #[cfg(target_os = "linux")]
         let original_dumpable = super::platform::current_process_dumpable()?;
