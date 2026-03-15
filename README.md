@@ -63,6 +63,14 @@ Albus does not claim protection against:
 - no external audit yet
 - conservative scope and claims
 
+## Direction
+
+Albus should aim to become the best local-first desktop authenticator in the
+category: trustworthy, portable, auditable, and easy to migrate into without
+expanding into sync, browser integration, or password management.
+
+The current product roadmap lives in [docs/roadmap.md](docs/roadmap.md).
+
 ## Features
 
 - encrypted local vault
@@ -86,6 +94,7 @@ Rust `1.94.0` is pinned in `rust-toolchain.toml`.
 ## Docs
 
 - [specification](docs/specs.md)
+- [roadmap](docs/roadmap.md)
 - [security policy](SECURITY.md)
 
 Release notes can live in GitHub Releases.
