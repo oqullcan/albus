@@ -256,7 +256,12 @@ mod unix_tests {
         std::fs::create_dir(&real_dir)?;
         symlink(&real_dir, &link_dir)?;
 
-        let error = ensure_non_symlink_path(&link_dir.join("vault.albus")).unwrap_err();
+        let error = match ensure_non_symlink_path(&link_dir.join("vault.albus")) {
+            Ok(()) => {
+                return Err(io::Error::other("expected symlink path rejection").into());
+            }
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), io::ErrorKind::Other);
         Ok(())
     }

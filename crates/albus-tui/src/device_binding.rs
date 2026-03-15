@@ -590,7 +590,7 @@ fn keyring_entry(vault_id: &str, binding: &LocalBindingHeader) -> Result<Keyring
         KEYRING_SERVICE_NAME,
         format!("{}:{vault_id}", binding.provider).as_str(),
     )
-    .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+    .map_err(|error| map_keyring_error(&error, binding, Some(vault_id)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -601,7 +601,7 @@ fn store_native_keyring_secret(
 ) -> Result<(), AppError> {
     keyring_entry(vault_id, binding)?
         .set_secret(secret)
-        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+        .map_err(|error| map_keyring_error(&error, binding, Some(vault_id)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -612,7 +612,7 @@ fn load_native_keyring_secret(
     keyring_entry(vault_id, binding)?
         .get_secret()
         .map(Zeroizing::new)
-        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+        .map_err(|error| map_keyring_error(&error, binding, Some(vault_id)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -622,10 +622,9 @@ fn delete_native_keyring_secret(
 ) -> Result<(), AppError> {
     match keyring_entry(vault_id, binding)?
         .delete_credential()
-        .map_err(|error| map_keyring_error(error, binding, Some(vault_id)))
+        .map_err(|error| map_keyring_error(&error, binding, Some(vault_id)))
     {
-        Ok(()) => Ok(()),
-        Err(AppError::MissingDeviceBindingKey { .. }) => Ok(()),
+        Ok(()) | Err(AppError::MissingDeviceBindingKey { .. }) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -663,7 +662,7 @@ fn delete_native_keyring_secret(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn map_keyring_error(
-    error: KeyringError,
+    error: &KeyringError,
     binding: &LocalBindingHeader,
     vault_id: Option<&str>,
 ) -> AppError {
@@ -677,12 +676,6 @@ fn map_keyring_error(
         | KeyringError::NotSupportedByStore(_) => AppError::DeviceBindingUnavailable {
             provider: binding.provider.clone(),
         },
-        KeyringError::BadEncoding(_)
-        | KeyringError::BadDataFormat(_, _)
-        | KeyringError::BadStoreFormat(_)
-        | KeyringError::TooLong(_, _)
-        | KeyringError::Invalid(_, _)
-        | KeyringError::Ambiguous(_) => AppError::DeviceBindingService(error.to_string()),
         _ => AppError::DeviceBindingService(error.to_string()),
     }
 }
