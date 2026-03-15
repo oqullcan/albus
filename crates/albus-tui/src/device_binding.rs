@@ -775,6 +775,35 @@ mod tests {
         )
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn running_in_github_actions() -> bool {
+        matches!(
+            std::env::var("GITHUB_ACTIONS")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn should_skip_native_binding_smoke_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        if !running_in_github_actions() {
+            return false;
+        }
+
+        matches!(
+            error.downcast_ref::<crate::error::AppError>(),
+            Some(
+                crate::error::AppError::DeviceBindingUnavailable { .. }
+                    | crate::error::AppError::MissingDeviceBindingKey { .. }
+                    | crate::error::AppError::DeviceBindingService(_)
+            )
+        )
+    }
+
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[derive(Clone, Debug)]
     struct BindingSmokeGuard {
@@ -803,9 +832,27 @@ mod tests {
         let prepared = store.prepare_for_new_vault(&vault_id, "passphrase", Some(binding))?;
         let loaded = store.prepare_for_existing_vault(&vault_id, "passphrase", Some(binding))?;
 
-        assert!(prepared.created_secret());
-        assert_eq!(prepared.as_str(), loaded.as_str());
-        assert_eq!(prepared.supplemental_secret(), loaded.supplemental_secret());
+        if !prepared.created_secret() {
+            return Err(std::io::Error::other(
+                "native binding smoke test did not create a fresh local secret",
+            )
+            .into());
+        }
+
+        if prepared.as_str() != loaded.as_str() {
+            return Err(std::io::Error::other(
+                "native binding smoke test returned a mismatched passphrase",
+            )
+            .into());
+        }
+
+        if prepared.supplemental_secret() != loaded.supplemental_secret() {
+            return Err(std::io::Error::other(
+                "native binding smoke test returned mismatched supplemental secrets",
+            )
+            .into());
+        }
+
         Ok(())
     }
 
@@ -838,7 +885,14 @@ mod tests {
         );
         let binding = macos_keychain_binding_header();
 
-        exercise_native_binding_round_trip(&store, &binding)?;
+        match exercise_native_binding_round_trip(&store, &binding) {
+            Ok(()) => {}
+            Err(error) if should_skip_native_binding_smoke_error(error.as_ref()) => {
+                eprintln!("skipping macOS native-binding smoke test in GitHub Actions: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+
         Ok(())
     }
 
@@ -857,7 +911,14 @@ mod tests {
         );
         let binding = linux_secret_service_binding_header();
 
-        exercise_native_binding_round_trip(&store, &binding)?;
+        match exercise_native_binding_round_trip(&store, &binding) {
+            Ok(()) => {}
+            Err(error) if should_skip_native_binding_smoke_error(error.as_ref()) => {
+                eprintln!("skipping Linux native-binding smoke test in GitHub Actions: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+
         Ok(())
     }
 }
