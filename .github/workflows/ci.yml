@@ -55,7 +55,7 @@ jobs:
         run: |
           dbus-run-session -- bash -lc 'eval "$(gnome-keyring-daemon --start --components=secrets)"; cargo test --workspace --locked'
       - name: Test
-        if: matrix.os != 'ubuntu-latest'
+        if: matrix.os == 'windows-latest'
         env:
           ALBUS_RUN_NATIVE_BINDING_SMOKE: ${{ matrix.native_binding_smoke }}
         run: cargo test --workspace --locked
