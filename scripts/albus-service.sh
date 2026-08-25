@@ -80,14 +80,22 @@ get_interfaces() {
 }
 
 restore_system_dns() {
+  local gw
+  gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || true)
+
   for iface in $(get_interfaces); do
     resolvectl default-route "$iface" true 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
-    resolvectl dns "$iface" 8.8.8.8 8.8.4.4 1.1.1.1 2>/dev/null || true
+    if [ -n "$gw" ] && [[ $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      resolvectl dns "$iface" "$gw" 1.1.1.1 8.8.8.8 9.9.9.9 2>/dev/null || true
+    else
+      resolvectl dns "$iface" 1.1.1.1 8.8.8.8 9.9.9.9 2>/dev/null || true
+    fi
   done
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
 }
+
 
 case "$action" in
   start)
