@@ -95,9 +95,21 @@ restore_system_dns() {
     resolvectl dnsovertls "$iface" no 2>/dev/null || true
     resolvectl dns "$iface" "${nameservers[@]}" 2>/dev/null || true
   done
+
+  # Update /etc/resolv.conf so libc / browsers querying resolv.conf directly never hit blocked 8.8.8.8
+  if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+    cat << EOF > /etc/resolv.conf
+# Restored by Albus for direct native connectivity
+nameserver ${gw:-192.168.1.1}
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+EOF
+  fi
+
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
 }
+
 
 
 
