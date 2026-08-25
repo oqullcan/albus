@@ -132,18 +132,21 @@ case "$action" in
     ;;
 
   stop)
-    # revert link dns and flush caches
+    # 1. disable transparent netfilter rules
+    if [ -x "$transparent_script" ]; then
+      "$transparent_script" disable 2>/dev/null || true
+    fi
+
+    # 2. revert link dns and flush caches
     for iface in $(get_interfaces); do
       resolvectl revert "$iface" 2>/dev/null || true
     done
     resolvectl flush-caches 2>/dev/null || true
 
-    # disable transparent netfilter rules
-    if [ -x "$transparent_script" ]; then
-      "$transparent_script" disable 2>/dev/null || true
-    fi
+    # 3. flush routing cache
+    ip route flush cache 2>/dev/null || true
 
-    # kill daemon
+    # 4. kill daemon
     if [ -f "$pid_file" ]; then
       pid=$(cat "$pid_file" 2>/dev/null || true)
       if [ -n "$pid" ]; then
@@ -152,11 +155,17 @@ case "$action" in
       rm -f "$pid_file"
     fi
     pkill -9 -x "albus-core" 2>/dev/null || true
+    rm -f /tmp/albus.sock "$log_file" "$legacy_pid" 2>/dev/null || true
 
-    rm -f /tmp/albus.sock 2>/dev/null || true
+    # 5. sync helpers
+    if [ "$script_dir" != "/usr/lib/albus" ] && [ -f "$script_dir/albus-service.sh" ]; then
+      install -m755 "$script_dir/albus-service.sh" /usr/lib/albus/albus-service.sh 2>/dev/null || true
+      install -m755 "$script_dir/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh 2>/dev/null || true
+    fi
 
     echo "{\"running\":false}"
     ;;
+
 
   fix-network|repair)
     # 1. Kill any running albus process
