@@ -80,31 +80,25 @@ get_interfaces() {
 }
 
 restore_system_dns() {
-  local nameservers=()
-  while IFS= read -r ns; do
-    if [ -n "$ns" ] && [[ ! "$ns" =~ ^127\.0\. ]]; then
-      nameservers+=("$ns")
-    fi
-  done < <(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}')
-
-  if [ ${#nameservers[@]} -eq 0 ]; then
-    nameservers=("8.8.8.8" "8.8.4.4" "1.1.1.1")
-  fi
-
   local gw
-  gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || true)
+  gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || echo "192.168.1.1")
+
+  local nameservers=()
   if [ -n "$gw" ] && [[ $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     nameservers+=("$gw")
   fi
+  nameservers+=("1.1.1.1" "1.0.0.1" "9.9.9.9")
 
   for iface in $(get_interfaces); do
     resolvectl default-route "$iface" true 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
+    resolvectl dnsovertls "$iface" no 2>/dev/null || true
     resolvectl dns "$iface" "${nameservers[@]}" 2>/dev/null || true
   done
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
 }
+
 
 
 case "$action" in
