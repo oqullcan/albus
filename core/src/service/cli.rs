@@ -93,42 +93,17 @@ pub fn is_daemon_running() -> bool {
 }
 
 pub fn cmd_status(json_mode: bool) {
-    let active_prof = get_active_profile();
-    let is_dev = is_dev_mode();
-
     if json_mode {
         if let Some(raw) = query_status_raw() {
-            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                val["profile"] = serde_json::Value::String(active_prof.clone());
-                if (is_dev && active_prof != "dev") || (!is_dev && active_prof != "stable") {
-                    val["running"] = serde_json::Value::Bool(false);
-                }
-                println!("{}", val);
-                return;
-            }
             println!("{}", raw);
         } else {
-            println!("{{\"running\":false,\"profile\":\"{}\"}}", active_prof);
+            println!("{{\"running\":false}}");
         }
         return;
     }
 
     if let Some(raw) = query_status_raw() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if is_dev && active_prof != "dev" {
-                print_banner();
-                println!("  ○ Status:       {}STANDBY (Stable Profile Active){}", C_DIM, C_RESET);
-                println!("  Run 'albusdev start' to switch to Dev Workbench.");
-                println!();
-                return;
-            } else if !is_dev && active_prof != "stable" {
-                print_banner();
-                println!("  ○ Status:       {}STANDBY (Dev Workbench Active){}", C_DIM, C_RESET);
-                println!("  Run 'albus start' to switch to Stable Edition.");
-                println!();
-                return;
-            }
-
             let total = val["total"].as_u64().unwrap_or(0);
             let tls = val["tls"].as_u64().unwrap_or(0);
             let bytes_str = val["bytes_str"].as_str().unwrap_or("0 B");
@@ -160,7 +135,7 @@ pub fn cmd_status(json_mode: bool) {
 
     print_banner();
     println!("  ○ Status:       {}STOPPED (Direct Network){}", C_DIM, C_RESET);
-    println!("  Run '{} start' to activate protection.", if is_dev { "albusdev" } else { "albus" });
+    println!("  Run 'albus start' to activate protection.");
     println!();
 }
 
