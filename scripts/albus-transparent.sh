@@ -18,9 +18,19 @@ teardown_all() {
   while ip6tables -D OUTPUT -j ALBUS_FILTER6 2>/dev/null; do :; done
   while ip6tables -D INPUT -j ALBUS_FILTER6 2>/dev/null; do :; done
 
+  while iptables -t nat -D OUTPUT -j ALBUS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p tcp -j ALBUS 2>/dev/null; do :; done
+  while iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p udp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p tcp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -j ALBUS_DNS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -j ALBUS 2>/dev/null; do :; done
+
+  while ip6tables -t nat -D OUTPUT -j ALBUS 2>/dev/null; do :; done
+  while ip6tables -t nat -D OUTPUT -p tcp -j ALBUS 2>/dev/null; do :; done
+  while ip6tables -t nat -F ALBUS 2>/dev/null; do :; done
+  while ip6tables -t nat -X ALBUS 2>/dev/null; do :; done
+
   while iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null; do :; done
 
   # 2. flush and delete custom chains
@@ -40,9 +50,9 @@ teardown_all() {
   iptables -t nat -X ALBUS 2>/dev/null || true
   iptables -t nat -F ALBUS_DNS 2>/dev/null || true
   iptables -t nat -X ALBUS_DNS 2>/dev/null || true
+
   while iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null; do :; done
   while iptables -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
-
 
   while ip6tables -D OUTPUT -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
   while ip6tables -D OUTPUT -p udp --dport 443 -j REJECT 2>/dev/null; do :; done
@@ -51,6 +61,7 @@ teardown_all() {
   while ip6tables -D INPUT ! -i lo -p udp --dport 5300 -j DROP 2>/dev/null; do :; done
   while ip6tables -D INPUT ! -i lo -p tcp --dport 5300 -j DROP 2>/dev/null; do :; done
 }
+
 
 
 if [ "$action" = "enable" ]; then
