@@ -113,8 +113,11 @@ pub fn cmd_status(json_mode: bool) {
             let on_bat = val["battery"].as_bool().unwrap_or(false);
             let poison = val["poison_blocks"].as_u64().unwrap_or(0);
 
+            let ver = val["version"].as_str().unwrap_or("v1.5.0-dev (Pure Rust)");
+
             print_banner();
             println!("  ● Status:       {}{}{}ACTIVE (Protected){}", C_GREEN, C_BOLD, C_RESET, C_RESET);
+            println!("    Engine Core:  {}{}{}{}", C_MAGENTA, C_BOLD, ver, C_RESET);
             println!("    Data Shield:  {}{}{}{}", C_CYAN, C_BOLD, bytes_str, C_RESET);
             if speed_str != "0 B/s" {
                 println!("    Throughput:   {}{}{}{}", C_GREEN, C_BOLD, speed_str, C_RESET);

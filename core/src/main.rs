@@ -463,7 +463,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let events_json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
 
                     let status_json = format!(
-                        "{{\"running\":true,\"total\":{},\"tls\":{},\"http\":{},\"bytes\":{},\"bytes_str\":\"{}\",\"speed_bps\":{},\"speed_str\":\"{}\",\"latency\":{},\"dns\":\"{}\",\"battery\":{},\"poison_blocks\":{},\"history\":{},\"events\":{}}}\n",
+                        "{{\"running\":true,\"version\":\"v1.5.0-dev (Pure Rust Native)\",\"total\":{},\"tls\":{},\"http\":{},\"bytes\":{},\"bytes_str\":\"{}\",\"speed_bps\":{},\"speed_str\":\"{}\",\"latency\":{},\"dns\":\"{}\",\"battery\":{},\"poison_blocks\":{},\"history\":{},\"events\":{}}}\n",
                         total, tls, http, bytes, bytes_formatted, speed_bps, speed_str, latency, dns_name, on_bat, poison_blocks, history_json, events_json
                     );
                     let _ = stream.write_all(status_json.as_bytes()).await;
