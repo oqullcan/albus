@@ -90,6 +90,19 @@ restore_system_dns() {
   fi
   nameservers+=("1.1.1.1" "1.0.0.1" "9.9.9.9")
 
+  # 1. Update /etc/systemd/resolved.conf first so systemd-resolved never uses blocked Google DoT
+  if [ -f /etc/systemd/resolved.conf ]; then
+    cat << EOF > /etc/systemd/resolved.conf
+[Resolve]
+DNS=1.1.1.1 1.0.0.1 ${gw:-192.168.1.1}
+FallbackDNS=9.9.9.9
+DNSOverTLS=no
+EOF
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 0.1
+  fi
+
+  # 2. Apply DNS servers to each link
   for iface in $(get_interfaces); do
     resolvectl default-route "$iface" true 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
@@ -97,22 +110,15 @@ restore_system_dns() {
     resolvectl dns "$iface" "${nameservers[@]}" 2>/dev/null || true
   done
 
-
-  if [ -f /etc/systemd/resolved.conf ]; then
-    if grep -q "DNSOverTLS=opportunistic" /etc/systemd/resolved.conf 2>/dev/null; then
-      sed -i 's/DNSOverTLS=opportunistic/DNSOverTLS=no/g' /etc/systemd/resolved.conf 2>/dev/null || true
-      systemctl reload-or-restart systemd-resolved 2>/dev/null || true
-    fi
-  fi
-
+  # 3. Ensure /etc/resolv.conf points to systemd stub resolver
   if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
   fi
 
-
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
 }
+
 
 
 
