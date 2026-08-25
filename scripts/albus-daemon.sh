@@ -40,9 +40,11 @@ resolve_binary() {
 }
 
 exec_privileged() {
-  local helper="$script_dir/albus-service.sh"
-  if [ -x "$ALBUS_LIB_DIR/albus-service.sh" ]; then
-    helper="$ALBUS_LIB_DIR/albus-service.sh"
+  local helper="$ALBUS_LIB_DIR/albus-service.sh"
+
+  if [ ! -x "$helper" ]; then
+    echo '{"running":false,"error":"Albus root helper (/usr/lib/albus/albus-service.sh) not installed. Please run install.sh first."}' >&2
+    exit 1
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
