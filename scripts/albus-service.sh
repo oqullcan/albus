@@ -80,18 +80,27 @@ get_interfaces() {
 }
 
 restore_system_dns() {
+  local nameservers=()
+  while IFS= read -r ns; do
+    if [ -n "$ns" ] && [[ ! "$ns" =~ ^127\.0\. ]]; then
+      nameservers+=("$ns")
+    fi
+  done < <(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}')
+
+  if [ ${#nameservers[@]} -eq 0 ]; then
+    nameservers=("8.8.8.8" "8.8.4.4" "1.1.1.1")
+  fi
+
   local gw
-  gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || echo "192.168.1.1")
+  gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || true)
+  if [ -n "$gw" ] && [[ $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    nameservers+=("$gw")
+  fi
 
   for iface in $(get_interfaces); do
     resolvectl default-route "$iface" true 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
-    resolvectl dnsovertls "$iface" no 2>/dev/null || true
-    if [ -n "$gw" ] && [[ $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      resolvectl dns "$iface" "$gw" 1.1.1.1 8.8.8.8 2>/dev/null || true
-    else
-      resolvectl dns "$iface" 1.1.1.1 8.8.8.8 2>/dev/null || true
-    fi
+    resolvectl dns "$iface" "${nameservers[@]}" 2>/dev/null || true
   done
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
@@ -156,13 +165,8 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. revert per-interface override and restore default route to use global resolved config
-    for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
-      resolvectl default-route "$iface" true 2>/dev/null || true
-    done
-    resolvectl flush-caches 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
+    # 2. restore healthy system DNS in systemd-resolved
+    restore_system_dns
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -175,7 +179,6 @@ case "$action" in
     pkill -9 -x "albus-core" 2>/dev/null || true
     rm -f /tmp/albus.sock "$log_file" "$legacy_pid" 2>/dev/null || true
 
-
     # 4. sync helpers
     if [ "$script_dir" != "/usr/lib/albus" ] && [ -f "$script_dir/albus-service.sh" ]; then
       install -m755 "$script_dir/albus-service.sh" /usr/lib/albus/albus-service.sh 2>/dev/null || true
@@ -184,6 +187,7 @@ case "$action" in
 
     echo "{\"running\":false}"
     ;;
+
 
 
   fix-network|repair)
