@@ -156,8 +156,13 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. restore healthy system DNS in systemd-resolved
-    restore_system_dns
+    # 2. revert per-interface override and restore default route to use global resolved config
+    for iface in $(get_interfaces); do
+      resolvectl revert "$iface" 2>/dev/null || true
+      resolvectl default-route "$iface" true 2>/dev/null || true
+    done
+    resolvectl flush-caches 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
