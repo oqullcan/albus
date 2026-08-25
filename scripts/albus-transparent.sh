@@ -1,7 +1,9 @@
 #!/bin/bash
 # albus transparent interception with stealth loopback, tcp mss clamping & zero plaintext dns fallback
 
-set -euo pipefail
+set -u
+
+
 
 action="${1:-enable}"
 custom_bootstraps="${2:-}"

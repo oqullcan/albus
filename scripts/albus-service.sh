@@ -1,7 +1,8 @@
 #!/bin/bash
 # albus system-wide privileged service helper (must execute as root)
 
-set -euo pipefail
+set -u
+
 
 # 1. security validation: must run as root
 if [ "$(id -u)" -ne 0 ]; then
