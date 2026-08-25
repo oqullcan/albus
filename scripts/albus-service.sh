@@ -159,16 +159,47 @@ case "$action" in
     ;;
 
   fix-network|repair)
-    for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
-    done
+    # 1. Kill any running albus process
+    if [ -f "$pid_file" ]; then
+      pid=$(cat "$pid_file" 2>/dev/null || true)
+      if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
+      rm -f "$pid_file"
+    fi
+    pkill -9 -x "albus-core" 2>/dev/null || true
+    rm -f "$pid_file" "$log_file" /tmp/albus.sock "$legacy_pid" 2>/dev/null || true
+
+    # 2. Complete firewall rule teardown (IPv4 + IPv6)
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
-    pkill -9 -x "albus-core" 2>/dev/null || true
+    iptables -t nat -F ALBUS 2>/dev/null || true
+    iptables -t nat -F ALBUS_DNS 2>/dev/null || true
+    iptables -t nat -D OUTPUT -j ALBUS 2>/dev/null || true
+    iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j ALBUS_DNS 2>/dev/null || true
+    ip6tables -t nat -F ALBUS 2>/dev/null || true
+    ip6tables -t nat -D OUTPUT -j ALBUS 2>/dev/null || true
 
-    rm -f "$pid_file" "$log_file" /tmp/albus.sock 2>/dev/null || true
+    # 3. Complete DNS & systemd-resolved reset
+    for iface in $(get_interfaces); do
+      resolvectl revert "$iface" 2>/dev/null || true
+    done
     resolvectl flush-caches 2>/dev/null || true
-    echo "{\"repaired\":true}"
+
+    # 4. Route and ARP cache flush
+    ip route flush cache 2>/dev/null || true
+
+    # 5. Sync root helper files and permissions
+    mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
+    if [ -x "$binary" ]; then
+      install -m755 "$binary" /usr/lib/albus/albus-core 2>/dev/null || true
+    fi
+    if [ "$script_dir" != "/usr/lib/albus" ] && [ -f "$script_dir/albus-service.sh" ]; then
+      install -m755 "$script_dir/albus-service.sh" /usr/lib/albus/albus-service.sh 2>/dev/null || true
+      install -m755 "$script_dir/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh 2>/dev/null || true
+    fi
+
+    echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 esac

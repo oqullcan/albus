@@ -142,19 +142,18 @@ case "$action" in
 
     if [ -s "$project_dir/bin/albus-core" ]; then
       chmod +x "$project_dir/bin/albus-core"
-      exec_privileged repair >/dev/null 2>&1 || true
       echo "{\"success\":true,\"version\":\"$ver\"}"
     else
-      echo "{\"success\":false,\"error\":\"Download failed. Check your internet connection.\"}"
+      echo "{\"success\":false,\"error\":\"Download failed. Check internet connection.\"}"
     fi
     exit 0
     ;;
 
   setup-compile)
     if command -v cargo >/dev/null 2>&1 && [ -f "$project_dir/core/Cargo.toml" ]; then
-      cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1 || true
-      if [ -x "$project_dir/core/target/release/albus-core" ]; then
-        exec_privileged repair >/dev/null 2>&1 || true
+      if cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1; then
+        mkdir -p "$project_dir/bin"
+        cp "$project_dir/core/target/release/albus-core" "$project_dir/bin/albus-core" 2>/dev/null || true
         echo "{\"success\":true,\"version\":\"compiled\"}"
       else
         echo "{\"success\":false,\"error\":\"Cargo compilation failed.\"}"
@@ -164,6 +163,7 @@ case "$action" in
     fi
     exit 0
     ;;
+
 
   get-config)
 

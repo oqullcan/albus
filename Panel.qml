@@ -154,19 +154,34 @@ Panel {
     onTriggered: root.purgeStatus = ""
   }
 
+  Process {
+    id: repairProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: repairCollector; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.isBusy = false
+      root.repairStatus = exitCode === 0 ? "REPAIRED" : "FAILED"
+      root.isRunning = false
+      root.refreshStatus()
+      repairTimer.restart()
+    }
+  }
+
   function repairNetwork() {
-    var p = Qt.createQmlObject('import Quickshell.Io; Process { running: false; command: [] }', root)
-    p.command = [root.daemonScriptPath, "fix-network"]
-    p.running = true
-    root.repairStatus = "REPAIRED"
-    repairTimer.restart()
+    root.repairStatus = "REPAIRING..."
+    root.isBusy = true
+    repairProcess.command = [root.daemonScriptPath, "fix-network"]
+    repairProcess.running = true
   }
 
   Timer {
     id: repairTimer
-    interval: 2500
+    interval: 3500
+    repeat: false
     onTriggered: root.repairStatus = ""
   }
+
 
   function exportProfile() {
     exportProcess.command = [root.daemonScriptPath, "export-profile"]
@@ -261,47 +276,73 @@ Panel {
 
   Process {
     id: setupDownloadProcess
-    command: [root.daemonScriptPath, "setup-download"]
-    stdout: StdioCollector {
-      onDataChanged: {
-        try {
-          var res = JSON.parse(value.trim())
-          if (res && res.success) {
-            root.setupStatus = "Core Ready (" + (res.version || "latest") + ")"
-            root.coreReady = true
-            root.refreshStatus()
-          } else {
-            root.setupStatus = (res && res.error) ? res.error : "Setup Failed"
-          }
-        } catch (e) {
-          root.setupStatus = "Setup Failed"
+    running: false
+    command: []
+    stdout: StdioCollector { id: dlCollector; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.isBusy = false
+      var raw = String(dlCollector.text || "").trim()
+      try {
+        var res = JSON.parse(raw)
+        if (res && res.success) {
+          root.setupStatus = "Core Ready (" + (res.version || "latest") + ")"
+          root.coreReady = true
+          root.refreshStatus()
+        } else {
+          root.setupStatus = (res && res.error) ? res.error : "Fetch Failed"
         }
-        root.isBusy = false
+      } catch (e) {
+        root.setupStatus = exitCode === 0 ? "Core Ready" : "Fetch Failed"
       }
+      setupStatusTimer.restart()
     }
   }
 
   Process {
     id: setupCompileProcess
-    command: [root.daemonScriptPath, "setup-compile"]
-    stdout: StdioCollector {
-      onDataChanged: {
-        try {
-          var res = JSON.parse(value.trim())
-          if (res && res.success) {
-            root.setupStatus = "Compiled Successfully"
-            root.coreReady = true
-            root.refreshStatus()
-          } else {
-            root.setupStatus = (res && res.error) ? res.error : "Compile Failed"
-          }
-        } catch (e) {
-          root.setupStatus = "Compile Failed"
+    running: false
+    command: []
+    stdout: StdioCollector { id: compCollector; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.isBusy = false
+      var raw = String(compCollector.text || "").trim()
+      try {
+        var res = JSON.parse(raw)
+        if (res && res.success) {
+          root.setupStatus = "Compiled Successfully"
+          root.coreReady = true
+          root.refreshStatus()
+        } else {
+          root.setupStatus = (res && res.error) ? res.error : "Compile Failed"
         }
-        root.isBusy = false
+      } catch (e) {
+        root.setupStatus = exitCode === 0 ? "Compiled" : "Compile Failed"
       }
+      setupStatusTimer.restart()
     }
   }
+
+  Timer {
+    id: setupStatusTimer
+    interval: 3500
+    repeat: false
+    onTriggered: root.setupStatus = ""
+  }
+
+  function fetchLatestCore() {
+    root.setupStatus = "Fetching..."
+    root.isBusy = true
+    setupDownloadProcess.command = [root.daemonScriptPath, "setup-download"]
+    setupDownloadProcess.running = true
+  }
+
+  function compileSourceCore() {
+    root.setupStatus = "Compiling..."
+    root.isBusy = true
+    setupCompileProcess.command = [root.daemonScriptPath, "setup-compile"]
+    setupCompileProcess.running = true
+  }
+
 
   function runDiagnostic() {
 
@@ -1566,7 +1607,9 @@ Panel {
 
                   Text {
                     anchors.centerIn: parent
-                    text: root.setupStatus !== "" ? root.setupStatus : "Fetch Core (" + root.latestReleaseVersion + ")"
+                    text: (root.setupStatus !== "" && root.setupStatus.indexOf("Compil") === -1)
+                      ? root.setupStatus
+                      : "Fetch Core (" + root.latestReleaseVersion + ")"
                     font.family: root.panelFont
                     font.pixelSize: Style.font.body
                     font.bold: true
@@ -1577,11 +1620,7 @@ Panel {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      root.setupStatus = "Fetching..."
-                      root.isBusy = true
-                      setupDownloadProcess.running = true
-                    }
+                    onClicked: root.fetchLatestCore()
                   }
                 }
 
@@ -1595,7 +1634,9 @@ Panel {
 
                   Text {
                     anchors.centerIn: parent
-                    text: "Compile Source"
+                    text: (root.setupStatus !== "" && root.setupStatus.indexOf("Compil") !== -1)
+                      ? root.setupStatus
+                      : "Compile Source"
                     font.family: root.panelFont
                     font.pixelSize: Style.font.body
                     font.bold: true
@@ -1606,13 +1647,10 @@ Panel {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      root.setupStatus = "Compiling..."
-                      root.isBusy = true
-                      setupCompileProcess.running = true
-                    }
+                    onClicked: root.compileSourceCore()
                   }
                 }
+
               }
 
               PanelSectionHeader {
