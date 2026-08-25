@@ -8,16 +8,32 @@ custom_bootstraps="${2:-}"
 port="1080"
 
 teardown() {
-  while iptables -t nat -D OUTPUT -p tcp -j ALBUS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -j ALBUS 2>/dev/null; do :; done
+  while iptables -t nat -D OUTPUT -p tcp -j ALBUS 2>/dev/null; do :; done
+  while iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p udp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p tcp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
-  while iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null; do :; done
+
+  while iptables -D OUTPUT -j ALBUS_QUIC 2>/dev/null; do :; done
+  while iptables -D INPUT -j ALBUS_IN 2>/dev/null; do :; done
+
+  while ip6tables -D OUTPUT -j ALBUS_V6 2>/dev/null; do :; done
+  while ip6tables -D INPUT -j ALBUS_V6_IN 2>/dev/null; do :; done
 
   iptables -t nat -F ALBUS 2>/dev/null || true
   iptables -t nat -X ALBUS 2>/dev/null || true
   iptables -t nat -F ALBUS_DNS 2>/dev/null || true
   iptables -t nat -X ALBUS_DNS 2>/dev/null || true
+
+  iptables -F ALBUS_QUIC 2>/dev/null || true
+  iptables -X ALBUS_QUIC 2>/dev/null || true
+  iptables -F ALBUS_IN 2>/dev/null || true
+  iptables -X ALBUS_IN 2>/dev/null || true
+
+  ip6tables -F ALBUS_V6 2>/dev/null || true
+  ip6tables -X ALBUS_V6 2>/dev/null || true
+  ip6tables -F ALBUS_V6_IN 2>/dev/null || true
+  ip6tables -X ALBUS_V6_IN 2>/dev/null || true
 
   while iptables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null; do :; done
   while iptables -D INPUT ! -i lo -p udp --dport 5300 -j DROP 2>/dev/null; do :; done
@@ -37,10 +53,12 @@ teardown() {
 if [ "$action" = "enable" ]; then
   teardown
 
-  # 1. port scan protection
-  iptables -I INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null || true
-  iptables -I INPUT 1 ! -i lo -p udp --dport 5300 -j DROP 2>/dev/null || true
-  iptables -I INPUT 1 ! -i lo -p tcp --dport 5300 -j DROP 2>/dev/null || true
+  # 1. port scan protection chain
+  iptables -N ALBUS_IN
+  iptables -A ALBUS_IN ! -i lo -p tcp --dport "$port" -j DROP
+  iptables -A ALBUS_IN ! -i lo -p udp --dport 5300 -j DROP
+  iptables -A ALBUS_IN ! -i lo -p tcp --dport 5300 -j DROP
+  iptables -I INPUT 1 -j ALBUS_IN
 
   # 2. tcp nat chain
   iptables -t nat -N ALBUS
@@ -89,19 +107,30 @@ if [ "$action" = "enable" ]; then
   iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j ALBUS_DNS
   iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j ALBUS_DNS
 
-  # 4. quic blocker (forces browsers to use tcp tls 1.3)
-  iptables -I OUTPUT 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+  # 4. quic blocker chain (forces browsers to use tcp tls 1.3)
+  iptables -N ALBUS_QUIC
+  iptables -A ALBUS_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+  iptables -I OUTPUT 1 -j ALBUS_QUIC
 
-  # 5. ipv6 leak blocker
-  ip6tables -I OUTPUT 1 -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset 2>/dev/null || true
-  ip6tables -I OUTPUT 1 -p udp --dport 443 -j REJECT 2>/dev/null || true
-  ip6tables -I OUTPUT 1 -p udp --dport 53 -j REJECT 2>/dev/null || true
+  # 5. ipv6 leak blocker chain
+  ip6tables -N ALBUS_V6
+  ip6tables -A ALBUS_V6 -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset
+  ip6tables -A ALBUS_V6 -p udp --dport 443 -j REJECT
+  ip6tables -A ALBUS_V6 -p udp --dport 53 -j REJECT
+  ip6tables -I OUTPUT 1 -j ALBUS_V6
+
+  ip6tables -N ALBUS_V6_IN
+  ip6tables -A ALBUS_V6_IN ! -i lo -p tcp --dport "$port" -j DROP
+  ip6tables -A ALBUS_V6_IN ! -i lo -p udp --dport 5300 -j DROP
+  ip6tables -A ALBUS_V6_IN ! -i lo -p tcp --dport 5300 -j DROP
+  ip6tables -I INPUT 1 -j ALBUS_V6_IN
 
   echo "{\"transparent\":\"enabled\"}"
 else
   teardown
   echo "{\"transparent\":\"disabled\"}"
 fi
+
 
 
 
