@@ -21,15 +21,11 @@ pub fn is_dev_mode() -> bool {
 }
 
 pub fn get_socket_paths() -> Vec<&'static str> {
-    if is_dev_mode() {
-        vec!["/tmp/albus-dev.sock"]
-    } else {
-        vec!["/tmp/albus.sock", "/run/albus/albus.sock"]
-    }
+    vec!["/tmp/albus-dev.sock", "/tmp/albus.sock", "/run/albus/albus.sock"]
 }
 
 pub fn get_pid_file() -> &'static str {
-    if is_dev_mode() {
+    if fs::metadata("/tmp/albus-dev.pid").is_ok() {
         "/tmp/albus-dev.pid"
     } else {
         "/run/albus/albus.pid"
@@ -236,7 +232,8 @@ pub fn cmd_fix_network() {
 }
 
 pub fn cmd_stop_process() {
-    if let Ok(pid_str) = fs::read_to_string(PID_FILE) {
+    let pid_file = get_pid_file();
+    if let Ok(pid_str) = fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
@@ -251,10 +248,11 @@ pub fn cmd_stop_process() {
                 }
             }
         }
-        let _ = fs::remove_file(PID_FILE);
+        let _ = fs::remove_file(pid_file);
     }
-    let _ = fs::remove_file(SOCKET_PATH);
-    let _ = fs::remove_file(RUN_SOCKET_PATH);
+    for s in get_socket_paths() {
+        let _ = fs::remove_file(s);
+    }
 }
 
 pub fn exec_privileged_run(action: &str, args: &[String]) {
@@ -271,7 +269,7 @@ pub fn exec_privileged_run(action: &str, args: &[String]) {
                 cmd_fix_network();
             }
             _ => {
-                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/lib/albus/albus-core"));
+                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/home/ogy/.local/bin/albusdev"));
                 let mut cmd = Command::new(exe);
                 cmd.arg(action).args(args);
                 let _ = cmd.status();
