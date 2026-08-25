@@ -39,8 +39,18 @@ fi
 
 
 
+# Clean up any legacy proxy environment configuration
+rm -f "$HOME/.config/environment.d/99-albus-proxy.conf" 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user unset-environment all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY 2>/dev/null || true
+fi
+if command -v gsettings >/dev/null 2>&1; then
+  gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null || true
+fi
+
 # 2. setup executable permissions on scripts
 chmod +x "$script_dir/scripts/albus-"*.sh 2>/dev/null || true
+
 
 # 3. install global CLI command to ~/.local/bin/albus
 mkdir -p "$HOME/.local/bin"
