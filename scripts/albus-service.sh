@@ -85,7 +85,8 @@ get_interfaces() {
 case "$action" in
   start)
     # clean previous instances
-    pkill -9 -f "albus-core" 2>/dev/null || true
+    pkill -9 -x "albus-core" 2>/dev/null || true
+
     rm -f "$pid_file" "$log_file" "$legacy_pid" /tmp/albus.sock 2>/dev/null || true
     sleep 0.05
 
@@ -153,7 +154,8 @@ case "$action" in
       fi
       rm -f "$pid_file"
     fi
-    pkill -9 -f "albus-core" 2>/dev/null || true
+    pkill -9 -x "albus-core" 2>/dev/null || true
+
     rm -f /tmp/albus.sock 2>/dev/null || true
 
     echo "{\"running\":false}"
@@ -166,7 +168,8 @@ case "$action" in
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
-    pkill -9 -f "albus-core" 2>/dev/null || true
+    pkill -9 -x "albus-core" 2>/dev/null || true
+
     rm -f "$pid_file" "$log_file" /tmp/albus.sock 2>/dev/null || true
     resolvectl flush-caches 2>/dev/null || true
     echo "{\"repaired\":true}"
