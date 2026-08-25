@@ -66,7 +66,24 @@ fn is_on_battery() -> bool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let cmd = if args.len() > 1 { args[1].as_str() } else { "status" };
+    let cmd = if args.len() > 1 {
+        let first = args[1].as_str();
+        if first.starts_with("--") {
+            if first == "--help" || first == "-h" {
+                "help"
+            } else if first == "--version" || first == "-v" {
+                "version"
+            } else if first == "--json" || first == "-j" {
+                "status"
+            } else {
+                "run"
+            }
+        } else {
+            first
+        }
+    } else {
+        "status"
+    };
 
     match cmd {
         "status" => {
