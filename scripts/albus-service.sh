@@ -161,6 +161,9 @@ case "$action" in
 
     # 2. restore healthy system DNS in systemd-resolved
     restore_system_dns
+    systemctl restart systemd-resolved 2>/dev/null || true
+    resolvectl flush-caches 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -182,8 +185,6 @@ case "$action" in
     echo "{\"running\":false}"
     ;;
 
-
-
   fix-network|repair)
     # 1. Kill any running albus process
     if [ -f "$pid_file" ]; then
@@ -201,6 +202,9 @@ case "$action" in
 
     # 3. Complete DNS & systemd-resolved reset
     restore_system_dns
+    systemctl restart systemd-resolved 2>/dev/null || true
+    resolvectl flush-caches 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
 
     # 4. Sync root helper files and permissions
     mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
@@ -214,6 +218,7 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 
 
 
