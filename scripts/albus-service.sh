@@ -166,16 +166,13 @@ case "$action" in
     ;;
 
   stop)
-    # 1. revert per-link DNS settings in systemd-resolved
-    for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
-    done
-    resolvectl flush-caches 2>/dev/null || true
-
-    # 2. disable transparent netfilter rules
+    # 1. disable transparent netfilter rules
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
+
+    # 2. restore healthy system DNS in systemd-resolved and /etc/resolv.conf
+    restore_system_dns
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -198,16 +195,13 @@ case "$action" in
     ;;
 
   fix-network|repair)
-    # 1. revert per-link DNS settings
-    for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
-    done
-    resolvectl flush-caches 2>/dev/null || true
-
-    # 2. Complete firewall rule teardown
+    # 1. Complete firewall rule teardown
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
+
+    # 2. restore healthy system DNS in systemd-resolved and /etc/resolv.conf
+    restore_system_dns
 
     # 3. Kill any running albus process
     if [ -f "$pid_file" ]; then
@@ -230,4 +224,5 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 esac
