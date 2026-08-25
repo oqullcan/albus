@@ -9,8 +9,6 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 ALBUS_LIB_DIR="/usr/lib/albus"
 ALBUS_RUN_DIR="/run/albus"
 ALBUS_SOCKET="/tmp/albus.sock"
@@ -19,6 +17,17 @@ ALBUS_LOG_FILE="$ALBUS_RUN_DIR/albus.log"
 ALBUS_LEGACY_PID="/tmp/albus-daemon.pid"
 ALBUS_HTTP_PORT=1080
 ALBUS_DNS_PORT=5300
+
+# Strictly resolve trusted root-owned binary
+resolve_trusted_binary() {
+  if [ -x "$ALBUS_LIB_DIR/albus-core" ]; then
+    echo "$ALBUS_LIB_DIR/albus-core"
+  elif [ -x "/usr/bin/albus-core" ]; then
+    echo "/usr/bin/albus-core"
+  else
+    echo ""
+  fi
+}
 
 # Get active physical non-loopback network interfaces
 get_active_interfaces() {
@@ -288,68 +297,22 @@ process_is_running() {
   pgrep -x "albus-core" >/dev/null 2>&1
 }
 
-# --- SYSTEM SYNC MODULE ---
-system_sync() {
-  local binary="${1:-}"
-
-  mkdir -p "$ALBUS_LIB_DIR/lib" "/usr/share/polkit-1/actions" 2>/dev/null || true
-
-  if [ -n "$binary" ] && [ -x "$binary" ]; then
-    install -m755 "$binary" "$ALBUS_LIB_DIR/albus-core" 2>/dev/null || true
-  fi
-
-  local src_dir=""
-  for u in /home/*; do
-    for cand in "$u/albusdev/scripts" "$u/.config/omarchy/plugins/io.github.oqullcan.albus/scripts"; do
-      if [ -f "$cand/albus-service.sh" ]; then
-        src_dir="$cand"
-        break 2
-      fi
-    done
-  done
-
-  if [ -n "$src_dir" ] && [ "$src_dir" != "$ALBUS_LIB_DIR" ]; then
-    install -m755 "$src_dir/albus-service.sh" "$ALBUS_LIB_DIR/albus-service.sh" 2>/dev/null || true
-    install -m755 "$src_dir/albus-transparent.sh" "$ALBUS_LIB_DIR/albus-transparent.sh" 2>/dev/null || true
-    if [ -d "$src_dir/lib" ]; then
-      install -m755 "$src_dir/lib/"*.sh "$ALBUS_LIB_DIR/lib/" 2>/dev/null || true
-    fi
-  fi
-}
-
 action="${1:-start}"
 mode="${2:-auto}"
 dns="${3:-quad9}"
 bootstrap="${4:-}"
 whitelist="${5:-}"
-provided_bin="${6:-}"
 
-binary=""
-if [ -n "$provided_bin" ] && [ -x "$provided_bin" ]; then
-  binary="$provided_bin"
-elif [ -x "$ALBUS_LIB_DIR/albus-core" ]; then
-  binary="$ALBUS_LIB_DIR/albus-core"
-elif [ -x "/usr/bin/albus-core" ]; then
-  binary="/usr/bin/albus-core"
-else
-  for u in /home/*; do
-    for cand in "$u/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core" "$u/albusdev/bin/albus-core" "$u/albusdev/core/target/release/albus-core"; do
-      if [ -x "$cand" ]; then
-        binary="$cand"
-        break 2
-      fi
-    done
-  done
-fi
+# Strictly use trusted system binary
+binary=$(resolve_trusted_binary)
 
 case "$action" in
   start)
     if [ -z "$binary" ] || [ ! -x "$binary" ]; then
-      echo '{"running":false,"error":"albus-core binary not found"}'
+      echo '{"running":false,"error":"albus-core binary not found in /usr/lib/albus/ or /usr/bin/"}'
       exit 1
     fi
 
-    system_sync "$binary"
     daemon_pid=$(process_start "$binary" "$mode" "$dns" "$bootstrap" "$whitelist")
     if [ $? -ne 0 ]; then
       exit 1
@@ -364,7 +327,6 @@ case "$action" in
     firewall_disable
     dns_restore_system
     process_stop
-    system_sync
 
     echo '{"running":false}'
     ;;
@@ -373,7 +335,6 @@ case "$action" in
     firewall_disable
     dns_restore_system
     process_stop
-    system_sync "$binary"
 
     echo '{"repaired":true,"message":"Network completely reset to system defaults"}'
     ;;

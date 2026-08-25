@@ -278,7 +278,7 @@ EOF
       fi
     fi
 
-    exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist" "$binary"
+    exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist"
     ;;
 
   stop)
