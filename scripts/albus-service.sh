@@ -166,14 +166,16 @@ case "$action" in
     ;;
 
   stop)
-    # 1. disable transparent netfilter rules
+    # 1. revert per-link DNS settings in systemd-resolved
+    for iface in $(get_interfaces); do
+      resolvectl revert "$iface" 2>/dev/null || true
+    done
+    resolvectl flush-caches 2>/dev/null || true
+
+    # 2. disable transparent netfilter rules
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
-
-    # 2. restart resolver service first to clear dead sockets, then apply clean DNS
-    systemctl restart systemd-resolved 2>/dev/null || true
-    restore_system_dns
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -196,7 +198,18 @@ case "$action" in
     ;;
 
   fix-network|repair)
-    # 1. Kill any running albus process
+    # 1. revert per-link DNS settings
+    for iface in $(get_interfaces); do
+      resolvectl revert "$iface" 2>/dev/null || true
+    done
+    resolvectl flush-caches 2>/dev/null || true
+
+    # 2. Complete firewall rule teardown
+    if [ -x "$transparent_script" ]; then
+      "$transparent_script" disable 2>/dev/null || true
+    fi
+
+    # 3. Kill any running albus process
     if [ -f "$pid_file" ]; then
       pid=$(cat "$pid_file" 2>/dev/null || true)
       if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
@@ -204,15 +217,6 @@ case "$action" in
     fi
     pkill -9 -x "albus-core" 2>/dev/null || true
     rm -f "$pid_file" "$log_file" /tmp/albus.sock "$legacy_pid" 2>/dev/null || true
-
-    # 2. Complete firewall rule teardown (IPv4 + IPv6)
-    if [ -x "$transparent_script" ]; then
-      "$transparent_script" disable 2>/dev/null || true
-    fi
-
-    # 3. Complete DNS & systemd-resolved reset
-    systemctl restart systemd-resolved 2>/dev/null || true
-    restore_system_dns
 
     # 4. Sync root helper files and permissions
     mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
@@ -226,9 +230,4 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
-
-
-
-
-
 esac
