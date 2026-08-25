@@ -98,9 +98,17 @@ restore_system_dns() {
   done
 
 
+  if [ -f /etc/systemd/resolved.conf ]; then
+    if grep -q "DNSOverTLS=opportunistic" /etc/systemd/resolved.conf 2>/dev/null; then
+      sed -i 's/DNSOverTLS=opportunistic/DNSOverTLS=no/g' /etc/systemd/resolved.conf 2>/dev/null || true
+      systemctl reload-or-restart systemd-resolved 2>/dev/null || true
+    fi
+  fi
+
   if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
   fi
+
 
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
