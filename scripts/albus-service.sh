@@ -90,6 +90,9 @@ restore_system_dns() {
   fi
   nameservers+=("1.1.1.1" "1.0.0.1" "9.9.9.9")
 
+  # Cleanly restart resolver daemon first to terminate any hanging DoT sockets
+  systemctl try-restart systemd-resolved 2>/dev/null || true
+
   for iface in $(get_interfaces); do
     resolvectl default-route "$iface" true 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
@@ -110,6 +113,7 @@ EOF
   resolvectl flush-caches 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
 }
+
 
 
 
