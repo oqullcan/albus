@@ -86,30 +86,25 @@ JSON
 }
 
 exec_privileged() {
-  local helper="/usr/lib/albus/albus-service.sh"
-
-  if [ ! -x "$helper" ] && [ -x "$script_dir/albus-service.sh" ]; then
-    helper="$script_dir/albus-service.sh"
-  fi
-
-  if [ ! -x "$helper" ]; then
-    echo "{\"running\":false,\"error\":\"Privileged helper not found. Please run ./install.sh to initialize.\"}"
-    exit 1
+  local helper="$script_dir/albus-service.sh"
+  if [ -x "/usr/lib/albus/albus-service.sh" ]; then
+    helper="/usr/lib/albus/albus-service.sh"
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
-    "$helper" "$@"
+    "$script_dir/albus-service.sh" "$@"
   elif [ -t 0 ] && command -v sudo >/dev/null 2>&1; then
-    sudo "$helper" "$@"
+    sudo "$script_dir/albus-service.sh" "$@"
   elif command -v pkexec >/dev/null 2>&1; then
     pkexec "$helper" "$@"
   elif command -v sudo >/dev/null 2>&1; then
-    sudo "$helper" "$@"
+    sudo "$script_dir/albus-service.sh" "$@"
   else
     echo "{\"running\":false,\"error\":\"Neither pkexec nor sudo found\"}"
     exit 1
   fi
 }
+
 
 
 
