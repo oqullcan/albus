@@ -135,6 +135,11 @@ case "$action" in
       "$transparent_script" enable "$bootstrap"
     fi
 
+    for iface in $(get_interfaces); do
+      resolvectl dns "$iface" 127.0.0.1:5300 2>/dev/null || true
+      resolvectl domain "$iface" "~." 2>/dev/null || true
+      resolvectl default-route "$iface" true 2>/dev/null || true
+    done
     resolvectl flush-caches 2>/dev/null || true
 
     # ensure control socket is world-accessible for UI IPC status polling
@@ -150,8 +155,12 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. restore healthy system DNS in systemd-resolved
-    restore_system_dns
+    # 2. revert DNS settings back to native system state
+    for iface in $(get_interfaces); do
+      resolvectl revert "$iface" 2>/dev/null || true
+    done
+    resolvectl flush-caches 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -172,6 +181,7 @@ case "$action" in
 
     echo "{\"running\":false}"
     ;;
+
 
   fix-network|repair)
     # 1. Kill any running albus process
