@@ -337,17 +337,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Prepare runtime directories
+    let pid_file = get_pid_file();
+    let socket_path = if is_dev_mode() { "/tmp/albus-dev.sock" } else { SOCKET_PATH };
+
     let _ = fs::create_dir_all("/run/albus");
     let _ = fs::set_permissions("/run/albus", Permissions::from_mode(0o755));
     let pid = std::process::id();
-    let _ = fs::write(PID_FILE, pid.to_string());
-    let _ = fs::set_permissions(PID_FILE, Permissions::from_mode(0o666));
+    let _ = fs::write(pid_file, pid.to_string());
+    let _ = fs::set_permissions(pid_file, Permissions::from_mode(0o666));
 
     // 3. Arm RAII Netfilter & DNS Guards (automatic cleanup on exit/crash/signal)
     let _fw_guard = FirewallGuard::enable(1080, &custom_bootstraps);
     let _dns_guard = DnsGuard::enable();
 
     // 4. Graceful termination handler
+    let sp_copy = socket_path.to_string();
+    let pf_copy = pid_file.to_string();
     tokio::spawn(async move {
         if let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             tokio::select! {
@@ -356,9 +361,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             firewall_disable();
             dns_restore_system();
-            let _ = fs::remove_file(SOCKET_PATH);
+            let _ = fs::remove_file(&sp_copy);
             let _ = fs::remove_file(RUN_SOCKET_PATH);
-            let _ = fs::remove_file(PID_FILE);
+            let _ = fs::remove_file(&pf_copy);
             std::process::exit(0);
         }
     });
@@ -408,10 +413,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&bind_addr).await?;
 
     // Setup unix control socket with world-accessible permissions for UI IPC
-    let _ = fs::remove_file(SOCKET_PATH);
-    let _ = fs::remove_file(RUN_SOCKET_PATH);
-    let unix_listener = UnixListener::bind(SOCKET_PATH).ok();
-    let _ = fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o666));
+    let _ = fs::remove_file(socket_path);
+    if !is_dev_mode() {
+        let _ = fs::remove_file(RUN_SOCKET_PATH);
+    }
+    let unix_listener = UnixListener::bind(socket_path).ok();
+    let _ = fs::set_permissions(socket_path, Permissions::from_mode(0o666));
 
     if let Some(ctrl) = unix_listener {
         let m = Arc::clone(&metrics);

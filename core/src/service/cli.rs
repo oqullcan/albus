@@ -14,6 +14,28 @@ pub const RUN_SOCKET_PATH: &str = "/run/albus/albus.sock";
 pub const PID_FILE: &str = "/run/albus/albus.pid";
 pub const LOG_FILE: &str = "/run/albus/albus.log";
 
+pub fn is_dev_mode() -> bool {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+    name.contains("dev") || std::env::args().any(|a| a == "--dev" || a == "-dev")
+}
+
+pub fn get_socket_paths() -> Vec<&'static str> {
+    if is_dev_mode() {
+        vec!["/tmp/albus-dev.sock"]
+    } else {
+        vec!["/tmp/albus.sock", "/run/albus/albus.sock"]
+    }
+}
+
+pub fn get_pid_file() -> &'static str {
+    if is_dev_mode() {
+        "/tmp/albus-dev.pid"
+    } else {
+        "/run/albus/albus.pid"
+    }
+}
+
 pub const C_RESET: &str = "\x1b[0m";
 pub const C_BOLD: &str = "\x1b[1m";
 pub const C_DIM: &str = "\x1b[2m";
@@ -25,12 +47,13 @@ pub const C_RED: &str = "\x1b[38;2;243;139;168m";
 pub const C_MAGENTA: &str = "\x1b[38;2;203;166;247m";
 
 pub fn print_banner() {
-    println!("{}{}  ALBUS ANTI-DPI{} {}(Omarchy Edition){}", C_MAGENTA, C_BOLD, C_RESET, C_DIM, C_RESET);
+    let suffix = if is_dev_mode() { " (DEV WORKBENCH)" } else { " (Omarchy Edition)" };
+    println!("{}{}  ALBUS ANTI-DPI{} {}{}{}", C_MAGENTA, C_BOLD, C_RESET, C_DIM, suffix, C_RESET);
     println!();
 }
 
 pub fn query_status_raw() -> Option<String> {
-    for path in [SOCKET_PATH, RUN_SOCKET_PATH] {
+    for path in get_socket_paths() {
         if let Ok(stream) = UnixStream::connect(path) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
             let mut reader = BufReader::new(stream);
@@ -44,7 +67,7 @@ pub fn query_status_raw() -> Option<String> {
 }
 
 pub fn is_daemon_running() -> bool {
-    if let Ok(pid_str) = fs::read_to_string(PID_FILE) {
+    if let Ok(pid_str) = fs::read_to_string(get_pid_file()) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             unsafe {
                 if libc::kill(pid, 0) == 0 {
@@ -237,10 +260,23 @@ pub fn cmd_stop_process() {
 pub fn exec_privileged_run(action: &str, args: &[String]) {
     // If already root, run directly
     if unsafe { libc::geteuid() } == 0 {
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/lib/albus/albus-core"));
-        let mut cmd = Command::new(exe);
-        cmd.arg(action).args(args);
-        let _ = cmd.status();
+        match action {
+            "stop" | "stop-service" => {
+                firewall_disable();
+                dns_restore_system();
+                cmd_stop_process();
+                println!("{{\"running\":false}}");
+            }
+            "fix-network" | "fix-network-service" => {
+                cmd_fix_network();
+            }
+            _ => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/lib/albus/albus-core"));
+                let mut cmd = Command::new(exe);
+                cmd.arg(action).args(args);
+                let _ = cmd.status();
+            }
+        }
         return;
     }
 
@@ -253,32 +289,33 @@ pub fn exec_privileged_run(action: &str, args: &[String]) {
         return;
     }
 
-    // Check trusted binary location
-    let trusted_bin = if fs::metadata("/usr/lib/albus/albus-core").is_ok() {
-        "/usr/lib/albus/albus-core"
+    // Determine authorized helper (either albus-service.sh or albus binary)
+    let (helper, helper_action) = if fs::metadata("/usr/lib/albus/albus-service.sh").is_ok() {
+        let act = match action {
+            "stop-service" | "stop" => "stop",
+            "fix-network-service" | "fix-network" => "fix-network",
+            "run" => "start",
+            _ => action,
+        };
+        ("/usr/lib/albus/albus-service.sh", act)
     } else if fs::metadata("/usr/lib/albus/albus").is_ok() {
-        "/usr/lib/albus/albus"
-    } else if fs::metadata("/usr/bin/albus-core").is_ok() {
-        "/usr/bin/albus-core"
-    } else if fs::metadata("/usr/bin/albus").is_ok() {
-        "/usr/bin/albus"
+        ("/usr/lib/albus/albus", action)
     } else {
-        "/usr/lib/albus/albus-core"
+        ("/usr/lib/albus/albus-core", action)
     };
 
-    // Invoke pkexec or sudo on the trusted root binary
-    let mut child_args = vec![action];
+    let mut child_args = vec![helper_action];
     for a in args {
         child_args.push(a.as_str());
     }
 
     if Command::new("which").arg("pkexec").output().map(|o| o.status.success()).unwrap_or(false) {
         let mut pk = Command::new("pkexec");
-        pk.arg(trusted_bin).args(&child_args);
+        pk.arg(helper).args(&child_args);
         let _ = pk.status();
     } else if Command::new("which").arg("sudo").output().map(|o| o.status.success()).unwrap_or(false) {
         let mut su = Command::new("sudo");
-        su.arg(trusted_bin).args(&child_args);
+        su.arg(helper).args(&child_args);
         let _ = su.status();
     } else {
         eprintln!("Neither pkexec nor sudo found.");

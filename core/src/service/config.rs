@@ -53,7 +53,11 @@ impl Default for AlbusConfig {
 impl AlbusConfig {
     pub fn config_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(".config/omarchy/plugins/io.github.oqullcan.albus")
+        if crate::service::cli::is_dev_mode() {
+            PathBuf::from(home).join(".config/omarchy/plugins/io.github.oqullcan.albus.dev")
+        } else {
+            PathBuf::from(home).join(".config/omarchy/plugins/io.github.oqullcan.albus")
+        }
     }
 
     pub fn config_file() -> PathBuf {

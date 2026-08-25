@@ -54,7 +54,7 @@ Panel {
   readonly property color dimColor: Qt.darker(root.foregroundColor, 1.4)
   readonly property color accentColor: root.bar && root.bar.urgent !== undefined ? root.bar.urgent : Color.accent
   readonly property string panelFont: root.bar ? root.bar.fontFamily : Style.font.family
-  readonly property string daemonScriptPath: Quickshell.env("HOME") + "/.local/bin/albus"
+  readonly property string daemonScriptPath: Quickshell.env("HOME") + "/.local/bin/albusdev"
 
 
 

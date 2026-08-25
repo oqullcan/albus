@@ -11,6 +11,10 @@ name = "albus"
 path = "src/main.rs"
 
 [[bin]]
+name = "albusdev"
+path = "src/main.rs"
+
+[[bin]]
 name = "albus-core"
 path = "src/main.rs"
 
