@@ -1,0 +1,17 @@
+[Unit]
+Description=Albus Anti-DPI and Encrypted DoH Daemon
+After=network.target network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/albus/albus run
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+TimeoutStopSec=3s
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_IPC_LOCK
+
+[Install]
+WantedBy=multi-user.target

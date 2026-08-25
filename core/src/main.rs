@@ -1,14 +1,14 @@
-// albus-core - lightweight local anti-censorship daemon with live monitor, data shield meter, battery awareness, and stealth loopback
+// albus - unified high-speed anti-dpi daemon, native cli, and system service orchestrator
 
 mod diagnostic;
 mod dns;
 mod engine;
 mod inbound;
 mod protocol;
+mod service;
 mod strategy;
 mod tun;
 
-use diagnostic::DiagnosticEngine;
 use dns::{DohResolver, LocalDnsServer};
 use engine::connector::MarkedConnector;
 use engine::monitor::ActivityMonitor;
@@ -16,19 +16,22 @@ use engine::netlink::RouteWatcher;
 use engine::pipeline::{EngineMetrics, Pipeline};
 use engine::router::{DomainRouter, RouteAction};
 use inbound::socks5::{Socks5Handler, TargetAddr};
+use service::cli::*;
+use service::config::AlbusConfig;
+use service::dns::{dns_restore_system, DnsGuard};
+use service::firewall::{firewall_disable, FirewallGuard};
 use strategy::adaptive::AdaptiveEvasionEngine;
 use strategy::BypassMode;
 use tun::{TunDevice, TunStack};
 
-
 use std::env;
-use std::fs::Permissions;
+use std::fs::{self, Permissions};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UnixListener};
 
 fn format_bytes(bytes: u64) -> String {
@@ -62,6 +65,187 @@ fn is_on_battery() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    let cmd = if args.len() > 1 { args[1].as_str() } else { "status" };
+
+    match cmd {
+        "status" => {
+            let json_mode = args.iter().any(|a| a == "--json" || a == "-j");
+            cmd_status(json_mode);
+            return Ok(());
+        }
+        "stats" => {
+            cmd_stats();
+            return Ok(());
+        }
+        "test" | "check" => {
+            cmd_test();
+            return Ok(());
+        }
+        "diag" | "diagnose" | "benchmark" => {
+            cmd_diagnose().await;
+            return Ok(());
+        }
+        "get-config" => {
+            let cfg = AlbusConfig::load();
+            println!("{}", serde_json::to_string(&cfg).unwrap_or_default());
+            return Ok(());
+        }
+        "save-config" => {
+            let mut cfg = AlbusConfig::load();
+            if args.len() > 2 && !args[2].is_empty() { cfg.mode = args[2].clone(); }
+            if args.len() > 3 && !args[3].is_empty() { cfg.dns = args[3].clone(); }
+            if args.len() > 4 { cfg.custom_url = args[4].clone(); }
+            if args.len() > 5 { cfg.custom_primary = args[5].clone(); }
+            if args.len() > 6 { cfg.custom_secondary = args[6].clone(); }
+            if args.len() > 7 { cfg.whitelist = args[7].clone(); }
+            if args.len() > 8 { cfg.autostart = args[8] == "true"; }
+            if args.len() > 9 { cfg.notifications = args[9] != "false"; }
+            let _ = cfg.save();
+            println!("{{\"saved\":true}}");
+            return Ok(());
+        }
+        "set-autostart" => {
+            let enable = args.get(2).map(|s| s == "true").unwrap_or(true);
+            let _ = AlbusConfig::set_autostart(enable);
+            println!("{{\"autostart\":{}}}", enable);
+            return Ok(());
+        }
+        "purge-cache" | "flush" => {
+            let _ = fs::remove_file(AlbusConfig::config_dir().join("stats.json"));
+            println!("{{\"purged\":true}}");
+            return Ok(());
+        }
+        "export-profile" => {
+            match AlbusConfig::export_profile() {
+                Ok(file) => println!("{{\"exported\":true,\"file\":\"{}\"}}", file),
+                Err(e) => println!("{{\"exported\":false,\"error\":\"{}\"}}", e),
+            }
+            return Ok(());
+        }
+        "import-profile" => {
+            match AlbusConfig::import_profile() {
+                Ok(file) => println!("{{\"imported\":true,\"file\":\"{}\"}}", file),
+                Err(e) => println!("{{\"imported\":false,\"error\":\"{}\"}}", e),
+            }
+            return Ok(());
+        }
+        "notify-evasion" => {
+            let target = args.get(2).map(|s| s.as_str()).unwrap_or("unknown");
+            let _ = std::process::Command::new("notify-send")
+                .args(["-a", "Albus", "-i", "security-high", "DPI Bypassed", &format!("Secured connection to {}", target)])
+                .output();
+            return Ok(());
+        }
+        "check-core" => {
+            println!("{{\"ready\":true,\"installed\":true}}");
+            return Ok(());
+        }
+        "fix-network" | "repair" => {
+            exec_privileged_run("fix-network-service", &[]);
+            return Ok(());
+        }
+        "fix-network-service" => {
+            cmd_fix_network();
+            return Ok(());
+        }
+        "stop" => {
+            print_banner();
+            println!("{}> Stopping Albus daemon and restoring network rules...{}", C_YELLOW, C_RESET);
+            exec_privileged_run("stop-service", &[]);
+            println!("{}[OK] Albus daemon stopped cleanly.{}", C_GREEN, C_RESET);
+            return Ok(());
+        }
+        "stop-service" => {
+            firewall_disable();
+            dns_restore_system();
+            cmd_stop_process();
+            println!("{{\"running\":false}}");
+            return Ok(());
+        }
+        "restart" => {
+            print_banner();
+            println!("{}> Restarting Albus Anti-DPI...{}", C_BLUE, C_RESET);
+            exec_privileged_run("stop-service", &[]);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let remaining_args: Vec<String> = if args.len() > 2 { args[2..].to_vec() } else { Vec::new() };
+            exec_privileged_run("run", &remaining_args);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cmd_status(false);
+            return Ok(());
+        }
+        "start" => {
+            print_banner();
+            println!("{}> Starting Albus Anti-DPI daemon...{}", C_BLUE, C_RESET);
+            let mut remaining_args: Vec<String> = if args.len() > 2 { args[2..].to_vec() } else { Vec::new() };
+
+            // Load saved user config defaults if empty
+            if remaining_args.is_empty() {
+                let cfg = AlbusConfig::load();
+                remaining_args.push(cfg.mode);
+                if cfg.dns == "custom" && !cfg.custom_url.is_empty() {
+                    remaining_args.push(cfg.custom_url);
+                } else {
+                    remaining_args.push(cfg.dns);
+                }
+                let mut bootstraps = Vec::new();
+                if !cfg.custom_primary.is_empty() { bootstraps.push(cfg.custom_primary); }
+                if !cfg.custom_secondary.is_empty() { bootstraps.push(cfg.custom_secondary); }
+                remaining_args.push(bootstraps.join(","));
+                remaining_args.push(cfg.whitelist);
+            }
+
+            exec_privileged_run("run", &remaining_args);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cmd_status(false);
+            return Ok(());
+        }
+        "logs" | "log" => {
+            for log_path in ["/run/albus/albus.log", "/tmp/albus.log"] {
+                if fs::metadata(log_path).is_ok() {
+                    println!("{}Tailing {} (Ctrl+C to exit):{}", C_CYAN, log_path, C_RESET);
+                    let _ = std::process::Command::new("tail").args(["-f", log_path]).status();
+                    return Ok(());
+                }
+            }
+            println!("{}No active log file found.{}", C_YELLOW, C_RESET);
+            return Ok(());
+        }
+        "help" | "--help" | "-h" => {
+            print_banner();
+            println!("{}USAGE:{} albus <command> [options]", C_BOLD, C_RESET);
+            println!();
+            println!("  {}start{}        Start Albus daemon with saved profile", C_GREEN, C_RESET);
+            println!("  {}stop{}         Stop daemon & safely clean firewall rules", C_YELLOW, C_RESET);
+            println!("  {}restart{}      Restart daemon", C_BLUE, C_RESET);
+            println!("  {}status{}       Show live protection status and metrics", C_CYAN, C_RESET);
+            println!("  {}stats{}        Detailed session telemetry and memory metrics", C_MAGENTA, C_RESET);
+            println!("  {}test{}         Run instant live leak & defense verification suite", C_GREEN, C_RESET);
+            println!("  {}fix-network{}  Emergency firewall flush & network repair", C_YELLOW, C_RESET);
+            println!("  {}purge{}        Flush local DNS resolver caches", C_BLUE, C_RESET);
+            println!("  {}diag{}         Run multi-CDN latency & bypass test", C_GREEN, C_RESET);
+            println!("  {}logs{}         Follow daemon logs in real-time", C_DIM, C_RESET);
+            println!();
+            return Ok(());
+        }
+        "version" | "--version" | "-v" => {
+            println!("Albus Anti-DPI v1.4.0");
+            return Ok(());
+        }
+        "run" | "daemon" | "--service" => {
+            // Daemon execution continues below
+        }
+        _ => {
+            print_banner();
+            println!("{}Unknown command: {}{}", C_RED, cmd, C_RESET);
+            println!("Run 'albus help' for available commands.");
+            return Ok(());
+        }
+    }
+
+    // --- DAEMON EXECUTION (Privileged System Service) ---
+
     // 1. best-effort file descriptor boost and physical memory locking (anti-swap)
     unsafe {
         let mut current_rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -73,11 +257,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &new_rlim);
         }
-        // mlockall: best-effort memory locking (requires CAP_IPC_LOCK or sufficient RLIMIT_MEMLOCK; ignored on EPERM)
         let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
     }
-
-    let args: Vec<String> = env::args().collect();
 
     let mut bind_addr = "127.0.0.1:1080".to_string();
     let mut dns_bind = "127.0.0.1:5300".to_string();
@@ -86,28 +267,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut custom_bootstraps: Vec<String> = Vec::new();
     let mut custom_whitelist: Vec<String> = Vec::new();
     let mut tun_interface: Option<String> = None;
-    let control_socket_path = "/tmp/albus.sock";
 
-    // simple debloated flag parser
-    let mut i = 1;
+    // Parse flags for daemon runtime
+    let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--bind" | "-b" => {
-                if i + 1 < args.len() {
-                    bind_addr = args[i + 1].clone();
-                    i += 1;
-                }
+                if i + 1 < args.len() { bind_addr = args[i + 1].clone(); i += 1; }
             }
             "--dns-bind" => {
-                if i + 1 < args.len() {
-                    dns_bind = args[i + 1].clone();
-                    i += 1;
-                }
+                if i + 1 < args.len() { dns_bind = args[i + 1].clone(); i += 1; }
             }
             "--tun" | "-t" => {
                 let name = if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    i += 1;
-                    args[i].clone()
+                    i += 1; args[i].clone()
                 } else {
                     "albus0".to_string()
                 };
@@ -125,76 +298,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--dns" | "-d" => {
-                if i + 1 < args.len() {
-                    dns_provider = args[i + 1].clone();
-                    i += 1;
-                }
+                if i + 1 < args.len() { dns_provider = args[i + 1].clone(); i += 1; }
             }
             "--bootstrap" | "-B" => {
-                if i + 1 < args.len() {
-                    custom_bootstraps.push(args[i + 1].clone());
-                    i += 1;
-                }
+                if i + 1 < args.len() { custom_bootstraps.push(args[i + 1].clone()); i += 1; }
             }
             "--whitelist" | "-W" => {
                 if i + 1 < args.len() {
                     for part in args[i + 1].split(',') {
                         let t = part.trim();
-                        if !t.is_empty() {
-                            custom_whitelist.push(t.to_string());
-                        }
+                        if !t.is_empty() { custom_whitelist.push(t.to_string()); }
                     }
                     i += 1;
                 }
             }
-            "--status" => {
-                if let Ok(stream) = tokio::net::UnixStream::connect(control_socket_path).await {
-                    let mut reader = BufReader::new(stream);
-                    let mut resp = String::new();
-                    if reader.read_line(&mut resp).await.is_ok() && !resp.trim().is_empty() {
-                        print!("{}", resp);
-                        return Ok(());
+            _ => {
+                // Positional arguments fallback: albus run [mode] [dns] [bootstraps] [whitelist]
+                if i == 2 {
+                    mode = match args[i].to_lowercase().as_str() {
+                        "split" => BypassMode::SniSplit,
+                        "disorder" => BypassMode::Disorder,
+                        "fake-ttl" | "fake_ttl" | "ghost" => BypassMode::FakeTtl,
+                        _ => BypassMode::StealthAuto,
+                    };
+                } else if i == 3 {
+                    dns_provider = args[i].clone();
+                } else if i == 4 && !args[i].is_empty() {
+                    custom_bootstraps.push(args[i].clone());
+                } else if i == 5 && !args[i].is_empty() {
+                    for part in args[i].split(',') {
+                        let t = part.trim();
+                        if !t.is_empty() { custom_whitelist.push(t.to_string()); }
                     }
                 }
-                println!("{{\"running\":false}}");
-                return Ok(());
             }
-            "--diagnose" => {
-                let report = DiagnosticEngine::run_full_diagnostic().await;
-                if let Ok(json) = serde_json::to_string(&report) {
-                    println!("{}", json);
-                }
-                return Ok(());
-            }
-            "--help" | "-h" => {
-                println!("albus-core: lightweight local anti-censorship daemon");
-                println!("usage: albus-core [options]");
-                println!("  --bind,      -b <addr>   bind address (default: 127.0.0.1:1080)");
-                println!("  --dns-bind   <addr>      dns listener address (default: 127.0.0.1:5300)");
-                println!("  --tun,       -t [dev]    enable optional userspace tun packet engine (default: albus0)");
-                println!("  --mode,      -m <mode>   bypass mode: auto, split, disorder, fake-ttl");
-                println!("  --dns,       -d <prov>   dns provider: quad9, cloudflare, adguard, custom");
-                println!("  --bootstrap, -B <ips>    custom bootstrap ips (primary and secondary)");
-                println!("  --whitelist, -W <rules>  custom direct passthrough domains");
-                println!("  --status                 check if daemon is running and retrieve stats");
-                println!("  --diagnose               run comprehensive health & connectivity benchmark");
-                return Ok(());
-            }
-            _ => {}
         }
         i += 1;
     }
 
+    // 2. Prepare runtime directories
+    let _ = fs::create_dir_all("/run/albus");
+    let _ = fs::set_permissions("/run/albus", Permissions::from_mode(0o755));
+    let pid = std::process::id();
+    let _ = fs::write(PID_FILE, pid.to_string());
+    let _ = fs::set_permissions(PID_FILE, Permissions::from_mode(0o666));
 
-    // 2. graceful shutdown signal handler
+    // 3. Arm RAII Netfilter & DNS Guards (automatic cleanup on exit/crash/signal)
+    let _fw_guard = FirewallGuard::enable(1080, &custom_bootstraps);
+    let _dns_guard = DnsGuard::enable();
+
+    // 4. Graceful termination handler
     tokio::spawn(async move {
         if let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {},
                 _ = sigterm.recv() => {},
             }
-            let _ = std::fs::remove_file("/tmp/albus.sock");
-            let _ = std::fs::remove_file("/tmp/albus-daemon.pid");
+            firewall_disable();
+            dns_restore_system();
+            let _ = fs::remove_file(SOCKET_PATH);
+            let _ = fs::remove_file(RUN_SOCKET_PATH);
+            let _ = fs::remove_file(PID_FILE);
             std::process::exit(0);
         }
     });
@@ -205,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor = Arc::new(ActivityMonitor::new());
     let adaptive = Arc::new(AdaptiveEvasionEngine::new());
 
-    // 1-second activity pulse rolling ticker
+    // Activity pulse ticker
     let monitor_ticker = Arc::clone(&monitor);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1000));
@@ -215,70 +379,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // spawn route & interface watcher for link roaming resilience
+    // Spawn route & interface watcher for link roaming resilience
     let doh_watcher = Arc::clone(&doh);
     tokio::spawn(async move {
         RouteWatcher::start(doh_watcher).await;
     });
 
-    // spawn local high-speed dns resolver on 127.0.0.1:5300 (stealth loopback)
+    // Spawn local high-speed DNS resolver on 127.0.0.1:5300
     let doh_dns = Arc::clone(&doh);
+    let dns_bind_clone = dns_bind.clone();
     tokio::spawn(async move {
-        let _ = LocalDnsServer::run(&dns_bind, doh_dns).await;
+        let _ = LocalDnsServer::run(&dns_bind_clone, doh_dns).await;
     });
 
-    // spawn optional userspace tun packet engine if requested
+    // Spawn optional userspace tun packet engine if requested
     if let Some(dev_name) = tun_interface {
         let m_tun = Arc::clone(&metrics);
         let mode_tun = mode;
         tokio::spawn(async move {
-            match TunDevice::create(&dev_name) {
-                Ok(dev) => {
-                    let dev_arc = Arc::new(dev);
-                    println!("albus-core tun virtual interface active on {}", dev_name);
-                    let _ = TunStack::run(dev_arc, mode_tun, m_tun).await;
-                }
-                Err(e) => {
-                    eprintln!("tun initialization notice (requires root/CAP_NET_ADMIN): {}", e);
-                }
+            if let Ok(dev) = TunDevice::create(&dev_name) {
+                let dev_arc = Arc::new(dev);
+                let _ = TunStack::run(dev_arc, mode_tun, m_tun).await;
             }
         });
     }
 
-    // bind socks5, http connect & transparent listener on 127.0.0.1:1080 (stealth loopback)
+    // Bind proxy listener on 127.0.0.1:1080
     let listener = TcpListener::bind(&bind_addr).await?;
-    println!("albus-core listening on proxy://{}", bind_addr);
 
-
-    // setup unix control socket with world accessible permissions for ui ipc
-    let _ = std::fs::remove_file(control_socket_path);
-    let unix_listener = UnixListener::bind(control_socket_path).ok();
-    if let Ok(()) = std::fs::set_permissions(control_socket_path, Permissions::from_mode(0o666)) {
-        // permissions configured
-    }
-
-    // spawn dns poisoning and censorship detection watcher
-    let metrics_poison = Arc::clone(&metrics);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        loop {
-            interval.tick().await;
-            if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                let dummy_query = vec![
-                    0xaa, 0xbb, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x07, b't', b'w', b'i', b't', b't', b'e', b'r', 0x03, b'c', b'o', b'm', 0x00,
-                    0x00, 0x01, 0x00, 0x01,
-                ];
-                let _ = socket.send_to(&dummy_query, "8.8.8.8:53").await;
-                let mut buf = [0u8; 512];
-                if let Ok(Ok((len, _))) = tokio::time::timeout(Duration::from_millis(600), socket.recv_from(&mut buf)).await {
-                    if len > 12 {
-                        metrics_poison.dns_poison_blocks.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    });
+    // Setup unix control socket with world-accessible permissions for UI IPC
+    let _ = fs::remove_file(SOCKET_PATH);
+    let _ = fs::remove_file(RUN_SOCKET_PATH);
+    let unix_listener = UnixListener::bind(SOCKET_PATH).ok();
+    let _ = fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o666));
 
     if let Some(ctrl) = unix_listener {
         let m = Arc::clone(&metrics);
@@ -311,13 +444,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = stream.write_all(status_json.as_bytes()).await;
                     let _ = stream.flush().await;
-
                 }
             }
         });
     }
 
-    // resilient main proxy accept loop
+    println!("{{\"running\":true,\"pid\":{},\"mode\":\"{:?}\",\"dns\":\"{}\"}}", pid, mode, dns_provider);
+
+    // Resilient main proxy accept loop
     loop {
         match listener.accept().await {
             Ok((mut client_stream, _)) => {

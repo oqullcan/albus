@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "albus-core"
+name = "albus"
 version = "1.4.0"
 dependencies = [
  "bytes",

@@ -104,8 +104,8 @@ Albus intercepts local outbound connections transparently and applies targeted p
 * **Operating System**: Linux with Kernel ≥ 5.10 (x86_64 or aarch64).
 * **Dependencies**: `iptables`, `iproute2`, `systemd`, `zenity` (optional, for GUI profile picker), `quickshell` (for Omarchy bar UI).
 * **Privilege Separation & TOCTOU Protection**:
-  * **Privileged System Helper (`/usr/lib/albus/albus-service.sh`)**: Immutable, root-owned helper installed to `/usr/lib/albus/` with `0755` permissions, strictly isolated from user-writable directories to prevent Time-of-Check to Time-of-Use (TOCTOU) prompt hijacking.
-  * **Polkit Action Policy (`io.github.oqullcan.albus.policy`)**: Registered under `/usr/share/polkit-1/actions/` to enforce authenticated execution of the root helper.
+  * **Privileged System Engine (`/usr/lib/albus/albus`)**: Immutable, root-owned binary installed to `/usr/lib/albus/` with `0755` permissions, strictly isolated from user-writable directories to prevent Time-of-Check to Time-of-Use (TOCTOU) prompt hijacking.
+  * **Polkit Action Policy (`io.github.oqullcan.albus.policy`)**: Registered under `/usr/share/polkit-1/actions/` to enforce authenticated execution of the root service binary.
   * **Desktop UI & CLI**: Runs entirely unprivileged in the user session, communicating with the daemon over a local Unix domain socket (`/tmp/albus.sock`).
 
 ---
