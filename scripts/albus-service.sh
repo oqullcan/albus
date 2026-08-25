@@ -11,19 +11,44 @@ fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 2. resolve core binary with prioritized root-owned system paths
-if [ -x "/usr/lib/albus/albus-core" ]; then
+action="${1:-start}"
+mode="${2:-auto}"
+dns="${3:-quad9}"
+bootstrap="${4:-}"
+whitelist="${5:-}"
+provided_bin="${6:-}"
+
+# 2. resolve core binary
+binary=""
+if [ -n "$provided_bin" ] && [ -x "$provided_bin" ]; then
+  binary="$provided_bin"
+elif [ -x "/usr/lib/albus/albus-core" ]; then
   binary="/usr/lib/albus/albus-core"
+elif [ -x "/usr/bin/albus-core" ]; then
+  binary="/usr/bin/albus-core"
 elif [ -x "$script_dir/../bin/albus-core" ]; then
   binary="$script_dir/../bin/albus-core"
 elif [ -x "$script_dir/../core/target/release/albus-core" ]; then
   binary="$script_dir/../core/target/release/albus-core"
-elif [ -x "/usr/bin/albus-core" ]; then
-  binary="/usr/bin/albus-core"
 else
-  binary="albus-core"
+  for u in /home/*; do
+    if [ -x "$u/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core" ]; then
+      binary="$u/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core"
+      break
+    elif [ -x "$u/albusdev/bin/albus-core" ]; then
+      binary="$u/albusdev/bin/albus-core"
+      break
+    elif [ -x "$u/.config/omarchy/plugins/io.github.oqullcan.albus/core/target/release/albus-core" ]; then
+      binary="$u/.config/omarchy/plugins/io.github.oqullcan.albus/core/target/release/albus-core"
+      break
+    fi
+  done
 fi
 
+if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+  echo "{\"running\":false,\"error\":\"albus-core binary not found\"}"
+  exit 1
+fi
 
 # 3. resolve transparent script
 transparent_script="$script_dir/albus-transparent.sh"
@@ -39,12 +64,6 @@ chmod 755 "$run_dir" 2>/dev/null || true
 pid_file="$run_dir/albus.pid"
 log_file="$run_dir/albus.log"
 legacy_pid="/tmp/albus-daemon.pid"
-
-action="${1:-start}"
-mode="${2:-auto}"
-dns="${3:-quad9}"
-bootstrap="${4:-}"
-whitelist="${5:-}"
 
 get_interfaces() {
   resolvectl 2>/dev/null | grep -E "Link [0-9]" | awk '{print $3}' | tr -d '()' || echo "enp3s0"
@@ -82,7 +101,9 @@ case "$action" in
     fi
 
     # enable netfilter transparent interception
-    "$transparent_script" enable "$bootstrap"
+    if [ -x "$transparent_script" ]; then
+      "$transparent_script" enable "$bootstrap"
+    fi
 
     # revert any lingering link-specific dns server overrides to avoid persistent lockups
     for iface in $(get_interfaces); do
@@ -105,7 +126,9 @@ case "$action" in
     resolvectl flush-caches 2>/dev/null || true
 
     # disable transparent netfilter rules
-    "$transparent_script" disable 2>/dev/null || true
+    if [ -x "$transparent_script" ]; then
+      "$transparent_script" disable 2>/dev/null || true
+    fi
 
     # kill daemon
     if [ -f "$pid_file" ]; then
@@ -122,11 +145,12 @@ case "$action" in
     ;;
 
   fix-network|repair)
-    # emergency network recovery: revert dns and flush all albus firewall rules
     for iface in $(get_interfaces); do
       resolvectl revert "$iface" 2>/dev/null || true
     done
-    "$transparent_script" disable 2>/dev/null || true
+    if [ -x "$transparent_script" ]; then
+      "$transparent_script" disable 2>/dev/null || true
+    fi
     pkill -9 -f "albus-core" 2>/dev/null || true
     rm -f "$pid_file" "$log_file" /tmp/albus.sock 2>/dev/null || true
     resolvectl flush-caches 2>/dev/null || true

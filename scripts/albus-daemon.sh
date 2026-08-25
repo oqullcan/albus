@@ -89,16 +89,18 @@ exec_privileged() {
   local helper="/usr/lib/albus/albus-service.sh"
 
   # If not yet installed to /usr/lib/albus (e.g. installed via omarchy plugin add), auto-provision root helper once
-  if [ ! -x "$helper" ]; then
+  if [ ! -x "$helper" ] || [ ! -x "/usr/lib/albus/albus-core" ]; then
     if command -v pkexec >/dev/null 2>&1; then
       pkexec bash -c "
         mkdir -p /usr/lib/albus /usr/share/polkit-1/actions && \
         install -m755 '$script_dir/albus-service.sh' /usr/lib/albus/albus-service.sh && \
         install -m755 '$script_dir/albus-transparent.sh' /usr/lib/albus/albus-transparent.sh && \
+        ([ ! -f '$binary' ] || install -m755 '$binary' /usr/lib/albus/albus-core) && \
         ([ ! -f '$project_dir/polkit/io.github.oqullcan.albus.policy' ] || install -m644 '$project_dir/polkit/io.github.oqullcan.albus.policy' /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy)
       " 2>/dev/null || true
     fi
   fi
+
 
   if [ ! -x "$helper" ] && [ -x "$script_dir/albus-service.sh" ]; then
     helper="$script_dir/albus-service.sh"
@@ -339,7 +341,8 @@ DESKTOP
       fi
     fi
 
-    exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist"
+    exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist" "$binary"
+
 
 
     ;;
