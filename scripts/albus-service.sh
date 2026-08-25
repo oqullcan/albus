@@ -79,6 +79,16 @@ get_interfaces() {
   resolvectl 2>/dev/null | grep -E "Link [0-9]" | awk '{print $3}' | tr -d '()' || echo "enp3s0"
 }
 
+restore_system_dns() {
+  for iface in $(get_interfaces); do
+    resolvectl default-route "$iface" true 2>/dev/null || true
+    resolvectl domain "$iface" "~." 2>/dev/null || true
+    resolvectl dns "$iface" 8.8.8.8 8.8.4.4 1.1.1.1 2>/dev/null || true
+  done
+  resolvectl flush-caches 2>/dev/null || true
+  ip route flush cache 2>/dev/null || true
+}
+
 case "$action" in
   start)
     # clean previous instances
@@ -112,7 +122,6 @@ case "$action" in
       exit 1
     fi
 
-
     # enable netfilter transparent interception
     if [ -x "$transparent_script" ]; then
       "$transparent_script" enable "$bootstrap"
@@ -133,19 +142,10 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. ensure network interfaces have valid default-route and DNS scopes
-    for iface in $(get_interfaces); do
-      resolvectl default-route "$iface" true 2>/dev/null || true
-      if resolvectl status "$iface" 2>/dev/null | grep -q "Current Scopes: none"; then
-        resolvectl dns "$iface" 8.8.8.8 8.8.4.4 2>/dev/null || true
-      fi
-    done
-    resolvectl flush-caches 2>/dev/null || true
+    # 2. restore healthy system DNS in systemd-resolved
+    restore_system_dns
 
-    # 3. flush routing cache
-    ip route flush cache 2>/dev/null || true
-
-    # 4. kill daemon
+    # 3. kill daemon
     if [ -f "$pid_file" ]; then
       pid=$(cat "$pid_file" 2>/dev/null || true)
       if [ -n "$pid" ]; then
@@ -156,7 +156,7 @@ case "$action" in
     pkill -9 -x "albus-core" 2>/dev/null || true
     rm -f /tmp/albus.sock "$log_file" "$legacy_pid" 2>/dev/null || true
 
-    # 5. sync helpers
+    # 4. sync helpers
     if [ "$script_dir" != "/usr/lib/albus" ] && [ -f "$script_dir/albus-service.sh" ]; then
       install -m755 "$script_dir/albus-service.sh" /usr/lib/albus/albus-service.sh 2>/dev/null || true
       install -m755 "$script_dir/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh 2>/dev/null || true
@@ -181,16 +181,9 @@ case "$action" in
     fi
 
     # 3. Complete DNS & systemd-resolved reset
-    for iface in $(get_interfaces); do
-      resolvectl default-route "$iface" true 2>/dev/null || true
-      resolvectl dns "$iface" 8.8.8.8 8.8.4.4 2>/dev/null || true
-    done
-    resolvectl flush-caches 2>/dev/null || true
+    restore_system_dns
 
-    # 4. Route and ARP cache flush
-    ip route flush cache 2>/dev/null || true
-
-    # 5. Sync root helper files and permissions
+    # 4. Sync root helper files and permissions
     mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
     if [ -x "$binary" ]; then
       install -m755 "$binary" /usr/lib/albus/albus-core 2>/dev/null || true
@@ -202,6 +195,7 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 
 
 esac
