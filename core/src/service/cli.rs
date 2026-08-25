@@ -5,6 +5,7 @@ use super::firewall::firewall_disable;
 use crate::diagnostic::DiagnosticEngine;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::Duration;
@@ -13,11 +14,27 @@ pub const SOCKET_PATH: &str = "/tmp/albus.sock";
 pub const RUN_SOCKET_PATH: &str = "/run/albus/albus.sock";
 pub const PID_FILE: &str = "/run/albus/albus.pid";
 pub const LOG_FILE: &str = "/run/albus/albus.log";
+pub const PROFILE_FILE: &str = "/tmp/albus-profile.active";
 
 pub fn is_dev_mode() -> bool {
     let exe = std::env::current_exe().unwrap_or_default();
     let name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
     name.contains("dev") || std::env::args().any(|a| a == "--dev" || a == "-dev")
+}
+
+pub fn get_active_profile() -> String {
+    fs::read_to_string(PROFILE_FILE)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| if is_dev_mode() { "dev".to_string() } else { "stable".to_string() })
+}
+
+pub fn set_active_profile(profile: &str) {
+    let _ = fs::write(PROFILE_FILE, profile);
+    let _ = fs::set_permissions(PROFILE_FILE, std::fs::Permissions::from_mode(0o666));
+}
+
+pub fn clear_active_profile() {
+    let _ = fs::remove_file(PROFILE_FILE);
 }
 
 pub fn get_socket_paths() -> Vec<&'static str> {
@@ -76,17 +93,42 @@ pub fn is_daemon_running() -> bool {
 }
 
 pub fn cmd_status(json_mode: bool) {
+    let active_prof = get_active_profile();
+    let is_dev = is_dev_mode();
+
     if json_mode {
         if let Some(raw) = query_status_raw() {
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                val["profile"] = serde_json::Value::String(active_prof.clone());
+                if (is_dev && active_prof != "dev") || (!is_dev && active_prof != "stable") {
+                    val["running"] = serde_json::Value::Bool(false);
+                }
+                println!("{}", val);
+                return;
+            }
             println!("{}", raw);
         } else {
-            println!("{{\"running\":false}}");
+            println!("{{\"running\":false,\"profile\":\"{}\"}}", active_prof);
         }
         return;
     }
 
     if let Some(raw) = query_status_raw() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if is_dev && active_prof != "dev" {
+                print_banner();
+                println!("  ○ Status:       {}STANDBY (Stable Profile Active){}", C_DIM, C_RESET);
+                println!("  Run 'albusdev start' to switch to Dev Workbench.");
+                println!();
+                return;
+            } else if !is_dev && active_prof != "stable" {
+                print_banner();
+                println!("  ○ Status:       {}STANDBY (Dev Workbench Active){}", C_DIM, C_RESET);
+                println!("  Run 'albus start' to switch to Stable Edition.");
+                println!();
+                return;
+            }
+
             let total = val["total"].as_u64().unwrap_or(0);
             let tls = val["tls"].as_u64().unwrap_or(0);
             let bytes_str = val["bytes_str"].as_str().unwrap_or("0 B");
@@ -117,8 +159,8 @@ pub fn cmd_status(json_mode: bool) {
     }
 
     print_banner();
-    println!("  ○ Status:       {}{}{}STOPPED (Direct Network){}", C_RED, C_BOLD, C_RESET, C_RESET);
-    println!("  {}Run 'albus start' to activate protection.{}", C_DIM, C_RESET);
+    println!("  ○ Status:       {}STOPPED (Direct Network){}", C_DIM, C_RESET);
+    println!("  Run '{} start' to activate protection.", if is_dev { "albusdev" } else { "albus" });
     println!();
 }
 
@@ -260,12 +302,14 @@ pub fn exec_privileged_run(action: &str, args: &[String]) {
     if unsafe { libc::geteuid() } == 0 {
         match action {
             "stop" | "stop-service" => {
+                clear_active_profile();
                 firewall_disable();
                 dns_restore_system();
                 cmd_stop_process();
                 println!("{{\"running\":false}}");
             }
             "fix-network" | "fix-network-service" => {
+                clear_active_profile();
                 cmd_fix_network();
             }
             _ => {
@@ -278,13 +322,18 @@ pub fn exec_privileged_run(action: &str, args: &[String]) {
         return;
     }
 
-    // Try systemctl first if service is installed
-    if action == "run" && Command::new("systemctl").args(["is-enabled", "albus"]).output().map(|o| o.status.success()).unwrap_or(false) {
-        let _ = Command::new("systemctl").args(["start", "albus"]).status();
-        return;
-    } else if action == "stop-service" && Command::new("systemctl").args(["is-active", "albus"]).output().map(|o| o.status.success()).unwrap_or(false) {
-        let _ = Command::new("systemctl").args(["stop", "albus"]).status();
-        return;
+    if is_dev_mode() {
+        if action == "run" || action == "start" {
+            set_active_profile("dev");
+        } else {
+            clear_active_profile();
+        }
+    } else {
+        if action == "run" || action == "start" {
+            set_active_profile("stable");
+        } else {
+            clear_active_profile();
+        }
     }
 
     // Determine authorized helper (either albus-service.sh or albus binary)
@@ -292,7 +341,7 @@ pub fn exec_privileged_run(action: &str, args: &[String]) {
         let act = match action {
             "stop-service" | "stop" => "stop",
             "fix-network-service" | "fix-network" => "fix-network",
-            "run" => "start",
+            "run" | "start" => "start",
             _ => action,
         };
         ("/usr/lib/albus/albus-service.sh", act)

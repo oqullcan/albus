@@ -469,7 +469,8 @@ Panel {
         var raw = String(statusStdout.text || "")
         if (Model.parseStatus(raw)) {
           var s = Model.getStatus()
-          root.isRunning = s.active
+          root.activeProfile = s.profile || "dev"
+          root.isRunning = s.active && (root.activeProfile === "dev" || root.activeProfile === "")
           root.totalConns = s.totalConnections
           root.tlsCount = s.tlsBypassed
           root.httpCount = s.httpBypassed

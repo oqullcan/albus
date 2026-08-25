@@ -4,6 +4,7 @@
 
 var daemonStatus = {
   active: false,
+  profile: "dev",
   totalConnections: 0,
   tlsBypassed: 0,
   httpBypassed: 0,
@@ -24,6 +25,7 @@ function parseStatus(rawJson) {
     var data = JSON.parse(rawJson.trim());
     if (data.running !== undefined) {
       daemonStatus.active = Boolean(data.running);
+      if (data.profile) daemonStatus.profile = String(data.profile);
       daemonStatus.totalConnections = Number(data.total) || 0;
       daemonStatus.tlsBypassed = Number(data.tls) || 0;
       daemonStatus.httpBypassed = Number(data.http) || 0;
