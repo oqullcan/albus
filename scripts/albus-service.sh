@@ -50,6 +50,19 @@ if [ -z "$binary" ] || [ ! -x "$binary" ]; then
   exit 1
 fi
 
+# Self-provision root helper and binary to /usr/lib/albus if missing
+if [ ! -x "/usr/lib/albus/albus-core" ]; then
+  mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
+  install -m755 "$binary" /usr/lib/albus/albus-core 2>/dev/null || true
+fi
+if [ ! -x "/usr/lib/albus/albus-service.sh" ]; then
+  install -m755 "$script_dir/albus-service.sh" /usr/lib/albus/albus-service.sh 2>/dev/null || true
+fi
+if [ ! -x "/usr/lib/albus/albus-transparent.sh" ]; then
+  install -m755 "$script_dir/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh 2>/dev/null || true
+fi
+
+
 # 3. resolve transparent script
 transparent_script="$script_dir/albus-transparent.sh"
 if [ ! -x "$transparent_script" ] && [ -x "/usr/lib/albus/albus-transparent.sh" ]; then
