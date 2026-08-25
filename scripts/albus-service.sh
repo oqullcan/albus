@@ -1,11 +1,35 @@
 #!/bin/bash
-# albus service manager
+# albus system-wide privileged service helper (must execute as root)
 
 set -euo pipefail
 
+# 1. security validation: must run as root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "{\"running\":false,\"error\":\"albus-service.sh must be executed as root\"}" >&2
+  exit 1
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_dir="$(dirname "$script_dir")"
-binary="$project_dir/core/target/release/albus-core"
+
+# 2. resolve core binary with prioritized root-owned system paths
+if [ -x "/usr/lib/albus/albus-core" ]; then
+  binary="/usr/lib/albus/albus-core"
+elif [ -x "$script_dir/../bin/albus-core" ]; then
+  binary="$script_dir/../bin/albus-core"
+elif [ -x "$script_dir/../core/target/release/albus-core" ]; then
+  binary="$script_dir/../core/target/release/albus-core"
+elif [ -x "/usr/bin/albus-core" ]; then
+  binary="/usr/bin/albus-core"
+else
+  binary="albus-core"
+fi
+
+
+# 3. resolve transparent script
+transparent_script="$script_dir/albus-transparent.sh"
+if [ ! -x "$transparent_script" ] && [ -x "/usr/lib/albus/albus-transparent.sh" ]; then
+  transparent_script="/usr/lib/albus/albus-transparent.sh"
+fi
 
 run_dir="/run/albus"
 mkdir -p "$run_dir" 2>/dev/null || run_dir="/tmp/albus"
@@ -14,6 +38,7 @@ chmod 755 "$run_dir" 2>/dev/null || true
 
 pid_file="$run_dir/albus.pid"
 log_file="$run_dir/albus.log"
+legacy_pid="/tmp/albus-daemon.pid"
 
 action="${1:-start}"
 mode="${2:-auto}"
@@ -27,14 +52,21 @@ get_interfaces() {
 
 case "$action" in
   start)
+    # clean previous instances
     pkill -9 -f "albus-core" 2>/dev/null || true
-    rm -f "$pid_file" "$log_file" /tmp/albus.sock 2>/dev/null || true
+    rm -f "$pid_file" "$log_file" "$legacy_pid" /tmp/albus.sock 2>/dev/null || true
     sleep 0.05
 
+    # build command
     cmd=("$binary" "--mode" "$mode" "--dns" "$dns")
-    if [ -n "$bootstrap" ]; then cmd+=("--bootstrap" "$bootstrap"); fi
-    if [ -n "$whitelist" ]; then cmd+=("--whitelist" "$whitelist"); fi
+    if [ -n "$bootstrap" ]; then
+      cmd+=("--bootstrap" "$bootstrap")
+    fi
+    if [ -n "$whitelist" ]; then
+      cmd+=("--whitelist" "$whitelist")
+    fi
 
+    # start background daemon as root
     touch "$log_file"
     chmod 666 "$log_file" 2>/dev/null || true
     setsid "${cmd[@]}" > "$log_file" 2>&1 &
@@ -42,48 +74,59 @@ case "$action" in
     echo "$daemon_pid" > "$pid_file"
     chmod 666 "$pid_file" 2>/dev/null || true
 
+    # verify daemon is alive
     sleep 0.2
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
       echo "{\"running\":false,\"error\":\"daemon failed to start\"}"
       exit 1
     fi
 
-    "$script_dir/albus-transparent.sh" enable "$bootstrap"
+    # enable netfilter transparent interception
+    "$transparent_script" enable "$bootstrap"
 
+    # revert any lingering link-specific dns server overrides to avoid persistent lockups
     for iface in $(get_interfaces); do
-      resolvectl dns "$iface" 127.0.0.1:5300 2>/dev/null || true
-      resolvectl domain "$iface" "~." 2>/dev/null || true
-      resolvectl default-route "$iface" true 2>/dev/null || true
+      resolvectl revert "$iface" 2>/dev/null || true
     done
     resolvectl flush-caches 2>/dev/null || true
 
+    # ensure control socket is world-accessible for UI IPC status polling
     sleep 0.05
     chmod 666 /tmp/albus.sock 2>/dev/null || true
+
     echo "{\"running\":true,\"pid\":$daemon_pid,\"mode\":\"$mode\",\"dns\":\"$dns\"}"
     ;;
 
   stop)
+    # revert link dns and flush caches
     for iface in $(get_interfaces); do
       resolvectl revert "$iface" 2>/dev/null || true
     done
     resolvectl flush-caches 2>/dev/null || true
-    "$script_dir/albus-transparent.sh" disable 2>/dev/null || true
 
+    # disable transparent netfilter rules
+    "$transparent_script" disable 2>/dev/null || true
+
+    # kill daemon
     if [ -f "$pid_file" ]; then
       pid=$(cat "$pid_file" 2>/dev/null || true)
-      if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
+      if [ -n "$pid" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
       rm -f "$pid_file"
     fi
     pkill -9 -f "albus-core" 2>/dev/null || true
     rm -f /tmp/albus.sock 2>/dev/null || true
+
     echo "{\"running\":false}"
     ;;
 
   fix-network|repair)
+    # emergency network recovery: revert dns and flush all albus firewall rules
     for iface in $(get_interfaces); do
       resolvectl revert "$iface" 2>/dev/null || true
     done
-    "$script_dir/albus-transparent.sh" disable 2>/dev/null || true
+    "$transparent_script" disable 2>/dev/null || true
     pkill -9 -f "albus-core" 2>/dev/null || true
     rm -f "$pid_file" "$log_file" /tmp/albus.sock 2>/dev/null || true
     resolvectl flush-caches 2>/dev/null || true
