@@ -99,6 +99,8 @@ exec_privileged() {
 
   if [ "$(id -u)" -eq 0 ]; then
     "$helper" "$@"
+  elif [ -t 0 ] && command -v sudo >/dev/null 2>&1; then
+    sudo "$helper" "$@"
   elif command -v pkexec >/dev/null 2>&1; then
     pkexec "$helper" "$@"
   elif command -v sudo >/dev/null 2>&1; then
@@ -108,6 +110,7 @@ exec_privileged() {
     exit 1
   fi
 }
+
 
 
 
