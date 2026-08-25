@@ -31,9 +31,8 @@ teardown_all() {
   iptables -t nat -X ALBUS_DNS 2>/dev/null || true
 
   # 3. clean any legacy orphaned filter rules
-  while iptables -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
-  while iptables -D OUTPUT -p udp --dport 53 ! -d 127.0.0.1 ! -d 10.0.0.0/8 ! -d 172.16.0.0/12 ! -d 192.168.0.0/16 -j DROP 2>/dev/null; do :; done
-  while iptables -D OUTPUT -p udp --dport 53 ! -d 127.0.0.1 -j DROP 2>/dev/null; do :; done
+  while iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null; do :; done
+
   while iptables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null; do :; done
   while iptables -D INPUT ! -i lo -p udp --dport 5300 -j DROP 2>/dev/null; do :; done
   while iptables -D INPUT ! -i lo -p tcp --dport 5300 -j DROP 2>/dev/null; do :; done
@@ -56,7 +55,12 @@ if [ "$action" = "enable" ]; then
   iptables -A ALBUS_FILTER ! -i lo -p udp --dport 5300 -j DROP
   iptables -A ALBUS_FILTER ! -i lo -p tcp --dport 5300 -j DROP
   iptables -A ALBUS_FILTER -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-  iptables -A ALBUS_FILTER -p udp --dport 53 ! -d 127.0.0.1 ! -d 10.0.0.0/8 ! -d 172.16.0.0/12 ! -d 192.168.0.0/16 -j DROP
+  iptables -A ALBUS_FILTER -d 127.0.0.0/8 -p udp --dport 53 -j RETURN
+  iptables -A ALBUS_FILTER -d 10.0.0.0/8 -p udp --dport 53 -j RETURN
+  iptables -A ALBUS_FILTER -d 172.16.0.0/12 -p udp --dport 53 -j RETURN
+  iptables -A ALBUS_FILTER -d 192.168.0.0/16 -p udp --dport 53 -j RETURN
+  iptables -A ALBUS_FILTER -p udp --dport 53 -j DROP
+
 
   ip6tables -N ALBUS_FILTER6
   ip6tables -A ALBUS_FILTER6 ! -i lo -p tcp --dport "$port" -j DROP
