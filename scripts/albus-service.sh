@@ -171,11 +171,9 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. restore healthy system DNS in systemd-resolved
-    restore_system_dns
+    # 2. restart resolver service first to clear dead sockets, then apply clean DNS
     systemctl restart systemd-resolved 2>/dev/null || true
-    resolvectl flush-caches 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
+    restore_system_dns
 
     # 3. kill daemon
     if [ -f "$pid_file" ]; then
@@ -213,10 +211,8 @@ case "$action" in
     fi
 
     # 3. Complete DNS & systemd-resolved reset
-    restore_system_dns
     systemctl restart systemd-resolved 2>/dev/null || true
-    resolvectl flush-caches 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
+    restore_system_dns
 
     # 4. Sync root helper files and permissions
     mkdir -p /usr/lib/albus /usr/share/polkit-1/actions 2>/dev/null || true
@@ -230,6 +226,7 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 
 
 
