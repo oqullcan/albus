@@ -27,12 +27,12 @@ autostart_file="$autostart_dir/albus.desktop"
 
 mkdir -p "$config_dir" "$autostart_dir"
 
-if [ -f "$HOME/.config/environment.d/99-albus-proxy.conf" ]; then
-  rm -f "$HOME/.config/environment.d/99-albus-proxy.conf"
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user unset-environment all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY 2>/dev/null || true
-  fi
+rm -f "$HOME/.config/environment.d/99-albus-proxy.conf" 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user unset-environment all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
+  systemctl --user daemon-reexec 2>/dev/null || true
 fi
+
 
 
 action="${1:-status}"
