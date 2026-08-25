@@ -40,10 +40,18 @@ teardown_all() {
   iptables -t nat -X ALBUS 2>/dev/null || true
   iptables -t nat -F ALBUS_DNS 2>/dev/null || true
   iptables -t nat -X ALBUS_DNS 2>/dev/null || true
-
   while iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null; do :; done
   while iptables -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+
+
+  while ip6tables -D OUTPUT -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
+  while ip6tables -D OUTPUT -p udp --dport 443 -j REJECT 2>/dev/null; do :; done
+  while ip6tables -D OUTPUT -p udp --dport 53 -j REJECT 2>/dev/null; do :; done
+  while ip6tables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null; do :; done
+  while ip6tables -D INPUT ! -i lo -p udp --dport 5300 -j DROP 2>/dev/null; do :; done
+  while ip6tables -D INPUT ! -i lo -p tcp --dport 5300 -j DROP 2>/dev/null; do :; done
 }
+
 
 if [ "$action" = "enable" ]; then
   teardown_all
