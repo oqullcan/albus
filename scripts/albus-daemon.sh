@@ -151,7 +151,7 @@ case "$action" in
 
     if [ -s "$project_dir/bin/albus-core" ]; then
       chmod +x "$project_dir/bin/albus-core"
-      if command -v pkexec >/dev/null 2>&1; then pkexec "$script_dir/albus-service.sh" repair >/dev/null 2>&1 || true
+      exec_privileged repair >/dev/null 2>&1 || true
       echo "{\"success\":true,\"version\":\"$ver\"}"
     else
       echo "{\"success\":false,\"error\":\"Download failed. Check your internet connection.\"}"
@@ -163,7 +163,7 @@ case "$action" in
     if command -v cargo >/dev/null 2>&1 && [ -f "$project_dir/core/Cargo.toml" ]; then
       cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1 || true
       if [ -x "$project_dir/core/target/release/albus-core" ]; then
-        if command -v pkexec >/dev/null 2>&1; then pkexec "$script_dir/albus-service.sh" repair >/dev/null 2>&1 || true
+        exec_privileged repair >/dev/null 2>&1 || true
         echo "{\"success\":true,\"version\":\"compiled\"}"
       else
         echo "{\"success\":false,\"error\":\"Cargo compilation failed.\"}"
@@ -193,7 +193,7 @@ case "$action" in
     ;;
 
   fix-network|repair)
-    if command -v pkexec >/dev/null 2>&1; then pkexec "$script_dir/albus-service.sh" repair
+    exec_privileged repair
     exit 0
     ;;
 
@@ -339,13 +339,13 @@ DESKTOP
       fi
     fi
 
-    if command -v pkexec >/dev/null 2>&1; then pkexec "$script_dir/albus-service.sh" start "$mode" "$dns" "$bootstrap" "$whitelist"
+    exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist"
 
 
     ;;
 
   stop)
-    if command -v pkexec >/dev/null 2>&1; then pkexec "$script_dir/albus-service.sh" stop
+    exec_privileged stop
     ;;
 
 
