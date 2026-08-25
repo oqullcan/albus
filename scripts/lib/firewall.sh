@@ -1,13 +1,10 @@
 #!/bin/bash
-# albus transparent redirection engine
+# albus netfilter & firewall management module
 
 set -u
 
-action="${1:-enable}"
-custom_bootstraps="${2:-}"
-port="${3:-1080}"
-
 firewall_disable() {
+  # 1. Remove jumps from main tables in safe unrolled loops
   while iptables -D OUTPUT -j ALBUS_OUT 2>/dev/null; do :; done
   while iptables -D INPUT -j ALBUS_IN 2>/dev/null; do :; done
   while ip6tables -D OUTPUT -j ALBUS_OUT6 2>/dev/null; do :; done
@@ -24,6 +21,7 @@ firewall_disable() {
   while iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null; do :; done
 
+  # 2. Flush and delete custom chains
   iptables -F ALBUS_OUT 2>/dev/null || true
   iptables -X ALBUS_OUT 2>/dev/null || true
   iptables -F ALBUS_IN 2>/dev/null || true
@@ -45,12 +43,14 @@ firewall_disable() {
   iptables -t nat -F ALBUS_DNS 2>/dev/null || true
   iptables -t nat -X ALBUS_DNS 2>/dev/null || true
 
+  # 3. Clean legacy standalone drop rules if present
   while iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null; do :; done
   while iptables -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
   while ip6tables -D OUTPUT -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
   while ip6tables -D OUTPUT -p udp --dport 443 -j REJECT 2>/dev/null; do :; done
   while ip6tables -D OUTPUT -p udp --dport 53 -j REJECT 2>/dev/null; do :; done
 
+  # 4. Flush kernel connection tracking to immediately evict NAT sessions
   if command -v conntrack >/dev/null 2>&1; then
     conntrack -F 2>/dev/null || true
   fi
@@ -60,8 +60,10 @@ firewall_enable() {
   local http_port="${1:-1080}"
   local custom_bootstraps="${2:-}"
 
+  # Always perform a clean teardown first
   firewall_disable
 
+  # 1. Create atomic filter chains
   iptables -N ALBUS_OUT
   iptables -A ALBUS_OUT -m mark --mark 0x1337 -j RETURN
   iptables -A ALBUS_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
@@ -81,6 +83,7 @@ firewall_enable() {
   ip6tables -A ALBUS_IN6 ! -i lo -p udp --dport 5300 -j DROP
   ip6tables -A ALBUS_IN6 ! -i lo -p tcp --dport 5300 -j DROP
 
+  # 2. Create NAT TCP chain
   iptables -t nat -N ALBUS
   iptables -t nat -A ALBUS -m mark --mark 0x1337 -j RETURN
   iptables -t nat -A ALBUS -d 0.0.0.0/8 -j RETURN
@@ -90,6 +93,7 @@ firewall_enable() {
   iptables -t nat -A ALBUS -d 172.16.0.0/12 -j RETURN
   iptables -t nat -A ALBUS -d 192.168.0.0/16 -j RETURN
 
+  # Bypass standard upstream DoH resolvers
   iptables -t nat -A ALBUS -d 9.9.9.9 -j RETURN
   iptables -t nat -A ALBUS -d 149.112.112.112 -j RETURN
   iptables -t nat -A ALBUS -d 1.1.1.1 -j RETURN
@@ -112,6 +116,7 @@ firewall_enable() {
   iptables -t nat -A ALBUS -p tcp --dport 80 -j REDIRECT --to-ports "$http_port"
   iptables -t nat -A ALBUS -p tcp --dport 443 -j REDIRECT --to-ports "$http_port"
 
+  # 3. Create NAT DNS chain
   iptables -t nat -N ALBUS_DNS
   iptables -t nat -A ALBUS_DNS -m mark --mark 0x1337 -j RETURN
   iptables -t nat -A ALBUS_DNS -d 127.0.0.0/8 -j RETURN
@@ -121,6 +126,7 @@ firewall_enable() {
   iptables -t nat -A ALBUS_DNS -p udp --dport 53 -j REDIRECT --to-ports 5300
   iptables -t nat -A ALBUS_DNS -p tcp --dport 53 -j REDIRECT --to-ports 5300
 
+  # 4. Link into system packet flow
   iptables -I OUTPUT 1 -j ALBUS_OUT
   iptables -I INPUT 1 -j ALBUS_IN
   ip6tables -I OUTPUT 1 -j ALBUS_OUT6
@@ -131,11 +137,3 @@ firewall_enable() {
   iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j ALBUS_DNS
   iptables -t mangle -I OUTPUT 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null || true
 }
-
-if [ "$action" = "enable" ]; then
-  firewall_enable "$port" "$custom_bootstraps"
-  echo '{"transparent":"enabled"}'
-else
-  firewall_disable
-  echo '{"transparent":"disabled"}'
-fi

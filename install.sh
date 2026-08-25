@@ -300,23 +300,26 @@ ln -s "$script_dir" "$omarchy_plugin_dir"
 # 5. install root-owned system helper and polkit policy (zero-TOCTOU security model)
 echo -e "\033[38;2;137;180;250m> Installing root-owned helper to /usr/lib/albus/...\033[0m"
 if [ "$(id -u)" -eq 0 ]; then
-  mkdir -p /usr/lib/albus /usr/share/polkit-1/actions
+  mkdir -p /usr/lib/albus/lib /usr/share/polkit-1/actions
   install -m755 "$script_dir/scripts/albus-service.sh" /usr/lib/albus/albus-service.sh
   install -m755 "$script_dir/scripts/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh
+  install -m755 "$script_dir/scripts/lib/"*.sh /usr/lib/albus/lib/ 2>/dev/null || true
   install -m755 "$script_dir/core/target/release/albus-core" /usr/lib/albus/albus-core
   install -m644 "$script_dir/polkit/io.github.oqullcan.albus.policy" /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
 elif command -v pkexec >/dev/null 2>&1; then
   pkexec bash -c "
-    mkdir -p /usr/lib/albus /usr/share/polkit-1/actions && \
+    mkdir -p /usr/lib/albus/lib /usr/share/polkit-1/actions && \
     install -m755 '$script_dir/scripts/albus-service.sh' /usr/lib/albus/albus-service.sh && \
     install -m755 '$script_dir/scripts/albus-transparent.sh' /usr/lib/albus/albus-transparent.sh && \
+    install -m755 '$script_dir/scripts/lib/'*.sh /usr/lib/albus/lib/ && \
     install -m755 '$script_dir/core/target/release/albus-core' /usr/lib/albus/albus-core && \
     install -m644 '$script_dir/polkit/io.github.oqullcan.albus.policy' /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
   "
 elif command -v sudo >/dev/null 2>&1; then
-  sudo mkdir -p /usr/lib/albus /usr/share/polkit-1/actions
+  sudo mkdir -p /usr/lib/albus/lib /usr/share/polkit-1/actions
   sudo install -m755 "$script_dir/scripts/albus-service.sh" /usr/lib/albus/albus-service.sh
   sudo install -m755 "$script_dir/scripts/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh
+  sudo install -m755 "$script_dir/scripts/lib/"*.sh /usr/lib/albus/lib/
   sudo install -m755 "$script_dir/core/target/release/albus-core" /usr/lib/albus/albus-core
   sudo install -m644 "$script_dir/polkit/io.github.oqullcan.albus.policy" /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
 fi

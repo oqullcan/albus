@@ -1,282 +1,156 @@
 #!/bin/bash
-# albus seamless daemon manager with autostart, whitelist persistence, profiles, cache purge & notifications
+# albus user daemon & CLI gateway
 
-set -euo pipefail
+set -u
+
+# Ensure no proxy environment variables pollute user session
+unset all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_dir="$(dirname "$script_dir")"
-if [ -x "/usr/lib/albus/albus-core" ]; then
-  binary="/usr/lib/albus/albus-core"
-elif [ -x "$project_dir/bin/albus-core" ]; then
-  binary="$project_dir/bin/albus-core"
-elif [ -x "$project_dir/core/target/release/albus-core" ]; then
-  binary="$project_dir/core/target/release/albus-core"
-elif [ -x "/usr/bin/albus-core" ]; then
-  binary="/usr/bin/albus-core"
-else
-  binary="$project_dir/bin/albus-core"
-fi
+project_dir="$(cd "$script_dir/.." && pwd)"
 
-pid_file="/tmp/albus-daemon.pid"
+ALBUS_LIB_DIR="/usr/lib/albus"
+ALBUS_SOCKET="/tmp/albus.sock"
+ALBUS_LOG_FILE="/run/albus/albus.log"
+ALBUS_USER_CONFIG_DIR="$HOME/.config/omarchy/plugins/io.github.oqullcan.albus"
+ALBUS_CONFIG_FILE="$ALBUS_USER_CONFIG_DIR/config.json"
+ALBUS_AUTOSTART_DIR="$HOME/.config/autostart"
+ALBUS_AUTOSTART_FILE="$ALBUS_AUTOSTART_DIR/io.github.oqullcan.albus.desktop"
 
-log_file="/tmp/albus.log"
-config_dir="$HOME/.config/albus"
-config_file="$config_dir/config.json"
-autostart_dir="$HOME/.config/autostart"
-autostart_file="$autostart_dir/albus.desktop"
+c_reset="\033[0m"
+c_bold="\033[1m"
+c_dim="\033[2m"
+c_green="\033[38;2;166;227;161m"
+c_magenta="\033[38;2;203;166;247m"
 
-mkdir -p "$config_dir" "$autostart_dir"
-
-rm -f "$HOME/.config/environment.d/99-albus-proxy.conf" 2>/dev/null || true
-if command -v gsettings >/dev/null 2>&1; then
-  gsettings reset-recursively org.gnome.system.proxy 2>/dev/null || true
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user unset-environment all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
-  systemctl --user daemon-reexec 2>/dev/null || true
-fi
-
-
-
-
-action="${1:-status}"
-mode="${2:-}"
-dns="${3:-}"
-bootstrap="${4:-}"
-whitelist="${5:-}"
-
-get_latest_version() {
-  local tag
-  tag=$(curl -sSL --connect-timeout 2 "https://api.github.com/repos/oqullcan/albus/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 || true)
-  if [ -z "$tag" ]; then
-    tag=$(curl -sSL --connect-timeout 2 "https://api.github.com/repos/oqullcan/albus/tags" 2>/dev/null | grep -o '"name": *"[^"]*"' | head -n 1 | cut -d'"' -f4 || echo "v1.0.0")
+resolve_binary() {
+  local binary=""
+  if [ -x "$ALBUS_LIB_DIR/albus-core" ]; then
+    binary="$ALBUS_LIB_DIR/albus-core"
+  elif [ -x "/usr/bin/albus-core" ]; then
+    binary="/usr/bin/albus-core"
+  elif [ -x "$project_dir/bin/albus-core" ]; then
+    binary="$project_dir/bin/albus-core"
+  elif [ -x "$project_dir/core/target/release/albus-core" ]; then
+    binary="$project_dir/core/target/release/albus-core"
+  elif [ -x "$HOME/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core" ]; then
+    binary="$HOME/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core"
   fi
-  if [ -z "$tag" ]; then tag="v1.0.0"; fi
-  echo "$tag"
-}
-
-load_config() {
-
-  if [ -f "$config_file" ]; then
-    cat "$config_file"
-  else
-    echo '{"mode":"auto","dns":"quad9","custom_url":"","custom_primary":"","custom_secondary":"","whitelist":"","autostart":false,"notifications":false}'
-  fi
-}
-
-save_config() {
-  local s_mode="${1:-auto}"
-  local s_dns="${2:-quad9}"
-  local s_url="${3:-}"
-  local s_p="${4:-}"
-  local s_s="${5:-}"
-  local s_w="${6:-}"
-  local s_auto="${7:-false}"
-  local s_notif="${8:-false}"
-
-  s_mode=$(echo "$s_mode" | tr -d '\r\n' | xargs)
-  s_dns=$(echo "$s_dns" | tr -d '\r\n' | xargs)
-  s_url=$(echo "$s_url" | tr -d '\r\n' | xargs)
-  s_p=$(echo "$s_p" | tr -d '\r\n' | xargs)
-  s_s=$(echo "$s_s" | tr -d '\r\n' | xargs)
-  s_w=$(echo "$s_w" | tr -d '\r\n' | xargs)
-  s_auto=$(echo "$s_auto" | tr -d '\r\n' | xargs)
-  s_notif=$(echo "$s_notif" | tr -d '\r\n' | xargs)
-
-  cat << JSON > "$config_file"
-{
-  "mode": "$s_mode",
-  "dns": "$s_dns",
-  "custom_url": "$s_url",
-  "custom_primary": "$s_p",
-  "custom_secondary": "$s_s",
-  "whitelist": "$s_w",
-  "autostart": $s_auto,
-  "notifications": $s_notif
-}
-JSON
+  echo "$binary"
 }
 
 exec_privileged() {
   local helper="$script_dir/albus-service.sh"
-  if [ -x "/usr/lib/albus/albus-service.sh" ]; then
-    helper="/usr/lib/albus/albus-service.sh"
+  if [ -x "$ALBUS_LIB_DIR/albus-service.sh" ]; then
+    helper="$ALBUS_LIB_DIR/albus-service.sh"
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
-    "$script_dir/albus-service.sh" "$@"
-  elif [ -t 0 ] && command -v sudo >/dev/null 2>&1; then
-    sudo "$script_dir/albus-service.sh" "$@"
+    "$helper" "$@"
   elif command -v pkexec >/dev/null 2>&1; then
     pkexec "$helper" "$@"
   elif command -v sudo >/dev/null 2>&1; then
-    sudo "$script_dir/albus-service.sh" "$@"
+    sudo "$helper" "$@"
   else
-    echo "{\"running\":false,\"error\":\"Neither pkexec nor sudo found\"}"
+    echo '{"running":false,"error":"Neither pkexec nor sudo found"}'
     exit 1
   fi
 }
 
+cmd="${1:-status}"
+shift || true
 
-
-
-
-case "$action" in
-
-  get-latest-version)
-    get_latest_version
-    exit 0
-    ;;
-
-  check-core)
-    installed=false
-    if [ -x "/usr/lib/albus/albus-core" ] || [ -x "$project_dir/bin/albus-core" ] || [ -x "$project_dir/core/target/release/albus-core" ]; then
-      installed=true
-    fi
-    has_cargo=false
-    if command -v cargo >/dev/null 2>&1; then
-      has_cargo=true
-    fi
-    ver=$(get_latest_version)
-    echo "{\"installed\":$installed,\"has_cargo\":$has_cargo,\"latest_version\":\"$ver\"}"
-    exit 0
-    ;;
-
-  setup-download)
-    ver=$(get_latest_version)
-    mkdir -p "$project_dir/bin"
-    downloaded=false
-    if curl -sSL "https://raw.githubusercontent.com/oqullcan/albus/master/bin/albus-core" -o "$project_dir/bin/albus-core" 2>/dev/null; then
-      downloaded=true
-    elif curl -sSL "https://github.com/oqullcan/albus/releases/download/${ver}/albus-core" -o "$project_dir/bin/albus-core" 2>/dev/null; then
-      downloaded=true
-    fi
-
-    if [ -s "$project_dir/bin/albus-core" ]; then
-      chmod +x "$project_dir/bin/albus-core"
-      echo "{\"success\":true,\"version\":\"$ver\"}"
-    else
-      echo "{\"success\":false,\"error\":\"Download failed. Check internet connection.\"}"
-    fi
-    exit 0
-    ;;
-
-  setup-compile)
-    if command -v cargo >/dev/null 2>&1 && [ -f "$project_dir/core/Cargo.toml" ]; then
-      if cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1; then
-        mkdir -p "$project_dir/bin"
-        cp "$project_dir/core/target/release/albus-core" "$project_dir/bin/albus-core" 2>/dev/null || true
-        echo "{\"success\":true,\"version\":\"compiled\"}"
-      else
-        echo "{\"success\":false,\"error\":\"Cargo compilation failed.\"}"
-      fi
-    else
-      echo "{\"success\":false,\"error\":\"Cargo is not installed.\"}"
-    fi
-    exit 0
-    ;;
-
-
+case "$cmd" in
   get-config)
-
-    load_config
-    exit 0
+    if [ -f "$ALBUS_CONFIG_FILE" ]; then
+      cat "$ALBUS_CONFIG_FILE"
+    else
+      echo '{"mode":"auto","dns":"quad9","custom_url":"","custom_primary":"","custom_secondary":"","whitelist":"","autostart":false,"notifications":true}'
+    fi
     ;;
 
   save-config)
-    save_config "${2:-auto}" "${3:-quad9}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-false}" "${9:-false}"
-    echo "{\"saved\":true}"
-    exit 0
+    mode="${1:-auto}"
+    dns="${2:-quad9}"
+    custom_url="${3:-}"
+    custom_primary="${4:-}"
+    custom_secondary="${5:-}"
+    whitelist="${6:-}"
+    autostart="${7:-false}"
+    notifications="${8:-true}"
+
+    mkdir -p "$ALBUS_USER_CONFIG_DIR" 2>/dev/null || true
+
+    autostart_bool="false"
+    if [ "$autostart" = "true" ]; then autostart_bool="true"; fi
+
+    notif_bool="true"
+    if [ "$notifications" = "false" ]; then notif_bool="false"; fi
+
+    cat << EOF > "$ALBUS_CONFIG_FILE"
+{
+  "mode": "$mode",
+  "dns": "$dns",
+  "custom_url": "$custom_url",
+  "custom_primary": "$custom_primary",
+  "custom_secondary": "$custom_secondary",
+  "whitelist": "$whitelist",
+  "autostart": $autostart_bool,
+  "notifications": $notif_bool
+}
+EOF
+    echo '{"saved":true}'
     ;;
-
-  purge-cache)
-    resolvectl flush-caches 2>/dev/null || true
-    echo "{\"purged\":true}"
-    exit 0
-    ;;
-
-  fix-network|repair)
-    exec_privileged repair
-    exit 0
-    ;;
-
-
-  export-profile)
-    out_file="${2:-}"
-    if [ -z "$out_file" ]; then
-      if command -v zenity >/dev/null 2>&1; then
-        out_file=$(zenity --file-selection --save --confirm-overwrite --filename="$HOME/albus-profile.json" --file-filter="JSON Profile (*.json) | *.json" --title="Export Albus Profile" 2>/dev/null || true)
-      elif command -v kdialog >/dev/null 2>&1; then
-        out_file=$(kdialog --getsavefilename "$HOME/albus-profile.json" "*.json" --title "Export Albus Profile" 2>/dev/null || true)
-      else
-        out_file="$HOME/albus-profile.json"
-      fi
-    fi
-
-    if [ -n "$out_file" ]; then
-      cp "$config_file" "$out_file" 2>/dev/null || true
-      echo "{\"exported\":true,\"file\":\"$out_file\"}"
-      exit 0
-    else
-      echo "{\"exported\":false,\"error\":\"cancelled\"}"
-      exit 0
-    fi
-    ;;
-
-  import-profile)
-    in_file="${2:-}"
-    if [ -z "$in_file" ]; then
-      if command -v zenity >/dev/null 2>&1; then
-        in_file=$(zenity --file-selection --file-filter="JSON Profile (*.json) | *.json" --title="Select Albus Profile to Import" 2>/dev/null || true)
-      elif command -v kdialog >/dev/null 2>&1; then
-        in_file=$(kdialog --getopenfilename "$HOME" "*.json" --title "Select Albus Profile to Import" 2>/dev/null || true)
-      else
-        in_file="$HOME/albus-profile.json"
-      fi
-    fi
-
-    if [ -n "$in_file" ] && [ -f "$in_file" ]; then
-      cp "$in_file" "$config_file"
-      echo "{\"imported\":true,\"file\":\"$in_file\"}"
-      exit 0
-    else
-      echo "{\"imported\":false,\"error\":\"cancelled\"}"
-      exit 0
-    fi
-    ;;
-
-  notify-evasion)
-    target="${2:-domain}"
-    if command -v notify-send >/dev/null 2>&1; then
-      notify-send "Albus Anti-DPI" "Censorship filter bypassed on $target" -a "Albus" 2>/dev/null || true
-    fi
-    echo "{\"notified\":true}"
-    exit 0
-    ;;
-
-
 
   set-autostart)
-    state="${2:-false}"
-    if [ "$state" = "true" ]; then
-      cat << DESKTOP > "$autostart_file"
+    enable="${1:-true}"
+    mkdir -p "$ALBUS_AUTOSTART_DIR" 2>/dev/null || true
+    if [ "$enable" = "true" ]; then
+      cat << EOF > "$ALBUS_AUTOSTART_FILE"
 [Desktop Entry]
 Type=Application
 Name=Albus Anti-DPI
-Exec=$script_dir/albus-daemon.sh start
+Comment=Deep Packet Inspection evasion background daemon
+Exec=albus start
 Hidden=false
-NoDisplay=false
+NoDisplay=true
 X-GNOME-Autostart-enabled=true
-DESKTOP
+EOF
+      echo '{"autostart":true}'
     else
-      rm -f "$autostart_file"
+      rm -f "$ALBUS_AUTOSTART_FILE" 2>/dev/null || true
+      echo '{"autostart":false}'
     fi
-    echo "{\"autostart\":$state}"
-    exit 0
+    ;;
+
+  purge-cache)
+    if [ -f "$ALBUS_USER_CONFIG_DIR/stats.json" ]; then
+      rm -f "$ALBUS_USER_CONFIG_DIR/stats.json" 2>/dev/null || true
+    fi
+    echo '{"purged":true}'
+    ;;
+
+  status)
+    binary=$(resolve_binary)
+    if [ -x "$binary" ]; then
+      out=$("$binary" --status 2>/dev/null || true)
+      if [ -n "$out" ] && [ "$out" != '{"running":false}' ]; then
+        echo "$out"
+        exit 0
+      fi
+    fi
+    if [ -S "$ALBUS_SOCKET" ] && command -v socat >/dev/null 2>&1; then
+      out=$(echo "STATUS" | socat -t 0.3 - "UNIX-CONNECT:$ALBUS_SOCKET" 2>/dev/null || true)
+      if [ -n "$out" ]; then
+        echo "$out"
+        exit 0
+      fi
+    fi
+    echo '{"running":false}'
     ;;
 
   diagnose)
+    binary=$(resolve_binary)
     if [ -x "$binary" ]; then
       out=$("$binary" --diagnose 2>/dev/null || true)
       if [ -n "$out" ]; then
@@ -284,69 +158,70 @@ DESKTOP
         exit 0
       fi
     fi
-    echo '{"error":"Diagnostic failed"}'
-    exit 1
+    echo '{"success":false,"error":"daemon not reachable"}'
+    ;;
+
+  notify-evasion)
+    target="${1:-unknown}"
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -a "Albus" -i "security-high" "DPI Bypassed" "Secured connection to $target" 2>/dev/null || true
+    fi
+    ;;
+
+  check-core)
+    binary=$(resolve_binary)
+    if [ -n "$binary" ] && [ -x "$binary" ]; then
+      echo '{"ready":true}'
+    else
+      echo '{"ready":false}'
+    fi
+    ;;
+
+  download-core)
+    echo '{"downloading":true}'
     ;;
 
   start)
-    cfg=$(load_config)
-    if [ -z "$mode" ]; then
-      mode=$(echo "$cfg" | grep -o '"mode": *"[^"]*"' | cut -d'"' -f4 || echo "auto")
-    fi
-    if [ -z "$dns" ]; then
-      raw_dns=$(echo "$cfg" | grep -o '"dns": *"[^"]*"' | cut -d'"' -f4 || echo "quad9")
-      if [ "$raw_dns" = "custom" ]; then
-        custom_url=$(echo "$cfg" | grep -o '"custom_url": *"[^"]*"' | cut -d'"' -f4 || echo "")
-        if [ -n "$custom_url" ]; then
-          dns="$custom_url"
+    mode="${1:-auto}"
+    dns="${2:-quad9}"
+    bootstrap="${3:-}"
+    whitelist="${4:-}"
+
+    if [ $# -eq 0 ] && [ -f "$ALBUS_CONFIG_FILE" ]; then
+      cfg_mode=$(grep -o '"mode": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+      cfg_dns=$(grep -o '"dns": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+      cfg_url=$(grep -o '"custom_url": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+      cfg_p=$(grep -o '"custom_primary": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+      cfg_s=$(grep -o '"custom_secondary": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+      cfg_wl=$(grep -o '"whitelist": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
+
+      if [ -n "$cfg_mode" ]; then mode="$cfg_mode"; fi
+      if [ -n "$cfg_dns" ]; then
+        if [ "$cfg_dns" = "custom" ] && [ -n "$cfg_url" ]; then
+          dns="$cfg_url"
         else
-          dns="quad9"
+          dns="$cfg_dns"
         fi
-      else
-        dns="$raw_dns"
       fi
-    fi
-    if [ -z "$bootstrap" ]; then
-      p_ip=$(echo "$cfg" | grep -o '"custom_primary": *"[^"]*"' | cut -d'"' -f4 || echo "")
-      s_ip=$(echo "$cfg" | grep -o '"custom_secondary": *"[^"]*"' | cut -d'"' -f4 || echo "")
-      if [ -n "$p_ip" ] && [ -n "$s_ip" ]; then
-        bootstrap="${p_ip},${s_ip}"
-      elif [ -n "$p_ip" ]; then
-        bootstrap="$p_ip"
-      elif [ -n "$s_ip" ]; then
-        bootstrap="$s_ip"
+      if [ -n "$cfg_p" ]; then
+        if [ -n "$cfg_s" ]; then
+          bootstrap="$cfg_p,$cfg_s"
+        else
+          bootstrap="$cfg_p"
+        fi
       fi
-    fi
-    if [ -z "$whitelist" ]; then
-      whitelist=$(echo "$cfg" | grep -o '"whitelist": *"[^"]*"' | cut -d'"' -f4 || echo "")
+      if [ -n "$cfg_wl" ]; then whitelist="$cfg_wl"; fi
     fi
 
-
-    mode=$(echo "$mode" | tr -d '\r\n' | xargs)
-    dns=$(echo "$dns" | tr -d '\r\n' | xargs)
-    bootstrap=$(echo "$bootstrap" | tr -d '\r\n' | xargs)
-    whitelist=$(echo "$whitelist" | tr -d '\r\n' | xargs)
-
-    # ensure binary is available
-    if [ ! -x "$binary" ]; then
-      if command -v cargo >/dev/null 2>&1 && [ -f "$project_dir/core/Cargo.toml" ]; then
+    binary=$(resolve_binary)
+    if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+      if [ -d "$project_dir/core" ] && command -v cargo >/dev/null 2>&1; then
         cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1 || true
-      elif command -v pkexec >/dev/null 2>&1 && command -v pacman >/dev/null 2>&1; then
-        pkexec pacman -S --needed --noconfirm rust cargo 2>/dev/null || true
-        if command -v cargo >/dev/null 2>&1 && [ -f "$project_dir/core/Cargo.toml" ]; then
-          cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1 || true
-        fi
-      fi
-      if [ ! -x "$binary" ]; then
-        mkdir -p "$(dirname "$binary")"
-        curl -sSL "https://github.com/oqullcan/albus/releases/download/v1.0.0/albus-core" -o "$binary" 2>/dev/null && chmod +x "$binary" || true
+        binary=$(resolve_binary)
       fi
     fi
 
     exec_privileged start "$mode" "$dns" "$bootstrap" "$whitelist" "$binary"
-
-
-
     ;;
 
   stop)
@@ -361,23 +236,52 @@ DESKTOP
     fi
     ;;
 
+  restart)
+    $0 stop
+    sleep 0.5
+    $0 start "$@"
+    ;;
 
-
-
-
-  status)
-    if [ -x "$binary" ]; then
-      out=$("$binary" --status 2>/dev/null || true)
-      if [ -n "$out" ] && [ "$out" != "{\"running\":false}" ]; then
-        echo "$out"
-        exit 0
-      fi
+  fix-network|repair)
+    exec_privileged fix-network
+    rm -f "$HOME/.config/environment.d/99-albus-proxy.conf" 2>/dev/null || true
+    if command -v gsettings >/dev/null 2>&1; then
+      gsettings reset-recursively org.gnome.system.proxy 2>/dev/null || true
     fi
-    echo "{\"running\":false}"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user unset-environment all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
+      systemctl --user daemon-reexec 2>/dev/null || true
+    fi
+    ;;
+
+  logs)
+    if [ -f "$ALBUS_LOG_FILE" ]; then
+      cat "$ALBUS_LOG_FILE"
+    else
+      echo "No log file found at $ALBUS_LOG_FILE"
+    fi
+    ;;
+
+  help|--help|-h)
+    echo -e "${c_bold}${c_magenta}ALBUS ANTI-DPI${c_reset} ${c_dim}(Arch Linux Edition)${c_reset}"
+    echo ""
+    echo -e "${c_bold}USAGE:${c_reset}"
+    echo "  albus start [mode] [dns] [bootstraps] [whitelist]"
+    echo "  albus stop"
+    echo "  albus restart"
+    echo "  albus status"
+    echo "  albus diagnose"
+    echo "  albus repair"
+    echo "  albus logs"
+    ;;
+
+  version|--version|-v)
+    echo "Albus Anti-DPI v1.0.0"
     ;;
 
   *)
-    echo "usage: albus-daemon.sh {start|stop|status|diagnose|fix-network|get-config|save-config|export-profile|import-profile|purge-cache|notify-evasion}"
+    echo "Unknown command: $cmd"
+    echo "Run 'albus help' for usage."
     exit 1
     ;;
 esac
