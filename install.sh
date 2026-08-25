@@ -8,36 +8,20 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo -e "\033[38;2;203;166;247m\033[1mALBUS ANTI-DPI INSTALLER\033[0m \033[2m(Omarchy)\033[0m"
 echo ""
 
-get_latest_version() {
-  local tag
-  tag=$(curl -sSL --connect-timeout 2 "https://api.github.com/repos/oqullcan/albus/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 || true)
-  if [ -z "$tag" ]; then
-    tag=$(curl -sSL --connect-timeout 2 "https://api.github.com/repos/oqullcan/albus/tags" 2>/dev/null | grep -o '"name": *"[^"]*"' | head -n 1 | cut -d'"' -f4 || echo "v1.0.0")
-  fi
-  if [ -z "$tag" ]; then tag="v1.0.0"; fi
-  echo "$tag"
-}
-
 # 1. resolve pre-compiled binary or build with cargo
 if [ -x "$script_dir/bin/albus-core" ]; then
   binary="$script_dir/bin/albus-core"
-  echo -e "\033[38;2;166;227;161m> Found ready pre-compiled binary (bin/albus-core). Zero build required!\033[0m"
+  echo -e "\033[38;2;166;227;161m> Found ready pre-compiled binary (bin/albus-core).\033[0m"
+elif [ -x "$script_dir/core/target/release/albus-core" ]; then
+  binary="$script_dir/core/target/release/albus-core"
+  echo -e "\033[38;2;166;227;161m> Found ready release binary (core/target/release/albus-core).\033[0m"
 elif command -v cargo >/dev/null 2>&1; then
   echo -e "\033[38;2;137;180;250m> Compiling optimized release binary with cargo...\033[0m"
   cargo build --release --manifest-path "$script_dir/core/Cargo.toml"
   binary="$script_dir/core/target/release/albus-core"
-else
-  latest_tag=$(get_latest_version)
-  echo -e "\033[38;2;249;226;175m> Fetching pre-compiled release binary (${latest_tag}) from GitHub...\033[0m"
   mkdir -p "$script_dir/bin"
-  curl -sSL "https://raw.githubusercontent.com/oqullcan/albus/master/bin/albus-core" -o "$script_dir/bin/albus-core" 2>/dev/null || \
-  curl -sSL "https://github.com/oqullcan/albus/releases/download/${latest_tag}/albus-core" -o "$script_dir/bin/albus-core" 2>/dev/null || true
-  chmod +x "$script_dir/bin/albus-core" 2>/dev/null || true
-  binary="$script_dir/bin/albus-core"
+  cp "$binary" "$script_dir/bin/albus-core"
 fi
-
-
-
 
 # Clean up any legacy proxy environment configuration
 rm -f "$HOME/.config/environment.d/99-albus-proxy.conf" 2>/dev/null || true
@@ -50,7 +34,9 @@ fi
 
 # 2. setup executable permissions on scripts
 chmod +x "$script_dir/scripts/albus-"*.sh 2>/dev/null || true
-
+if [ -d "$script_dir/scripts/lib" ]; then
+  chmod +x "$script_dir/scripts/lib/"*.sh 2>/dev/null || true
+fi
 
 # 3. install global CLI command to ~/.local/bin/albus
 mkdir -p "$HOME/.local/bin"
@@ -63,8 +49,20 @@ set -euo pipefail
 
 plugin_dir="$HOME/.config/omarchy/plugins/io.github.oqullcan.albus"
 daemon_script="$plugin_dir/scripts/albus-daemon.sh"
-binary="$plugin_dir/core/target/release/albus-core"
 
+resolve_binary() {
+  if [ -x "/usr/lib/albus/albus-core" ]; then
+    echo "/usr/lib/albus/albus-core"
+  elif [ -x "$plugin_dir/bin/albus-core" ]; then
+    echo "$plugin_dir/bin/albus-core"
+  elif [ -x "$plugin_dir/core/target/release/albus-core" ]; then
+    echo "$plugin_dir/core/target/release/albus-core"
+  elif [ -x "/usr/bin/albus-core" ]; then
+    echo "/usr/bin/albus-core"
+  else
+    echo "$plugin_dir/bin/albus-core"
+  fi
+}
 
 c_reset="\033[0m"
 c_bold="\033[1m"
@@ -83,13 +81,49 @@ print_banner() {
 
 cmd="${1:-status}"
 
+show_status() {
+  raw=$("$daemon_script" status 2>/dev/null || echo '{"running":false}')
+  if echo "$raw" | grep -q '"running":true'; then
+    total=$(echo "$raw" | grep -o '"total":[0-9]*' | cut -d: -f2 || echo "0")
+    tls=$(echo "$raw" | grep -o '"tls":[0-9]*' | cut -d: -f2 || echo "0")
+    bytes_str=$(echo "$raw" | grep -o '"bytes_str":"[^"]*"' | cut -d'"' -f4 || echo "0 B")
+    speed_str=$(echo "$raw" | grep -o '"speed_str":"[^"]*"' | cut -d'"' -f4 || echo "0 B/s")
+    lat=$(echo "$raw" | grep -o '"latency":[0-9]*' | cut -d: -f2 || echo "0")
+    dns=$(echo "$raw" | grep -o '"dns":"[^"]*"' | cut -d'"' -f4 || echo "Quad9")
+    on_bat=$(echo "$raw" | grep -o '"battery":[^,}]*' | cut -d: -f2 || echo "false")
+    poison=$(echo "$raw" | grep -o '"poison_blocks":[0-9]*' | cut -d: -f2 || echo "0")
+
+    print_banner
+    echo -e "  ● Status:       ${c_green}${c_bold}ACTIVE (Protected)${c_reset}"
+    echo -e "    Data Shield:  ${c_cyan}${c_bold}${bytes_str}${c_reset}"
+    if [ "$speed_str" != "0 B/s" ]; then
+      echo -e "    Throughput:   ${c_green}${c_bold}${speed_str}${c_reset}"
+    fi
+    echo -e "    DNS Relay:    ${c_blue}${dns}${c_reset} (${c_yellow}${lat} ms${c_reset})"
+    echo -e "    TLS Bypassed: ${c_magenta}${tls}${c_reset} / ${total} sessions"
+
+    if [ "$poison" -gt 0 ]; then
+      echo -e "    DNS Armor:    ${c_yellow}${poison} ISP Poisoning Attacks Deflected${c_reset}"
+    fi
+    if [ "$on_bat" = "true" ]; then
+      echo -e "    Power Mode:   ${c_green}Battery-Aware (Eco Polling)${c_reset}"
+    fi
+    echo ""
+  else
+    print_banner
+    echo -e "  ○ Status:       ${c_red}${c_bold}STOPPED (Direct Network)${c_reset}"
+    echo -e "  ${c_dim}Run 'albus start' to activate protection.${c_reset}"
+    echo ""
+  fi
+}
+
 case "$cmd" in
   start)
     print_banner
     echo -e "${c_blue}> Starting Albus Anti-DPI daemon...${c_reset}"
     "$daemon_script" start "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     sleep 0.2
-    albus status
+    show_status
     ;;
 
   stop)
@@ -106,43 +140,11 @@ case "$cmd" in
     sleep 0.3
     "$daemon_script" start "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     sleep 0.2
-    albus status
+    show_status
     ;;
 
   status)
-    raw=$("$daemon_script" status 2>/dev/null || echo '{"running":false}')
-    if echo "$raw" | grep -q '"running":true'; then
-      total=$(echo "$raw" | grep -o '"total":[0-9]*' | cut -d: -f2 || echo "0")
-      tls=$(echo "$raw" | grep -o '"tls":[0-9]*' | cut -d: -f2 || echo "0")
-      bytes_str=$(echo "$raw" | grep -o '"bytes_str":"[^"]*"' | cut -d'"' -f4 || echo "0 B")
-      speed_str=$(echo "$raw" | grep -o '"speed_str":"[^"]*"' | cut -d'"' -f4 || echo "0 B/s")
-      lat=$(echo "$raw" | grep -o '"latency":[0-9]*' | cut -d: -f2 || echo "0")
-      dns=$(echo "$raw" | grep -o '"dns":"[^"]*"' | cut -d'"' -f4 || echo "Quad9")
-      on_bat=$(echo "$raw" | grep -o '"battery":[^,}]*' | cut -d: -f2 || echo "false")
-      poison=$(echo "$raw" | grep -o '"poison_blocks":[0-9]*' | cut -d: -f2 || echo "0")
-
-      print_banner
-      echo -e "  ● Status:       ${c_green}${c_bold}ACTIVE (Protected)${c_reset}"
-      echo -e "    Data Shield:  ${c_cyan}${c_bold}${bytes_str}${c_reset}"
-      if [ "$speed_str" != "0 B/s" ]; then
-        echo -e "    Throughput:   ${c_green}${c_bold}${speed_str}${c_reset}"
-      fi
-      echo -e "    DNS Relay:    ${c_blue}${dns}${c_reset} (${c_yellow}${lat} ms${c_reset})"
-      echo -e "    TLS Bypassed: ${c_magenta}${tls}${c_reset} / ${total} sessions"
-
-      if [ "$poison" -gt 0 ]; then
-        echo -e "    DNS Armor:    ${c_yellow}${poison} ISP Poisoning Attacks Deflected${c_reset}"
-      fi
-      if [ "$on_bat" = "true" ]; then
-        echo -e "    Power Mode:   ${c_green}Battery-Aware (Eco Polling)${c_reset}"
-      fi
-      echo ""
-    else
-      print_banner
-      echo -e "  ○ Status:       ${c_red}${c_bold}STOPPED (Direct Network)${c_reset}"
-      echo -e "  ${c_dim}Run 'albus start' to activate protection.${c_reset}"
-      echo ""
-    fi
+    show_status
     ;;
 
   stats)
@@ -202,7 +204,8 @@ case "$cmd" in
     print_banner
     echo -e "${c_blue}> Running comprehensive multi-CDN connectivity benchmark...${c_reset}"
     echo ""
-    "$binary" --diagnose
+    bin=$(resolve_binary)
+    "$bin" --diagnose
     echo ""
     ;;
 
@@ -252,15 +255,21 @@ case "$cmd" in
       echo -e "  [${c_yellow}○${c_reset}] DNS Leak Armor:        ${c_dim}Unloaded${c_reset}"
     fi
 
-
     echo ""
     echo -e "  ${c_dim}Run 'albus diag' for CDN latency & target bypass benchmark.${c_reset}"
     echo ""
     ;;
 
   logs|log)
-    echo -e "${c_cyan}Tailing /tmp/albus.log (Ctrl+C to exit):${c_reset}"
-    tail -f /tmp/albus.log
+    if [ -f "/run/albus/albus.log" ]; then
+      echo -e "${c_cyan}Tailing /run/albus/albus.log (Ctrl+C to exit):${c_reset}"
+      tail -f /run/albus/albus.log
+    elif [ -f "/tmp/albus.log" ]; then
+      echo -e "${c_cyan}Tailing /tmp/albus.log (Ctrl+C to exit):${c_reset}"
+      tail -f /tmp/albus.log
+    else
+      echo -e "${c_yellow}No log file found.${c_reset}"
+    fi
     ;;
 
   help|--help|-h)
@@ -304,7 +313,9 @@ if [ "$(id -u)" -eq 0 ]; then
   install -m755 "$script_dir/scripts/albus-service.sh" /usr/lib/albus/albus-service.sh
   install -m755 "$script_dir/scripts/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh
   install -m755 "$script_dir/scripts/lib/"*.sh /usr/lib/albus/lib/ 2>/dev/null || true
-  install -m755 "$script_dir/core/target/release/albus-core" /usr/lib/albus/albus-core
+  if [ -f "$binary" ]; then
+    install -m755 "$binary" /usr/lib/albus/albus-core
+  fi
   install -m644 "$script_dir/polkit/io.github.oqullcan.albus.policy" /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
 elif command -v pkexec >/dev/null 2>&1; then
   pkexec bash -c "
@@ -312,7 +323,7 @@ elif command -v pkexec >/dev/null 2>&1; then
     install -m755 '$script_dir/scripts/albus-service.sh' /usr/lib/albus/albus-service.sh && \
     install -m755 '$script_dir/scripts/albus-transparent.sh' /usr/lib/albus/albus-transparent.sh && \
     install -m755 '$script_dir/scripts/lib/'*.sh /usr/lib/albus/lib/ && \
-    install -m755 '$script_dir/core/target/release/albus-core' /usr/lib/albus/albus-core && \
+    ( [ -f '$binary' ] && install -m755 '$binary' /usr/lib/albus/albus-core || true ) && \
     install -m644 '$script_dir/polkit/io.github.oqullcan.albus.policy' /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
   "
 elif command -v sudo >/dev/null 2>&1; then
@@ -320,10 +331,11 @@ elif command -v sudo >/dev/null 2>&1; then
   sudo install -m755 "$script_dir/scripts/albus-service.sh" /usr/lib/albus/albus-service.sh
   sudo install -m755 "$script_dir/scripts/albus-transparent.sh" /usr/lib/albus/albus-transparent.sh
   sudo install -m755 "$script_dir/scripts/lib/"*.sh /usr/lib/albus/lib/
-  sudo install -m755 "$script_dir/core/target/release/albus-core" /usr/lib/albus/albus-core
+  if [ -f "$binary" ]; then
+    sudo install -m755 "$binary" /usr/lib/albus/albus-core
+  fi
   sudo install -m644 "$script_dir/polkit/io.github.oqullcan.albus.policy" /usr/share/polkit-1/actions/io.github.oqullcan.albus.policy
 fi
 
 echo -e "\033[38;2;166;227;161m[OK] Installation complete!\033[0m"
 echo -e "Run \033[1m'albus status'\033[0m or open the Omarchy panel to start."
-

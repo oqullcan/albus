@@ -27,12 +27,12 @@ resolve_binary() {
   local binary=""
   if [ -x "$ALBUS_LIB_DIR/albus-core" ]; then
     binary="$ALBUS_LIB_DIR/albus-core"
-  elif [ -x "/usr/bin/albus-core" ]; then
-    binary="/usr/bin/albus-core"
   elif [ -x "$project_dir/bin/albus-core" ]; then
     binary="$project_dir/bin/albus-core"
   elif [ -x "$project_dir/core/target/release/albus-core" ]; then
     binary="$project_dir/core/target/release/albus-core"
+  elif [ -x "/usr/bin/albus-core" ]; then
+    binary="/usr/bin/albus-core"
   elif [ -x "$HOME/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core" ]; then
     binary="$HOME/.config/omarchy/plugins/io.github.oqullcan.albus/bin/albus-core"
   fi
@@ -171,23 +171,74 @@ EOF
   check-core)
     binary=$(resolve_binary)
     if [ -n "$binary" ] && [ -x "$binary" ]; then
-      echo '{"ready":true}'
+      echo '{"ready":true,"installed":true}'
     else
-      echo '{"ready":false}'
+      echo '{"ready":false,"installed":false}'
     fi
     ;;
 
-  download-core)
-    echo '{"downloading":true}'
+  setup-download|download-core)
+    mkdir -p "$project_dir/bin"
+    if [ -f "$project_dir/bin/albus-core" ] && [ -x "$project_dir/bin/albus-core" ]; then
+      echo '{"success":true,"version":"ready"}'
+    elif [ -f "$project_dir/core/target/release/albus-core" ] && [ -x "$project_dir/core/target/release/albus-core" ]; then
+      cp "$project_dir/core/target/release/albus-core" "$project_dir/bin/albus-core" 2>/dev/null || true
+      chmod +x "$project_dir/bin/albus-core" 2>/dev/null || true
+      echo '{"success":true,"version":"built"}'
+    else
+      echo '{"success":false,"error":"binary not available"}'
+    fi
+    ;;
+
+  setup-compile)
+    if command -v cargo >/dev/null 2>&1 && [ -d "$project_dir/core" ]; then
+      if cargo build --release --manifest-path "$project_dir/core/Cargo.toml" >/dev/null 2>&1; then
+        mkdir -p "$project_dir/bin" 2>/dev/null || true
+        cp "$project_dir/core/target/release/albus-core" "$project_dir/bin/albus-core" 2>/dev/null || true
+        chmod +x "$project_dir/bin/albus-core" 2>/dev/null || true
+        echo '{"success":true}'
+      else
+        echo '{"success":false,"error":"cargo build failed"}'
+      fi
+    else
+      echo '{"success":false,"error":"cargo compiler not found"}'
+    fi
+    ;;
+
+  export-profile)
+    export_file="$HOME/albus-profile.json"
+    if [ -f "$ALBUS_CONFIG_FILE" ]; then
+      cp "$ALBUS_CONFIG_FILE" "$export_file"
+      echo "{\"exported\":true,\"file\":\"$export_file\"}"
+    else
+      echo "{\"exported\":false,\"error\":\"no config found\"}"
+    fi
+    ;;
+
+  import-profile)
+    import_file="$HOME/albus-profile.json"
+    if [ -f "$import_file" ]; then
+      mkdir -p "$ALBUS_USER_CONFIG_DIR" 2>/dev/null || true
+      cp "$import_file" "$ALBUS_CONFIG_FILE"
+      echo "{\"imported\":true,\"file\":\"$import_file\"}"
+    else
+      echo "{\"imported\":false,\"error\":\"$import_file not found\"}"
+    fi
     ;;
 
   start)
-    mode="${1:-auto}"
-    dns="${2:-quad9}"
-    bootstrap="${3:-}"
-    whitelist="${4:-}"
+    arg_mode="${1:-}"
+    arg_dns="${2:-}"
+    arg_bootstrap="${3:-}"
+    arg_whitelist="${4:-}"
 
-    if [ $# -eq 0 ] && [ -f "$ALBUS_CONFIG_FILE" ]; then
+    mode="${arg_mode:-auto}"
+    dns="${arg_dns:-quad9}"
+    bootstrap="$arg_bootstrap"
+    whitelist="$arg_whitelist"
+
+    # If parameters are not explicitly provided via CLI, load saved preferences from config.json
+    if [ -f "$ALBUS_CONFIG_FILE" ]; then
       cfg_mode=$(grep -o '"mode": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
       cfg_dns=$(grep -o '"dns": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
       cfg_url=$(grep -o '"custom_url": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
@@ -195,22 +246,26 @@ EOF
       cfg_s=$(grep -o '"custom_secondary": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
       cfg_wl=$(grep -o '"whitelist": *"[^"]*"' "$ALBUS_CONFIG_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)
 
-      if [ -n "$cfg_mode" ]; then mode="$cfg_mode"; fi
-      if [ -n "$cfg_dns" ]; then
+      if [ -z "$arg_mode" ] && [ -n "$cfg_mode" ]; then
+        mode="$cfg_mode"
+      fi
+      if [ -z "$arg_dns" ] && [ -n "$cfg_dns" ]; then
         if [ "$cfg_dns" = "custom" ] && [ -n "$cfg_url" ]; then
           dns="$cfg_url"
         else
           dns="$cfg_dns"
         fi
       fi
-      if [ -n "$cfg_p" ]; then
-        if [ -n "$cfg_s" ]; then
+      if [ -z "$arg_bootstrap" ]; then
+        if [ -n "$cfg_p" ] && [ -n "$cfg_s" ]; then
           bootstrap="$cfg_p,$cfg_s"
-        else
+        elif [ -n "$cfg_p" ]; then
           bootstrap="$cfg_p"
         fi
       fi
-      if [ -n "$cfg_wl" ]; then whitelist="$cfg_wl"; fi
+      if [ -z "$arg_whitelist" ] && [ -n "$cfg_wl" ]; then
+        whitelist="$cfg_wl"
+      fi
     fi
 
     binary=$(resolve_binary)
@@ -238,7 +293,7 @@ EOF
 
   restart)
     $0 stop
-    sleep 0.5
+    sleep 0.3
     $0 start "$@"
     ;;
 
@@ -257,6 +312,8 @@ EOF
   logs)
     if [ -f "$ALBUS_LOG_FILE" ]; then
       cat "$ALBUS_LOG_FILE"
+    elif [ -f "/tmp/albus.log" ]; then
+      cat "/tmp/albus.log"
     else
       echo "No log file found at $ALBUS_LOG_FILE"
     fi
@@ -276,7 +333,7 @@ EOF
     ;;
 
   version|--version|-v)
-    echo "Albus Anti-DPI v1.0.0"
+    echo "Albus Anti-DPI v1.4.0"
     ;;
 
   *)

@@ -51,6 +51,13 @@ firewall_disable() {
   while iptables -t nat -D OUTPUT -p udp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -p tcp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
   while iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null; do :; done
+
+  while iptables -t nat -D PREROUTING -p tcp -j ALBUS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -p udp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -p tcp --dport 53 -j ALBUS_DNS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -j ALBUS 2>/dev/null; do :; done
+  while iptables -t nat -D PREROUTING -j ALBUS_DNS 2>/dev/null; do :; done
+
   while iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null; do :; done
 
   iptables -F ALBUS_OUT 2>/dev/null || true
@@ -169,6 +176,8 @@ dns_set_albus() {
     resolvectl dns "$iface" 127.0.0.1:5300 2>/dev/null || true
     resolvectl domain "$iface" "~." 2>/dev/null || true
     resolvectl default-route "$iface" true 2>/dev/null || true
+    resolvectl dnsovertls "$iface" no 2>/dev/null || true
+    resolvectl dnssec "$iface" no 2>/dev/null || true
   done
   resolvectl flush-caches 2>/dev/null || true
 }
@@ -188,8 +197,8 @@ dns_restore_system() {
   for iface in $ifaces; do
     resolvectl revert "$iface" 2>/dev/null || true
     resolvectl default-route "$iface" true 2>/dev/null || true
-    resolvectl domain "$iface" "~." 2>/dev/null || true
-    resolvectl dnsovertls "$iface" no 2>/dev/null || true
+    resolvectl domain "$iface" "" 2>/dev/null || true
+    resolvectl dnsovertls "$iface" opportunistic 2>/dev/null || true
     resolvectl dnssec "$iface" no 2>/dev/null || true
     resolvectl dns "$iface" "${nameservers[@]}" 2>/dev/null || true
   done
@@ -283,7 +292,7 @@ process_is_running() {
 system_sync() {
   local binary="${1:-}"
 
-  mkdir -p "$ALBUS_LIB_DIR" "/usr/share/polkit-1/actions" 2>/dev/null || true
+  mkdir -p "$ALBUS_LIB_DIR/lib" "/usr/share/polkit-1/actions" 2>/dev/null || true
 
   if [ -n "$binary" ] && [ -x "$binary" ]; then
     install -m755 "$binary" "$ALBUS_LIB_DIR/albus-core" 2>/dev/null || true
@@ -302,6 +311,9 @@ system_sync() {
   if [ -n "$src_dir" ] && [ "$src_dir" != "$ALBUS_LIB_DIR" ]; then
     install -m755 "$src_dir/albus-service.sh" "$ALBUS_LIB_DIR/albus-service.sh" 2>/dev/null || true
     install -m755 "$src_dir/albus-transparent.sh" "$ALBUS_LIB_DIR/albus-transparent.sh" 2>/dev/null || true
+    if [ -d "$src_dir/lib" ]; then
+      install -m755 "$src_dir/lib/"*.sh "$ALBUS_LIB_DIR/lib/" 2>/dev/null || true
+    fi
   fi
 }
 

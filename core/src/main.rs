@@ -115,10 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--mode" | "-m" => {
                 if i + 1 < args.len() {
-                    mode = match args[i + 1].as_str() {
+                    mode = match args[i + 1].to_lowercase().as_str() {
                         "split" => BypassMode::SniSplit,
                         "disorder" => BypassMode::Disorder,
-                        "fake-ttl" => BypassMode::FakeTtl,
+                        "fake-ttl" | "fake_ttl" | "ghost" => BypassMode::FakeTtl,
                         _ => BypassMode::StealthAuto,
                     };
                     i += 1;

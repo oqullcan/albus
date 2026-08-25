@@ -1,6 +1,6 @@
 [package]
 name = "albus-core"
-version = "0.1.0"
+version = "1.4.0"
 edition = "2021"
 authors = ["albus team"]
 description = "lightweight local anti-censorship and dpi evasion daemon"
