@@ -74,7 +74,8 @@ Panel {
     interval: root.onBattery ? 2500 : 1000
     running: true
     repeat: true
-    onTriggered: if (!root.isBusy && !root.isDiagnosing) root.refreshStatus()
+    onTriggered: if (!root.isBusy && !root.isDiagnosing && !actionProcess.running) root.refreshStatus()
+
   }
 
   function open() {
@@ -311,7 +312,7 @@ Panel {
 
   Timer {
     id: busySafetyTimer
-    interval: 600
+    interval: 45000
     repeat: false
     onTriggered: {
       root.isBusy = false
@@ -319,12 +320,20 @@ Panel {
     }
   }
 
+  Timer {
+    id: statusSafetyDelayTimer
+    interval: 350
+    repeat: false
+    onTriggered: root.refreshStatus()
+  }
+
   function refreshStatus() {
-    if (!statusProcess.running && !root.isBusy) {
+    if (!statusProcess.running && !actionProcess.running) {
       statusProcess.command = [root.daemonScriptPath, "status"]
       statusProcess.running = true
     }
   }
+
 
   function runDaemon(action) {
     root.isBusy = true
@@ -467,8 +476,10 @@ Panel {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onExited: function(exitCode) {
       root.isBusy = false
-      root.refreshStatus()
+      busySafetyTimer.stop()
+      statusSafetyDelayTimer.restart()
     }
+
   }
 
   KeyboardPanel {

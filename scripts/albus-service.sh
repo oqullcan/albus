@@ -96,9 +96,11 @@ case "$action" in
     # verify daemon is alive
     sleep 0.2
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
-      echo "{\"running\":false,\"error\":\"daemon failed to start\"}"
+      err=$(cat "$log_file" 2>/dev/null | tail -n 3 | tr -d '"\r\n' || echo "daemon failed to start")
+      echo "{\"running\":false,\"error\":\"$err\"}"
       exit 1
     fi
+
 
     # enable netfilter transparent interception
     if [ -x "$transparent_script" ]; then
