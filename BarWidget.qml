@@ -8,7 +8,7 @@ import "Model.js" as Model
 // albus bar widget component with clean typography, zero emojis, and middle-click toggle
 BarWidget {
   id: root
-  moduleName: "io.github.oqullcan.albus"
+  moduleName: "io.github.oqullcan.albus.dev"
 
   // panel lifecycle state
 
@@ -78,7 +78,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "io.github.oqullcan.albus"
+    target: "io.github.oqullcan.albus.dev"
 
     function open(): void { root.open() }
 
@@ -98,8 +98,8 @@ BarWidget {
     useActiveColor: true
     activeColor: root.bar && root.bar.urgent !== undefined ? root.bar.urgent : Color.accent
     tooltipText: root.protectionActive
-      ? ("Albus Anti-DPI: Protected • " + (panelLoader.item ? panelLoader.item.activeDns : "Quad9") + (panelLoader.item && panelLoader.item.dnsLatency > 0 ? " (" + panelLoader.item.dnsLatency + "ms)" : "") + " • Middle-click to disable")
-      : "Albus Anti-DPI: Standby • Click or Middle-click to protect"
+      ? ("Albus Anti-DPI (DEV): Protected • " + (panelLoader.item ? panelLoader.item.activeDns : "Quad9") + (panelLoader.item && panelLoader.item.dnsLatency > 0 ? " (" + panelLoader.item.dnsLatency + "ms)" : "") + " • Middle-click to disable")
+      : "Albus Anti-DPI (DEV): Standby • Click or Middle-click to protect"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) {
         root.toggle()

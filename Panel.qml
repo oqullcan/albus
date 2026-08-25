@@ -9,7 +9,7 @@ import "Model.js" as Model
 // albus anti-dpi disciplined, authentic omarchy dashboard with hotkeys, clean telemetry and zero design departure
 Panel {
   id: root
-  moduleName: "io.github.oqullcan.albus"
+  moduleName: "io.github.oqullcan.albus.dev"
   manageIpc: false
 
   // injected bar and host references
@@ -557,7 +557,7 @@ Panel {
         // 1. HERO HEADER (Exact Omarchy PanelHero with Live Symmetrical Radar Indicator)
         PanelHero {
           width: parent.width
-          title: "Albus Anti-DPI"
+          title: "Albus Anti-DPI (DEV)"
           meta: root.isBusy
             ? "CONFIGURING KERNEL RULES"
             : (root.isRunning ? "PROTECTION ACTIVE" : "STANDBY")

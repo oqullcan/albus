@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.oqullcan.albus",
-  "name": "Albus Anti-DPI",
-  "version": "1.4.0",
+  "id": "io.github.oqullcan.albus.dev",
+  "name": "Albus Anti-DPI (Dev)",
+  "version": "1.5.0-dev",
   "author": "oqullcan",
   "license": "MIT",
-  "description": "High-performance native anti-DPI, packet segmentation, and DNS-over-HTTPS evasion suite for Omarchy.",
+  "description": "Development & Pure Rust sandbox build of Albus Anti-DPI Suite for Omarchy.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,10 +13,9 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Albus Anti-DPI",
+    "displayName": "Albus (Dev)",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"
   }
 }
-
