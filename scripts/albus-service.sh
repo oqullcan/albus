@@ -118,10 +118,6 @@ case "$action" in
       "$transparent_script" enable "$bootstrap"
     fi
 
-    # revert any lingering link-specific dns server overrides to avoid persistent lockups
-    for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
-    done
     resolvectl flush-caches 2>/dev/null || true
 
     # ensure control socket is world-accessible for UI IPC status polling
@@ -137,9 +133,12 @@ case "$action" in
       "$transparent_script" disable 2>/dev/null || true
     fi
 
-    # 2. revert link dns and flush caches
+    # 2. ensure network interfaces have valid default-route and DNS scopes
     for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
+      resolvectl default-route "$iface" true 2>/dev/null || true
+      if resolvectl status "$iface" 2>/dev/null | grep -q "Current Scopes: none"; then
+        resolvectl dns "$iface" 8.8.8.8 8.8.4.4 2>/dev/null || true
+      fi
     done
     resolvectl flush-caches 2>/dev/null || true
 
@@ -166,7 +165,6 @@ case "$action" in
     echo "{\"running\":false}"
     ;;
 
-
   fix-network|repair)
     # 1. Kill any running albus process
     if [ -f "$pid_file" ]; then
@@ -181,17 +179,11 @@ case "$action" in
     if [ -x "$transparent_script" ]; then
       "$transparent_script" disable 2>/dev/null || true
     fi
-    iptables -t nat -F ALBUS 2>/dev/null || true
-    iptables -t nat -F ALBUS_DNS 2>/dev/null || true
-    iptables -t nat -D OUTPUT -j ALBUS 2>/dev/null || true
-    iptables -t nat -D OUTPUT -j ALBUS_DNS 2>/dev/null || true
-    iptables -t nat -D PREROUTING -j ALBUS_DNS 2>/dev/null || true
-    ip6tables -t nat -F ALBUS 2>/dev/null || true
-    ip6tables -t nat -D OUTPUT -j ALBUS 2>/dev/null || true
 
     # 3. Complete DNS & systemd-resolved reset
     for iface in $(get_interfaces); do
-      resolvectl revert "$iface" 2>/dev/null || true
+      resolvectl default-route "$iface" true 2>/dev/null || true
+      resolvectl dns "$iface" 8.8.8.8 8.8.4.4 2>/dev/null || true
     done
     resolvectl flush-caches 2>/dev/null || true
 
@@ -210,5 +202,6 @@ case "$action" in
 
     echo "{\"repaired\":true,\"message\":\"Network completely reset to system defaults\"}"
     ;;
+
 
 esac
