@@ -5,8 +5,8 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "albus",
-    author = "albus contributors",
-    version = "1.0.0",
+    author = "oqullcan",
+    version = "2.0.0",
     about = "ebpf sock_ops tcp mss fragmentation and doh proxy engine",
     long_about = "albus is a kernel-level network utility utilizing ebpf sock_ops and encrypted doh to bypass deep packet inspection."
 )]
