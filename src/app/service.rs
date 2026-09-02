@@ -56,7 +56,7 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
     let unit_content = format!(
         r#"[Unit]
 Description=albus — High-Performance eBPF DPI Bypass & DoH DNS Service
-Documentation=https://github.com/albusdpi/albus
+Documentation=https://github.com/oqullcan/albus
 After=network.target network-online.target
 Wants=network-online.target
 

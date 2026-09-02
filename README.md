@@ -85,8 +85,9 @@ To mitigate "Harvest Now, Decrypt Later" surveillance, the DNS subsystem employs
 
 ### Compilation
 ```bash
-git clone https://github.com/albusdpi/albus.git
+git clone https://github.com/oqullcan/albus.git
 cd albus
+git checkout v2.0.0
 
 # Compile release profile with LTO and binary stripping
 cargo build --release
