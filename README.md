@@ -144,12 +144,12 @@ albus monitor                # Interactive curses-style telemetry TUI
 
 ## Desktop Integration (Omarchy Shell)
 
-Albus includes a first-party Omarchy Quattro desktop panel widget in `extra/omarchy/` providing live packet stream monitoring, one-click resolver switching (Quad9, Cloudflare, Mullvad profiles), security toggles, and keyboard shortcuts (`1-3` tabs, `Space` toggle, `P` pause, `J/K` scroll).
+Albus includes a first-party Omarchy Quattro desktop panel widget (`BarWidget.qml` & `Panel.qml`) providing live packet stream monitoring, one-click resolver switching (Quad9, Cloudflare, Mullvad profiles), security toggles, and keyboard shortcuts (`1-3` tabs, `Space` toggle, `P` pause, `J/K` scroll).
 
 ```bash
 # Deploy plugin to active user configuration directory
 mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev
-cp -r extra/omarchy/* ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
+cp manifest.json BarWidget.qml Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
 omarchy-shell shell rescanPlugins
 ```
 
