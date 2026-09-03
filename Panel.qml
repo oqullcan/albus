@@ -1201,6 +1201,7 @@ Panel {
                       Text {
                         Layout.fillWidth: true
                         text: modelData.title
+                        textFormat: Text.PlainText
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: true
@@ -1210,6 +1211,7 @@ Panel {
 
                       Text {
                         text: modelData.detail
+                        textFormat: Text.PlainText
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption - 1
                         color: root.dim
@@ -1219,6 +1221,7 @@ Panel {
 
                       Text {
                         text: modelData.time
+                        textFormat: Text.PlainText
                         font.family: "monospace"
                         font.pixelSize: Style.font.caption - 1
                         color: root.dim
@@ -1233,6 +1236,7 @@ Panel {
                     text: root.streamSearchQuery !== ""
                       ? "No events matching \"" + root.streamSearchQuery + "\""
                       : (root.isRunning ? "Listening for real-time DPI flows..." : "Service is offline. Start Albus to stream flows.")
+                    textFormat: Text.PlainText
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1276,6 +1280,7 @@ Panel {
             Text {
               anchors.centerIn: parent
               text: root.toastMessage
+              textFormat: Text.PlainText
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
