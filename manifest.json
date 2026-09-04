@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.oqullcan.albus.dev",
   "name": "Albus DPI",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "Oğulcan Yetim",
   "license": "MIT",
   "description": "Kernel-level deep packet inspection (DPI) evasion engine and post-quantum DNS-over-HTTPS suite with Omarchy integration.",

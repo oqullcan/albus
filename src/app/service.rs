@@ -28,6 +28,7 @@ pub fn handle_service_command(cmd: ServiceCommands) -> Result<(), Box<dyn std::e
         ServiceCommands::Start => start_service(),
         ServiceCommands::Stop => stop_service(),
         ServiceCommands::Restart => restart_service(),
+        ServiceCommands::Reload => reload_service(),
         ServiceCommands::Status => show_service_status(),
         ServiceCommands::Logs => show_service_logs(),
     }
@@ -63,6 +64,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={exec_start}
+ExecReload=/bin/kill -s HUP $MAINPID
 ExecStopPost={exec_stop}
 Restart=always
 RestartSec=3
@@ -72,7 +74,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BI
 
 [Install]
 WantedBy=multi-user.target
-"#
+"#,
     );
 
     fs::write(SERVICE_FILE_PATH, unit_content)?;
@@ -163,6 +165,16 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("albus.service restarted.");
     } else {
         eprintln!("Failed to restart albus.service");
+    }
+    Ok(())
+}
+
+fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let status = Command::new("systemctl").args(["kill", "-s", "HUP", "albus.service"]).status()?;
+    if status.success() {
+        println!("albus.service configuration reloaded live via SIGHUP.");
+    } else {
+        eprintln!("Failed to reload albus.service — verify daemon is actively running");
     }
     Ok(())
 }

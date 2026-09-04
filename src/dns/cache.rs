@@ -70,6 +70,13 @@ impl DnsCache {
         None
     }
 
+    // clears all entries from the in-memory cache
+    pub fn clear(&self) {
+        if let Ok(mut map) = self.entries.lock() {
+            map.clear();
+        }
+    }
+
     // parses minimum ttl across answer section and inserts wire response into cache
     pub fn insert(&self, query_bytes: &[u8], response_bytes: &[u8]) {
         if query_bytes.len() < 12 || response_bytes.len() < 12 {

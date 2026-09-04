@@ -1,7 +1,7 @@
 //! rfc 8484 dns-over-https (doh) client implementation supporting preset and custom upstreams, ip bootstrapping, and post-quantum cryptography.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -17,6 +17,22 @@ const MULLVAD_EXTENDED_IPS: &[Ipv4Addr] = &[Ipv4Addr::new(194, 242, 2, 5)];
 const MULLVAD_FAMILY_IPS: &[Ipv4Addr] = &[Ipv4Addr::new(194, 242, 2, 6)];
 const MULLVAD_ALL_IPS: &[Ipv4Addr] = &[Ipv4Addr::new(194, 242, 2, 9)];
 
+const CLOUDFLARE_IPS_V6: &[Ipv6Addr] = &[
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001),
+];
+const QUAD9_IPS_V6: &[Ipv6Addr] = &[
+    Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe),
+    Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009),
+];
+
+const MULLVAD_STANDARD_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0002)];
+const MULLVAD_ADBLOCK_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0003)];
+const MULLVAD_BASE_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0004)];
+const MULLVAD_EXTENDED_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0005)];
+const MULLVAD_FAMILY_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0006)];
+const MULLVAD_ALL_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0009)];
+
 // static lookup table of pre-configured public doh endpoints and bootstrap ipv4 addresses
 pub static DOH_PRESETS: LazyLock<HashMap<&'static str, (&'static str, &'static [Ipv4Addr])>> = LazyLock::new(|| {
     let mut m = HashMap::new();
@@ -29,6 +45,21 @@ pub static DOH_PRESETS: LazyLock<HashMap<&'static str, (&'static str, &'static [
     m.insert("mullvad-extended", ("https://extended.dns.mullvad.net/dns-query", MULLVAD_EXTENDED_IPS));
     m.insert("mullvad-family", ("https://family.dns.mullvad.net/dns-query", MULLVAD_FAMILY_IPS));
     m.insert("mullvad-all", ("https://all.dns.mullvad.net/dns-query", MULLVAD_ALL_IPS));
+    m
+});
+
+// static lookup table of pre-configured public doh endpoints and bootstrap ipv6 addresses
+pub static DOH_PRESETS_V6: LazyLock<HashMap<&'static str, &'static [Ipv6Addr]>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("cloudflare", CLOUDFLARE_IPS_V6);
+    m.insert("quad9", QUAD9_IPS_V6);
+    m.insert("mullvad", MULLVAD_STANDARD_IPS_V6);
+    m.insert("mullvad-standard", MULLVAD_STANDARD_IPS_V6);
+    m.insert("mullvad-adblock", MULLVAD_ADBLOCK_IPS_V6);
+    m.insert("mullvad-base", MULLVAD_BASE_IPS_V6);
+    m.insert("mullvad-extended", MULLVAD_EXTENDED_IPS_V6);
+    m.insert("mullvad-family", MULLVAD_FAMILY_IPS_V6);
+    m.insert("mullvad-all", MULLVAD_ALL_IPS_V6);
     m
 });
 
@@ -48,11 +79,26 @@ impl SingleDoHClient {
         custom_bootstrap_ips: &[Ipv4Addr],
         pqc: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if pqc {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        if !pqc {
+            // enforce classical key exchange ONLY: eliminate all post-quantum KEMs
+            provider.kx_groups.retain(|kx| {
+                let name = format!("{:?}", kx.name());
+                !name.contains("MLKEM") && !name.contains("Kyber")
+            });
         }
 
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         let mut builder = reqwest::Client::builder()
+            .use_preconfigured_tls(client_config)
             .timeout(Duration::from_secs(5));
 
         if let Ok(parsed) = Url::parse(upstream) {
@@ -244,9 +290,87 @@ pub fn extract_upstream_ips(
     ips
 }
 
+// extracts ipv6 addresses of upstream doh endpoints to populate ebpf exclusion maps
+pub fn extract_upstream_ips_v6(
+    upstreams_csv: &str,
+    custom_bootstrap_ips: &[Ipv6Addr],
+) -> Vec<Ipv6Addr> {
+    let mut ips = Vec::new();
+
+    // append all user-specified bootstrap endpoints
+    ips.extend_from_slice(custom_bootstrap_ips);
+
+    for raw in upstreams_csv.split(',') {
+        let u = raw.trim();
+        if u.is_empty() {
+            continue;
+        }
+
+        if let Some(preset_ips) = DOH_PRESETS_V6.get(u) {
+            ips.extend_from_slice(preset_ips);
+            continue;
+        }
+
+        if let Ok(parsed) = Url::parse(u) {
+            if let Some(host_str) = parsed.host_str() {
+                let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(ip) = clean_host.parse::<Ipv6Addr>() {
+                    ips.push(ip);
+                } else {
+                    let host_with_port = format!("{}:{}", host_str, parsed.port().unwrap_or(443));
+                    if let Ok(resolved) = host_with_port.to_socket_addrs() {
+                        for addr in resolved {
+                            if let std::net::SocketAddr::V6(v6) = addr {
+                                ips.push(*v6.ip());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pqc_toggle_true_vs_false_kx_groups() {
+        // 1. verify pqc: true contains quantum-resistant KEM hybrid group
+        let client_pqc = SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true);
+        assert!(client_pqc.is_ok(), "PQC client initialization should succeed");
+        assert!(client_pqc.unwrap().pqc);
+
+        // 2. verify pqc: false contains exclusively classical elliptic curves
+        let client_classical = SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false);
+        assert!(client_classical.is_ok(), "Classical client initialization should succeed");
+        assert!(!client_classical.unwrap().pqc);
+
+        // 3. assert crypto provider kx_groups filtering correctness
+        let mut classical_provider = rustls::crypto::aws_lc_rs::default_provider();
+        classical_provider.kx_groups.retain(|kx| {
+            let name = format!("{:?}", kx.name());
+            !name.contains("MLKEM") && !name.contains("Kyber")
+        });
+
+        for kx in &classical_provider.kx_groups {
+            let name = format!("{:?}", kx.name());
+            assert!(!name.contains("MLKEM"), "Classical provider must not contain ML-KEM");
+            assert!(!name.contains("Kyber"), "Classical provider must not contain Kyber");
+        }
+
+        let pqc_provider = rustls::crypto::aws_lc_rs::default_provider();
+        let has_pq = pqc_provider.kx_groups.iter().any(|kx| {
+            let name = format!("{:?}", kx.name());
+            name.contains("MLKEM") || name.contains("Kyber")
+        });
+        assert!(has_pq, "PQC provider must contain quantum-resistant ML-KEM or Kyber group");
+    }
 
     #[test]
     fn test_extract_preset_ips() {
@@ -255,6 +379,15 @@ mod tests {
         assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)));
         assert!(ips.contains(&Ipv4Addr::new(194, 242, 2, 2)));
         assert!(ips.contains(&Ipv4Addr::new(194, 242, 2, 9)));
+    }
+
+    #[test]
+    fn test_extract_preset_ips_v6() {
+        let ips = extract_upstream_ips_v6("cloudflare,quad9,mullvad,mullvad-all", &[]);
+        assert!(ips.contains(&Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)));
+        assert!(ips.contains(&Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)));
+        assert!(ips.contains(&Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0002)));
+        assert!(ips.contains(&Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0009)));
     }
 
     #[tokio::test]

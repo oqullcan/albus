@@ -1,6 +1,6 @@
 [package]
 name = "albus"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["oqullcan"]
 description = "Pure Rust DPI bypass and encrypted DNS tool for Linux"
@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
+webpki-roots = "1.0"
 
 [build-dependencies]
 cc = "1.1"

@@ -82,7 +82,7 @@ pub fn checksum(data: &[u8]) -> u16 {
     checksum_finalize(sum)
 }
 
-// serializes ipv4 header and tcp segment directly into pre-allocated stack buffer
+// serializes ipv4 or ipv6 header and tcp segment directly into pre-allocated stack buffer
 pub fn build_packet_stack_opts(
     conn: &ConnInfo,
     payload: &[u8],
@@ -90,75 +90,141 @@ pub fn build_packet_stack_opts(
     bad_checksum: bool,
 ) -> StackPacket {
     let mut pkt = StackPacket::new();
-    let tcp_hdr_len = 20;
-    let ip_hdr_len = 20;
-    let total_len = ip_hdr_len + tcp_hdr_len + payload.len();
 
-    if total_len > MAX_PACKET_LEN {
-        return pkt;
+    match (conn.src_ip, conn.dst_ip) {
+        (std::net::IpAddr::V6(src6), std::net::IpAddr::V6(dst6)) => {
+            let tcp_hdr_len = 20;
+            let ip_hdr_len = 40;
+            let total_len = ip_hdr_len + tcp_hdr_len + payload.len();
+
+            if total_len > MAX_PACKET_LEN {
+                return pkt;
+            }
+
+            // 1. construct ipv6 header (rfc 8200)
+            let mut ip6_hdr = [0u8; 40];
+            ip6_hdr[0] = 0x60; // version 6, traffic class 0
+            let payload_len = (tcp_hdr_len + payload.len()) as u16;
+            ip6_hdr[4..6].copy_from_slice(&payload_len.to_be_bytes());
+            ip6_hdr[6] = 6; // next header: tcp (6)
+            ip6_hdr[7] = ttl; // hop limit
+            ip6_hdr[8..24].copy_from_slice(&src6.octets());
+            ip6_hdr[24..40].copy_from_slice(&dst6.octets());
+
+            pkt.buf[0..40].copy_from_slice(&ip6_hdr);
+
+            // 2. construct tcp header (rfc 793)
+            let mut tcp_hdr = [0u8; 20];
+            tcp_hdr[0..2].copy_from_slice(&conn.src_port.to_be_bytes());
+            tcp_hdr[2..4].copy_from_slice(&conn.dst_port.to_be_bytes());
+            tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
+            tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
+            tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
+            tcp_hdr[13] = 0x18; // control flags: psh + ack
+            let window_size: u16 = 502;
+            tcp_hdr[14..16].copy_from_slice(&window_size.to_be_bytes());
+
+            // 3. compute tcp checksum over ipv6 pseudo-header (rfc 8200 section 8.1)
+            let mut pseudo_sum: u32 = 0;
+            pseudo_sum = checksum_partial(&src6.octets(), pseudo_sum);
+            pseudo_sum = checksum_partial(&dst6.octets(), pseudo_sum);
+            let tcp_len_u32 = payload_len as u32;
+            pseudo_sum = checksum_partial(&tcp_len_u32.to_be_bytes(), pseudo_sum);
+            let next_hdr = [0x00, 0x00, 0x00, 6];
+            pseudo_sum = checksum_partial(&next_hdr, pseudo_sum);
+            pseudo_sum = checksum_partial(&tcp_hdr, pseudo_sum);
+            pseudo_sum = checksum_partial(payload, pseudo_sum);
+
+            let tcp_cs = if bad_checksum {
+                0xDEAD
+            } else {
+                checksum_finalize(pseudo_sum)
+            };
+
+            tcp_hdr[16] = (tcp_cs >> 8) as u8;
+            tcp_hdr[17] = tcp_cs as u8;
+
+            pkt.buf[40..60].copy_from_slice(&tcp_hdr);
+
+            let payload_end = 60 + payload.len();
+            pkt.buf[60..payload_end].copy_from_slice(payload);
+            pkt.len = payload_end;
+
+            pkt
+        }
+        (std::net::IpAddr::V4(src4), std::net::IpAddr::V4(dst4)) => {
+            let tcp_hdr_len = 20;
+            let ip_hdr_len = 20;
+            let total_len = ip_hdr_len + tcp_hdr_len + payload.len();
+
+            if total_len > MAX_PACKET_LEN {
+                return pkt;
+            }
+
+            // 1. construct ipv4 header (rfc 791)
+            let mut ip_hdr = [0u8; 20];
+            ip_hdr[0] = 0x45; // version 4, internet header length 5 (20 bytes)
+            ip_hdr[1] = 0x00; // differentiated services code point / ecn
+            ip_hdr[2] = (total_len >> 8) as u8;
+            ip_hdr[3] = total_len as u8;
+            ip_hdr[4] = 0x12; // packet identification
+            ip_hdr[5] = 0x34;
+            ip_hdr[6] = 0x40; // flags: don't fragment (df) bit set
+            ip_hdr[7] = 0x00;
+            ip_hdr[8] = ttl;
+            ip_hdr[9] = 6; // transport protocol: tcp (6)
+            ip_hdr[12..16].copy_from_slice(&src4.octets());
+            ip_hdr[16..20].copy_from_slice(&dst4.octets());
+
+            let ip_cs = checksum(&ip_hdr);
+            ip_hdr[10] = (ip_cs >> 8) as u8;
+            ip_hdr[11] = ip_cs as u8;
+
+            pkt.buf[0..20].copy_from_slice(&ip_hdr);
+
+            // 2. construct tcp header (rfc 793)
+            let mut tcp_hdr = [0u8; 20];
+            tcp_hdr[0..2].copy_from_slice(&conn.src_port.to_be_bytes());
+            tcp_hdr[2..4].copy_from_slice(&conn.dst_port.to_be_bytes());
+            tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
+            tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
+            tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
+            tcp_hdr[13] = 0x18; // control flags: psh + ack
+            let window_size: u16 = 502;
+            tcp_hdr[14..16].copy_from_slice(&window_size.to_be_bytes());
+            tcp_hdr[18] = 0; // urgent pointer
+            tcp_hdr[19] = 0;
+
+            // 3. compute tcp checksum over pseudo-header + tcp header + payload
+            let tcp_seg_len = (tcp_hdr_len + payload.len()) as u16;
+            let mut pseudo_sum: u32 = 0;
+            pseudo_sum = checksum_partial(&src4.octets(), pseudo_sum);
+            pseudo_sum = checksum_partial(&dst4.octets(), pseudo_sum);
+            let proto_and_len = [0x00, 6, (tcp_seg_len >> 8) as u8, tcp_seg_len as u8];
+            pseudo_sum = checksum_partial(&proto_and_len, pseudo_sum);
+            pseudo_sum = checksum_partial(&tcp_hdr, pseudo_sum);
+            pseudo_sum = checksum_partial(payload, pseudo_sum);
+
+            let tcp_cs = if bad_checksum {
+                0xDEAD // inject deliberate checksum mismatch to deceive stateful middleboxes
+            } else {
+                checksum_finalize(pseudo_sum)
+            };
+
+            tcp_hdr[16] = (tcp_cs >> 8) as u8;
+            tcp_hdr[17] = tcp_cs as u8;
+
+            pkt.buf[20..40].copy_from_slice(&tcp_hdr);
+
+            // 4. append transport layer payload
+            let payload_end = 40 + payload.len();
+            pkt.buf[40..payload_end].copy_from_slice(payload);
+            pkt.len = payload_end;
+
+            pkt
+        }
+        _ => pkt,
     }
-
-    // 1. construct ipv4 header (rfc 791)
-    let mut ip_hdr = [0u8; 20];
-    ip_hdr[0] = 0x45; // version 4, internet header length 5 (20 bytes)
-    ip_hdr[1] = 0x00; // differentiated services code point / ecn
-    ip_hdr[2] = (total_len >> 8) as u8;
-    ip_hdr[3] = total_len as u8;
-    ip_hdr[4] = 0x12; // packet identification
-    ip_hdr[5] = 0x34;
-    ip_hdr[6] = 0x40; // flags: don't fragment (df) bit set
-    ip_hdr[7] = 0x00;
-    ip_hdr[8] = ttl;
-    ip_hdr[9] = 6; // transport protocol: tcp (6)
-    ip_hdr[12..16].copy_from_slice(&conn.src_ip.octets());
-    ip_hdr[16..20].copy_from_slice(&conn.dst_ip.octets());
-
-    let ip_cs = checksum(&ip_hdr);
-    ip_hdr[10] = (ip_cs >> 8) as u8;
-    ip_hdr[11] = ip_cs as u8;
-
-    pkt.buf[0..20].copy_from_slice(&ip_hdr);
-
-    // 2. construct tcp header (rfc 793)
-    let mut tcp_hdr = [0u8; 20];
-    tcp_hdr[0..2].copy_from_slice(&conn.src_port.to_be_bytes());
-    tcp_hdr[2..4].copy_from_slice(&conn.dst_port.to_be_bytes());
-    tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
-    tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
-    tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
-    tcp_hdr[13] = 0x18; // control flags: psh + ack
-    let window_size: u16 = 502;
-    tcp_hdr[14..16].copy_from_slice(&window_size.to_be_bytes());
-    tcp_hdr[18] = 0; // urgent pointer
-    tcp_hdr[19] = 0;
-
-    // 3. compute tcp checksum over pseudo-header + tcp header + payload
-    let tcp_seg_len = (tcp_hdr_len + payload.len()) as u16;
-    let mut pseudo_sum: u32 = 0;
-    pseudo_sum = checksum_partial(&conn.src_ip.octets(), pseudo_sum);
-    pseudo_sum = checksum_partial(&conn.dst_ip.octets(), pseudo_sum);
-    let proto_and_len = [0x00, 6, (tcp_seg_len >> 8) as u8, tcp_seg_len as u8];
-    pseudo_sum = checksum_partial(&proto_and_len, pseudo_sum);
-    pseudo_sum = checksum_partial(&tcp_hdr, pseudo_sum);
-    pseudo_sum = checksum_partial(payload, pseudo_sum);
-
-    let tcp_cs = if bad_checksum {
-        0xDEAD // inject deliberate checksum mismatch to deceive stateful middleboxes
-    } else {
-        checksum_finalize(pseudo_sum)
-    };
-
-    tcp_hdr[16] = (tcp_cs >> 8) as u8;
-    tcp_hdr[17] = tcp_cs as u8;
-
-    pkt.buf[20..40].copy_from_slice(&tcp_hdr);
-
-    // 4. append transport layer payload
-    let payload_end = 40 + payload.len();
-    pkt.buf[40..payload_end].copy_from_slice(payload);
-    pkt.len = payload_end;
-
-    pkt
 }
 
 #[inline]
@@ -265,8 +331,13 @@ mod tests {
         // tcp segment verification
         let tcp_seg = &pkt[20..];
         let mut pseudo = Vec::new();
-        pseudo.extend_from_slice(&conn.src_ip.octets());
-        pseudo.extend_from_slice(&conn.dst_ip.octets());
+        match (conn.src_ip, conn.dst_ip) {
+            (std::net::IpAddr::V4(s), std::net::IpAddr::V4(d)) => {
+                pseudo.extend_from_slice(&s.octets());
+                pseudo.extend_from_slice(&d.octets());
+            }
+            _ => unreachable!(),
+        }
         pseudo.push(0x00);
         pseudo.push(6); // tcp
         pseudo.push((tcp_seg.len() >> 8) as u8);
@@ -274,6 +345,45 @@ mod tests {
         pseudo.extend_from_slice(tcp_seg);
 
         // complement property: checksum over pseudo header + segment must be 0
+        assert_eq!(checksum(&pseudo), 0x0000);
+    }
+
+    #[test]
+    fn test_packet_building_and_tcp_checksum_ipv6() {
+        use std::net::Ipv6Addr;
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let conn = ConnInfo::new_v6(
+            src,
+            dst,
+            54321,
+            443,
+            2000,
+            4000,
+        );
+        let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let ttl = 64;
+
+        let pkt = build_packet(&conn, payload, ttl);
+        assert_eq!(pkt.len(), 40 + 20 + payload.len());
+
+        // ipv6 header checks
+        assert_eq!(pkt[0], 0x60); // version 6
+        assert_eq!(pkt[6], 6);    // next header: tcp
+        assert_eq!(pkt[7], 64);   // hop limit
+        assert_eq!(&pkt[8..24], &src.octets());
+        assert_eq!(&pkt[24..40], &dst.octets());
+
+        // tcp segment verification over ipv6 pseudo header
+        let tcp_seg = &pkt[40..];
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        let tcp_len_u32 = tcp_seg.len() as u32;
+        pseudo.extend_from_slice(&tcp_len_u32.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 6]);
+        pseudo.extend_from_slice(tcp_seg);
+
         assert_eq!(checksum(&pseudo), 0x0000);
     }
 

@@ -6,6 +6,6 @@ pub mod ech;
 pub mod server;
 pub mod system;
 
-pub use doh::extract_upstream_ips;
+pub use doh::{extract_upstream_ips, extract_upstream_ips_v6};
 pub use server::DnsServer;
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};

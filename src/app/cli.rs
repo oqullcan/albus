@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "albus",
     author = "oqullcan",
-    version = "2.0.0",
+    version = "2.1.0",
     about = "ebpf sock_ops tcp mss fragmentation and doh proxy engine",
     long_about = "albus is a kernel-level network utility utilizing ebpf sock_ops and encrypted doh to bypass deep packet inspection."
 )]
@@ -84,6 +84,9 @@ pub enum ServiceCommands {
     // restart systemd service to reload parameters
     Restart,
 
+    // reload systemd service configuration live via SIGHUP
+    Reload,
+
     // print systemd service operational status
     Status,
 
@@ -141,6 +144,18 @@ pub struct RunArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub block_quic: bool,
 
+    // drop outgoing webrtc stun traffic (udp 3478, 5349) to prevent ip leaks
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub block_stun: bool,
+
+    // activate strict dns kill-switch blocking all non-loopback plaintext dns queries
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub kill_switch: bool,
+
+    // activate fail-closed network lockdown blocking outbound http/https if ebpf fails
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub network_lockdown: bool,
+
     // filter aaaa queries to prevent unfragmented ipv6 bypass leaks
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub block_ipv6: bool,
@@ -148,6 +163,10 @@ pub struct RunArgs {
     // tcp max segment size clamp for tls clienthello fragmentation
     #[arg(long, default_value_t = 88)]
     pub mss: u16,
+
+    // minimum tcp mss clamp for jitter randomization (0 = fixed mss)
+    #[arg(long, default_value_t = 64)]
+    pub min_mss: u16,
 
     // transmitted byte threshold before restoring native line-rate mss
     #[arg(long, default_value_t = 600)]
@@ -169,8 +188,8 @@ pub struct RunArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub pqc: bool,
 
-    // enforce volatile only-ram execution and isolate state in tmpfs (/dev/shm)
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    // enforce volatile only-ram execution and isolate state in tmpfs (/run)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub ram_only: bool,
 
     // enable verbose debug logging in tracing subscriber

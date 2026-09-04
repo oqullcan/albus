@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, RawFd};
 use tracing::{debug, info, warn};
 
@@ -26,7 +26,7 @@ pub const BPF_PSEUDO_MAP_FD: u8 = 1;
 
 // memory layout of connection event emitted across perf ring buffer
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RawConnEvent {
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -34,6 +34,27 @@ pub struct RawConnEvent {
     pub dst_port: u16,
     pub seq: u32,
     pub ack: u32,
+    pub family: u8,
+    pub reserved: [u8; 3],
+    pub src_ip6: [u32; 4],
+    pub dst_ip6: [u32; 4],
+}
+
+impl Default for RawConnEvent {
+    fn default() -> Self {
+        Self {
+            src_ip: 0,
+            dst_ip: 0,
+            src_port: 0,
+            dst_port: 0,
+            seq: 0,
+            ack: 0,
+            family: 2, // AF_INET default
+            reserved: [0; 3],
+            src_ip6: [0; 4],
+            dst_ip6: [0; 4],
+        }
+    }
 }
 
 // runtime configuration struct mirrored to ebpf array map
@@ -43,18 +64,20 @@ pub struct BpfConfig {
     pub mss: u16,
     pub restore_mss: u16,
     pub restore_after_bytes: u32,
+    pub min_mss: u16,
     pub enabled: u8,
-    pub reserved: [u8; 7],
+    pub reserved: [u8; 5],
 }
 
 impl BpfConfig {
-    pub fn new(mss: u16, restore_mss: u16, restore_after_bytes: u32, enabled: bool) -> Self {
+    pub fn new(mss: u16, restore_mss: u16, restore_after_bytes: u32, min_mss: u16, enabled: bool) -> Self {
         Self {
             mss,
             restore_mss,
             restore_after_bytes,
+            min_mss,
             enabled: if enabled { 1 } else { 0 },
-            reserved: [0; 7],
+            reserved: [0; 5],
         }
     }
 }
@@ -66,6 +89,7 @@ pub struct BpfEngine {
     pub config_map_fd: RawFd,
     pub target_ports_fd: RawFd,
     pub exclude_ips_fd: RawFd,
+    pub exclude_ips_v6_fd: RawFd,
     pub conn_events_fd: RawFd,
     pub connections_fd: RawFd,
     pub perf_readers: Vec<PerfReader>,
@@ -82,6 +106,7 @@ impl BpfEngine {
         let config_map_fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, 4, std::mem::size_of::<BpfConfig>() as u32, 1, "config_map")?;
         let target_ports_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 2, 1, 64, "target_ports")?;
         let exclude_ips_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 4, 1, 64, "exclude_ips")?;
+        let exclude_ips_v6_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 16, 1, 64, "exclude_ips_v6")?;
         let conn_events_fd = bpf_create_map(BPF_MAP_TYPE_PERF_EVENT_ARRAY, 4, 4, (num_cpus.max(128)) as u32, "conn_events")?;
         let connections_fd = bpf_create_map(BPF_MAP_TYPE_LRU_HASH, 8, 8, 65536, "connections")?;
 
@@ -89,6 +114,7 @@ impl BpfEngine {
         map_fds.insert("config_map".to_string(), config_map_fd);
         map_fds.insert("target_ports".to_string(), target_ports_fd);
         map_fds.insert("exclude_ips".to_string(), exclude_ips_fd);
+        map_fds.insert("exclude_ips_v6".to_string(), exclude_ips_v6_fd);
         map_fds.insert("conn_events".to_string(), conn_events_fd);
         map_fds.insert("connections".to_string(), connections_fd);
 
@@ -132,13 +158,25 @@ impl BpfEngine {
             config_map_fd,
             target_ports_fd,
             exclude_ips_fd,
+            exclude_ips_v6_fd,
             conn_events_fd,
             connections_fd,
             perf_readers,
             attached: true,
         })
     }
+}
 
+// lightweight copyable handles to ebpf map file descriptors for live runtime reconfiguration
+#[derive(Debug, Clone, Copy)]
+pub struct BpfMapHandles {
+    pub config_map_fd: RawFd,
+    pub target_ports_fd: RawFd,
+    pub exclude_ips_fd: RawFd,
+    pub exclude_ips_v6_fd: RawFd,
+}
+
+impl BpfMapHandles {
     // writes runtime parameters into index 0 of config_map
     pub fn push_config(&self, cfg: BpfConfig) -> Result<()> {
         let key = 0u32;
@@ -154,7 +192,7 @@ impl BpfEngine {
         Ok(())
     }
 
-    // inserts destination ips into exclusion map to bypass packet fragmentation
+    // inserts destination ipv4 addresses into exclusion map to bypass packet fragmentation
     pub fn push_exclude_ips(&self, ips: &[Ipv4Addr]) -> Result<()> {
         let val = 1u8;
         for ip in ips {
@@ -162,6 +200,48 @@ impl BpfEngine {
             bpf_map_update(self.exclude_ips_fd, &key, &val)?;
         }
         Ok(())
+    }
+
+    // inserts destination ipv6 addresses into exclusion map to bypass packet fragmentation
+    pub fn push_exclude_ips_v6(&self, ips: &[Ipv6Addr]) -> Result<()> {
+        let val = 1u8;
+        for ip in ips {
+            let key = ip.octets();
+            bpf_map_update(self.exclude_ips_v6_fd, &key, &val)?;
+        }
+        Ok(())
+    }
+}
+
+impl BpfEngine {
+    // extracts lightweight copyable map descriptors for dynamic reconfiguration
+    pub fn map_handles(&self) -> BpfMapHandles {
+        BpfMapHandles {
+            config_map_fd: self.config_map_fd,
+            target_ports_fd: self.target_ports_fd,
+            exclude_ips_fd: self.exclude_ips_fd,
+            exclude_ips_v6_fd: self.exclude_ips_v6_fd,
+        }
+    }
+
+    // writes runtime parameters into index 0 of config_map
+    pub fn push_config(&self, cfg: BpfConfig) -> Result<()> {
+        self.map_handles().push_config(cfg)
+    }
+
+    // inserts target destination ports into lookup hash map
+    pub fn push_target_ports(&self, ports: &[u16]) -> Result<()> {
+        self.map_handles().push_target_ports(ports)
+    }
+
+    // inserts destination ips into exclusion map to bypass packet fragmentation
+    pub fn push_exclude_ips(&self, ips: &[Ipv4Addr]) -> Result<()> {
+        self.map_handles().push_exclude_ips(ips)
+    }
+
+    // inserts destination ipv6 addresses into exclusion map to bypass packet fragmentation
+    pub fn push_exclude_ips_v6(&self, ips: &[Ipv6Addr]) -> Result<()> {
+        self.map_handles().push_exclude_ips_v6(ips)
     }
 
     // polls ring buffer pages across all active per-core perf readers
@@ -204,6 +284,9 @@ impl Drop for BpfEngine {
             }
             if self.exclude_ips_fd >= 0 {
                 libc::close(self.exclude_ips_fd);
+            }
+            if self.exclude_ips_v6_fd >= 0 {
+                libc::close(self.exclude_ips_v6_fd);
             }
             if self.conn_events_fd >= 0 {
                 libc::close(self.conn_events_fd);
@@ -665,6 +748,9 @@ impl PerfReader {
             return;
         }
 
+        // smp_rmb: synchronize with kernel's perf ring write before reading data section
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
         let data_ptr = unsafe { (self.mmap_ptr as *const u8).add(self.page_size) };
         let data_len = self.mmap_size - self.page_size;
         let data_mask = data_len - 1;
@@ -706,6 +792,8 @@ impl PerfReader {
             tail += size as u64;
         }
 
+        // smp_mb: ensure all ring data reads have completed before advancing data_tail
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         unsafe { std::ptr::write_volatile(&mut header.data_tail, tail); }
     }
 }
@@ -735,6 +823,7 @@ mod tests {
         let mut map_fds = HashMap::new();
         map_fds.insert("config_map".to_string(), 100);
         map_fds.insert("exclude_ips".to_string(), 101);
+        map_fds.insert("exclude_ips_v6".to_string(), 105);
         map_fds.insert("target_ports".to_string(), 102);
         map_fds.insert("conn_events".to_string(), 103);
         map_fds.insert("connections".to_string(), 104);
@@ -745,6 +834,7 @@ mod tests {
         let imms: Vec<i32> = insns.iter().map(|i| i.imm).collect();
         assert!(imms.contains(&100), "config_map relocation (fd 100) must be applied");
         assert!(imms.contains(&101), "exclude_ips relocation (fd 101) must be applied");
+        assert!(imms.contains(&105), "exclude_ips_v6 relocation (fd 105) must be applied");
         assert!(imms.contains(&102), "target_ports relocation (fd 102) must be applied");
         assert!(imms.contains(&103), "conn_events relocation (fd 103) must be applied");
         assert!(imms.contains(&104), "connections relocation (fd 104) must be applied");

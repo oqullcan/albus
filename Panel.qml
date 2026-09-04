@@ -17,7 +17,7 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // navigation tab indices: 0 = dns & security, 1 = dpi evasion, 2 = live telemetry
+  // navigation tab indices: 0 = settings (dns, dpi & security), 1 = live logs telemetry
   property int activeTab: 0
 
   // reactive runtime state
@@ -30,15 +30,37 @@ Panel {
   property string customBootstrapPrimary: ""
   property string customBootstrapSecondary: ""
   property string customMss: "88"
-  property string customFakeSni: "www.google.com"
+  property string customMinMss: "64"
+  property string customFakeTtl: "0"
+  property string customFakeSni: ""
   property bool fakeBadChecksum: false
   property bool autoTtlEnabled: true
   property bool dnssecEnabled: true
   property bool pqcEnabled: true
-  property bool ramOnlyEnabled: true
+  property bool ramOnlyEnabled: false
   property bool blockQuicEnabled: true
+  property bool blockStunEnabled: true
+  property bool killSwitchEnabled: true
+  property bool networkLockdownEnabled: false
   property bool blockIpv6Enabled: true
   property string toastMessage: ""
+  property bool isConfigLoading: false
+
+  // preserved CLI configuration parameters not directly exposed in UI
+  property var storedPorts: [443]
+  property int storedRestoreAfterBytes: 600
+  property int storedRestoreMss: 0
+  property string storedCgroup: "/sys/fs/cgroup"
+
+  onOpenedChanged: if (opened) {
+    loadConfig()
+    refreshStatus()
+  }
+
+  Component.onCompleted: {
+    loadConfig()
+    refreshStatus()
+  }
 
   // event stream telemetry state
   property var rawStreamEvents: []
@@ -49,6 +71,11 @@ Panel {
   property int countInjected: 0
   property int countDns: 0
   property int countQuic: 0
+  property int countShield: 0
+  property bool isAtBottom: true
+  property int copiedEventId: -1
+  property int recentEventCount: 0
+  property string eventRateText: "idle"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.6)
@@ -57,6 +84,85 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color accent: Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  component CompactToggle: Rectangle {
+    id: ctRoot
+    property string label: ""
+    property string description: ""
+    property bool checked: false
+    property color foreground: root.foreground
+    property color accent: "#10B981"
+    property bool showDivider: true
+    signal clicked()
+
+    width: parent.width
+    implicitHeight: descText.visible ? Style.space(40) : Style.space(32)
+    color: ctMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent"
+
+    Behavior on color { ColorAnimation { duration: 90 } }
+
+    MouseArea {
+      id: ctMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: ctRoot.clicked()
+    }
+
+    RowLayout {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      spacing: Style.space(8)
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: 1
+
+        Text {
+          text: ctRoot.label
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          color: ctRoot.checked ? ctRoot.foreground : root.dim
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          Layout.fillWidth: true
+        }
+
+        Text {
+          id: descText
+          visible: ctRoot.description !== ""
+          text: ctRoot.description
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption - 1
+          color: ctRoot.checked ? Qt.darker(root.foreground, 1.8) : root.subtle
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          Layout.fillWidth: true
+        }
+      }
+
+      ToggleSwitch {
+        checked: ctRoot.checked
+        trackHeight: 18
+        interactive: false
+        foreground: ctRoot.foreground
+        accent: ctRoot.accent
+      }
+    }
+
+    Rectangle {
+      visible: ctRoot.showDivider
+      anchors.bottom: parent.bottom
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      height: 1
+      color: Qt.rgba(1, 1, 1, 0.05)
+    }
+  }
 
   function showToast(msg) {
     root.toastMessage = msg
@@ -71,12 +177,31 @@ Panel {
 
   Timer {
     id: autoApplyTimer
-    interval: 250
+    interval: 600
     repeat: false
     onTriggered: root.applyAndSave()
   }
 
+  Timer {
+    id: rateTimer
+    interval: 1000
+    running: root.opened && root.activeTab === 1
+    repeat: true
+    onTriggered: {
+      var r = root.recentEventCount
+      root.recentEventCount = 0
+      root.eventRateText = r > 0 ? (r + " flow/s") : "idle"
+    }
+  }
+
+  Timer {
+    id: copiedFeedbackTimer
+    interval: 1200
+    onTriggered: root.copiedEventId = -1
+  }
+
   function scheduleAutoApply() {
+    if (root.isConfigLoading) return
     autoApplyTimer.restart()
   }
 
@@ -122,46 +247,89 @@ Panel {
     var clean = stripAnsi(raw).trim()
     if (clean === "") return null
 
-    var timeMatch = clean.match(/(\d{2}:\d{2}:\d{2})/)
-    var timeStr = timeMatch ? timeMatch[1] : ""
+    var timeStr = ""
+    var isoMatch = clean.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/)
+    if (isoMatch) {
+      try {
+        var d = new Date(isoMatch[1])
+        if (!isNaN(d.getTime())) {
+          var pad = function(n) { return n < 10 ? "0" + n : n }
+          timeStr = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds())
+        }
+      } catch (e) {}
+    }
+    if (timeStr === "") {
+      var timeMatch = clean.match(/(\d{2}:\d{2}:\d{2})/)
+      timeStr = timeMatch ? timeMatch[1] : ""
+    }
 
-    var category = "INFO"
-    var badgeColor = "#10B981"
+    var category = "SYS"
+    var badgeColor = "#94A3B8"
     var title = clean
-    var detail = "Kernel event"
+    var detail = "System event"
+    var tag = ""
 
     if (clean.indexOf("fake ClientHello injected") !== -1 || clean.indexOf("ClientHello") !== -1) {
       category = "INJECT"
       badgeColor = "#38BDF8"
       var dstMatch = clean.match(/dst=([^\s]+)/)
       var ttlMatch = clean.match(/ttl=([^\s]+)/)
+      var badCsMatch = clean.match(/bad_csum=([^\s]+)/) || clean.match(/bad_cs=([^\s]+)/)
       title = dstMatch ? dstMatch[1] : "TLS ClientHello"
-      detail = "Fake SNI desync injected" + (ttlMatch ? " • TTL " + ttlMatch[1] : "")
-    } else if (clean.indexOf("DNS server started") !== -1) {
+      var isBad = badCsMatch && (badCsMatch[1] === "true" || badCsMatch[1] === "1")
+      detail = isBad ? "0xDEAD bad-checksum middlebox desync" : "Fake SNI desync injected"
+      tag = (isBad ? "0xDEAD • " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL")
+    } else if (clean.indexOf("DNS cache hit") !== -1 || clean.indexOf("cache_0ms") !== -1) {
       category = "DNS"
       badgeColor = "#A855F7"
-      title = "DoH Engine Active (127.0.0.1:53)"
-      detail = "Fast-Path in-memory cache ready"
-    } else if (clean.indexOf("DNS") !== -1 || clean.indexOf("query") !== -1 || clean.indexOf("resolved") !== -1) {
+      var domMatch = clean.match(/domain=([^\s]+)/)
+      title = domMatch ? domMatch[1].replace(/["',]/g, "") : "DNS Cache Hit"
+      detail = "Resolved via in-memory 0ms cache"
+      tag = "0ms Cache"
+    } else if (clean.indexOf("DNS server started") !== -1 || clean.indexOf("DNS-over-HTTPS proxy listening") !== -1) {
+      category = "SYS"
+      badgeColor = "#A855F7"
+      title = "DoH Resolver Online"
+      detail = "127.0.0.1:53 proxy listener ready"
+      tag = "127.0.0.1"
+    } else if (clean.indexOf("DNS resolved") !== -1 || clean.indexOf("DNS") !== -1 || clean.indexOf("query") !== -1 || clean.indexOf("resolved") !== -1) {
       category = "DNS"
       badgeColor = "#A855F7"
       var domMatch = clean.match(/domain=([^\s]+)/) || clean.match(/upstream=([^\s]+)/)
-      title = domMatch ? domMatch[1] : "DoH Query"
-      detail = "Encrypted DNS resolution"
+      var dnssecMatch = clean.match(/dnssec_authenticated=true/) || clean.match(/is_ad=true/)
+      title = domMatch ? domMatch[1].replace(/["',]/g, "") : "DoH Query"
+      detail = "Encrypted upstream resolution"
+      tag = dnssecMatch ? "DNSSEC" : "DoH"
     } else if (clean.indexOf("QUIC") !== -1 || clean.indexOf("blocked") !== -1) {
       category = "QUIC"
       badgeColor = "#F59E0B"
       title = "QUIC (UDP 443) Blocked"
-      detail = "Forced TCP fallback for DPI bypass"
+      detail = "Forced browser fallback to TCP"
+      tag = "UDP 443"
+    } else if (clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1) {
+      category = "SHIELD"
+      badgeColor = "#10B981"
+      var isLock = clean.indexOf("Lockdown") !== -1
+      title = isLock ? "Network Lockdown Rule" : "Privacy Shield Block"
+      detail = isLock ? "Fail-closed TCP 80/443 protection" : "WebRTC STUN / DNS leak drop"
+      tag = isLock ? "Lockdown" : "Leak Block"
     } else if (clean.indexOf("Error") !== -1 || clean.indexOf("Failed") !== -1) {
       category = "ERROR"
       badgeColor = "#EF4444"
       title = clean.replace(/.*Error:\s*/, "")
-      detail = "Service warning / error"
+      detail = "Service warning / alert"
+      tag = "ERROR"
+    } else if (clean.indexOf("SIGHUP") !== -1 || clean.indexOf("reloading") !== -1 || clean.indexOf("Reloading") !== -1) {
+      category = "SYS"
+      badgeColor = "#94A3B8"
+      title = "Live Parameters Reloaded"
+      detail = "eBPF maps updated via SIGHUP"
+      tag = "Reload"
     } else {
       var stripped = clean.replace(/^[\d\-T:\.Z]+\s*(INFO|WARN|DEBUG|ERROR)?\s*/, "")
       title = stripped !== "" ? stripped : clean
       detail = "Kernel event"
+      tag = "INFO"
     }
 
     return {
@@ -169,7 +337,9 @@ Panel {
       category: category,
       badgeColor: badgeColor,
       title: title,
-      detail: detail
+      detail: detail,
+      tag: tag,
+      raw: clean
     }
   }
 
@@ -177,21 +347,26 @@ Panel {
     var parsed = parseLogLine(rawLine)
     if (!parsed) return
 
+    root.recentEventCount++
+
     if (parsed.category === "INJECT") root.countInjected++
     else if (parsed.category === "DNS") root.countDns++
     else if (parsed.category === "QUIC") root.countQuic++
+    else if (parsed.category === "SHIELD") root.countShield++
 
     if (root.isStreamPaused) return
 
     var list = root.rawStreamEvents.slice()
     list.push(parsed)
-    if (list.length > 80) list.shift()
+    if (list.length > 120) list.shift()
     root.rawStreamEvents = list
 
     updateDisplayEvents()
-    Qt.callLater(function() {
-      if (streamListView) streamListView.positionViewAtEnd()
-    })
+    if (root.isAtBottom) {
+      Qt.callLater(function() {
+        if (streamListView) streamListView.positionViewAtEnd()
+      })
+    }
   }
 
   function updateDisplayEvents() {
@@ -206,7 +381,8 @@ Panel {
 
       var queryMatch = (query === "" || 
                         item.title.toLowerCase().indexOf(query) !== -1 || 
-                        item.detail.toLowerCase().indexOf(query) !== -1)
+                        item.detail.toLowerCase().indexOf(query) !== -1 ||
+                        (item.tag && item.tag.toLowerCase().indexOf(query) !== -1))
       if (!queryMatch) continue
 
       filtered.push(item)
@@ -223,9 +399,11 @@ Panel {
     root.isStreamPaused = !root.isStreamPaused
     if (!root.isStreamPaused) {
       updateDisplayEvents()
-      Qt.callLater(function() {
-        if (streamListView) streamListView.positionViewAtEnd()
-      })
+      if (root.isAtBottom) {
+        Qt.callLater(function() {
+          if (streamListView) streamListView.positionViewAtEnd()
+        })
+      }
     }
   }
 
@@ -235,6 +413,11 @@ Panel {
     root.countInjected = 0
     root.countDns = 0
     root.countQuic = 0
+    root.countShield = 0
+    root.recentEventCount = 0
+    root.eventRateText = "idle"
+    root.copiedEventId = -1
+    root.isAtBottom = true
   }
 
   function open() {
@@ -269,34 +452,72 @@ Panel {
   }
 
   function applyAndSave() {
+    if (root.isConfigLoading) return
+    autoApplyTimer.stop()
     var args = ["config", "set"]
 
     var upstream = root.activeDnsKey
     if (upstream.indexOf("mullvad") !== -1) {
       upstream = root.mullvadProfile === "standard" ? "mullvad" : "mullvad-" + root.mullvadProfile
     } else if (upstream === "custom") {
-      upstream = root.customDnsUrl.trim() !== "" ? root.customDnsUrl.trim() : "quad9"
+      var trimmedUrl = root.customDnsUrl.trim()
+      if (trimmedUrl === "" || (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://") && trimmedUrl.indexOf(".") === -1)) {
+        return
+      }
+      upstream = trimmedUrl
     }
     args.push("--doh-upstream", upstream)
 
+    var ipRegex = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
+    var p1 = root.customBootstrapPrimary.trim()
+    var p2 = root.customBootstrapSecondary.trim()
+    if ((p1 !== "" && !ipRegex.test(p1)) || (p2 !== "" && !ipRegex.test(p2))) {
+      // User is mid-typing an IP address; don't execute incomplete CLI call
+      return
+    }
+
     var boots = []
-    if (root.customBootstrapPrimary.trim() !== "") boots.push(root.customBootstrapPrimary.trim())
-    if (root.customBootstrapSecondary.trim() !== "") boots.push(root.customBootstrapSecondary.trim())
+    if (p1 !== "" && ipRegex.test(p1)) boots.push(p1)
+    if (p2 !== "" && ipRegex.test(p2)) boots.push(p2)
     if (boots.length > 0) {
       args.push("--doh-bootstrap-ips", boots.join(","))
     }
 
     args.push("--mss", root.customMss.trim() !== "" ? root.customMss.trim() : "88")
+    args.push("--min-mss", root.customMinMss.trim() !== "" ? root.customMinMss.trim() : "64")
+    var ttlVal = parseInt(root.customFakeTtl.trim(), 10)
+    if (isNaN(ttlVal) || ttlVal <= 0) {
+      args.push("--auto-ttl", "true")
+      args.push("--fake-ttl", "8")
+      root.autoTtlEnabled = true
+    } else {
+      args.push("--auto-ttl", "false")
+      var clampedTtl = Math.min(Math.max(ttlVal, 1), 255)
+      args.push("--fake-ttl", String(clampedTtl))
+      root.autoTtlEnabled = false
+    }
     if (root.customFakeSni.trim() !== "") {
       args.push("--fake-sni", root.customFakeSni.trim())
     }
     args.push("--fake-bad-checksum", root.fakeBadChecksum ? "true" : "false")
-    args.push("--auto-ttl", root.autoTtlEnabled ? "true" : "false")
     args.push("--block-quic", root.blockQuicEnabled ? "true" : "false")
+    args.push("--block-stun", root.blockStunEnabled ? "true" : "false")
+    args.push("--kill-switch", root.killSwitchEnabled ? "true" : "false")
+    args.push("--network-lockdown", root.networkLockdownEnabled ? "true" : "false")
     args.push("--block-ipv6", root.blockIpv6Enabled ? "true" : "false")
     args.push("--dnssec", root.dnssecEnabled ? "true" : "false")
     args.push("--pqc", root.pqcEnabled ? "true" : "false")
     args.push("--ram-only", root.ramOnlyEnabled ? "true" : "false")
+
+    // preserve backend tuning parameters
+    if (root.storedPorts && root.storedPorts.length > 0) {
+      args.push("--ports", root.storedPorts.join(","))
+    }
+    args.push("--restore-after-bytes", String(root.storedRestoreAfterBytes))
+    args.push("--restore-mss", String(root.storedRestoreMss))
+    if (root.storedCgroup) {
+      args.push("--cgroup", root.storedCgroup)
+    }
 
     configSetProc.command = ["albus"].concat(args)
     configSetProc.running = true
@@ -319,11 +540,21 @@ Panel {
   }
 
   function purgeDnsCache() {
-    showToast("DNS cache cleared")
+    flushCacheProc.command = ["systemctl", "kill", "-s", "SIGUSR1", "albus.service"]
+    flushCacheProc.running = true
   }
 
   function openMonitor() {
     terminalProc.running = true
+  }
+
+  Process {
+    id: flushCacheProc
+    command: []
+    running: false
+    onExited: function(code) {
+      root.showToast("DNS cache flushed")
+    }
   }
 
   // subprocess definitions
@@ -337,12 +568,6 @@ Panel {
         var s = root.parseStatusJson(text)
         if (s) {
           root.isRunning = s.active
-          if (s.dohUpstream) {
-            if (s.dohUpstream === "quad9") root.activeDnsLabel = "Quad9"
-            else if (s.dohUpstream === "cloudflare") root.activeDnsLabel = "Cloudflare"
-            else if (s.dohUpstream.indexOf("mullvad") !== -1) root.activeDnsLabel = "Mullvad"
-            else root.activeDnsLabel = "Custom"
-          }
         }
       }
     }
@@ -357,15 +582,27 @@ Panel {
       onStreamFinished: {
         var cfg = root.parseConfigJson(text)
         if (cfg) {
+          root.isConfigLoading = true
+
           root.customMss = String(cfg.mss || 88)
-          root.customFakeSni = cfg.fake_sni || "www.google.com"
+          root.customMinMss = String(cfg.min_mss !== undefined ? cfg.min_mss : 64)
+          root.customFakeTtl = cfg.auto_ttl === false ? String(cfg.fake_ttl || 8) : "0"
+          root.customFakeSni = cfg.fake_sni || ""
           root.fakeBadChecksum = !!cfg.fake_bad_checksum
           root.autoTtlEnabled = cfg.auto_ttl !== false
           root.dnssecEnabled = cfg.dnssec !== false
           root.pqcEnabled = cfg.pqc !== false
-          root.ramOnlyEnabled = cfg.ram_only !== false
+          root.ramOnlyEnabled = !!cfg.ram_only
           root.blockQuicEnabled = cfg.block_quic !== false
+          root.blockStunEnabled = cfg.block_stun !== false
+          root.killSwitchEnabled = cfg.kill_switch !== false
+          root.networkLockdownEnabled = !!cfg.network_lockdown
           root.blockIpv6Enabled = cfg.block_ipv6 !== false
+
+          if (cfg.ports && Array.isArray(cfg.ports)) root.storedPorts = cfg.ports
+          if (cfg.restore_after_bytes !== undefined) root.storedRestoreAfterBytes = cfg.restore_after_bytes
+          if (cfg.restore_mss !== undefined) root.storedRestoreMss = cfg.restore_mss
+          if (cfg.cgroup_path) root.storedCgroup = cfg.cgroup_path
 
           var up = cfg.doh_upstream || "quad9"
           if (up === "cloudflare" || up === "quad9") {
@@ -386,10 +623,10 @@ Panel {
             root.customDnsUrl = up
           }
 
-          if (cfg.doh_bootstrap_ips && cfg.doh_bootstrap_ips.length > 0) {
-            root.customBootstrapPrimary = cfg.doh_bootstrap_ips[0] || ""
-            root.customBootstrapSecondary = cfg.doh_bootstrap_ips[1] || ""
-          }
+          root.customBootstrapPrimary = (cfg.doh_bootstrap_ips && cfg.doh_bootstrap_ips.length > 0) ? (cfg.doh_bootstrap_ips[0] || "") : ""
+          root.customBootstrapSecondary = (cfg.doh_bootstrap_ips && cfg.doh_bootstrap_ips.length > 1) ? (cfg.doh_bootstrap_ips[1] || "") : ""
+
+          root.isConfigLoading = false
         }
       }
     }
@@ -400,12 +637,16 @@ Panel {
     command: []
     running: false
     onExited: function(code) {
-      root.showToast("Settings applied")
-      if (root.isRunning) {
-        daemonActionProc.command = ["systemctl", "restart", "albus.service"]
-        daemonActionProc.running = true
+      if (code === 0) {
+        root.showToast("Settings applied")
+        if (root.isRunning) {
+          daemonActionProc.command = ["systemctl", "restart", "albus.service"]
+          daemonActionProc.running = true
+        } else {
+          root.refreshStatus()
+        }
       } else {
-        root.refreshStatus()
+        root.showToast("Failed to save settings")
       }
     }
   }
@@ -417,6 +658,7 @@ Panel {
     onExited: function(code) {
       root.isBusy = false
       root.refreshStatus()
+      root.loadConfig()
     }
   }
 
@@ -436,7 +678,7 @@ Panel {
   Process {
     id: streamProc
     command: ["journalctl", "-u", "albus.service", "-n", "40", "-f", "--no-pager", "-o", "cat"]
-    running: root.opened && root.activeTab === 2
+    running: root.opened && root.activeTab === 1
     stdout: SplitParser {
       onRead: function(line) {
         root.appendStreamEvent(line)
@@ -463,7 +705,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(430))
+    contentWidth: panel.fittedContentWidth(Style.space(520))
     contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight + Style.space(20))
 
     PanelKeyCatcher {
@@ -475,16 +717,15 @@ Panel {
       onTextKey: function(t) {
         if (t === "1") root.activeTab = 0
         else if (t === "2") root.activeTab = 1
-        else if (t === "3") root.activeTab = 2
         else if (t === " " || t === "t" || t === "T") root.toggleDaemon()
         else if (t === "r" || t === "R") root.restartDaemon()
         else if (t === "c" || t === "C") root.purgeDnsCache()
         else if (t === "p" || t === "P") root.togglePause()
         else if (t === "j" || t === "J") {
-          if (root.activeTab === 2 && streamListView) streamListView.contentY = Math.min(streamListView.contentHeight - streamListView.height, streamListView.contentY + 50)
+          if (root.activeTab === 1 && streamListView) streamListView.contentY = Math.min(streamListView.contentHeight - streamListView.height, streamListView.contentY + 50)
         }
         else if (t === "k" || t === "K") {
-          if (root.activeTab === 2 && streamListView) streamListView.contentY = Math.max(0, streamListView.contentY - 50)
+          if (root.activeTab === 1 && streamListView) streamListView.contentY = Math.max(0, streamListView.contentY - 50)
         }
       }
 
@@ -507,57 +748,57 @@ Panel {
           spacing: Style.space(10)
 
           // 1. clean header bar
-          RowLayout {
+          Item {
             width: parent.width
-            spacing: Style.space(8)
+            implicitHeight: Math.max(headerCol.implicitHeight, mainSwitch.implicitHeight)
 
-            ColumnLayout {
-              Layout.fillWidth: true
+            Column {
+              id: headerCol
+              anchors.left: parent.left
+              anchors.right: mainSwitch.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
               spacing: 2
 
-              RowLayout {
+              Row {
                 spacing: Style.space(6)
-
-                Rectangle {
-                  width: Style.space(7)
-                  height: Style.space(7)
-                  radius: Style.cornerRadius
-                  color: root.isRunning ? "#10B981" : root.subtle
-
-                  SequentialAnimation on opacity {
-                    running: root.isRunning && root.opened
-                    loops: Animation.Infinite
-                    NumberAnimation { from: 1.0; to: 0.3; duration: 1000; easing.type: Easing.InOutSine }
-                    NumberAnimation { from: 0.3; to: 1.0; duration: 1000; easing.type: Easing.InOutSine }
-                  }
-                }
+                height: Math.max(albusTitle.implicitHeight, statusText.implicitHeight)
 
                 Text {
+                  id: albusTitle
                   text: "ALBUS"
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                   font.bold: true
                   color: root.foreground
+                  anchors.verticalCenter: parent.verticalCenter
                 }
 
                 Text {
+                  id: statusText
                   text: root.isRunning ? "● ACTIVE" : "○ STANDBY"
                   font.family: "monospace"
                   font.pixelSize: Style.font.caption - 1
                   font.bold: true
                   color: root.isRunning ? "#10B981" : root.dim
+                  anchors.verticalCenter: parent.verticalCenter
                 }
               }
 
               Text {
-                text: root.isBusy ? "Applying rules..." : (root.isRunning ? "eBPF sock_ops • ML-KEM-768 • /dev/shm" : "Engine is offline")
+                width: parent.width
+                text: root.isBusy ? "Applying rules..." : (root.isRunning ? ("eBPF sock_ops • ML-KEM-768 • " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent")) : "Engine is offline")
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption - 1
                 color: root.dim
+                elide: Text.ElideRight
               }
             }
 
             ToggleSwitch {
+              id: mainSwitch
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
               checked: root.isRunning
               busy: root.isBusy
               foreground: root.foreground
@@ -566,36 +807,56 @@ Panel {
             }
           }
 
-          // 2. sharp segmented tab bar
-          Row {
+          // 2. ultra-sleek segmented tab bar
+          BorderSurface {
             width: parent.width
-            spacing: Style.space(4)
+            height: Style.space(32)
+            radius: Style.cornerRadius
+            color: Qt.rgba(1, 1, 1, 0.02)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.borderMuted)
 
-            Button {
-              width: (mainColumn.width - Style.space(8)) / 3
-              text: "01 DNS & SEC"
-              selected: root.activeTab === 0
-              bordered: true
-              fontSize: Style.font.caption - 1
-              onClicked: root.activeTab = 0
-            }
+            Row {
+              anchors.fill: parent
+              anchors.margins: 2
+              spacing: 2
 
-            Button {
-              width: (mainColumn.width - Style.space(8)) / 3
-              text: "02 DPI EVASION"
-              selected: root.activeTab === 1
-              bordered: true
-              fontSize: Style.font.caption - 1
-              onClicked: root.activeTab = 1
-            }
+              Repeater {
+                model: [
+                  { index: 0, label: "SETTINGS" },
+                  { index: 1, label: "LOGS" }
+                ]
 
-            Button {
-              width: (mainColumn.width - Style.space(8)) / 3
-              text: "03 TELEMETRY"
-              selected: root.activeTab === 2
-              bordered: true
-              fontSize: Style.font.caption - 1
-              onClicked: root.activeTab = 2
+                Rectangle {
+                  id: mainTabPill
+                  width: (parent.width - 2) / 2
+                  height: parent.height
+                  radius: Style.cornerRadius > 0 ? Style.cornerRadius - 1 : 0
+                  readonly property bool isSelected: root.activeTab === modelData.index
+                  color: isSelected ? Qt.rgba(1, 1, 1, 0.10) : (mainTabMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent")
+                  border.color: isSelected ? Qt.rgba(1, 1, 1, 0.22) : "transparent"
+                  border.width: isSelected ? 1 : 0
+
+                  Behavior on color { ColorAnimation { duration: 90 } }
+
+                  MouseArea {
+                    id: mainTabMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.activeTab = modelData.index
+                  }
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: modelData.label
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption - 1
+                    font.bold: mainTabPill.isSelected
+                    color: mainTabPill.isSelected ? root.foreground : root.dim
+                    textFormat: Text.PlainText
+                  }
+                }
+              }
             }
           }
 
@@ -605,7 +866,7 @@ Panel {
             width: parent.width
             implicitHeight: currentTabItem ? currentTabItem.implicitHeight : 0
 
-            readonly property Item currentTabItem: root.activeTab === 0 ? tab0 : (root.activeTab === 1 ? tab1 : tab2)
+            readonly property Item currentTabItem: root.activeTab === 0 ? tab0 : tab1
 
             Behavior on implicitHeight {
               NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
@@ -630,59 +891,72 @@ Panel {
               }
 
               // horizontal segmented resolver selector
-              Row {
+              BorderSurface {
                 width: parent.width
-                spacing: Style.space(4)
+                height: Style.space(30)
+                radius: Style.cornerRadius
+                color: Qt.rgba(1, 1, 1, 0.02)
+                borderSpec: Border.controlSpec("normal", root.foreground, root.borderMuted)
 
-                Button {
-                  width: (mainColumn.width - Style.space(12)) / 4
-                  text: (root.activeDnsKey === "quad9" ? "● " : "") + "Quad9"
-                  selected: root.activeDnsKey === "quad9"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  onClicked: {
-                    root.activeDnsKey = "quad9"
-                    root.activeDnsLabel = "Quad9"
-                    root.scheduleAutoApply()
-                  }
-                }
+                Row {
+                  anchors.fill: parent
+                  anchors.margins: 2
+                  spacing: 2
 
-                Button {
-                  width: (mainColumn.width - Style.space(12)) / 4
-                  text: (root.activeDnsKey === "cloudflare" ? "● " : "") + "Cloudflare"
-                  selected: root.activeDnsKey === "cloudflare"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  onClicked: {
-                    root.activeDnsKey = "cloudflare"
-                    root.activeDnsLabel = "Cloudflare"
-                    root.scheduleAutoApply()
-                  }
-                }
+                  Repeater {
+                    model: [
+                      { key: "quad9", label: "Quad9" },
+                      { key: "cloudflare", label: "Cloudflare" },
+                      { key: "mullvad", label: "Mullvad" },
+                      { key: "custom", label: "Custom" }
+                    ]
 
-                Button {
-                  width: (mainColumn.width - Style.space(12)) / 4
-                  text: (root.activeDnsKey.indexOf("mullvad") !== -1 ? "● " : "") + "Mullvad"
-                  selected: root.activeDnsKey.indexOf("mullvad") !== -1
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  onClicked: {
-                    root.activeDnsKey = root.mullvadProfile === "standard" ? "mullvad" : "mullvad-" + root.mullvadProfile
-                    root.activeDnsLabel = "Mullvad"
-                    root.scheduleAutoApply()
-                  }
-                }
+                    Rectangle {
+                      id: segPill
+                      width: (parent.width - 6) / 4
+                      height: parent.height
+                      radius: Style.cornerRadius > 0 ? Style.cornerRadius - 1 : 0
+                      readonly property bool isSelected: modelData.key === "mullvad" ? root.activeDnsKey.indexOf("mullvad") !== -1 : root.activeDnsKey === modelData.key
+                      color: isSelected ? Qt.rgba(1, 1, 1, 0.10) : (pillMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent")
+                      border.color: isSelected ? Qt.rgba(1, 1, 1, 0.22) : "transparent"
+                      border.width: isSelected ? 1 : 0
 
-                Button {
-                  width: (mainColumn.width - Style.space(12)) / 4
-                  text: (root.activeDnsKey === "custom" ? "● " : "") + "Custom"
-                  selected: root.activeDnsKey === "custom"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  onClicked: {
-                    root.activeDnsKey = "custom"
-                    root.activeDnsLabel = "Custom"
-                    root.scheduleAutoApply()
+                      Behavior on color { ColorAnimation { duration: 90 } }
+
+                      MouseArea {
+                        id: pillMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          if (modelData.key === "mullvad") {
+                            root.activeDnsKey = root.mullvadProfile === "standard" ? "mullvad" : "mullvad-" + root.mullvadProfile
+                            root.activeDnsLabel = "Mullvad"
+                            root.applyAndSave()
+                          } else if (modelData.key === "custom") {
+                            root.activeDnsKey = "custom"
+                            root.activeDnsLabel = "Custom"
+                            if (root.customDnsUrl.trim() !== "") {
+                              root.applyAndSave()
+                            }
+                          } else {
+                            root.activeDnsKey = modelData.key
+                            root.activeDnsLabel = modelData.label
+                            root.applyAndSave()
+                          }
+                        }
+                      }
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption - 1
+                        font.bold: segPill.isSelected
+                        color: segPill.isSelected ? root.foreground : root.dim
+                        textFormat: Text.PlainText
+                      }
+                    }
                   }
                 }
               }
@@ -706,79 +980,79 @@ Panel {
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "standard" ? "● " : "") + "Standard"
+                    text: "Standard"
                     selected: root.mullvadProfile === "standard"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "standard"
                       root.activeDnsKey = "mullvad"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "adblock" ? "● " : "") + "Adblock"
+                    text: "Adblock"
                     selected: root.mullvadProfile === "adblock"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "adblock"
                       root.activeDnsKey = "mullvad-adblock"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "base" ? "● " : "") + "Base"
+                    text: "Base"
                     selected: root.mullvadProfile === "base"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "base"
                       root.activeDnsKey = "mullvad-base"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "extended" ? "● " : "") + "Extended"
+                    text: "Extended"
                     selected: root.mullvadProfile === "extended"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "extended"
                       root.activeDnsKey = "mullvad-extended"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "family" ? "● " : "") + "Family"
+                    text: "Family"
                     selected: root.mullvadProfile === "family"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "family"
                       root.activeDnsKey = "mullvad-family"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
 
                   Button {
                     width: (mainColumn.width - Style.space(8)) / 3
-                    text: (root.mullvadProfile === "all" ? "● " : "") + "All Shield"
+                    text: "All Shield"
                     selected: root.mullvadProfile === "all"
                     bordered: true
                     fontSize: Style.font.caption - 1
                     onClicked: {
                       root.mullvadProfile = "all"
                       root.activeDnsKey = "mullvad-all"
-                      root.scheduleAutoApply()
+                      root.applyAndSave()
                     }
                   }
                 }
@@ -795,7 +1069,7 @@ Panel {
                   width: parent.width
                   placeholderText: "https://doh.example.com/dns-query"
                   text: root.customDnsUrl
-                  onTextChanged: {
+                  onTextEdited: {
                     root.customDnsUrl = text
                     root.scheduleAutoApply()
                   }
@@ -811,9 +1085,12 @@ Panel {
                     Text { text: "Bootstrap IP 1"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
-                      placeholderText: ""
+                      placeholderText: "e.g. 45.90.28.0"
                       text: root.customBootstrapPrimary
-                      onTextChanged: {
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption
+                      accent: "#10B981"
+                      onTextEdited: {
                         root.customBootstrapPrimary = text
                         root.scheduleAutoApply()
                       }
@@ -826,9 +1103,12 @@ Panel {
                     Text { text: "Bootstrap IP 2"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
-                      placeholderText: ""
+                      placeholderText: "e.g. 45.90.30.0"
                       text: root.customBootstrapSecondary
-                      onTextChanged: {
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption
+                      accent: "#10B981"
+                      onTextEdited: {
                         root.customBootstrapSecondary = text
                         root.scheduleAutoApply()
                       }
@@ -838,57 +1118,212 @@ Panel {
               }
 
               PanelSectionHeader {
-                text: "SECURITY & STORAGE POLICIES"
+                text: "DPI EVASION"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
 
-              // frameless seamless policy list
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Column {
+                  width: (parent.width - Style.space(12)) / 3
+                  spacing: 2
+                  Text { text: "TCP MSS"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  TextField {
+                    width: parent.width
+                    text: root.customMss
+                    font.family: "monospace"
+                    font.pixelSize: Style.font.caption
+                    accent: "#10B981"
+                    onTextEdited: {
+                      root.customMss = text
+                      root.scheduleAutoApply()
+                    }
+                  }
+                }
+
+                Column {
+                  width: (parent.width - Style.space(12)) / 3
+                  spacing: 2
+                  Text { text: "Min MSS (Jitter)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  TextField {
+                    width: parent.width
+                    text: root.customMinMss
+                    font.family: "monospace"
+                    font.pixelSize: Style.font.caption
+                    accent: "#10B981"
+                    onTextEdited: {
+                      root.customMinMss = text
+                      root.scheduleAutoApply()
+                    }
+                  }
+                }
+
+                Column {
+                  width: (parent.width - Style.space(12)) / 3
+                  spacing: 2
+                  Text { text: "TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  TextField {
+                    width: parent.width
+                    text: root.customFakeTtl
+                    placeholderText: "0"
+                    font.family: "monospace"
+                    font.pixelSize: Style.font.caption
+                    accent: "#10B981"
+                    onTextEdited: {
+                      root.customFakeTtl = text
+                      root.scheduleAutoApply()
+                    }
+                  }
+                }
+              }
+
               Column {
                 width: parent.width
-                spacing: Style.space(4)
-
-                Toggle {
+                spacing: 2
+                Text { text: "Fake SNI (Pool / Custom)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                TextField {
                   width: parent.width
-                  label: "DNSSEC cryptographic validation"
-                  description: "Enforce DO-bit & Authenticated Data verification"
-                  checked: root.dnssecEnabled
-                  onClicked: {
-                    root.dnssecEnabled = !root.dnssecEnabled
+                  text: root.customFakeSni
+                  placeholderText: "Default pool (rotating)"
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.caption
+                  accent: "#10B981"
+                  onTextEdited: {
+                    root.customFakeSni = text
                     root.scheduleAutoApply()
                   }
                 }
+              }
 
-                Toggle {
+              // grouped DPI evasion card
+              Rectangle {
+                width: parent.width
+                implicitHeight: dpiCol.implicitHeight
+                radius: Style.cornerRadius
+                color: Qt.rgba(1, 1, 1, 0.02)
+                border.color: Qt.rgba(1, 1, 1, 0.07)
+                border.width: 1
+                clip: true
+
+                Column {
+                  id: dpiCol
                   width: parent.width
-                  label: "Post-Quantum Kyber768 (PQC)"
-                  description: "Hybrid ML-KEM-768 quantum-safe key exchange"
-                  checked: root.pqcEnabled
-                  onClicked: {
-                    root.pqcEnabled = !root.pqcEnabled
-                    root.scheduleAutoApply()
+
+                  CompactToggle {
+                    label: "Bad checksum desync (0xDEAD)"
+                    description: "Poison stateful DPI inspection tables"
+                    checked: root.fakeBadChecksum
+                    onClicked: {
+                      root.fakeBadChecksum = !root.fakeBadChecksum
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Block QUIC (UDP 443)"
+                    description: "Force browser HTTPS fallback to TCP"
+                    checked: root.blockQuicEnabled
+                    onClicked: {
+                      root.blockQuicEnabled = !root.blockQuicEnabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Block WebRTC STUN"
+                    description: "Drop UDP 3478/5349 to prevent browser IP leaks"
+                    checked: root.blockStunEnabled
+                    showDivider: false
+                    onClicked: {
+                      root.blockStunEnabled = !root.blockStunEnabled
+                      root.applyAndSave()
+                    }
                   }
                 }
+              }
 
-                Toggle {
+              PanelSectionHeader {
+                text: "SECURITY POLICIES"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              // grouped security & storage card
+              Rectangle {
+                width: parent.width
+                implicitHeight: secCol.implicitHeight
+                radius: Style.cornerRadius
+                color: Qt.rgba(1, 1, 1, 0.02)
+                border.color: Qt.rgba(1, 1, 1, 0.07)
+                border.width: 1
+                clip: true
+
+                Column {
+                  id: secCol
                   width: parent.width
-                  label: "Only-RAM volatile storage"
-                  description: "Isolate state in /dev/shm — zero physical disk writes"
-                  checked: root.ramOnlyEnabled
-                  onClicked: {
-                    root.ramOnlyEnabled = !root.ramOnlyEnabled
-                    root.scheduleAutoApply()
+
+                  CompactToggle {
+                    label: "DNSSEC cryptographic validation"
+                    description: "Enforce DO-bit & Authenticated Data verification"
+                    checked: root.dnssecEnabled
+                    onClicked: {
+                      root.dnssecEnabled = !root.dnssecEnabled
+                      root.applyAndSave()
+                    }
                   }
-                }
 
-                Toggle {
-                  width: parent.width
-                  label: "Filter AAAA (IPv6 drop)"
-                  description: "Prevent unfragmented IPv6 inspection bypass leaks"
-                  checked: root.blockIpv6Enabled
-                  onClicked: {
-                    root.blockIpv6Enabled = !root.blockIpv6Enabled
-                    root.scheduleAutoApply()
+                  CompactToggle {
+                    label: "Post-Quantum Kyber768 (PQC)"
+                    description: "Hybrid ML-KEM-768 quantum-safe key exchange"
+                    checked: root.pqcEnabled
+                    onClicked: {
+                      root.pqcEnabled = !root.pqcEnabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Strict DNS Kill-Switch"
+                    description: "Block non-loopback plaintext port 53 DNS leaks"
+                    checked: root.killSwitchEnabled
+                    onClicked: {
+                      root.killSwitchEnabled = !root.killSwitchEnabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Fail-Closed Network Lockdown"
+                    description: "Block outbound web traffic (ports 80/443) if eBPF fails"
+                    checked: root.networkLockdownEnabled
+                    onClicked: {
+                      root.networkLockdownEnabled = !root.networkLockdownEnabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Filter AAAA (IPv6 drop)"
+                    description: "Prevent unfragmented IPv6 inspection bypass leaks"
+                    checked: root.blockIpv6Enabled
+                    onClicked: {
+                      root.blockIpv6Enabled = !root.blockIpv6Enabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Only-RAM volatile storage"
+                    description: "Isolate state in volatile memory /run (wipes settings on reboot)"
+                    checked: root.ramOnlyEnabled
+                    showDivider: false
+                    onClicked: {
+                      root.ramOnlyEnabled = !root.ramOnlyEnabled
+                      root.applyAndSave()
+                    }
                   }
                 }
               }
@@ -908,7 +1343,7 @@ Panel {
 
                 Button {
                   width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Flush Cache (0ms)"
+                  text: "Flush Cache"
                   bordered: true
                   fontSize: Style.font.caption
                   onClicked: root.purgeDnsCache()
@@ -916,165 +1351,85 @@ Panel {
               }
             }
 
-            // tab 1: transport layer desynchronization tuning
+            // tab 1: realtime packet flow telemetry stream (LOGS)
             Column {
               id: tab1
               width: parent.width
               visible: root.activeTab === 1
               opacity: root.activeTab === 1 ? 1.0 : 0.0
-              spacing: Style.space(8)
-
-              Behavior on opacity {
-                NumberAnimation { duration: 160; easing.type: Easing.OutQuad }
-              }
-
-              PanelSectionHeader {
-                text: "TCP MSS & FAKE PAYLOAD"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-
-                Column {
-                  width: Style.space(110)
-                  spacing: 2
-                  Text { text: "TCP MSS (bytes)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                  TextField {
-                    width: parent.width
-                    text: root.customMss
-                    onTextChanged: {
-                      root.customMss = text
-                      root.scheduleAutoApply()
-                    }
-                  }
-                }
-
-                Column {
-                  width: parent.width - Style.space(116)
-                  spacing: 2
-                  Text { text: "Fake SNI domain"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                  TextField {
-                    width: parent.width
-                    text: root.customFakeSni
-                    onTextChanged: {
-                      root.customFakeSni = text
-                      root.scheduleAutoApply()
-                    }
-                  }
-                }
-              }
-
-              PanelSectionHeader {
-                text: "KERNEL DESYNCHRONIZATION POLICIES"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              // frameless evasion list
-              Column {
-                width: parent.width
-                spacing: Style.space(4)
-
-                Toggle {
-                  width: parent.width
-                  label: "Auto-TTL middlebox probing"
-                  description: "Dynamically calculate router hop distance"
-                  checked: root.autoTtlEnabled
-                  onClicked: {
-                    root.autoTtlEnabled = !root.autoTtlEnabled
-                    root.scheduleAutoApply()
-                  }
-                }
-
-                Toggle {
-                  width: parent.width
-                  label: "Bad checksum desync (0xDEAD)"
-                  description: "Poison stateful DPI inspection tables"
-                  checked: root.fakeBadChecksum
-                  onClicked: {
-                    root.fakeBadChecksum = !root.fakeBadChecksum
-                    root.scheduleAutoApply()
-                  }
-                }
-
-                Toggle {
-                  width: parent.width
-                  label: "Block QUIC (UDP 443)"
-                  description: "Force browser HTTPS fallback to TCP"
-                  checked: root.blockQuicEnabled
-                  onClicked: {
-                    root.blockQuicEnabled = !root.blockQuicEnabled
-                    root.scheduleAutoApply()
-                  }
-                }
-              }
-            }
-
-            // tab 2: realtime packet flow telemetry stream
-            Column {
-              id: tab2
-              width: parent.width
-              visible: root.activeTab === 2
-              opacity: root.activeTab === 2 ? 1.0 : 0.0
               spacing: Style.space(6)
 
               Behavior on opacity {
                 NumberAnimation { duration: 160; easing.type: Easing.OutQuad }
               }
 
-              // telemetry counters header
+              // telemetry counters header (4 interactive metric cards)
               Row {
                 width: parent.width
                 spacing: Style.space(4)
 
-                BorderSurface {
-                  width: (mainColumn.width - Style.space(8)) / 3
-                  height: Style.space(34)
-                  radius: Style.cornerRadius
-                  color: Style.hoverFillFor(root.foreground, "#38BDF8")
-                  borderSpec: Border.controlSpec("normal", root.foreground, "#38BDF8")
+                Repeater {
+                  model: [
+                    { key: "INJECT", label: "Injected", count: root.countInjected, color: "#38BDF8" },
+                    { key: "DNS",    label: "DoH Resolv", count: root.countDns,      color: "#A855F7" },
+                    { key: "QUIC",   label: "QUIC Block", count: root.countQuic,     color: "#F59E0B" },
+                    { key: "SHIELD", label: "Shield",     count: root.countShield,   color: "#10B981" }
+                  ]
 
-                  RowLayout {
-                    anchors.centerIn: parent
-                    spacing: Style.space(4)
+                  Rectangle {
+                    id: metricCard
+                    width: (mainColumn.width - Style.space(12)) / 4
+                    height: Style.space(38)
+                    radius: Style.cornerRadius
+                    readonly property color cardCol: modelData.color
+                    readonly property bool isSelected: root.streamFilter === modelData.key
+                    color: isSelected 
+                      ? Qt.rgba(cardCol.r, cardCol.g, cardCol.b, 0.16)
+                      : (cardMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(1, 1, 1, 0.02))
+                    border.color: isSelected 
+                      ? cardCol 
+                      : (cardMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : root.borderMuted)
+                    border.width: isSelected ? 1.5 : 1
 
-                    Text { text: String(root.countInjected); font.bold: true; font.family: "monospace"; font.pixelSize: Style.font.bodySmall; color: "#38BDF8" }
-                    Text { text: "Injected"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; color: root.dim }
-                  }
-                }
+                    Behavior on color { ColorAnimation { duration: 90 } }
+                    Behavior on border.color { ColorAnimation { duration: 90 } }
 
-                BorderSurface {
-                  width: (mainColumn.width - Style.space(8)) / 3
-                  height: Style.space(34)
-                  radius: Style.cornerRadius
-                  color: Style.hoverFillFor(root.foreground, "#A855F7")
-                  borderSpec: Border.controlSpec("normal", root.foreground, "#A855F7")
+                    MouseArea {
+                      id: cardMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        if (root.streamFilter === modelData.key) {
+                          root.setFilter("ALL")
+                        } else {
+                          root.setFilter(modelData.key)
+                        }
+                      }
+                    }
 
-                  RowLayout {
-                    anchors.centerIn: parent
-                    spacing: Style.space(4)
+                    ColumnLayout {
+                      anchors.centerIn: parent
+                      spacing: 0
 
-                    Text { text: String(root.countDns); font.bold: true; font.family: "monospace"; font.pixelSize: Style.font.bodySmall; color: "#A855F7" }
-                    Text { text: "DoH Resolv"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; color: root.dim }
-                  }
-                }
+                      Text {
+                        text: String(modelData.count)
+                        font.bold: true
+                        font.family: "monospace"
+                        font.pixelSize: Style.font.bodySmall
+                        color: modelData.color
+                        Layout.alignment: Qt.AlignHCenter
+                      }
 
-                BorderSurface {
-                  width: (mainColumn.width - Style.space(8)) / 3
-                  height: Style.space(34)
-                  radius: Style.cornerRadius
-                  color: Style.hoverFillFor(root.foreground, "#F59E0B")
-                  borderSpec: Border.controlSpec("normal", root.foreground, "#F59E0B")
-
-                  RowLayout {
-                    anchors.centerIn: parent
-                    spacing: Style.space(4)
-
-                    Text { text: String(root.countQuic); font.bold: true; font.family: "monospace"; font.pixelSize: Style.font.bodySmall; color: "#F59E0B" }
-                    Text { text: "QUIC Block"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; color: root.dim }
+                      Text {
+                        text: modelData.label
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption - 2
+                        font.bold: metricCard.isSelected
+                        color: metricCard.isSelected ? root.foreground : root.dim
+                        Layout.alignment: Qt.AlignHCenter
+                      }
+                    }
                   }
                 }
               }
@@ -1091,68 +1446,141 @@ Panel {
                 }
               }
 
-              // category selection pills and pause toggle
-              RowLayout {
+              // category filter pills, live packet flow rate, pause, clear & terminal actions
+              Item {
                 width: parent.width
-                spacing: Style.space(4)
+                implicitHeight: Math.max(filterPillsRow.implicitHeight, rightStreamControls.implicitHeight)
 
-                Button {
-                  text: "All"
-                  selected: root.streamFilter === "ALL"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  horizontalPadding: Style.space(6)
-                  verticalPadding: Style.space(2)
-                  onClicked: root.setFilter("ALL")
+                Row {
+                  id: filterPillsRow
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Button {
+                    text: "All"
+                    selected: root.streamFilter === "ALL"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("ALL")
+                  }
+
+                  Button {
+                    text: "Inject"
+                    selected: root.streamFilter === "INJECT"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("INJECT")
+                  }
+
+                  Button {
+                    text: "DNS"
+                    selected: root.streamFilter === "DNS"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("DNS")
+                  }
+
+                  Button {
+                    text: "QUIC"
+                    selected: root.streamFilter === "QUIC"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("QUIC")
+                  }
+
+                  Button {
+                    text: "Shield"
+                    selected: root.streamFilter === "SHIELD"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("SHIELD")
+                  }
                 }
 
-                Button {
-                  text: "Inject"
-                  selected: root.streamFilter === "INJECT"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  horizontalPadding: Style.space(6)
-                  verticalPadding: Style.space(2)
-                  onClicked: root.setFilter("INJECT")
-                }
+                Row {
+                  id: rightStreamControls
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
 
-                Button {
-                  text: "DNS"
-                  selected: root.streamFilter === "DNS"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  horizontalPadding: Style.space(6)
-                  verticalPadding: Style.space(2)
-                  onClicked: root.setFilter("DNS")
-                }
+                  // live flow rate indicator badge
+                  Rectangle {
+                    height: pauseStreamBtn.height
+                    width: rateContentRow.implicitWidth + Style.space(10)
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.03)
+                    border.color: root.borderMuted
+                    border.width: 1
 
-                Button {
-                  text: "QUIC"
-                  selected: root.streamFilter === "QUIC"
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  horizontalPadding: Style.space(6)
-                  verticalPadding: Style.space(2)
-                  onClicked: root.setFilter("QUIC")
-                }
+                    Row {
+                      id: rateContentRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
 
-                Item { Layout.fillWidth: true }
+                      Rectangle {
+                        width: 5
+                        height: 5
+                        radius: 0
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: (root.isRunning && !root.isStreamPaused) ? "#10B981" : root.dim
+                      }
 
-                Button {
-                  text: root.isStreamPaused ? "Resume Stream" : "Pause Stream"
-                  selected: root.isStreamPaused
-                  bordered: true
-                  fontSize: Style.font.caption - 1
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(2)
-                  onClicked: root.togglePause()
+                      Text {
+                        text: root.eventRateText
+                        font.family: "monospace"
+                        font.pixelSize: Style.font.caption - 2
+                        color: root.dim
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+                  }
+
+                  Button {
+                    id: pauseStreamBtn
+                    text: root.isStreamPaused ? "Resume" : "Pause"
+                    selected: root.isStreamPaused
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.togglePause()
+                  }
+
+                  Button {
+                    text: "Clear"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.clearStream()
+                  }
+
+                  Button {
+                    text: "TUI"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.openMonitor()
+                  }
                 }
               }
 
-              // borderless terminal stream list
+              // borderless terminal stream list with smart pinning
               BorderSurface {
                 width: parent.width
-                height: Style.space(220)
+                height: Style.space(330)
                 color: Style.normalFillFor(root.foreground, root.accent)
                 borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
                 radius: Style.cornerRadius
@@ -1161,27 +1589,42 @@ Panel {
                 ListView {
                   id: streamListView
                   anchors.fill: parent
-                  anchors.leftMargin: Style.space(8)
-                  anchors.rightMargin: Style.space(8)
+                  anchors.leftMargin: Style.space(6)
+                  anchors.rightMargin: Style.space(6)
                   anchors.topMargin: Style.space(6)
                   anchors.bottomMargin: Style.space(6)
                   model: root.displayEvents
-                  spacing: Style.space(2)
+                  spacing: Style.space(3)
                   boundsBehavior: Flickable.StopAtBounds
+
+                  onContentYChanged: {
+                    var maxScroll = contentHeight - height
+                    root.isAtBottom = (maxScroll <= 0 || (maxScroll - contentY) < 30)
+                  }
 
                   delegate: Rectangle {
                     id: eventCard
                     width: streamListView.width
                     height: Style.space(30)
                     radius: Style.cornerRadius
-                    color: eventMouse.containsMouse ? Style.hoverFillFor(root.foreground, modelData.badgeColor) : "transparent"
+                    readonly property color badgeCol: modelData.badgeColor
+                    readonly property bool isCopied: root.copiedEventId === index
+                    color: isCopied
+                      ? Qt.rgba(0.06, 0.72, 0.5, 0.16)
+                      : (eventMouse.containsMouse ? Style.hoverFillFor(root.foreground, modelData.badgeColor) : "transparent")
+
+                    Behavior on color { ColorAnimation { duration: 90 } }
 
                     MouseArea {
                       id: eventMouse
                       anchors.fill: parent
                       hoverEnabled: true
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: root.copyToClipboard(modelData.title)
+                      onClicked: {
+                        root.copyToClipboard(modelData.title + (modelData.tag ? " " + modelData.tag : ""))
+                        root.copiedEventId = index
+                        copiedFeedbackTimer.restart()
+                      }
                     }
 
                     RowLayout {
@@ -1190,14 +1633,28 @@ Panel {
                       anchors.rightMargin: Style.space(6)
                       spacing: Style.space(8)
 
+                      // 1. Sleek category micro badge pill
                       Rectangle {
-                        width: Style.space(6)
-                        height: Style.space(6)
+                        implicitWidth: catText.implicitWidth + Style.space(8)
+                        implicitHeight: Style.space(18)
                         radius: Style.cornerRadius
-                        color: modelData.badgeColor
+                        color: Qt.rgba(badgeCol.r, badgeCol.g, badgeCol.b, 0.14)
+                        border.color: Qt.rgba(badgeCol.r, badgeCol.g, badgeCol.b, 0.35)
+                        border.width: 1
                         Layout.alignment: Qt.AlignVCenter
+
+                        Text {
+                          id: catText
+                          anchors.centerIn: parent
+                          text: modelData.category
+                          font.family: "monospace"
+                          font.pixelSize: Style.font.caption - 2
+                          font.bold: true
+                          color: modelData.badgeColor
+                        }
                       }
 
+                      // 2. Title / target domain
                       Text {
                         Layout.fillWidth: true
                         text: modelData.title
@@ -1209,22 +1666,46 @@ Panel {
                         elide: Text.ElideRight
                       }
 
+                      // 3. Detail text (hidden on narrow widths)
                       Text {
                         text: modelData.detail
                         textFormat: Text.PlainText
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption - 1
                         color: root.dim
-                        visible: eventCard.width > Style.space(300)
+                        visible: eventCard.width > Style.space(340)
                         elide: Text.ElideRight
                       }
 
+                      // 4. Tag pill (TTL, DNSSEC, 0ms Cache, etc.)
+                      Rectangle {
+                        visible: modelData.tag !== undefined && modelData.tag !== ""
+                        implicitWidth: tagText.implicitWidth + Style.space(8)
+                        implicitHeight: Style.space(16)
+                        radius: Style.cornerRadius
+                        color: Qt.rgba(1, 1, 1, 0.05)
+                        border.color: Qt.rgba(1, 1, 1, 0.10)
+                        border.width: 1
+                        Layout.alignment: Qt.AlignVCenter
+
+                        Text {
+                          id: tagText
+                          anchors.centerIn: parent
+                          text: modelData.tag || ""
+                          font.family: "monospace"
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.dim
+                        }
+                      }
+
+                      // 5. Copied badge or Timestamp
                       Text {
-                        text: modelData.time
+                        text: eventCard.isCopied ? "COPIED" : modelData.time
                         textFormat: Text.PlainText
                         font.family: "monospace"
                         font.pixelSize: Style.font.caption - 1
-                        color: root.dim
+                        font.bold: eventCard.isCopied
+                        color: eventCard.isCopied ? "#10B981" : root.dim
                         Layout.alignment: Qt.AlignVCenter
                       }
                     }
@@ -1242,27 +1723,38 @@ Panel {
                     font.pixelSize: Style.font.caption
                   }
                 }
-              }
 
-              // stream auxiliary action triggers
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
+                // Floating Jump to latest button when user scrolls up
+                Rectangle {
+                  visible: !root.isAtBottom && root.displayEvents.length > 0
+                  anchors.bottom: parent.bottom
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  anchors.bottomMargin: Style.space(8)
+                  width: jumpText.implicitWidth + Style.space(16)
+                  height: Style.space(22)
+                  radius: Style.cornerRadius
+                  color: Qt.rgba(0.08, 0.08, 0.10, 0.95)
+                  border.color: root.borderMuted
+                  border.width: 1
 
-                Button {
-                  width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Clear Stream"
-                  bordered: true
-                  fontSize: Style.font.caption
-                  onClicked: root.clearStream()
-                }
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      streamListView.positionViewAtEnd()
+                      root.isAtBottom = true
+                    }
+                  }
 
-                Button {
-                  width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Open Terminal TUI"
-                  bordered: true
-                  fontSize: Style.font.caption
-                  onClicked: root.openMonitor()
+                  Text {
+                    id: jumpText
+                    anchors.centerIn: parent
+                    text: "Jump to latest"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption - 1
+                    font.bold: true
+                    color: "#38BDF8"
+                  }
                 }
               }
             }
@@ -1289,11 +1781,29 @@ Panel {
           }
 
           // keybindings footer
-          RowLayout {
+          Item {
             width: parent.width
-            Text { text: "1-3 tabs • space toggle"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; color: root.dim }
-            Item { Layout.fillWidth: true }
-            Text { text: "p pause • j/k scroll • esc close"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; color: root.dim }
+            implicitHeight: Math.max(leftHint.implicitHeight, rightHint.implicitHeight)
+
+            Text {
+              id: leftHint
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "1-2 tabs • space toggle"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption - 1
+              color: root.dim
+            }
+
+            Text {
+              id: rightHint
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "p pause • j/k scroll • esc close"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption - 1
+              color: root.dim
+            }
           }
         }
       }

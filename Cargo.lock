@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "albus"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cc",
  "clap",
@@ -26,6 +26,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -46,6 +46,11 @@ impl TtlCache {
             if guard.len() >= MAX_CACHE_ENTRIES {
                 // evict entries older than 3600 seconds when table capacity is saturated
                 guard.retain(|_, entry| entry.inserted_at.elapsed().as_secs() < 3600);
+                if guard.len() >= MAX_CACHE_ENTRIES {
+                    if let Some(oldest) = guard.keys().next().cloned() {
+                        guard.remove(&oldest);
+                    }
+                }
             }
             guard.insert(
                 ip,

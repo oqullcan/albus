@@ -49,14 +49,17 @@ pub fn show_status_json() {
         .unwrap_or(false);
 
     let is_active = is_service_active || is_process_running;
+    let cfg = crate::app::config::Config::load_or_default();
 
     if is_active {
         println!(
-            "{{\"text\":\"󰞌\",\"alt\":\"active\",\"tooltip\":\"albus DPI Bypass: ACTIVE\\nEngine: eBPF sock_ops\\nDNS: 127.0.0.1 (Encrypted DoH)\",\"class\":\"active\"}}"
+            "{{\"text\":\"󰞌\",\"alt\":\"active\",\"tooltip\":\"albus DPI Bypass: ACTIVE\\nEngine: eBPF sock_ops\\nDNS: 127.0.0.1 (Encrypted DoH)\",\"class\":\"active\",\"active\":true,\"doh_upstream\":\"{}\"}}",
+            cfg.doh_upstream
         );
     } else {
         println!(
-            "{{\"text\":\"󰞏\",\"alt\":\"inactive\",\"tooltip\":\"albus DPI Bypass: INACTIVE\\nRun 'sudo albus run' or 'sudo albus service start'\",\"class\":\"inactive\"}}"
+            "{{\"text\":\"󰞏\",\"alt\":\"inactive\",\"tooltip\":\"albus DPI Bypass: INACTIVE\\nRun 'sudo albus run' or 'sudo albus service start'\",\"class\":\"inactive\",\"active\":false,\"doh_upstream\":\"{}\"}}",
+            cfg.doh_upstream
         );
     }
 }

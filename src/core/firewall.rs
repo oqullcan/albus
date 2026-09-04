@@ -1,4 +1,4 @@
-//! iptables and ip6tables packet filtering rules to enforce tcp fallback from http/3 quic.
+//! iptables and ip6tables packet filtering rules for quic fallback, webrtc stun drop, and dns leak kill-switch.
 
 use std::process::Command;
 use tracing::{debug, info};
@@ -16,9 +16,8 @@ pub fn block_quic() {
     info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
 }
 
-// purges injected reject rules from output filter chain
+// purges injected reject rules for udp 443
 pub fn unblock_quic() {
-    // iterate until no matching reject rules remain in ipv4 output chain
     while let Ok(status) = Command::new("iptables")
         .args(["-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
         .status()
@@ -28,7 +27,6 @@ pub fn unblock_quic() {
         }
     }
 
-    // iterate until no matching reject rules remain in ipv6 output chain
     while let Ok(status) = Command::new("ip6tables")
         .args(["-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
         .status()
@@ -39,4 +37,145 @@ pub fn unblock_quic() {
     }
 
     debug!("QUIC firewall rules cleaned up");
+}
+
+// blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks
+pub fn block_stun() {
+    for port in &["3478", "5349"] {
+        let _ = Command::new("iptables")
+            .args(["-I", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"])
+            .status();
+
+        let _ = Command::new("ip6tables")
+            .args(["-I", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"])
+            .status();
+    }
+
+    info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
+}
+
+// purges stun packet filtering rules
+pub fn unblock_stun() {
+    for port in &["3478", "5349"] {
+        while let Ok(status) = Command::new("iptables")
+            .args(["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"])
+            .status()
+        {
+            if !status.success() {
+                break;
+            }
+        }
+
+        while let Ok(status) = Command::new("ip6tables")
+            .args(["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"])
+            .status()
+        {
+            if !status.success() {
+                break;
+            }
+        }
+    }
+
+    debug!("STUN firewall rules cleaned up");
+}
+
+// enables strict dns kill-switch: drops all non-loopback outbound port 53 traffic
+// guarantees no application or rogue dhcp server can leak plaintext dns to the isp
+pub fn enable_kill_switch() {
+    // block unencrypted udp and tcp port 53 leaving non-loopback interfaces
+    let _ = Command::new("iptables")
+        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .status();
+    let _ = Command::new("iptables")
+        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .status();
+
+    let _ = Command::new("ip6tables")
+        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .status();
+    let _ = Command::new("ip6tables")
+        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .status();
+
+    info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
+}
+
+// removes dns kill-switch filtering rules
+pub fn disable_kill_switch() {
+    while let Ok(status) = Command::new("iptables")
+        .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .status()
+    {
+        if !status.success() {
+            break;
+        }
+    }
+    while let Ok(status) = Command::new("iptables")
+        .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .status()
+    {
+        if !status.success() {
+            break;
+        }
+    }
+
+    while let Ok(status) = Command::new("ip6tables")
+        .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .status()
+    {
+        if !status.success() {
+            break;
+        }
+    }
+    while let Ok(status) = Command::new("ip6tables")
+        .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .status()
+    {
+        if !status.success() {
+            break;
+        }
+    }
+
+    debug!("DNS Kill-Switch deactivated");
+}
+
+// enables fail-closed network lockdown: blocks outbound non-loopback tcp traffic on ports 80 and 443
+// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails
+pub fn enable_network_lockdown() {
+    for port in &["80", "443"] {
+        let _ = Command::new("iptables")
+            .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .status();
+
+        let _ = Command::new("ip6tables")
+            .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .status();
+    }
+
+    info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
+}
+
+// purges fail-closed network lockdown rules
+pub fn disable_network_lockdown() {
+    for port in &["80", "443"] {
+        while let Ok(status) = Command::new("iptables")
+            .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .status()
+        {
+            if !status.success() {
+                break;
+            }
+        }
+
+        while let Ok(status) = Command::new("ip6tables")
+            .args(["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .status()
+        {
+            if !status.success() {
+                break;
+            }
+        }
+    }
+
+    debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");
 }

@@ -32,7 +32,7 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("  \x1b[1mresolver\x1b[0m  127.0.0.1:53 \x1b[2m(quad9 doh • pqc ml-kem-768 • dnssec)\x1b[0m");
     println!("  \x1b[1mevasion\x1b[0m   mss 88b \x1b[2m(restore 600b) • auto-ttl • fake sni • quic drop\x1b[0m");
-    println!("  \x1b[1mstorage\x1b[0m   volatile tmpfs \x1b[2m(/dev/shm — zero-disk footprint)\x1b[0m");
+    println!("  \x1b[1mstorage\x1b[0m   volatile tmpfs \x1b[2m(/run — zero-disk footprint)\x1b[0m");
     println!("\n\x1b[2m──────────────────────────────────────────────────────────────────────────\x1b[0m\n");
     stdout.flush()?;
 

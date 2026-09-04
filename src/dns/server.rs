@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::cache::DnsCache;
 use super::doh::DoHResolver;
@@ -86,6 +86,51 @@ impl DnsServer {
         let dnssec = self.dnssec;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
+        let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick_count: u64 = 0;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        tick_count = tick_count.wrapping_add(1);
+
+                        // 1. Passive check: verify resolv.conf still directs queries to loopback
+                        if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+                            let has_loopback = content.lines().any(|line| {
+                                let trimmed = line.trim();
+                                (trimmed.starts_with("nameserver 127.0.0.1") || trimmed.starts_with("nameserver 127.0.0.53"))
+                                    && !trimmed.starts_with('#')
+                            });
+
+                            if !has_loopback {
+                                warn!("DNS leak canary: /etc/resolv.conf does not point to 127.0.0.1 (possible DHCP/NetworkManager overwrite). Auto-healing system DNS...");
+                                if let Err(e) = crate::dns::system::set_system_dns() {
+                                    warn!("failed to auto-heal /etc/resolv.conf: {}", e);
+                                } else {
+                                    info!("DNS leak canary: successfully auto-healed /etc/resolv.conf to 127.0.0.1");
+                                }
+                            }
+                        }
+
+                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
+                        if tick_count % 4 == 0 {
+                            run_active_canary_probe().await;
+                        }
+                    }
+                    _ = canary_shutdown_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        const MAX_CONCURRENT_DNS_TASKS: usize = 512;
+        const MAX_IP_QUEUE_ENTRIES: usize = 4096;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_TASKS));
+
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
 
@@ -99,8 +144,30 @@ impl DnsServer {
                                 let resolver_clone = resolver.clone();
                                 let cache_clone = cache.clone();
                                 let ip_queue_clone = ip_queue.clone();
+                                let sem_clone = semaphore.clone();
 
                                 tokio::spawn(async move {
+                                    // shed load under flooding attacks to prevent unbounded task/socket spawning
+                                    let _permit = match sem_clone.try_acquire() {
+                                        Ok(permit) => permit,
+                                        Err(_) => {
+                                            if query_data.len() >= 4 {
+                                                let mut fail_resp = query_data.clone();
+                                                fail_resp[2] |= 0x80;
+                                                fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // SERVFAIL
+                                                let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
+                                            }
+                                            return;
+                                        }
+                                    };
+
+                                    // 0. intercept internal dns leak test canary probe
+                                    if is_canary_query(&query_data) {
+                                        let canary_resp = build_canary_response(&query_data, Ipv4Addr::new(127, 0, 0, 99));
+                                        let _ = socket_clone.send_to(&canary_resp, peer_addr).await;
+                                        return;
+                                    }
+
                                     // 1. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
                                     if block_ipv6 && is_aaaa_query(&query_data) {
                                         let nodata = build_nodata_response(&query_data);
@@ -119,6 +186,11 @@ impl DnsServer {
                                                     "DNS cache hit"
                                                 );
                                                 let mut map = ip_queue_clone.lock().await;
+                                                if map.len() >= MAX_IP_QUEUE_ENTRIES {
+                                                    if let Some(oldest) = map.keys().next().cloned() {
+                                                        map.remove(&oldest);
+                                                    }
+                                                }
                                                 for ip in ips {
                                                     let queue = map.entry(ip).or_default();
                                                     if queue.len() < 50 {
@@ -154,6 +226,11 @@ impl DnsServer {
                                                         "DNS resolved"
                                                     );
                                                     let mut map = ip_queue_clone.lock().await;
+                                                    if map.len() >= MAX_IP_QUEUE_ENTRIES {
+                                                        if let Some(oldest) = map.keys().next().cloned() {
+                                                            map.remove(&oldest);
+                                                        }
+                                                    }
                                                     for ip in ips {
                                                         let queue = map.entry(ip).or_default();
                                                         if queue.len() < 50 {
@@ -201,6 +278,12 @@ impl DnsServer {
     // signals graceful shutdown to background udp listener task
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    // clears all entries from the in-memory response cache
+    pub fn flush_cache(&self) {
+        self.cache.clear();
+        info!("DNS in-memory response cache flushed");
     }
 }
 
@@ -268,6 +351,126 @@ pub fn is_dnssec_authenticated(response: &[u8]) -> bool {
         (response[3] & 0x20) != 0
     } else {
         false
+    }
+}
+
+// inspects question section for internal dns leak test probe domain
+pub fn is_canary_query(data: &[u8]) -> bool {
+    if let Some((domain, _)) = parse_dns_name(data, 12) {
+        domain == "leak-test.albus.internal" || domain == "canary.albus.internal"
+    } else {
+        false
+    }
+}
+
+// generates synthetic a-record response pointing to internal canary ip (127.0.0.99)
+pub fn build_canary_response(query: &[u8], canary_ip: Ipv4Addr) -> Vec<u8> {
+    if query.len() < 12 {
+        return query.to_vec();
+    }
+
+    // locate the end of question section
+    let mut pos = 12;
+    while pos < query.len() {
+        let len = query[pos] as usize;
+        if len == 0 {
+            pos += 1;
+            break;
+        }
+        if (len & 0xC0) == 0xC0 {
+            pos += 2;
+            break;
+        }
+        pos += 1 + len;
+    }
+    pos += 4; // qtype (2) + qclass (2)
+    if pos > query.len() {
+        pos = query.len();
+    }
+
+    let mut resp = Vec::with_capacity(pos + 16);
+    resp.extend_from_slice(&query[..pos]);
+
+    resp[2] = 0x81; // qr=1, rd=1
+    resp[3] = 0x80; // ra=1, rcode=0
+    resp[6] = 0x00;
+    resp[7] = 0x01; // ancount = 1
+    resp[8] = 0x00;
+    resp[9] = 0x00;
+    resp[10] = 0x00;
+    resp[11] = 0x00;
+
+    // answer rr pointing to question section at offset 12 (0xc00c)
+    resp.push(0xc0);
+    resp.push(0x0c);
+    resp.push(0x00);
+    resp.push(0x01); // type a (1)
+    resp.push(0x00);
+    resp.push(0x01); // class in (1)
+    resp.extend_from_slice(&60u32.to_be_bytes()); // ttl = 60s
+    resp.push(0x00);
+    resp.push(0x04); // rdlength = 4
+    resp.extend_from_slice(&canary_ip.octets());
+
+    resp
+}
+
+// builds standard rfc 1035 dns query for leak-test.albus.internal (type a, class in)
+pub fn build_canary_query() -> Vec<u8> {
+    let mut query = vec![
+        0xca, 0xfe, // Transaction ID
+        0x01, 0x00, // Flags: standard query, recursion desired
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, // Answer RRs: 0
+        0x00, 0x00, // Authority RRs: 0
+        0x00, 0x00, // Additional RRs: 0
+    ];
+    let domain = "leak-test.albus.internal";
+    for label in domain.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0x00); // root label
+    query.extend_from_slice(&[0x00, 0x01]); // Type A (1)
+    query.extend_from_slice(&[0x00, 0x01]); // Class IN (1)
+    query
+}
+
+// actively probes local loopback resolver to verify canary responsiveness and detect dns leaks
+async fn run_active_canary_probe() {
+    let probe_res = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let query = build_canary_query();
+        sock.send_to(&query, "127.0.0.1:53").await?;
+
+        let mut resp_buf = [0u8; 512];
+        let (len, _) = sock.recv_from(&mut resp_buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(resp_buf[..len].to_vec())
+    }).await;
+
+    match probe_res {
+        Ok(Ok(resp)) => {
+            if resp.windows(4).any(|w| w == [127, 0, 0, 99]) {
+                debug!("active DNS leak canary probe passed: 127.0.0.99 verified from local proxy");
+            } else {
+                warn!("Active DNS Leak Canary TRIPPED: resolver responded without expected canary IP (127.0.0.99). Potential DNS hijacking or poisoned cache detected!");
+                if let Err(e) = crate::dns::system::set_system_dns() {
+                    warn!("failed to auto-heal /etc/resolv.conf: {}", e);
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("Active DNS Leak Canary probe network error ({}). Auto-healing system DNS...", e);
+            if let Err(err) = crate::dns::system::set_system_dns() {
+                warn!("failed to auto-heal /etc/resolv.conf: {}", err);
+            }
+        }
+        Err(_) => {
+            warn!("Active DNS Leak Canary probe timed out (1.5s): local DNS proxy unresponsive! Auto-healing system DNS...");
+            if let Err(e) = crate::dns::system::set_system_dns() {
+                warn!("failed to auto-heal /etc/resolv.conf: {}", e);
+            }
+        }
     }
 }
 
@@ -484,5 +687,40 @@ mod tests {
     fn test_parse_dns_response_empty() {
         assert_eq!(parse_dns_response(&[]), None);
         assert_eq!(parse_dns_response(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn test_dns_leak_canary_intercept() {
+        // build query for leak-test.albus.internal
+        let mut query = vec![
+            0xDE, 0xAD, // ID
+            0x01, 0x00, // standard query
+            0x00, 0x01, // qdcount = 1
+            0x00, 0x00, // ancount
+            0x00, 0x00, // nscount
+            0x00, 0x00, // arcount
+        ];
+        let domain = "leak-test.albus.internal";
+        for part in domain.split('.') {
+            query.push(part.len() as u8);
+            query.extend_from_slice(part.as_bytes());
+        }
+        query.push(0x00);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A, IN
+
+        assert!(is_canary_query(&query));
+
+        let canary_resp = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
+        assert!(canary_resp.len() > query.len());
+        // verify 127.0.0.99 is contained in the answer section
+        assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
+    }
+
+    #[test]
+    fn test_build_canary_query() {
+        let query = build_canary_query();
+        assert!(is_canary_query(&query));
+        let canary_resp = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
+        assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
     }
 }

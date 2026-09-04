@@ -1,5 +1,4 @@
 //! binary entrypoint for daemon lifecycle, cli dispatch, and engine execution.
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
 use albus::app::cli::{Cli, Commands, ConfigCommands, RunArgs};
 use albus::app::config::Config;
@@ -14,9 +13,6 @@ use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // initialize process-wide post-quantum cryptographic provider (aws-lc-rs ml-kem-768 / kyber768 hybrid key exchange)
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     // parse command line arguments via clap derive parser
     let cli = Cli::parse();
 
@@ -39,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mut cfg = Config::load_or_default();
                     // update runtime tuning parameters
                     cfg.mss = args.mss;
+                    cfg.min_mss = args.min_mss;
                     cfg.restore_mss = args.restore_mss;
                     cfg.restore_after_bytes = args.restore_after_bytes;
                     cfg.ports = args.ports;
@@ -53,6 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.doh_upstream = args.doh_upstream;
                     cfg.doh_bootstrap_ips = args.doh_bootstrap_ips;
                     cfg.block_quic = args.block_quic;
+                    cfg.block_stun = args.block_stun;
+                    cfg.kill_switch = args.kill_switch;
+                    cfg.network_lockdown = args.network_lockdown;
                     cfg.block_ipv6 = args.block_ipv6;
                     cfg.dnssec = args.dnssec;
                     cfg.pqc = args.pqc;
@@ -62,10 +62,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let path = Config::default_config_path();
                     cfg.save_to_file(&path)?;
                     if cfg.ram_only {
-                        println!("albus configuration saved to volatile ram storage (/dev/shm/albus/config.json)");
+                        println!(
+                            "albus configuration saved to volatile ram storage ({})",
+                            Config::volatile_config_path().display()
+                        );
                     } else {
                         println!("albus configuration saved to {}", path.display());
                     }
+
+                    // if background daemon is actively running, notify it via SIGHUP to apply maps live
+                    let is_active = std::process::Command::new("systemctl")
+                        .args(["is-active", "--quiet", "albus.service"])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if is_active {
+                        let _ = std::process::Command::new("systemctl")
+                            .args(["kill", "-s", "HUP", "albus.service"])
+                            .status();
+                        println!("live configuration reloaded into running albus daemon (SIGHUP)");
+                    }
+
                     Ok(())
                 }
                 None => {
@@ -92,6 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             println!("albus cleanup");
             firewall::unblock_quic();
+            firewall::unblock_stun();
+            firewall::disable_kill_switch();
+            firewall::disable_network_lockdown();
             match dns::cleanup_system_dns() {
                 Ok(true) => {
                     println!("cleanup complete — system DNS and firewall rules restored");

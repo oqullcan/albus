@@ -38,14 +38,32 @@ pub fn has_btf() -> bool {
     Path::new("/sys/kernel/btf/vmlinux").exists()
 }
 
-// checks kernel support for ebpf sock_ops hook points and bpf_setsockopt helper
+// parses linux kernel release string (e.g. "6.13.5-arch1", "5.15.0-generic") into (major, minor)
+pub fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split('.');
+    let major = parts.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+// checks kernel support for ebpf sock_ops hook points, minimum kernel version (>= 5.10), and cgroup v2
 pub fn have_sock_ops() -> bool {
     if !is_root() {
         return false;
     }
 
-    if let Ok(version_str) = fs::read_to_string("/proc/version") {
-        return version_str.contains("Linux");
+    // verify kernel version is at least 5.10
+    if let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") {
+        if let Some((major, minor)) = parse_kernel_version(&release) {
+            if major < 5 || (major == 5 && minor < 10) {
+                return false;
+            }
+        }
+    }
+
+    // verify cgroup v2 hierarchy is accessible
+    if !is_cgroup_v2("/sys/fs/cgroup") {
+        return false;
     }
 
     true
@@ -86,6 +104,14 @@ mod tests {
         let ifaces = list_active_interfaces();
         // loopback is filtered out
         assert!(!ifaces.contains(&"lo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_kernel_version() {
+        assert_eq!(parse_kernel_version("6.13.5-arch1"), Some((6, 13)));
+        assert_eq!(parse_kernel_version("5.10.0-8-amd64"), Some((5, 10)));
+        assert_eq!(parse_kernel_version("4.19.128"), Some((4, 19)));
+        assert_eq!(parse_kernel_version("invalid"), None);
     }
 
     #[test]

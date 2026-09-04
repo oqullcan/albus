@@ -1,5 +1,14 @@
 //! rfc 6066 server name indication (sni) extension parser for clienthello records.
 
+// default pool of legitimate high-reputation domain snis used for decoy rotation
+pub const DEFAULT_DECOY_SNI_POOL: &[&str] = &[
+    "www.google.com",
+    "cloudflare.com",
+    "www.microsoft.com",
+    "aws.amazon.com",
+    "apple.com",
+];
+
 // parses the server name indication hostname string from an incoming tls clienthello record
 pub fn parse_sni(data: &[u8]) -> Option<String> {
     // 1. verify tls record layer encapsulation (content_type 0x16)
@@ -138,5 +147,15 @@ mod tests {
         assert_eq!(parse_sni(&[]), None);
         assert_eq!(parse_sni(&[0x16, 0x03]), None);
         assert_eq!(parse_sni(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn test_decoy_sni_pool_roundtrip() {
+        use crate::core::fake::clienthello::build_fake_client_hello;
+        for &domain in DEFAULT_DECOY_SNI_POOL {
+            let ch = build_fake_client_hello(domain);
+            let parsed = parse_sni(&ch);
+            assert_eq!(parsed.as_deref(), Some(domain));
+        }
     }
 }
