@@ -4,7 +4,7 @@
   "name": "Albus DPI",
   "version": "2.1.0",
   "author": "Oğulcan Yetim",
-  "license": "MIT",
+  "license": "GPL-3.0",
   "description": "Kernel-level deep packet inspection (DPI) evasion engine and post-quantum DNS-over-HTTPS suite with Omarchy integration.",
   "kinds": [
     "bar-widget"

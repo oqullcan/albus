@@ -6,7 +6,7 @@
 [![rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![ebpf](https://img.shields.io/badge/kernel-eBPF%20CO--RE-success.svg)](https://docs.kernel.org/bpf/)
 [![crypto](https://img.shields.io/badge/pqc-ML--KEM--768-purple.svg)](https://csrc.nist.gov/pubs/fips/203/final)
-[![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
 ---
 
@@ -29,7 +29,7 @@
 | **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
 | **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs` cryptographic provider. |
 | **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
-| **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` enables unprivileged desktop management of `albus.service`. |
+| **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` enables passwordless desktop management for `wheel`/`sudo` users. |
 
 ---
 
@@ -128,13 +128,16 @@ sudo albus run --doh-upstream mullvad-base
 sudo albus run --doh-upstream "https://doh.example.com/dns-query" --doh-bootstrap-ips "93.184.216.34"
 ```
 
-### Daemon Management
+### Daemon & Configuration Management
 ```bash
 sudo albus service install   # Install systemd unit and provision albus.rules
 sudo albus service start     # Start background daemon
 sudo albus service status    # Inspect operational metrics
 sudo albus service reload    # Send SIGHUP for zero-downtime runtime map reload
+albus config get             # Inspect active persistent configuration (JSON)
+sudo albus config set --doh-upstream cloudflare  # Update settings and reload daemon live
 albus monitor                # Interactive curses-style telemetry TUI
+sudo albus cleanup           # Restore original /etc/resolv.conf and purge firewall rules
 ```
 
 ### Options Reference
@@ -143,6 +146,7 @@ albus monitor                # Interactive curses-style telemetry TUI
 | `--mss` | `u16` | `88` | Initial TCP MSS size for TLS ClientHello fragmentation |
 | `--min-mss` | `u16` | `64` | Minimum TCP MSS for randomized per-connection jitter (`0` disables jitter) |
 | `--restore-after-bytes` | `u32` | `600` | Transmitted byte threshold prior to line-rate MSS restoration |
+| `--ports` | `Vec<u16>` | `[443]` | Target destination ports for eBPF sock_ops interception |
 | `--fake-ttl` | `u8` | `8` | Fallback TTL for raw socket packet injection |
 | `--auto-ttl` | `bool` | `true` | Dynamic hop-distance path measurement |
 | `--fake-sni` | `String` | `None` | Server Name Indication override (defaults to rotating high-reputation pool) |
@@ -152,7 +156,7 @@ albus monitor                # Interactive curses-style telemetry TUI
 | `--doh-bootstrap-ips` | `Vec<IPv4>`| `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
 | `--dnssec` | `bool` | `true` | Enforce EDNS0 DO-bit and Authenticated Data validation |
 | `--pqc` | `bool` | `true` | Enable hybrid ML-KEM-768 post-quantum key exchange |
-| `--ram-only` | `bool` | `true` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |
+| `--ram-only` | `bool` | `false` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |
 | `--block-quic` | `bool` | `true` | Drop outbound UDP 443 to force TLS/TCP transport |
 | `--block-stun` | `bool` | `true` | Drop outbound STUN (UDP 3478, 5349) to prevent WebRTC IP leaks |
 | `--kill-switch` | `bool` | `true` | Strict DNS kill-switch dropping non-loopback UDP/TCP 53 |
@@ -163,7 +167,12 @@ albus monitor                # Interactive curses-style telemetry TUI
 
 ## Desktop Integration (Omarchy Shell)
 
-Albus includes a first-party Omarchy Quattro desktop panel widget (`BarWidget.qml` & `Panel.qml`) providing live packet stream monitoring, one-click resolver switching (Quad9, Cloudflare, Mullvad profiles), security toggles, and keyboard shortcuts (`1-3` tabs, `Space` toggle, `P` pause, `J/K` scroll).
+Albus includes a first-party Omarchy Quattro desktop panel widget (`BarWidget.qml` & `Panel.qml`) providing live packet stream monitoring, one-click resolver switching (Quad9, Cloudflare, Mullvad profiles), security toggles, and keyboard shortcuts (`1-2` tabs, `Space` toggle, `P` pause, `J/K` scroll).
+
+<p align="center">
+  <img src="assets/panel_settings.png" alt="Albus Omarchy Panel Settings" width="48%" />
+  <img src="assets/panel_logs.png" alt="Albus Omarchy Panel Live Logs" width="48%" />
+</p>
 
 ```bash
 # Deploy plugin to active user configuration directory
@@ -176,5 +185,4 @@ omarchy-shell shell rescanPlugins
 
 ## License
 
-This project is licensed under the **MIT License**.  
-Author: **oqullcan**
+This project is licensed under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE).

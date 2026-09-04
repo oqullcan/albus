@@ -51,7 +51,7 @@ pub struct Config {
     pub dnssec: bool,
     #[serde(default = "default_true")]
     pub pqc: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub ram_only: bool,
     #[serde(default)]
     pub verbose: bool,
@@ -166,116 +166,147 @@ fn get_sudo_user_home() -> Option<PathBuf> {
     None
 }
 
-// safely writes content to path while rejecting symlinks and enforcing restrictive permissions (0700/0600)
-fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
-    let p = path.as_ref();
-    if let Ok(meta) = fs::symlink_metadata(p) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("security violation: refusing to follow symlink at {}", p.display()),
-            ));
-        }
-    }
-    if let Some(parent) = p.parent() {
-        if let Ok(pmeta) = fs::symlink_metadata(parent) {
-            if pmeta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("security violation: refusing to write into symlinked directory at {}", parent.display()),
-                ));
+#[cfg(unix)]
+struct FsPrivilegeGuard {
+    active: bool,
+}
+
+#[cfg(unix)]
+impl FsPrivilegeGuard {
+    // temporarily drops filesystem credentials (fsuid/fsgid) to the unprivileged caller when running under sudo
+    fn drop_to_sudo_user() -> Self {
+        let current_euid = unsafe { libc::geteuid() };
+        if current_euid == 0 {
+            if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+                if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
+                    if uid != 0 {
+                        unsafe {
+                            libc::setfsgid(gid);
+                            libc::setfsuid(uid);
+                        }
+                        return Self { active: true };
+                    }
+                }
             }
         }
+        Self { active: false }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FsPrivilegeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                libc::setfsuid(0);
+                libc::setfsgid(0);
+            }
+        }
+    }
+}
+
+// safely writes content to path atomically rejecting symlinks and dropping privileges on user paths
+fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
+    let p = path.as_ref();
+    let is_system_path = p.starts_with("/run/albus") || p.starts_with("/etc/albus");
+
+    #[cfg(unix)]
+    let _guard = if !is_system_path {
+        FsPrivilegeGuard::drop_to_sudo_user()
+    } else {
+        FsPrivilegeGuard { active: false }
+    };
+
+    if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-            if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-                if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
-                    let p_str = parent.to_string_lossy();
-                    if !p_str.starts_with("/run/albus") && !p_str.starts_with("/etc/albus") {
-                        if let Ok(cp) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()) {
-                            unsafe { libc::chown(cp.as_ptr(), uid, gid); }
-                        }
-                    }
-                }
-            }
         }
     }
-    fs::write(p, content)?;
+
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o600));
-        if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-            if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
-                let p_str = p.to_string_lossy();
-                if !p_str.starts_with("/run/albus") && !p_str.starts_with("/etc/albus") {
-                    if let Ok(cp) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
-                        unsafe { libc::chown(cp.as_ptr(), uid, gid); }
-                    }
-                }
-            }
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+
+    let mut file = options.open(p)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
-// safely reads content while rejecting symlinks and enforcing strict ownership checks
+// safely reads content while atomically rejecting symlinks and enforcing strict ownership checks
 fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     let p = path.as_ref();
-    if let Ok(meta) = fs::symlink_metadata(p) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("security violation: refusing to read symlink config at {}", p.display()),
-            ));
-        }
+    let is_system_path = p.starts_with("/run/albus") || p.starts_with("/etc/albus");
 
-        if let Some(parent) = p.parent() {
-            if let Ok(pmeta) = fs::symlink_metadata(parent) {
-                if pmeta.file_type().is_symlink() {
+    #[cfg(unix)]
+    let _guard = if !is_system_path {
+        FsPrivilegeGuard::drop_to_sudo_user()
+    } else {
+        FsPrivilegeGuard { active: false }
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let mut file = options.open(p)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("security violation: refusing to read non-regular file at {}", p.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let file_uid = meta.uid();
+        let current_uid = unsafe { libc::getuid() };
+
+        if current_uid == 0 {
+            if is_system_path {
+                if file_uid != 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        format!("security violation: refusing to read config in symlinked directory at {}", parent.display()),
+                        format!("security violation: system config {} owned by untrusted uid {}", p.display(), file_uid),
                     ));
                 }
-            }
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let file_uid = meta.uid();
-            let current_uid = unsafe { libc::getuid() };
-
-            if current_uid == 0 {
-                let p_str = p.to_string_lossy();
-                if p_str.starts_with("/run/albus") || p_str.starts_with("/etc/albus") {
-                    if file_uid != 0 {
+            } else if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
+                if let Ok(sudo_uid) = sudo_uid_str.trim().parse::<libc::uid_t>() {
+                    if file_uid != 0 && file_uid != sudo_uid {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
-                            format!("security violation: system config {} owned by untrusted uid {}", p.display(), file_uid),
+                            format!("security violation: user config {} owned by untrusted uid {}", p.display(), file_uid),
                         ));
                     }
-                } else if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
-                    if let Ok(sudo_uid) = sudo_uid_str.trim().parse::<libc::uid_t>() {
-                        if file_uid != 0 && file_uid != sudo_uid {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                format!("security violation: user config {} owned by untrusted uid {}", p.display(), file_uid),
-                            ));
-                        }
-                    }
                 }
-            } else if file_uid != current_uid && file_uid != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("security violation: config {} owned by untrusted uid {}", p.display(), file_uid),
-                ));
             }
+        } else if file_uid != current_uid && file_uid != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("security violation: config {} owned by untrusted uid {}", p.display(), file_uid),
+            ));
         }
     }
-    fs::read_to_string(p)
+
+    use std::io::Read;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 impl Config {
@@ -419,6 +450,9 @@ mod tests {
 
         let result = safe_read(&symlink_file);
         assert!(result.is_err(), "safe_read must reject symlinks");
+
+        let write_result = safe_write(&symlink_file, "{\"mss\": 99}");
+        assert!(write_result.is_err(), "safe_write must reject symlinks via O_NOFOLLOW");
 
         let _ = fs::remove_file(&symlink_file);
         let _ = fs::remove_file(&real_file);

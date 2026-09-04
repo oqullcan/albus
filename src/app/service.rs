@@ -14,7 +14,9 @@ const POLKIT_RULE_CONTENT: &str = r#"polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units") {
         var unit = action.lookup("unit");
         if (unit == "albus.service") {
-            return polkit.Result.YES;
+            if (subject.isInGroup("wheel") || subject.isInGroup("sudo")) {
+                return polkit.Result.YES;
+            }
         }
     }
 });
