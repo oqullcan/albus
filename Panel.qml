@@ -73,6 +73,9 @@ Panel {
   property bool ednsPaddingEnabled: true
   property bool blockUndelegatedEnabled: true
   property bool netmonEnabled: true
+  property bool odohEnabled: false
+  property string odohRelay: ""
+  property string odohTarget: ""
 
   // preserved CLI configuration parameters not directly exposed in UI
   property var storedPorts: [443]
@@ -636,6 +639,13 @@ Panel {
     args.push("--edns-padding", root.ednsPaddingEnabled ? "true" : "false")
     args.push("--block-undelegated", root.blockUndelegatedEnabled ? "true" : "false")
     args.push("--netmon", root.netmonEnabled ? "true" : "false")
+    args.push("--odoh", root.odohEnabled ? "true" : "false")
+    if (root.odohRelay.trim() !== "") {
+      args.push("--odoh-relay", root.odohRelay.trim())
+    }
+    if (root.odohTarget.trim() !== "") {
+      args.push("--odoh-target", root.odohTarget.trim())
+    }
 
     // preserve backend tuning parameters
     if (root.storedPorts && root.storedPorts.length > 0) {
@@ -743,6 +753,9 @@ Panel {
           root.ednsPaddingEnabled = cfg.edns_padding !== false
           root.blockUndelegatedEnabled = cfg.block_undelegated !== false
           root.netmonEnabled = cfg.netmon !== false
+          root.odohEnabled = !!cfg.odoh_enabled
+          root.odohRelay = cfg.odoh_relay || ""
+          root.odohTarget = cfg.odoh_target || ""
 
           if (cfg.ports && Array.isArray(cfg.ports)) root.storedPorts = cfg.ports
           if (cfg.restore_after_bytes !== undefined) root.storedRestoreAfterBytes = cfg.restore_after_bytes
@@ -1532,7 +1545,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "HARDENED DNS & FILTERS"
-                subtitle: (root.blocklistEnabled ? "Blocklist • " : "") + (root.localDohEnabled ? "Local DoH • " : "") + (root.tcpListenerEnabled ? "TCP:53" : "")
+                subtitle: (root.odohEnabled ? "ODoH • " : "") + (root.blocklistEnabled ? "Blocklist • " : "") + (root.localDohEnabled ? "Local DoH • " : "") + (root.tcpListenerEnabled ? "TCP:53" : "")
                 sectionKey: "dns"
               }
 
@@ -1616,6 +1629,146 @@ Panel {
                       onTextEdited: {
                         root.localDohAddr = text
                         root.scheduleAutoApply()
+                      }
+                    }
+                  }
+
+                  // Oblivious DoH (RFC 9230) Relay Card
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: odohCardCol.implicitHeight
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: root.odohEnabled ? Qt.rgba(0.06, 0.72, 0.51, 0.3) : Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+                    clip: true
+
+                    Column {
+                      id: odohCardCol
+                      width: parent.width
+
+                      CompactToggle {
+                        label: "Oblivious DoH (RFC 9230)"
+                        description: "Decouple client IP from DNS via HPKE proxy relay"
+                        checked: root.odohEnabled
+                        showDivider: root.odohEnabled
+                        onClicked: {
+                          root.odohEnabled = !root.odohEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        width: parent.width
+                        visible: root.odohEnabled
+                        spacing: Style.space(4)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(8)
+                        rightPadding: Style.space(8)
+
+                        Text {
+                          text: "ODoH Relay Proxy URL (Intermediary)"
+                          color: root.dim
+                          font.pixelSize: Style.font.caption - 1
+                          font.family: root.fontFamily
+                        }
+                        TextField {
+                          width: parent.width
+                          text: root.odohRelay
+                          placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
+                          font.family: "monospace"
+                          font.pixelSize: Style.font.caption
+                          accent: "#10B981"
+                          onTextEdited: {
+                            root.odohRelay = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+
+                        Text {
+                          text: "ODoH Target Resolver URL (Decryption Endpoint)"
+                          color: root.dim
+                          font.pixelSize: Style.font.caption - 1
+                          font.family: root.fontFamily
+                        }
+                        TextField {
+                          width: parent.width
+                          text: root.odohTarget
+                          placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
+                          font.family: "monospace"
+                          font.pixelSize: Style.font.caption
+                          accent: "#10B981"
+                          onTextEdited: {
+                            root.odohTarget = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+
+                        Row {
+                          spacing: Style.space(6)
+                          topPadding: Style.space(2)
+
+                          Rectangle {
+                            height: Style.space(22)
+                            width: presetBtnText.implicitWidth + Style.space(12)
+                            radius: Style.cornerRadius - 2
+                            color: presetBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                            border.color: Qt.rgba(1, 1, 1, 0.1)
+                            border.width: 1
+
+                            Text {
+                              id: presetBtnText
+                              anchors.centerIn: parent
+                              text: "Fill Cloudflare Preset"
+                              color: root.foreground
+                              font.pixelSize: Style.font.caption - 1
+                              font.family: root.fontFamily
+                            }
+
+                            MouseArea {
+                              id: presetBtnMouse
+                              anchors.fill: parent
+                              hoverEnabled: true
+                              cursorShape: Qt.PointingHandCursor
+                              onClicked: {
+                                root.odohRelay = "https://odoh.cloudflare-dns.com/dns-query"
+                                root.odohTarget = "https://odoh.cloudflare-dns.com/dns-query"
+                                root.applyAndSave()
+                              }
+                            }
+                          }
+
+                          Rectangle {
+                            height: Style.space(22)
+                            width: clearBtnText.implicitWidth + Style.space(12)
+                            radius: Style.cornerRadius - 2
+                            color: clearBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                            border.color: Qt.rgba(1, 1, 1, 0.1)
+                            border.width: 1
+
+                            Text {
+                              id: clearBtnText
+                              anchors.centerIn: parent
+                              text: "Reset Defaults"
+                              color: root.dim
+                              font.pixelSize: Style.font.caption - 1
+                              font.family: root.fontFamily
+                            }
+
+                            MouseArea {
+                              id: clearBtnMouse
+                              anchors.fill: parent
+                              hoverEnabled: true
+                              cursorShape: Qt.PointingHandCursor
+                              onClicked: {
+                                root.odohRelay = ""
+                                root.odohTarget = ""
+                                root.applyAndSave()
+                              }
+                            }
+                          }
+                        }
                       }
                     }
                   }

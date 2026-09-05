@@ -29,16 +29,22 @@ impl Engine {
     // initializes engine subsystems and configures runtime parameters
     pub fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // resolve upstream doh resolver ips to populate bpf exclusion map
-        let exclude_ips = if cfg.doh_enabled {
+        let mut exclude_ips = if cfg.doh_enabled {
             extract_upstream_ips(&cfg.doh_upstream, &cfg.doh_bootstrap_ips)
         } else {
             Vec::new()
         };
-        let exclude_ips_v6 = if cfg.doh_enabled {
+        let mut exclude_ips_v6 = if cfg.doh_enabled {
             extract_upstream_ips_v6(&cfg.doh_upstream, &[])
         } else {
             Vec::new()
         };
+
+        if cfg.odoh_enabled {
+            let relay = cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+            exclude_ips.extend(extract_upstream_ips(relay, &[]));
+            exclude_ips_v6.extend(extract_upstream_ips_v6(relay, &[]));
+        }
 
         // configure dynamic auto-ttl estimator with boundary bounds
         let auto_ttl_config = AutoTtlConfig {
@@ -191,6 +197,23 @@ impl Engine {
                 None
             };
 
+            let odoh_client = if cfg.odoh_enabled {
+                let relay = cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+                let target = cfg.odoh_target.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_TARGET);
+                match crate::dns::ODoHClient::new(relay, target, reqwest::Client::new()) {
+                    Ok(c) => {
+                        info!(relay = %relay, target = %target, "Oblivious DoH (RFC 9230) client initialized");
+                        Some(Arc::new(c))
+                    }
+                    Err(e) => {
+                        warn!("failed to initialize odoh client (relay: {}, target: {}): {}", relay, target, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             Some(Arc::new(DnsServer::new(
                 &cfg.doh_upstream,
                 &cfg.doh_bootstrap_ips,
@@ -214,6 +237,7 @@ impl Engine {
                 query_logger,
                 cfg.allowlist_path.clone(),
                 cfg.blocklist_path.clone(),
+                odoh_client,
             )?))
         } else {
             None
@@ -321,16 +345,22 @@ impl Engine {
         let new_cfg = Config::load_or_default();
         info!("Reloading configuration from {}", Config::default_config_path().display());
 
-        let exclude_ips = if new_cfg.doh_enabled {
+        let mut exclude_ips = if new_cfg.doh_enabled {
             extract_upstream_ips(&new_cfg.doh_upstream, &new_cfg.doh_bootstrap_ips)
         } else {
             Vec::new()
         };
-        let exclude_ips_v6 = if new_cfg.doh_enabled {
+        let mut exclude_ips_v6 = if new_cfg.doh_enabled {
             extract_upstream_ips_v6(&new_cfg.doh_upstream, &[])
         } else {
             Vec::new()
         };
+
+        if new_cfg.odoh_enabled {
+            let relay = new_cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+            exclude_ips.extend(extract_upstream_ips(relay, &[]));
+            exclude_ips_v6.extend(extract_upstream_ips_v6(relay, &[]));
+        }
 
         let auto_ttl_config = AutoTtlConfig {
             enabled: new_cfg.auto_ttl,

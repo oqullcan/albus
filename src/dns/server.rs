@@ -27,6 +27,7 @@ use super::ip_filter::{extract_resolved_ips, IpFilter};
 use super::local_doh::LocalDoHServer;
 use super::logger::{QueryLogEntry, QueryLogger, QueryStatus};
 use super::netmon::NetworkMonitor;
+use super::odoh::ODoHClient;
 use super::padding::apply_edns_options;
 use super::stats::DnsStats;
 use super::tcp::DnsTcpServer;
@@ -37,6 +38,7 @@ use super::watcher::FileWatcher;
 #[derive(Clone)]
 pub struct DnsServer {
     resolver: DoHResolver,
+    pub odoh_client: Option<Arc<ODoHClient>>,
     upstream_desc: String,
     block_ipv6: bool,
     dnssec: bool,
@@ -88,12 +90,14 @@ impl DnsServer {
         query_logger: Option<Arc<QueryLogger>>,
         allowlist_path: Option<String>,
         blocklist_path: Option<String>,
+        odoh_client: Option<Arc<ODoHClient>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let resolver = DoHResolver::new(upstreams_csv, custom_bootstrap_ips, pqc)?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             resolver,
+            odoh_client,
             upstream_desc: upstreams_csv.to_string(),
             block_ipv6,
             dnssec,
@@ -148,6 +152,7 @@ impl DnsServer {
             true,
             true,
             "127.0.0.1:8053".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -520,6 +525,23 @@ impl DnsServer {
         }
     }
 
+    /// executes query resolution via oblivious doh relay (rfc 9230) if configured,
+    /// with transparent automatic fallback to direct doh pool upon error
+    async fn resolve_upstream(
+        &self,
+        outgoing_query: &[u8],
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref odoh) = self.odoh_client {
+            match odoh.resolve(outgoing_query).await {
+                Ok(resp) => return Ok((resp, "odoh".to_string())),
+                Err(e) => {
+                    warn!("ODoH resolution failed ({}), falling back to direct DoH upstream", e);
+                }
+            }
+        }
+        self.resolver.resolve(outgoing_query).await
+    }
+
     // common unified query resolution pipeline shared across udp, tcp 53 (rfc 7766), and local doh (rfc 8484)
     pub async fn resolve_packet(&self, query_data: &[u8], client_ip: IpAddr) -> Option<Vec<u8>> {
         const MAX_IP_QUEUE_ENTRIES: usize = 4096;
@@ -662,7 +684,7 @@ impl DnsServer {
             query_data.to_vec()
         };
 
-        match self.resolver.resolve(&outgoing_query).await {
+        match self.resolve_upstream(&outgoing_query).await {
             Ok((resp_bytes, via)) => {
                 // Anti-DNS-Rebinding validation
                 if self.anti_dns_rebinding {
@@ -728,7 +750,7 @@ impl DnsServer {
                             };
                             if ancount == 0 {
                                 let a_query = build_a_query(&key.name);
-                                if let Ok((a_resp, _)) = self.resolver.resolve(&a_query).await {
+                                if let Ok((a_resp, _)) = self.resolve_upstream(&a_query).await {
                                     if let Some((_, v4_ips)) = parse_dns_response(&a_resp) {
                                         if !v4_ips.is_empty() {
                                             let dns64_resp = build_dns64_response(query_data, &v4_ips, 300);

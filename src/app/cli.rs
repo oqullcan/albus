@@ -260,6 +260,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub ipcrypt_key: Option<String>,
 
+    // enable oblivious dns-over-https (odoh, rfc 9230) proxying
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub odoh: bool,
+
+    // oblivious doh relay proxy url
+    #[arg(long)]
+    pub odoh_relay: Option<String>,
+
+    // oblivious doh target resolver url
+    #[arg(long)]
+    pub odoh_target: Option<String>,
+
     // enable verbose debug logging in tracing subscriber
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,

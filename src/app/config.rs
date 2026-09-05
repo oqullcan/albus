@@ -96,6 +96,12 @@ pub struct Config {
     pub query_log_path: Option<String>,
     #[serde(default)]
     pub ipcrypt_key: Option<String>,
+    #[serde(default)]
+    pub odoh_enabled: bool,
+    #[serde(default)]
+    pub odoh_relay: Option<String>,
+    #[serde(default)]
+    pub odoh_target: Option<String>,
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -166,6 +172,9 @@ impl Default for Config {
             query_log: false,
             query_log_path: None,
             ipcrypt_key: None,
+            odoh_enabled: false,
+            odoh_relay: None,
+            odoh_target: None,
         }
     }
 }

@@ -82,6 +82,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if args.ipcrypt_key.is_some() {
                         cfg.ipcrypt_key = args.ipcrypt_key;
                     }
+                    cfg.odoh_enabled = args.odoh;
+                    if args.odoh_relay.is_some() {
+                        cfg.odoh_relay = args.odoh_relay;
+                    }
+                    if args.odoh_target.is_some() {
+                        cfg.odoh_target = args.odoh_target;
+                    }
                     cfg.verbose = args.verbose;
 
                     let path = Config::default_config_path();
@@ -218,6 +225,15 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     }
     if let Some(ref key) = args.ipcrypt_key {
         cfg.ipcrypt_key = Some(key.clone());
+    }
+    if args.odoh {
+        cfg.odoh_enabled = true;
+    }
+    if let Some(ref relay) = args.odoh_relay {
+        cfg.odoh_relay = Some(relay.clone());
+    }
+    if let Some(ref target) = args.odoh_target {
+        cfg.odoh_target = Some(target.clone());
     }
 
     if is_root() {
