@@ -35,7 +35,7 @@ pub fn apply_edns_padding(query: &[u8], dnssec: bool) -> Vec<u8> {
 
 // applies rfc 8467 padding and rfc 7871 ecs zero-scope anonymity to outgoing queries
 pub fn apply_edns_options(query: &[u8], dnssec: bool, padding: bool, ecs_zero: bool) -> Vec<u8> {
-    if query.len() < 12 {
+    if query.len() < 12 || query.len() > 65500 {
         return query.to_vec();
     }
 

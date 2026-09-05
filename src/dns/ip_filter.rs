@@ -125,6 +125,10 @@ pub fn extract_resolved_ips(response_wire: &[u8]) -> Vec<IpAddr> {
             ips.push(IpAddr::V6(std::net::Ipv6Addr::from(oct)));
         }
 
+        if ips.len() >= 64 {
+            break;
+        }
+
         pos += rdlength;
     }
 

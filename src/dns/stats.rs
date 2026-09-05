@@ -80,7 +80,11 @@ impl DnsStats {
         // atomic write via temporary file
         let tmp_path = format!("{}.tmp.{}", path.as_ref().display(), std::process::id());
         fs::write(&tmp_path, json.as_bytes())?;
-        fs::rename(tmp_path, path)?;
+        let res = fs::rename(&tmp_path, path);
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        res?;
         Ok(())
     }
 }

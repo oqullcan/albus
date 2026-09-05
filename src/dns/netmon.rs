@@ -46,12 +46,16 @@ impl NetworkMonitor {
 
         // 3. read active interface operstates (/sys/class/net/*/operstate)
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
+            let mut ifaces: Vec<(String, String)> = Vec::new();
             for entry in entries.flatten() {
                 let state_file = entry.path().join("operstate");
-                if let Ok(state) = fs::read_to_string(state_file) {
-                    entry.file_name().hash(&mut hasher);
-                    state.trim().hash(&mut hasher);
-                }
+                let state = fs::read_to_string(state_file).unwrap_or_default();
+                ifaces.push((entry.file_name().to_string_lossy().to_string(), state.trim().to_string()));
+            }
+            ifaces.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (name, state) in ifaces {
+                name.hash(&mut hasher);
+                state.hash(&mut hasher);
             }
         }
 

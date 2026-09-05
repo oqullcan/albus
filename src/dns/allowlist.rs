@@ -74,9 +74,13 @@ impl DomainAllowlist {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut allowlist = Self::new();
+        const MAX_ALLOWLIST_ENTRIES: usize = 100_000;
 
         for line in reader.lines() {
             let line = line?;
+            if allowlist.len() >= MAX_ALLOWLIST_ENTRIES {
+                break;
+            }
             allowlist.add(&line);
         }
 

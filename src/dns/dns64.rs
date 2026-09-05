@@ -25,33 +25,20 @@ pub fn build_dns64_response(query_data: &[u8], ipv4_addrs: &[Ipv4Addr], ttl: u32
         return query_data.to_vec();
     }
 
-    // locate end of question section
-    let mut pos = 12;
-    while pos < query_data.len() {
-        let len = query_data[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if (len & 0xC0) == 0xC0 {
-            pos += 2;
-            break;
-        }
-        pos += 1 + len;
-    }
-    pos += 4; // qtype (2) + qclass (2)
-    if pos > query_data.len() {
-        pos = query_data.len();
-    }
+    let pos = match crate::dns::filter::extract_question_end(query_data) {
+        Some(end) => end,
+        None => return query_data.to_vec(),
+    };
 
-    let mut resp = Vec::with_capacity(pos + (ipv4_addrs.len() * 28));
+    let count = ipv4_addrs.len().min(64);
+    let mut resp = Vec::with_capacity(pos + (count * 28));
     resp.extend_from_slice(&query_data[..pos]);
 
     // header flags: QR=1 (response), AA=1, RD=1, RA=1, RCODE=0
     resp[2] = 0x81;
     resp[3] = 0x80;
     // ancount = number of synthesized addresses
-    let ancount = ipv4_addrs.len() as u16;
+    let ancount = count as u16;
     resp[6] = (ancount >> 8) as u8;
     resp[7] = (ancount & 0xff) as u8;
     // nscount = 0, arcount = 0
@@ -60,7 +47,7 @@ pub fn build_dns64_response(query_data: &[u8], ipv4_addrs: &[Ipv4Addr], ttl: u32
     resp[10] = 0;
     resp[11] = 0;
 
-    for ip in ipv4_addrs {
+    for ip in ipv4_addrs.iter().take(count) {
         let v6 = synthesize_dns64_ipv6(*ip);
         // pointer to question name at offset 12 (0xc00c)
         resp.push(0xc0);

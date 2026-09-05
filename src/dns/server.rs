@@ -467,10 +467,8 @@ impl DnsServer {
                                     let _permit = match sem_clone.try_acquire() {
                                         Ok(permit) => permit,
                                         Err(_) => {
-                                            if query_data.len() >= 4 {
-                                                let mut fail_resp = query_data.clone();
-                                                fail_resp[2] |= 0x80;
-                                                fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // SERVFAIL
+                                            if query_data.len() >= 12 {
+                                                let fail_resp = build_servfail_response(&query_data);
                                                 let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
                                             }
                                             return;
@@ -544,6 +542,11 @@ impl DnsServer {
 
     // common unified query resolution pipeline shared across udp, tcp 53 (rfc 7766), and local doh (rfc 8484)
     pub async fn resolve_packet(&self, query_data: &[u8], client_ip: IpAddr) -> Option<Vec<u8>> {
+        // validate minimal DNS header length and ensure packet is a query (QR == 0)
+        if query_data.len() < 12 || (query_data[2] & 0x80) != 0 {
+            return None;
+        }
+
         const MAX_IP_QUEUE_ENTRIES: usize = 4096;
         let start_time = std::time::Instant::now();
         self.stats.total_queries.fetch_add(1, Ordering::Relaxed);
@@ -575,7 +578,7 @@ impl DnsServer {
                 debug!(domain = %key.name, ip = %captive_ip, "Synthesized captive portal detection response");
                 self.stats.captive_probes.fetch_add(1, Ordering::Relaxed);
                 self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Captive, start_time, Some("captive_probe"));
-                return Some(build_captive_response(query_data, captive_ip));
+                return build_captive_response(query_data, captive_ip);
             }
         }
 
@@ -809,11 +812,8 @@ impl DnsServer {
                     return Some(stale_resp);
                 }
 
-                if query_data.len() >= 4 {
-                    let mut fail_resp = query_data.to_vec();
-                    fail_resp[2] |= 0x80;
-                    fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // servfail rcode
-                    Some(fail_resp)
+                if query_data.len() >= 12 {
+                    Some(build_servfail_response(query_data))
                 } else {
                     None
                 }
@@ -1023,6 +1023,23 @@ pub fn build_nodata_response(query: &[u8]) -> Vec<u8> {
     resp
 }
 
+// generates synthetic servfail response (rcode=2) truncated to question section
+pub fn build_servfail_response(query: &[u8]) -> Vec<u8> {
+    let q_end = extract_question_end(query).unwrap_or(query.len().min(12));
+    let mut resp = query[..q_end].to_vec();
+    if resp.len() >= 12 {
+        resp[2] = (resp[2] | 0x80) | 0x01; // response flag (qr=1) + recursion desired
+        resp[3] = 0x82; // recursion available + servfail (rcode=2)
+        resp[6] = 0; // ancount = 0
+        resp[7] = 0;
+        resp[8] = 0; // nscount = 0
+        resp[9] = 0;
+        resp[10] = 0; // arcount = 0
+        resp[11] = 0;
+    }
+    resp
+}
+
 // parses answer section records to extract domain name and a-record ipv4 addresses
 pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
     if data.len() < 12 {
@@ -1037,9 +1054,18 @@ pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
     }
 
     let mut pos = 12;
+    let mut domain = String::new();
 
-    let (domain, next_pos) = parse_dns_name(data, pos)?;
-    pos = next_pos + 4;
+    for i in 0..qdcount {
+        let (d, next_pos) = parse_dns_name(data, pos)?;
+        if i == 0 {
+            domain = d;
+        }
+        pos = next_pos + 4;
+        if pos > data.len() {
+            return None;
+        }
+    }
 
     if ancount == 0 || pos > data.len() {
         return Some((domain, Vec::new()));
@@ -1255,5 +1281,20 @@ mod tests {
         assert!(is_canary_query(&query));
         let canary_resp = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
         assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
+    }
+
+    #[test]
+    fn test_build_servfail_response() {
+        let query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        let resp = build_servfail_response(&query);
+        assert_eq!(resp.len(), query.len());
+        assert_eq!(resp[2] & 0x80, 0x80); // QR=1
+        assert_eq!(resp[3] & 0x0F, 0x02); // SERVFAIL (rcode=2)
+        assert_eq!(resp[6], 0); // ANCOUNT = 0
+        assert_eq!(resp[7], 0);
     }
 }

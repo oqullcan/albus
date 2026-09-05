@@ -2,7 +2,7 @@
 
 use super::types::ConnInfo;
 
-pub const MAX_PACKET_LEN: usize = 512;
+pub const MAX_PACKET_LEN: usize = 1500;
 
 // fixed-size stack buffer eliminating heap allocation overhead during packet synthesis
 #[derive(Clone, Copy)]

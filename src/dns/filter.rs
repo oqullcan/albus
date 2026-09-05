@@ -172,6 +172,9 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
             // pointer is 2 bytes
             return Some(pos + 2);
         }
+        if (len & 0xC0) != 0 {
+            return None; // invalid / reserved label format
+        }
         pos += 1 + len;
         jumps += 1;
         if jumps > 128 {
@@ -197,6 +200,9 @@ pub fn extract_question_end(query: &[u8]) -> Option<usize> {
         if (len & 0xC0) == 0xC0 {
             pos += 2;
             break;
+        }
+        if (len & 0xC0) != 0 {
+            return None; // invalid / reserved label format
         }
         pos += 1 + len;
         jumps += 1;

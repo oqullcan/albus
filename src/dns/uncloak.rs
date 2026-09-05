@@ -91,6 +91,9 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
         if (len & 0xC0) == 0xC0 {
             return Some(pos + 2);
         }
+        if (len & 0xC0) != 0 {
+            return None; // invalid / reserved label format per RFC 1035
+        }
         pos += 1 + len;
         jumps += 1;
         if jumps > 128 {
@@ -135,6 +138,10 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
             continue;
         }
 
+        if (len & 0xC0) != 0 {
+            return None; // invalid / reserved label format
+        }
+
         pos += 1;
         if pos + len > data.len() {
             return None;
@@ -142,6 +149,9 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
 
         let label_str = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
         labels.push(label_str);
+        if labels.len() >= 128 {
+            return None;
+        }
         pos += len;
 
         if !jumped {

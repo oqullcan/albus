@@ -131,6 +131,10 @@ impl DnsTcpServer {
                                         }
 
                                         if let Some(resp_bytes) = handler_clone(msg_buf, peer_addr).await {
+                                            if resp_bytes.len() > 65535 {
+                                                warn!("TCP DNS response length {} exceeds RFC 7766 limit (65535 bytes)", resp_bytes.len());
+                                                break;
+                                            }
                                             let resp_len = (resp_bytes.len() as u16).to_be_bytes();
                                             let write_res = tokio::time::timeout(Duration::from_secs(5), async {
                                                 stream.write_all(&resp_len).await?;

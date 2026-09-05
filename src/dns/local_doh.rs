@@ -109,15 +109,19 @@ impl LocalDoHServer {
 
                                     let req = &buf[..n];
                                     let (query_bytes, _is_post) = match parse_http_dns_request(req) {
-                                        Some(parsed) => parsed,
-                                        None => {
-                                            // return simple 200 health check info page for browser visits
+                                        HttpDnsRequest::Query(bytes, is_post) => (bytes, is_post),
+                                        HttpDnsRequest::HealthCheck => {
                                             let body = "Albus Secure Local DoH Resolver (RFC 8484) Active\nEndpoint: /dns-query\n";
                                             let resp = format!(
                                                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                                 body.len(),
                                                 body
                                             );
+                                            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
+                                            return;
+                                        }
+                                        HttpDnsRequest::BadRequest => {
+                                            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
                                             let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
                                             return;
                                         }
@@ -157,55 +161,88 @@ impl LocalDoHServer {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HttpDnsRequest {
+    Query(Vec<u8>, bool), // (bytes, is_post)
+    HealthCheck,
+    BadRequest,
+}
+
 // parses incoming http/1.1 request headers and separates raw binary dns query bytes
-fn parse_http_dns_request(req: &[u8]) -> Option<(Vec<u8>, bool)> {
+pub fn parse_http_dns_request(req: &[u8]) -> HttpDnsRequest {
     // locate header delimiter \r\n\r\n or \n\n without assuming entire body is utf-8
     let (header_end, delim_len) = if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
         (p, 4)
     } else if let Some(p) = req.windows(2).position(|w| w == b"\n\n") {
         (p, 2)
     } else {
-        return None;
+        return HttpDnsRequest::BadRequest;
     };
 
-    let header_str = std::str::from_utf8(&req[..header_end]).ok()?;
+    let header_str = match std::str::from_utf8(&req[..header_end]) {
+        Ok(s) => s,
+        Err(_) => return HttpDnsRequest::BadRequest,
+    };
     let mut lines = header_str.lines();
-    let first_line = lines.next()?;
+    let first_line = match lines.next() {
+        Some(l) => l,
+        None => return HttpDnsRequest::BadRequest,
+    };
     let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    let uri = parts.next()?;
+    let method = match parts.next() {
+        Some(m) => m,
+        None => return HttpDnsRequest::BadRequest,
+    };
+    let uri = match parts.next() {
+        Some(u) => u,
+        None => return HttpDnsRequest::BadRequest,
+    };
 
-    if method == "POST" && uri.starts_with("/dns-query") {
-        let body_start = header_end + delim_len;
-        let mut body = &req[body_start..];
+    if uri.starts_with("/dns-query") {
+        if method == "POST" {
+            let body_start = header_end + delim_len;
+            let mut body = &req[body_start..];
 
-        // check Content-Length if present to avoid reading trailing pipeline bytes
-        for line in lines {
-            let lower = line.to_ascii_lowercase();
-            if let Some(val) = lower.strip_prefix("content-length:") {
-                if let Ok(cl) = val.trim().parse::<usize>() {
-                    if body.len() > cl {
-                        body = &body[..cl];
+            // check Content-Length if present to avoid reading trailing pipeline bytes
+            for line in lines {
+                let lower = line.to_ascii_lowercase();
+                if let Some(val) = lower.strip_prefix("content-length:") {
+                    if let Ok(cl) = val.trim().parse::<usize>() {
+                        if body.len() > cl {
+                            body = &body[..cl];
+                        }
+                        break;
                     }
-                    break;
                 }
             }
-        }
 
-        if !body.is_empty() {
-            return Some((body.to_vec(), true));
+            if !body.is_empty() {
+                return HttpDnsRequest::Query(body.to_vec(), true);
+            } else {
+                return HttpDnsRequest::BadRequest;
+            }
+        } else if method == "GET" {
+            if let Some(b64_str) = uri.strip_prefix("/dns-query?dns=") {
+                let query_b64 = b64_str.split('&').next().unwrap_or("");
+                if let Some(decoded) = decode_b64url(query_b64) {
+                    if !decoded.is_empty() {
+                        return HttpDnsRequest::Query(decoded, false);
+                    }
+                }
+            }
+            return HttpDnsRequest::BadRequest;
+        } else {
+            return HttpDnsRequest::BadRequest;
         }
-    } else if method == "GET" && uri.starts_with("/dns-query?dns=") {
-        let b64_str = uri.strip_prefix("/dns-query?dns=")?;
-        let query_b64 = b64_str.split('&').next()?;
-        let decoded = decode_b64url(query_b64)?;
-        return Some((decoded, false));
     }
 
-    None
+    HttpDnsRequest::HealthCheck
 }
 
-fn decode_b64url(s: &str) -> Option<Vec<u8>> {
+pub fn decode_b64url(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || s.len() > 65536 {
+        return None;
+    }
     let mut clean = s.replace('-', "+").replace('_', "/");
     while clean.len() % 4 != 0 {
         clean.push('=');
@@ -217,10 +254,16 @@ fn decode_b64url(s: &str) -> Option<Vec<u8>> {
     }
     let bytes = clean.as_bytes();
     let mut out = Vec::with_capacity((bytes.len() * 3) / 4);
+    let mut padding_seen = false;
+
     for chunk in bytes.chunks(4) {
         if chunk.len() < 4 {
             break;
         }
+        if padding_seen {
+            return None;
+        }
+
         let b0 = map[chunk[0] as usize];
         let b1 = map[chunk[1] as usize];
         let b2 = if chunk[2] == b'=' { 0 } else { map[chunk[2] as usize] };
@@ -229,6 +272,15 @@ fn decode_b64url(s: &str) -> Option<Vec<u8>> {
         // reject chunk if any character is invalid (255)
         if b0 == 255 || b1 == 255 || (chunk[2] != b'=' && b2 == 255) || (chunk[3] != b'=' && b3 == 255) {
             return None;
+        }
+
+        // reject invalid padding: '=X' is invalid; '=' at index 2 requires '=' at index 3
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return None;
+        }
+
+        if chunk[2] == b'=' || chunk[3] == b'=' {
+            padding_seen = true;
         }
 
         let t = ((b0 as u32) << 18) | ((b1 as u32) << 12) | ((b2 as u32) << 6) | (b3 as u32);
@@ -251,10 +303,7 @@ mod tests {
     fn test_parse_post_doh_request() {
         let raw = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\n\r\n\x12\x34\x01\x00";
         let parsed = parse_http_dns_request(raw);
-        assert!(parsed.is_some());
-        let (bytes, is_post) = parsed.unwrap();
-        assert!(is_post);
-        assert_eq!(&bytes, b"\x12\x34\x01\x00");
+        assert_eq!(parsed, HttpDnsRequest::Query(b"\x12\x34\x01\x00".to_vec(), true));
     }
 
     #[test]
@@ -262,10 +311,7 @@ mod tests {
         // High byte 0x80, 0xff, 0xfe are invalid UTF-8 sequences in raw wire format
         let raw = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\n\x80\xff\xfe\x01";
         let parsed = parse_http_dns_request(raw);
-        assert!(parsed.is_some(), "Binary non-UTF-8 DNS query MUST be successfully parsed");
-        let (bytes, is_post) = parsed.unwrap();
-        assert!(is_post);
-        assert_eq!(&bytes, b"\x80\xff\xfe\x01");
+        assert_eq!(parsed, HttpDnsRequest::Query(b"\x80\xff\xfe\x01".to_vec(), true));
     }
 
     #[test]
@@ -280,10 +326,7 @@ mod tests {
         // Base64URL encoding of [0x12, 0x34] is "EjQ"
         let raw = b"GET /dns-query?dns=EjQ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let parsed = parse_http_dns_request(raw);
-        assert!(parsed.is_some());
-        let (bytes, is_post) = parsed.unwrap();
-        assert!(!is_post);
-        assert_eq!(&bytes, &[0x12, 0x34]);
+        assert_eq!(parsed, HttpDnsRequest::Query(vec![0x12, 0x34], false));
     }
 
     #[tokio::test]
@@ -320,5 +363,17 @@ mod tests {
         assert_eq!(body[2] & 0x80, 0x80);
 
         let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn test_parse_http_dns_request_health_check_and_bad_request() {
+        let health = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        assert_eq!(parse_http_dns_request(health), HttpDnsRequest::HealthCheck);
+
+        let bad_get = b"GET /dns-query?dns=INVALID!BASE64 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        assert_eq!(parse_http_dns_request(bad_get), HttpDnsRequest::BadRequest);
+
+        let empty_post = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(parse_http_dns_request(empty_post), HttpDnsRequest::BadRequest);
     }
 }

@@ -34,6 +34,10 @@ pub struct DnsStamp {
 impl DnsStamp {
     // parses an "sdns://..." stamp string into structured encrypted endpoint configuration
     pub fn parse(stamp_str: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if stamp_str.len() > 8192 {
+            return Err("dns stamp exceeds maximum allowed length (8192 bytes)".into());
+        }
+
         let clean = stamp_str.trim();
         let encoded = clean.strip_prefix("sdns://").unwrap_or(clean);
 

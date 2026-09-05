@@ -62,7 +62,7 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
 
     let env_user_line = if let Ok(user) = std::env::var("SUDO_USER") {
         let trimmed = user.trim();
-        if !trimmed.is_empty() && trimmed != "root" {
+        if !trimmed.is_empty() && trimmed != "root" && crate::app::config::is_valid_username(trimmed) {
             format!("Environment=ALBUS_CONFIG_USER={}\n", trimmed)
         } else {
             String::new()

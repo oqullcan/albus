@@ -110,6 +110,16 @@ impl IpCrypt {
     }
 }
 
+impl Drop for IpCrypt {
+    fn drop(&mut self) {
+        for b in self.key.iter_mut() {
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn rotl8(x: u8, n: u32) -> u8 {
     (x << n) | (x >> (8 - n))

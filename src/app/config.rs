@@ -183,7 +183,7 @@ impl Default for Config {
 use std::os::unix::fs::PermissionsExt;
 
 // validates username against Linux / POSIX rules (1..=32 chars, [a-zA-Z_][a-zA-Z0-9_-]*)
-fn is_valid_username(username: &str) -> bool {
+pub(crate) fn is_valid_username(username: &str) -> bool {
     if username.is_empty() || username.len() > 32 {
         return false;
     }
@@ -471,6 +471,14 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("security violation: refusing to read non-regular file at {}", p.display()),
+        ));
+    }
+
+    const MAX_CONFIG_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB maximum config size
+    if meta.len() > MAX_CONFIG_FILE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config file {} exceeds maximum safety limit (10 MB)", p.display()),
         ));
     }
 

@@ -28,7 +28,8 @@ impl UpstreamStats {
     }
 
     pub fn rtt_ms(&self) -> f64 {
-        f64::from_bits(self.ewma_rtt_ms.load(Ordering::Relaxed))
+        let val = f64::from_bits(self.ewma_rtt_ms.load(Ordering::Relaxed));
+        if val.is_finite() && val > 0.0 { val } else { 50.0 }
     }
 
     pub fn success_rate(&self) -> f64 {
@@ -46,27 +47,29 @@ impl UpstreamStats {
         let rtt = self.rtt_ms();
         let rtt_score = (1.0 - (rtt / 1000.0)).clamp(0.0, 1.0);
         let rel_score = self.success_rate().clamp(0.0, 1.0);
-        (rtt_score * 0.7) + (rel_score * 0.3)
+        let res = (rtt_score * 0.7) + (rel_score * 0.3);
+        if res.is_finite() { res } else { 0.5 }
     }
 
     // updates moving average latency and success counters
     pub fn record_outcome(&self, latency: Duration, success: bool) {
         self.total_queries.fetch_add(1, Ordering::Relaxed);
+        let prev_bits = self.ewma_rtt_ms.load(Ordering::Relaxed);
+        let prev_raw = f64::from_bits(prev_bits);
+        let prev = if prev_raw.is_finite() && prev_raw > 0.0 { prev_raw } else { 50.0 };
+
         if !success {
             self.failed_queries.fetch_add(1, Ordering::Relaxed);
-            // penalize rtt on failure by doubling estimated rtt up to 1000ms
-            let prev_bits = self.ewma_rtt_ms.load(Ordering::Relaxed);
-            let prev = f64::from_bits(prev_bits);
+            // penalize rtt on failure by doubling estimated rtt up to 1500ms
             let penalized = (prev * 2.0).min(1500.0);
             self.ewma_rtt_ms.store(penalized.to_bits(), Ordering::Relaxed);
             return;
         }
 
         let sample_ms = latency.as_secs_f64() * 1000.0;
-        let prev_bits = self.ewma_rtt_ms.load(Ordering::Relaxed);
-        let prev = f64::from_bits(prev_bits);
+        let sample = if sample_ms.is_finite() && sample_ms >= 0.0 { sample_ms } else { 50.0 };
         // ewma smoothing factor: 0.8 * old + 0.2 * new
-        let next = (prev * 0.8) + (sample_ms * 0.2);
+        let next = (prev * 0.8) + (sample * 0.2);
         self.ewma_rtt_ms.store(next.to_bits(), Ordering::Relaxed);
     }
 }

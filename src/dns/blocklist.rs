@@ -209,11 +209,24 @@ impl CompactBlocklist {
         let mut node_raw = vec![0u8; nodes_len * node_size];
         file.read_exact(&mut node_raw)?;
 
-        unsafe {
-            let ptr = node_raw.as_ptr() as *const CompactNode;
-            for i in 0..nodes_len {
-                nodes.push(*ptr.add(i));
-            }
+        for chunk in node_raw.chunks_exact(node_size) {
+            let label_offset = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let label_len = u16::from_le_bytes(chunk[4..6].try_into().unwrap());
+            let is_terminal = chunk[6] != 0;
+            let reserved = chunk[7];
+            let first_child = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let child_count = u16::from_le_bytes(chunk[12..14].try_into().unwrap());
+            let padding = u16::from_le_bytes(chunk[14..16].try_into().unwrap());
+
+            nodes.push(CompactNode {
+                label_offset,
+                label_len,
+                is_terminal,
+                _reserved: reserved,
+                first_child,
+                child_count,
+                _padding: padding,
+            });
         }
 
         // validate consistency of every node to prevent out-of-bounds panics or corrupt state

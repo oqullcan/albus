@@ -212,7 +212,7 @@ impl DoHResolver {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize doh preset {}: {}", u, e),
                 }
-            } else if u.starts_with("http://") || u.starts_with("https://") {
+            } else if u.starts_with("https://") {
                 let name = Url::parse(u)
                     .ok()
                     .and_then(|p| p.host_str().map(|s| s.to_string()))
@@ -221,6 +221,8 @@ impl DoHResolver {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize custom doh {}: {}", u, e),
                 }
+            } else if u.starts_with("http://") {
+                warn!("RFC 8484 violation: plain HTTP DoH ({}) is prohibited to prevent plaintext DNS leaks; use https://", u);
             } else if u.starts_with("sdns://") {
                 match crate::dns::stamp::DnsStamp::parse(u) {
                     Ok(stamp) => {

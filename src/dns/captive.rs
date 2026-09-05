@@ -85,15 +85,12 @@ pub fn check_captive_portal(domain: &str, qtype: u16) -> Option<IpAddr> {
 }
 
 // builds synthetic dns response with 60s ttl for captive portal resolution
-pub fn build_captive_response(query: &[u8], ip: IpAddr) -> Vec<u8> {
+pub fn build_captive_response(query: &[u8], ip: IpAddr) -> Option<Vec<u8>> {
     if query.len() < 12 {
-        return query.to_vec();
+        return None;
     }
 
-    let q_end = match extract_question_end(query) {
-        Some(end) => end,
-        None => return query.to_vec(),
-    };
+    let q_end = extract_question_end(query)?;
 
     let mut resp = Vec::with_capacity(q_end + 32);
     resp.extend_from_slice(&query[..q_end]);
@@ -133,7 +130,7 @@ pub fn build_captive_response(query: &[u8], ip: IpAddr) -> Vec<u8> {
         }
     }
 
-    resp
+    Some(resp)
 }
 
 #[cfg(test)]
@@ -156,7 +153,7 @@ mod tests {
             0x00, 0x01, 0x00, 0x01,
         ];
         let ip = check_captive_portal("captive.apple.com", 1).unwrap();
-        let resp = build_captive_response(&query, ip);
+        let resp = build_captive_response(&query, ip).expect("valid captive response");
         assert_eq!(resp[0], 0x12);
         assert_eq!(resp[1], 0x34);
         assert_eq!(resp[2] & 0x80, 0x80); // QR=1

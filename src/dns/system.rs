@@ -51,10 +51,14 @@ fn revert_resolvectl_dns() {
         .output();
 }
 
-// checks if nameserver line points to a local resolver loopback address
+// checks if nameserver line points to a local resolver loopback address (127.0.0.0/8 or ::1)
 fn is_loopback_nameserver(trimmed: &str) -> bool {
     if let Some(ns) = trimmed.strip_prefix("nameserver").map(|s| s.trim()) {
-        ns == "127.0.0.1" || ns == "127.0.0.53" || ns == "::1"
+        if let Ok(ip) = ns.parse::<std::net::IpAddr>() {
+            ip.is_loopback()
+        } else {
+            ns == "127.0.0.1" || ns == "127.0.0.53" || ns == "::1"
+        }
     } else {
         false
     }

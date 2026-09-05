@@ -146,6 +146,10 @@ impl ODoHClient {
         let relay_url = Url::parse(relay_url_str)?;
         let target_url = Url::parse(target_url_str)?;
 
+        if relay_url.scheme() != "https" || target_url.scheme() != "https" {
+            return Err("both oblivious relay and target URLs must use HTTPS".into());
+        }
+
         Ok(Self {
             relay_url,
             target_url,
@@ -227,6 +231,10 @@ impl ODoHClient {
         dns_query: &[u8],
         target_cfg: &ODoHConfigContents,
     ) -> Result<(Vec<u8>, ODoHContext), Box<dyn std::error::Error + Send + Sync>> {
+        if dns_query.is_empty() || dns_query.len() > 65535 {
+            return Err("invalid dns query length for odoh encapsulation".into());
+        }
+
         // 1. format ObliviousDoHMessagePlaintext (query + padding)
         let pad_len = match dns_query.len() {
             0..=128 => 128 - dns_query.len(),

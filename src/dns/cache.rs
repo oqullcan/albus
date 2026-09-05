@@ -206,10 +206,16 @@ pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
                 pos += 2;
                 break;
             }
+            if (len & 0xC0) != 0 {
+                return;
+            }
             if pos + 1 + len > data.len() {
                 return;
             }
             pos += 1 + len;
+        }
+        if pos + 4 > data.len() {
+            return;
         }
         pos += 4; // qtype + qclass
     }
@@ -233,6 +239,9 @@ pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
                 if (len & 0xC0) == 0xC0 {
                     pos += 2;
                     break;
+                }
+                if (len & 0xC0) != 0 {
+                    return;
                 }
                 if pos + 1 + len > data.len() {
                     return;
@@ -279,6 +288,9 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
         if (len & 0xC0) == 0xC0 {
             pos += 2;
             break;
+        }
+        if (len & 0xC0) != 0 {
+            return None;
         }
         pos += 1;
         if pos + len > data.len() {
@@ -331,10 +343,16 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
                 pos += 2;
                 break;
             }
+            if (len & 0xC0) != 0 {
+                return min_ttl;
+            }
             if pos + 1 + len > data.len() {
                 return min_ttl;
             }
             pos += 1 + len;
+        }
+        if pos + 4 > data.len() {
+            return min_ttl;
         }
         pos += 4;
     }
@@ -356,6 +374,9 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
                 if (len & 0xC0) == 0xC0 {
                     pos += 2;
                     break;
+                }
+                if (len & 0xC0) != 0 {
+                    return min_ttl;
                 }
                 if pos + 1 + len > data.len() {
                     return min_ttl;

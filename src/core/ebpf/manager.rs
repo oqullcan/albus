@@ -180,7 +180,11 @@ impl BpfManager {
                         IpAddr::V6(_) => fake_ttl_fallback,
                     };
 
-                    let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
+                    let payload: &[u8] = if fake_payloads.is_empty() {
+                        &FAKE_TLS_CLIENT_HELLO
+                    } else {
+                        &fake_payloads[decoy_idx % fake_payloads.len()]
+                    };
                     decoy_idx = decoy_idx.wrapping_add(1);
 
                     if let Err(e) = raw_socket.send_fake_opts(&conn, payload, optimal_ttl, fake_bad_checksum) {
