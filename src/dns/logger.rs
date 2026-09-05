@@ -174,6 +174,10 @@ fn sanitize_log_field(s: &str) -> String {
 
 // rotates file.log -> file.log.1 -> file.log.2
 fn rotate_files(base_path: &Path, max_backups: usize) {
+    if max_backups == 0 {
+        let _ = fs::remove_file(base_path);
+        return;
+    }
     for i in (1..max_backups).rev() {
         let src = format!("{}.{}", base_path.display(), i);
         let dst = format!("{}.{}", base_path.display(), i + 1);

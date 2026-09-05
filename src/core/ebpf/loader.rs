@@ -493,14 +493,32 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
     let e_shnum = u16::from_le_bytes(elf_bytes[60..62].try_into().unwrap()) as usize;
     let e_shstrndx = u16::from_le_bytes(elf_bytes[62..64].try_into().unwrap()) as usize;
 
-    if e_shoff + (e_shnum * e_shentsize) > elf_bytes.len() {
+    if e_shentsize < 64 || e_shnum == 0 || e_shstrndx >= e_shnum {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid ELF section header dimensions"));
+    }
+
+    let sh_table_size = e_shnum
+        .checked_mul(e_shentsize)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ELF section table size overflow"))?;
+    let sh_table_end = e_shoff
+        .checked_add(sh_table_size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ELF section table offset overflow"))?;
+
+    if sh_table_end > elf_bytes.len() {
         return Err(Error::new(ErrorKind::InvalidData, "ELF section header table out of bounds"));
     }
 
     let shstrtab_hdr_offset = e_shoff + (e_shstrndx * e_shentsize);
     let shstrtab_offset = u64::from_le_bytes(elf_bytes[shstrtab_hdr_offset + 24..shstrtab_hdr_offset + 32].try_into().unwrap()) as usize;
     let shstrtab_size = u64::from_le_bytes(elf_bytes[shstrtab_hdr_offset + 32..shstrtab_hdr_offset + 40].try_into().unwrap()) as usize;
-    let shstrtab = &elf_bytes[shstrtab_offset..shstrtab_offset + shstrtab_size];
+    let shstrtab_end = shstrtab_offset
+        .checked_add(shstrtab_size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ELF shstrtab offset overflow"))?;
+
+    if shstrtab_end > elf_bytes.len() {
+        return Err(Error::new(ErrorKind::InvalidData, "ELF shstrtab section out of bounds"));
+    }
+    let shstrtab = &elf_bytes[shstrtab_offset..shstrtab_end];
 
     let get_sh_name = |name_offset: usize| -> String {
         if name_offset < shstrtab.len() {
@@ -543,8 +561,15 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
     let (_, code_offset, code_size) = sockops_section
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "could not find 'sockops' program section in BPF ELF"))?;
 
-    let code_bytes = &elf_bytes[code_offset..code_offset + code_size];
-    let mut insns = Vec::with_capacity(code_size / 8);
+    let code_end = code_offset
+        .checked_add(code_size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "code section offset overflow"))?;
+    if code_end > elf_bytes.len() {
+        return Err(Error::new(ErrorKind::InvalidData, "code section exceeds ELF binary bounds"));
+    }
+
+    let code_bytes = &elf_bytes[code_offset..code_end];
+    let mut insns = Vec::with_capacity((code_size / 8).min(65536));
 
     for chunk in code_bytes.as_chunks::<8>().0 {
         insns.push(BpfInsn {
@@ -557,17 +582,43 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
 
     // perform map file descriptor relocation for ld_imm64 instructions
     if let (Some((sym_off, sym_size, sym_link)), Some((_, rel_off, rel_size, entry_size))) = (symtab_section, rel_section) {
+        if entry_size == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "invalid zero entry_size in relocation section"));
+        }
+
+        let rel_end = rel_off
+            .checked_add(rel_size)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel section offset overflow"))?;
+        if rel_end > elf_bytes.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "rel section exceeds ELF binary bounds"));
+        }
+
+        let sym_end = sym_off
+            .checked_add(sym_size)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "symtab section offset overflow"))?;
+        if sym_end > elf_bytes.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "symtab section exceeds ELF binary bounds"));
+        }
+
         let strtab = if sym_link < e_shnum {
             let str_hdr = e_shoff + (sym_link * e_shentsize);
-            let s_off = u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap()) as usize;
-            let s_size = u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap()) as usize;
-            if s_off + s_size <= elf_bytes.len() {
-                &elf_bytes[s_off..s_off + s_size]
+            if str_hdr + 40 <= elf_bytes.len() {
+                let s_off = u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap()) as usize;
+                let s_size = u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap()) as usize;
+                if s_off.checked_add(s_size).map(|end| end <= elf_bytes.len()).unwrap_or(false) {
+                    &elf_bytes[s_off..s_off + s_size]
+                } else {
+                    &[]
+                }
             } else {
                 &[]
             }
         } else if let Some((str_off, str_size)) = strtab_section {
-            &elf_bytes[str_off..str_off + str_size]
+            if str_off.checked_add(str_size).map(|end| end <= elf_bytes.len()).unwrap_or(false) {
+                &elf_bytes[str_off..str_off + str_size]
+            } else {
+                &[]
+            }
         } else {
             &[]
         };
@@ -582,28 +633,32 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
             }
         };
 
-        let num_syms = sym_size / 24;
+        let num_syms = (sym_size / 24).min(100_000);
         let mut symbols = Vec::with_capacity(num_syms);
         for i in 0..num_syms {
             let s_off = sym_off + (i * 24);
-            let st_name = u32::from_le_bytes(elf_bytes[s_off..s_off + 4].try_into().unwrap()) as usize;
-            symbols.push(get_sym_name(st_name));
+            if s_off + 4 <= elf_bytes.len() {
+                let st_name = u32::from_le_bytes(elf_bytes[s_off..s_off + 4].try_into().unwrap()) as usize;
+                symbols.push(get_sym_name(st_name));
+            }
         }
 
         let num_rels = rel_size / entry_size;
 
         for i in 0..num_rels {
             let r_off = rel_off + (i * entry_size);
-            let r_offset = u64::from_le_bytes(elf_bytes[r_off..r_off + 8].try_into().unwrap()) as usize;
-            let r_info = u64::from_le_bytes(elf_bytes[r_off + 8..r_off + 16].try_into().unwrap());
-            let sym_idx = (r_info >> 32) as usize;
+            if r_off + 16 <= elf_bytes.len() {
+                let r_offset = u64::from_le_bytes(elf_bytes[r_off..r_off + 8].try_into().unwrap()) as usize;
+                let r_info = u64::from_le_bytes(elf_bytes[r_off + 8..r_off + 16].try_into().unwrap());
+                let sym_idx = (r_info >> 32) as usize;
 
-            let insn_idx = r_offset / 8;
-            if insn_idx < insns.len() && sym_idx < symbols.len() {
-                let sym_name = &symbols[sym_idx];
-                if let Some(&fd) = map_fds.get(sym_name) {
-                    insns[insn_idx].dst_reg = (BPF_PSEUDO_MAP_FD << 4) | (insns[insn_idx].dst_reg & 0x0F);
-                    insns[insn_idx].imm = fd;
+                let insn_idx = r_offset / 8;
+                if insn_idx < insns.len() && sym_idx < symbols.len() {
+                    let sym_name = &symbols[sym_idx];
+                    if let Some(&fd) = map_fds.get(sym_name) {
+                        insns[insn_idx].dst_reg = (BPF_PSEUDO_MAP_FD << 4) | (insns[insn_idx].dst_reg & 0x0F);
+                        insns[insn_idx].imm = fd;
+                    }
                 }
             }
         }
@@ -771,7 +826,7 @@ impl PerfReader {
             let event_type = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap());
             let size = u16::from_ne_bytes(hdr_bytes[6..8].try_into().unwrap()) as usize;
 
-            if size == 0 || tail + (size as u64) > head {
+            if size < 8 || tail.checked_add(size as u64).map(|t| t > head).unwrap_or(true) {
                 break;
             }
 

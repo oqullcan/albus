@@ -70,6 +70,10 @@ pub fn extract_alias_targets(response_wire: &[u8]) -> Vec<String> {
             }
         }
 
+        if targets.len() >= 64 {
+            break;
+        }
+
         pos += rdlength;
     }
 

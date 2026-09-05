@@ -483,8 +483,8 @@ impl DnsServer {
                                 });
                             }
                             Err(e) => {
-                                error!("UDP recv_from error: {}", e);
-                                break;
+                                warn!("UDP recv_from error: {}; continuing", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                             }
                         }
                     }
@@ -1006,9 +1006,10 @@ async fn run_active_canary_probe() {
     }
 }
 
-// generates synthetic noerror response with ancount=0 (nodata)
+// generates synthetic noerror response with ancount=0 (nodata) truncated to question section
 pub fn build_nodata_response(query: &[u8]) -> Vec<u8> {
-    let mut resp = query.to_vec();
+    let q_end = extract_question_end(query).unwrap_or(query.len().min(12));
+    let mut resp = query[..q_end].to_vec();
     if resp.len() >= 12 {
         resp[2] = (resp[2] | 0x80) | 0x01; // response flag (qr=1) + recursion desired
         resp[3] = 0x80; // recursion available + noerror (rcode=0)

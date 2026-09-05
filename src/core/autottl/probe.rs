@@ -48,6 +48,9 @@ impl AutoTtlEstimator {
             return ttl;
         }
 
+        // eagerly insert default_ttl to prevent task storm for identical uncached IP
+        self.cache.insert(dst_ip, self.config.default_ttl);
+
         // spawn non-blocking hop measurement task within runtime context
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let this = self.clone();

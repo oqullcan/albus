@@ -142,8 +142,8 @@ impl LocalDoHServer {
                                 });
                             }
                             Err(e) => {
-                                debug!("local DoH accept error: {}", e);
-                                break;
+                                warn!("local DoH accept error: {}; continuing", e);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
                     }

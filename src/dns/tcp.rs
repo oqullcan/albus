@@ -145,8 +145,8 @@ impl DnsTcpServer {
                                 });
                             }
                             Err(e) => {
-                                debug!("TCP DNS accept error: {}", e);
-                                break;
+                                warn!("TCP DNS accept error: {}; continuing", e);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
                     }

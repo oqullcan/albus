@@ -206,6 +206,9 @@ pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
                 pos += 2;
                 break;
             }
+            if pos + 1 + len > data.len() {
+                return;
+            }
             pos += 1 + len;
         }
         pos += 4; // qtype + qclass
@@ -230,6 +233,9 @@ pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
                 if (len & 0xC0) == 0xC0 {
                     pos += 2;
                     break;
+                }
+                if pos + 1 + len > data.len() {
+                    return;
                 }
                 pos += 1 + len;
             }
@@ -281,6 +287,9 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
         if let Ok(label) = std::str::from_utf8(&data[pos..pos + len]) {
             labels.push(label.to_lowercase());
         }
+        if labels.len() >= 128 {
+            return None;
+        }
         pos += len;
     }
 
@@ -308,6 +317,7 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
         return 60;
     }
 
+    let mut min_ttl = 300u32;
     let mut pos = 12;
 
     for _ in 0..qdcount {
@@ -321,12 +331,13 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
                 pos += 2;
                 break;
             }
+            if pos + 1 + len > data.len() {
+                return min_ttl;
+            }
             pos += 1 + len;
         }
         pos += 4;
     }
-
-    let mut min_ttl = 300u32;
 
     for _ in 0..ancount {
         if pos >= data.len() {
@@ -345,6 +356,9 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
                 if (len & 0xC0) == 0xC0 {
                     pos += 2;
                     break;
+                }
+                if pos + 1 + len > data.len() {
+                    return min_ttl;
                 }
                 pos += 1 + len;
             }
