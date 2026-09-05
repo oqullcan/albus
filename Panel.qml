@@ -76,12 +76,18 @@ Panel {
   property bool odohEnabled: false
   property string odohRelay: ""
   property string odohTarget: ""
+  property bool dnsRacingEnabled: true
 
   // preserved CLI configuration parameters not directly exposed in UI
   property var storedPorts: [443]
   property int storedRestoreAfterBytes: 600
   property int storedRestoreMss: 0
   property string storedCgroup: "/sys/fs/cgroup"
+  property int storedFakeSeqOffset: 0
+  property int storedMinTtl: 3
+  property int storedMaxTtl: 12
+  property var storedAllowDomains: []
+  property string storedAllowlistPath: ""
 
   onOpenedChanged: if (opened) {
     loadConfig()
@@ -375,17 +381,64 @@ Panel {
     var detail = "System event"
     var tag = ""
 
-    if (clean.indexOf("fake ClientHello injected") !== -1 || clean.indexOf("ClientHello") !== -1) {
+    if (clean.indexOf("fake ClientHello injected") !== -1 || clean.indexOf("ClientHello") !== -1 || (clean.indexOf("HTTP") !== -1 && clean.indexOf("split") !== -1)) {
       category = "INJECT"
       badgeColor = "#38BDF8"
+      var isHttp = clean.indexOf("HTTP") !== -1 && clean.indexOf("split") !== -1
       var dstMatch = clean.match(/dst=([^\s]+)/)
       var ttlMatch = clean.match(/ttl=([^\s]+)/)
       var badCsMatch = clean.match(/bad_csum=([^\s]+)/) || clean.match(/bad_cs=([^\s]+)/)
-      title = dstMatch ? dstMatch[1] : "TLS ClientHello"
+      title = isHttp ? "HTTP Request Split" : (dstMatch ? dstMatch[1] : "TLS ClientHello")
       var isBad = badCsMatch && (badCsMatch[1] === "true" || badCsMatch[1] === "1")
-      detail = isBad ? "0xDEAD bad-checksum middlebox desync" : "Fake SNI desync injected"
-      tag = (isBad ? "0xDEAD • " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL")
-    } else if (clean.indexOf("DNS cache hit") !== -1 || clean.indexOf("cache_0ms") !== -1) {
+      detail = isHttp ? "HTTP/1.1 verb fragmented desync" : (isBad ? "0xDEAD bad-checksum middlebox desync" : "Fake SNI desync injected")
+      tag = isHttp ? "HTTP/1.1" : ((isBad ? "0xDEAD • " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL"))
+    } else if (clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1 || clean.indexOf("CNAME cloaking") !== -1 || clean.indexOf("Bogon") !== -1 || clean.indexOf("Anti-DNS Rebinding") !== -1 || clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1 || clean.indexOf("undelegated") !== -1) {
+      category = "SHIELD"
+      badgeColor = "#10B981"
+      var isHagezi = clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1
+      var isCname = clean.indexOf("CNAME cloaking") !== -1
+      var isBogon = clean.indexOf("Bogon") !== -1
+      var isRebind = clean.indexOf("Anti-DNS Rebinding") !== -1
+      var isLock = clean.indexOf("Lockdown") !== -1
+      var isCanary = clean.indexOf("canary") !== -1
+      var isStun = clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1
+      var domMatch = clean.match(/domain=([^\s]+)/) || clean.match(/uncloaked_target=([^\s]+)/)
+      var cleanDom = domMatch ? domMatch[1].replace(/["',?]/g, "") : ""
+
+      if (isHagezi) {
+        title = cleanDom !== "" ? cleanDom : "HaGeZi Block"
+        detail = "Ad/malware domain filtered"
+        tag = "Threat Block"
+      } else if (isCname) {
+        title = cleanDom !== "" ? cleanDom : "CNAME Tracker Block"
+        detail = "Uncloaked tracking domain sinkholed"
+        tag = "Uncloak"
+      } else if (isBogon) {
+        title = cleanDom !== "" ? cleanDom : "Bogon IP Dropped"
+        detail = "Unroutable / martian IP filtered"
+        tag = "Bogon Drop"
+      } else if (isRebind) {
+        title = cleanDom !== "" ? cleanDom : "DNS Rebinding Shield"
+        detail = "RFC 1918 private IP leak blocked"
+        tag = "Anti-Rebind"
+      } else if (isLock) {
+        title = "Network Lockdown Rule"
+        detail = "Fail-closed TCP 80/443 protection"
+        tag = "Lockdown"
+      } else if (isCanary) {
+        title = "DNS Leak Canary Probe"
+        detail = "Internal leak detection intercepted"
+        tag = "Canary"
+      } else if (isStun) {
+        title = "WebRTC STUN Block"
+        detail = "UDP 3478/5349 IP leak prevented"
+        tag = "STUN Drop"
+      } else {
+        title = cleanDom !== "" ? cleanDom : "Privacy Shield Block"
+        detail = "Undelegated query / leak drop"
+        tag = "Shield"
+      }
+    } else if (clean.indexOf("DNS cache hit") !== -1 || clean.indexOf("cache_0ms") !== -1 || clean.indexOf("cloaking table") !== -1) {
       category = "DNS"
       badgeColor = "#A855F7"
       var domMatch = clean.match(/domain=([^\s]+)/)
@@ -406,19 +459,12 @@ Panel {
       title = domMatch ? domMatch[1].replace(/["',]/g, "") : "DoH Query"
       detail = "Encrypted upstream resolution"
       tag = dnssecMatch ? "DNSSEC" : "DoH"
-    } else if (clean.indexOf("QUIC") !== -1 || clean.indexOf("blocked") !== -1) {
+    } else if (clean.indexOf("QUIC") !== -1) {
       category = "QUIC"
       badgeColor = "#F59E0B"
       title = "QUIC (UDP 443) Blocked"
       detail = "Forced browser fallback to TCP"
       tag = "UDP 443"
-    } else if (clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1) {
-      category = "SHIELD"
-      badgeColor = "#10B981"
-      var isLock = clean.indexOf("Lockdown") !== -1
-      title = isLock ? "Network Lockdown Rule" : "Privacy Shield Block"
-      detail = isLock ? "Fail-closed TCP 80/443 protection" : "WebRTC STUN / DNS leak drop"
-      tag = isLock ? "Lockdown" : "Leak Block"
     } else if (clean.indexOf("Error") !== -1 || clean.indexOf("Failed") !== -1) {
       category = "ERROR"
       badgeColor = "#EF4444"
@@ -647,6 +693,8 @@ Panel {
       args.push("--odoh-target", root.odohTarget.trim())
     }
 
+    args.push("--dns-racing", root.dnsRacingEnabled ? "true" : "false")
+
     // preserve backend tuning parameters
     if (root.storedPorts && root.storedPorts.length > 0) {
       args.push("--ports", root.storedPorts.join(","))
@@ -655,6 +703,15 @@ Panel {
     args.push("--restore-mss", String(root.storedRestoreMss))
     if (root.storedCgroup) {
       args.push("--cgroup", root.storedCgroup)
+    }
+    args.push("--fake-seq-offset", String(root.storedFakeSeqOffset))
+    args.push("--min-ttl", String(root.storedMinTtl))
+    args.push("--max-ttl", String(root.storedMaxTtl))
+    if (root.storedAllowDomains && root.storedAllowDomains.length > 0) {
+      args.push("--allow-domains", root.storedAllowDomains.join(","))
+    }
+    if (root.storedAllowlistPath && root.storedAllowlistPath.trim() !== "") {
+      args.push("--allowlist-path", root.storedAllowlistPath.trim())
     }
 
     configSetProc.command = ["albus"].concat(args)
@@ -756,11 +813,17 @@ Panel {
           root.odohEnabled = !!cfg.odoh_enabled
           root.odohRelay = cfg.odoh_relay || ""
           root.odohTarget = cfg.odoh_target || ""
+          root.dnsRacingEnabled = cfg.dns_racing !== false
 
           if (cfg.ports && Array.isArray(cfg.ports)) root.storedPorts = cfg.ports
           if (cfg.restore_after_bytes !== undefined) root.storedRestoreAfterBytes = cfg.restore_after_bytes
           if (cfg.restore_mss !== undefined) root.storedRestoreMss = cfg.restore_mss
           if (cfg.cgroup_path) root.storedCgroup = cfg.cgroup_path
+          if (cfg.fake_seq_offset !== undefined) root.storedFakeSeqOffset = cfg.fake_seq_offset
+          if (cfg.min_ttl !== undefined) root.storedMinTtl = cfg.min_ttl
+          if (cfg.max_ttl !== undefined) root.storedMaxTtl = cfg.max_ttl
+          if (cfg.allow_domains && Array.isArray(cfg.allow_domains)) root.storedAllowDomains = cfg.allow_domains
+          if (cfg.allowlist_path) root.storedAllowlistPath = cfg.allowlist_path
 
           var up = cfg.doh_upstream || "quad9"
           if (up === "cloudflare" || up === "quad9") {
@@ -1044,7 +1107,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "UPSTREAM RESOLVER"
-                subtitle: root.activeDnsLabel + (root.activeDnsKey.indexOf("mullvad") !== -1 ? " (" + root.mullvadProfile + ")" : "")
+                subtitle: root.activeDnsLabel + (root.activeDnsKey.indexOf("mullvad") !== -1 ? " (" + root.mullvadProfile + ")" : "") + (root.dnsRacingEnabled ? " • Racing" : "")
                 sectionKey: "upstream"
               }
 
@@ -1287,6 +1350,33 @@ Panel {
                             root.customBootstrapSecondary = text
                             root.scheduleAutoApply()
                           }
+                        }
+                      }
+                    }
+                  }
+
+                  // Happy Eyeballs DNS Racing toggle card
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: racingCol.implicitHeight
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+                    clip: true
+
+                    Column {
+                      id: racingCol
+                      width: parent.width
+
+                      CompactToggle {
+                        label: "Happy Eyeballs DNS Racing"
+                        description: "Concurrent upstream racing across top resolvers for minimal latency"
+                        checked: root.dnsRacingEnabled
+                        showDivider: false
+                        onClicked: {
+                          root.dnsRacingEnabled = !root.dnsRacingEnabled
+                          root.applyAndSave()
                         }
                       }
                     }
