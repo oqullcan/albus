@@ -115,7 +115,7 @@ static inline int handle_established(struct bpf_sock_ops *skops, struct albus_co
         }
     }
 
-    __u16 dst_port = (__u16)(bpf_ntohl(skops->remote_port) >> 16);
+    __u16 dst_port = (__u16)bpf_ntohl(skops->remote_port);
     __u8 *is_target = bpf_map_lookup_elem(&target_ports, &dst_port);
     if (!is_target) {
         return BPF_OK;

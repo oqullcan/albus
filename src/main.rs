@@ -220,6 +220,10 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
         cfg.ipcrypt_key = Some(key.clone());
     }
 
+    if is_root() {
+        let _ = cfg.save_to_file("/etc/albus/config.json");
+    }
+
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;
     engine.run().await

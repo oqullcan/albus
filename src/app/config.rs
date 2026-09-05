@@ -471,6 +471,32 @@ impl Config {
             }
         }
 
+        // 5. if running as root system daemon, discover active desktop user runtime config (/run/user/*/albus/config.json)
+        if crate::core::ebpf::is_root() {
+            if let Ok(entries) = std::fs::read_dir("/run/user") {
+                for entry in entries.flatten() {
+                    let user_run_cfg = entry.path().join("albus/config.json");
+                    if user_run_cfg.exists() {
+                        if let Ok(cfg) = Self::load_from_file(&user_run_cfg) {
+                            return cfg;
+                        }
+                    }
+                }
+            }
+
+            // 6. also check user persistent configs (/home/*/.config/albus/config.json)
+            if let Ok(entries) = std::fs::read_dir("/home") {
+                for entry in entries.flatten() {
+                    let user_disk_cfg = entry.path().join(".config/albus/config.json");
+                    if user_disk_cfg.exists() {
+                        if let Ok(cfg) = Self::load_from_file(&user_disk_cfg) {
+                            return cfg;
+                        }
+                    }
+                }
+            }
+        }
+
         Self::default()
     }
 }
