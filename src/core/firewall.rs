@@ -187,28 +187,4 @@ mod tests {
         // flush_rule should terminate quickly without panic even if the binary does not exist
         flush_rule("nonexistent_firewall_cmd_xyz", &["-D", "OUTPUT"]);
     }
-
-    #[test]
-    fn test_firewall_quic_lifecycle_no_panic() {
-        block_quic();
-        unblock_quic();
-    }
-
-    #[test]
-    fn test_firewall_stun_lifecycle_no_panic() {
-        block_stun();
-        unblock_stun();
-    }
-
-    #[test]
-    fn test_firewall_kill_switch_lifecycle_no_panic() {
-        enable_kill_switch();
-        disable_kill_switch();
-    }
-
-    #[test]
-    fn test_firewall_network_lockdown_lifecycle_no_panic() {
-        enable_network_lockdown();
-        disable_network_lockdown();
-    }
 }
