@@ -85,3 +85,24 @@ fn format_bool(ok: bool) -> &'static str {
         "NOT supported"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bool() {
+        assert_eq!(format_bool(true), "supported");
+        assert_eq!(format_bool(false), "NOT supported");
+    }
+
+    #[test]
+    fn test_status_json_no_panic() {
+        show_status_json();
+    }
+
+    #[test]
+    fn test_status_plaintext_no_panic() {
+        show_status();
+    }
+}

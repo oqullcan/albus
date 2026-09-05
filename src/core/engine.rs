@@ -464,3 +464,66 @@ impl Engine {
         self.bpf_manager.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_engine_new_and_shutdown_no_doh() {
+        let mut cfg = Config::default();
+        cfg.doh_enabled = false;
+        cfg.block_quic = false;
+        cfg.block_stun = false;
+        cfg.kill_switch = false;
+        cfg.network_lockdown = false;
+        cfg.mss = 96;
+
+        let mut engine = Engine::new(cfg).expect("engine initialization should succeed");
+        assert_eq!(engine.cfg.mss, 96);
+        assert!(engine.dns_server.is_none());
+
+        // Test shutdown
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_engine_reload_config() {
+        let mut cfg = Config::default();
+        cfg.doh_enabled = false;
+        cfg.block_quic = false;
+        cfg.block_stun = false;
+        cfg.kill_switch = false;
+        cfg.network_lockdown = false;
+        cfg.mss = 88;
+
+        let mut engine = Engine::new(cfg).expect("engine initialization should succeed");
+        assert_eq!(engine.cfg.mss, 88);
+
+        // reload_config reloads from disk or defaults
+        engine.reload_config();
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_engine_with_cloaking_and_forwarding_rules() {
+        let mut cfg = Config::default();
+        cfg.doh_enabled = true;
+        cfg.block_quic = false;
+        cfg.block_stun = false;
+        cfg.kill_switch = false;
+        cfg.network_lockdown = false;
+        cfg.blocklist = false; // Disable remote fetch in tests
+        cfg.cloaking_rules
+            .insert("internal.corp".to_string(), "10.0.0.1".to_string());
+        cfg.cloaking_rules
+            .insert("invalid.domain".to_string(), "invalid-ip".to_string());
+        cfg.forwarding_rules
+            .insert("corp.local".to_string(), "127.0.0.1:5353".to_string());
+
+        let mut engine = Engine::new(cfg).expect("engine should handle cloaking and forwarding");
+        assert!(engine.dns_server.is_some());
+        engine.shutdown();
+    }
+}

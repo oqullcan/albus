@@ -35,18 +35,18 @@ fn main() {
                 bpf_out.to_str().unwrap()
             );
         }
-        _ => {
-            // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
-            let fallback = env::current_dir().unwrap().join("bpf/sockops.bpf.o");
-            if fallback.exists() {
-                let _ = std::fs::copy(&fallback, &bpf_out);
-                println!(
-                    "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
-                    bpf_out.to_str().unwrap()
+        Ok(s) => {
+            panic!(
+                    "clang failed to compile eBPF bytecode (exit code: {:?}). Please ensure 'clang', 'llvm', and kernel headers ('linux-libc-dev') are installed.\n\
+                     Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev",
+                    s.code()
                 );
-            } else {
-                panic!("Failed to compile eBPF bytecode and no fallback sockops.bpf.o found");
-            }
+        }
+        Err(e) => {
+            panic!(
+                    "Failed to execute clang ({e}). Please ensure 'clang' is installed and available in PATH.\n\
+                     Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev"
+                );
         }
     }
 }

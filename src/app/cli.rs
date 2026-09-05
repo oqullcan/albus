@@ -293,3 +293,178 @@ fn parse_optional_ipv4(s: &str) -> Result<std::net::Ipv4Addr, String> {
     }
     trimmed.parse().map_err(|e| format!("{}", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_cli_default_run_args() {
+        let cli = Cli::try_parse_from(["albus"]).expect("default args should parse");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.run_args.mss, 88);
+        assert_eq!(cli.run_args.min_mss, 64);
+        assert_eq!(cli.run_args.fake_ttl, 8);
+        assert_eq!(cli.run_args.ports, vec![443]);
+        assert!(cli.run_args.doh);
+        assert!(cli.run_args.pqc);
+        assert!(cli.run_args.block_quic);
+        assert!(cli.run_args.block_stun);
+        assert!(cli.run_args.kill_switch);
+        assert!(!cli.run_args.network_lockdown);
+        assert_eq!(cli.run_args.doh_upstream, "quad9");
+    }
+
+    #[test]
+    fn test_cli_run_subcommand_with_custom_flags() {
+        let cli = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--mss",
+            "120",
+            "--min-mss",
+            "70",
+            "--fake-ttl",
+            "5",
+            "--ports",
+            "80,443,8443",
+            "--doh-upstream",
+            "cloudflare",
+            "--fake-sni",
+            "example.com",
+            "--verbose",
+        ])
+        .expect("custom run args should parse");
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.mss, 120);
+                assert_eq!(args.min_mss, 70);
+                assert_eq!(args.fake_ttl, 5);
+                assert_eq!(args.ports, vec![80, 443, 8443]);
+                assert_eq!(args.doh_upstream, "cloudflare");
+                assert_eq!(args.fake_sni.as_deref(), Some("example.com"));
+                assert!(args.verbose);
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_cli_status_subcommand() {
+        let cli_default = Cli::try_parse_from(["albus", "status"]).unwrap();
+        match cli_default.command {
+            Some(Commands::Status(args)) => assert!(!args.json),
+            _ => panic!("expected Commands::Status"),
+        }
+
+        let cli_json = Cli::try_parse_from(["albus", "status", "--json"]).unwrap();
+        match cli_json.command {
+            Some(Commands::Status(args)) => assert!(args.json),
+            _ => panic!("expected Commands::Status with json"),
+        }
+    }
+
+    #[test]
+    fn test_cli_service_subcommands() {
+        let commands = [
+            (
+                "start",
+                matches!(ServiceCommands::Start, ServiceCommands::Start),
+            ),
+            (
+                "stop",
+                matches!(ServiceCommands::Stop, ServiceCommands::Stop),
+            ),
+            (
+                "restart",
+                matches!(ServiceCommands::Restart, ServiceCommands::Restart),
+            ),
+            (
+                "reload",
+                matches!(ServiceCommands::Reload, ServiceCommands::Reload),
+            ),
+            (
+                "status",
+                matches!(ServiceCommands::Status, ServiceCommands::Status),
+            ),
+            (
+                "logs",
+                matches!(ServiceCommands::Logs, ServiceCommands::Logs),
+            ),
+            (
+                "uninstall",
+                matches!(ServiceCommands::Uninstall, ServiceCommands::Uninstall),
+            ),
+        ];
+
+        for (cmd_name, _) in commands {
+            let cli = Cli::try_parse_from(["albus", "service", cmd_name])
+                .unwrap_or_else(|e| panic!("failed to parse service {cmd_name}: {e}"));
+            assert!(matches!(cli.command, Some(Commands::Service(_))));
+        }
+
+        let cli_install =
+            Cli::try_parse_from(["albus", "service", "install", "--mss", "92"]).unwrap();
+        match cli_install.command {
+            Some(Commands::Service(ServiceArgs {
+                command: ServiceCommands::Install(args),
+            })) => {
+                assert_eq!(args.mss, 92);
+            }
+            _ => panic!("expected ServiceCommands::Install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_config_subcommands() {
+        let cli_get = Cli::try_parse_from(["albus", "config", "get"]).unwrap();
+        assert!(matches!(
+            cli_get.command,
+            Some(Commands::Config(ConfigArgs {
+                command: Some(ConfigCommands::Get)
+            }))
+        ));
+
+        let cli_set = Cli::try_parse_from(["albus", "config", "set", "--mss", "140"]).unwrap();
+        match cli_set.command {
+            Some(Commands::Config(ConfigArgs {
+                command: Some(ConfigCommands::Set(args)),
+            })) => {
+                assert_eq!(args.mss, 140);
+            }
+            _ => panic!("expected ConfigCommands::Set"),
+        }
+    }
+
+    #[test]
+    fn test_cli_misc_subcommands() {
+        let cli_mon = Cli::try_parse_from(["albus", "monitor"]).unwrap();
+        assert!(matches!(cli_mon.command, Some(Commands::Monitor)));
+
+        let cli_clean = Cli::try_parse_from(["albus", "cleanup"]).unwrap();
+        assert!(matches!(cli_clean.command, Some(Commands::Cleanup)));
+    }
+
+    #[test]
+    fn test_cli_parse_optional_ipv4() {
+        assert_eq!(
+            parse_optional_ipv4("1.1.1.1").unwrap(),
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
+        assert_eq!(
+            parse_optional_ipv4(" 8.8.8.8 ").unwrap(),
+            Ipv4Addr::new(8, 8, 8, 8)
+        );
+        assert!(parse_optional_ipv4("").is_err());
+        assert!(parse_optional_ipv4("   ").is_err());
+        assert!(parse_optional_ipv4("999.999.999.999").is_err());
+        assert!(parse_optional_ipv4("invalid-ip").is_err());
+    }
+
+    #[test]
+    fn test_cli_invalid_flag_rejected() {
+        assert!(Cli::try_parse_from(["albus", "--non-existent-flag"]).is_err());
+    }
+}

@@ -242,3 +242,42 @@ fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .status()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_polkit_rule_content() {
+        assert!(POLKIT_RULE_CONTENT.contains("org.freedesktop.systemd1.manage-units"));
+        assert!(POLKIT_RULE_CONTENT.contains("albus.service"));
+        assert!(POLKIT_RULE_CONTENT.contains("wheel"));
+        assert!(POLKIT_RULE_CONTENT.contains("sudo"));
+    }
+
+    #[test]
+    fn test_service_constants() {
+        assert_eq!(SERVICE_FILE_PATH, "/etc/systemd/system/albus.service");
+        assert_eq!(SYSTEM_BIN_PATH, "/usr/local/bin/albus");
+        assert_eq!(POLKIT_RULE_PATH, "/etc/polkit-1/rules.d/albus.rules");
+    }
+
+    #[test]
+    fn test_service_unprivileged_errors() {
+        if !is_root() {
+            let cli = crate::app::cli::Cli::try_parse_from(["albus"]).unwrap();
+            let install_res = install_service(&cli.run_args);
+            assert!(install_res.is_err());
+
+            let start_res = start_service();
+            assert!(start_res.is_err());
+
+            let stop_res = stop_service();
+            assert!(stop_res.is_err());
+
+            let restart_res = restart_service();
+            assert!(restart_res.is_err());
+        }
+    }
+}

@@ -272,3 +272,54 @@ impl Drop for BpfManager {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::autottl::AutoTtlConfig;
+
+    fn test_bpf_config() -> BpfManagerConfig {
+        BpfManagerConfig {
+            mss: 88,
+            min_mss: 64,
+            restore_mss: 1460,
+            restore_after_bytes: 600,
+            ports: vec![443],
+            exclude_ips: vec![Ipv4Addr::new(1, 1, 1, 1)],
+            exclude_ips_v6: vec![Ipv6Addr::LOCALHOST],
+            cgroup_path: "/sys/fs/cgroup".to_string(),
+            fake_ttl: 8,
+            fake_sni: Some("test.example.com".to_string()),
+            fake_bad_checksum: false,
+            fake_seq_offset: 0,
+            pqc: true,
+            auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+        }
+    }
+
+    #[test]
+    fn test_bpf_manager_lifecycle() {
+        let cfg = test_bpf_config();
+        let mut manager = BpfManager::new(cfg);
+        assert!(!manager.running.load(Ordering::SeqCst));
+
+        // stop on unstarted manager is idempotent and safe
+        manager.stop();
+        assert!(!manager.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_bpf_manager_reload_maps_unattached() {
+        let cfg = test_bpf_config();
+        let mut manager = BpfManager::new(cfg);
+
+        let mut updated_cfg = test_bpf_config();
+        updated_cfg.mss = 128;
+        updated_cfg.ports = vec![80, 443];
+
+        let res = manager.reload_maps(&updated_cfg);
+        assert!(res.is_ok());
+        assert_eq!(manager.cfg.mss, 128);
+        assert_eq!(manager.cfg.ports, vec![80, 443]);
+    }
+}
