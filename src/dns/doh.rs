@@ -26,42 +26,79 @@ const QUAD9_IPS_V6: &[Ipv6Addr] = &[
     Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009),
 ];
 
-const MULLVAD_STANDARD_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0002)];
+const MULLVAD_STANDARD_IPS_V6: &[Ipv6Addr] =
+    &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0002)];
 const MULLVAD_ADBLOCK_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0003)];
 const MULLVAD_BASE_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0004)];
-const MULLVAD_EXTENDED_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0005)];
+const MULLVAD_EXTENDED_IPS_V6: &[Ipv6Addr] =
+    &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0005)];
 const MULLVAD_FAMILY_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0006)];
 const MULLVAD_ALL_IPS_V6: &[Ipv6Addr] = &[Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0009)];
 
 // static lookup table of pre-configured public doh endpoints and bootstrap ipv4 addresses
-pub static DOH_PRESETS: LazyLock<HashMap<&'static str, (&'static str, &'static [Ipv4Addr])>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("cloudflare", ("https://cloudflare-dns.com/dns-query", CLOUDFLARE_IPS));
-    m.insert("quad9", ("https://dns.quad9.net/dns-query", QUAD9_IPS));
-    m.insert("mullvad", ("https://dns.mullvad.net/dns-query", MULLVAD_STANDARD_IPS));
-    m.insert("mullvad-standard", ("https://dns.mullvad.net/dns-query", MULLVAD_STANDARD_IPS));
-    m.insert("mullvad-adblock", ("https://adblock.dns.mullvad.net/dns-query", MULLVAD_ADBLOCK_IPS));
-    m.insert("mullvad-base", ("https://base.dns.mullvad.net/dns-query", MULLVAD_BASE_IPS));
-    m.insert("mullvad-extended", ("https://extended.dns.mullvad.net/dns-query", MULLVAD_EXTENDED_IPS));
-    m.insert("mullvad-family", ("https://family.dns.mullvad.net/dns-query", MULLVAD_FAMILY_IPS));
-    m.insert("mullvad-all", ("https://all.dns.mullvad.net/dns-query", MULLVAD_ALL_IPS));
-    m
-});
+pub static DOH_PRESETS: LazyLock<HashMap<&'static str, (&'static str, &'static [Ipv4Addr])>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert(
+            "cloudflare",
+            ("https://cloudflare-dns.com/dns-query", CLOUDFLARE_IPS),
+        );
+        m.insert("quad9", ("https://dns.quad9.net/dns-query", QUAD9_IPS));
+        m.insert(
+            "mullvad",
+            ("https://dns.mullvad.net/dns-query", MULLVAD_STANDARD_IPS),
+        );
+        m.insert(
+            "mullvad-standard",
+            ("https://dns.mullvad.net/dns-query", MULLVAD_STANDARD_IPS),
+        );
+        m.insert(
+            "mullvad-adblock",
+            (
+                "https://adblock.dns.mullvad.net/dns-query",
+                MULLVAD_ADBLOCK_IPS,
+            ),
+        );
+        m.insert(
+            "mullvad-base",
+            ("https://base.dns.mullvad.net/dns-query", MULLVAD_BASE_IPS),
+        );
+        m.insert(
+            "mullvad-extended",
+            (
+                "https://extended.dns.mullvad.net/dns-query",
+                MULLVAD_EXTENDED_IPS,
+            ),
+        );
+        m.insert(
+            "mullvad-family",
+            (
+                "https://family.dns.mullvad.net/dns-query",
+                MULLVAD_FAMILY_IPS,
+            ),
+        );
+        m.insert(
+            "mullvad-all",
+            ("https://all.dns.mullvad.net/dns-query", MULLVAD_ALL_IPS),
+        );
+        m
+    });
 
 // static lookup table of pre-configured public doh endpoints and bootstrap ipv6 addresses
-pub static DOH_PRESETS_V6: LazyLock<HashMap<&'static str, &'static [Ipv6Addr]>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("cloudflare", CLOUDFLARE_IPS_V6);
-    m.insert("quad9", QUAD9_IPS_V6);
-    m.insert("mullvad", MULLVAD_STANDARD_IPS_V6);
-    m.insert("mullvad-standard", MULLVAD_STANDARD_IPS_V6);
-    m.insert("mullvad-adblock", MULLVAD_ADBLOCK_IPS_V6);
-    m.insert("mullvad-base", MULLVAD_BASE_IPS_V6);
-    m.insert("mullvad-extended", MULLVAD_EXTENDED_IPS_V6);
-    m.insert("mullvad-family", MULLVAD_FAMILY_IPS_V6);
-    m.insert("mullvad-all", MULLVAD_ALL_IPS_V6);
-    m
-});
+pub static DOH_PRESETS_V6: LazyLock<HashMap<&'static str, &'static [Ipv6Addr]>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("cloudflare", CLOUDFLARE_IPS_V6);
+        m.insert("quad9", QUAD9_IPS_V6);
+        m.insert("mullvad", MULLVAD_STANDARD_IPS_V6);
+        m.insert("mullvad-standard", MULLVAD_STANDARD_IPS_V6);
+        m.insert("mullvad-adblock", MULLVAD_ADBLOCK_IPS_V6);
+        m.insert("mullvad-base", MULLVAD_BASE_IPS_V6);
+        m.insert("mullvad-extended", MULLVAD_EXTENDED_IPS_V6);
+        m.insert("mullvad-family", MULLVAD_FAMILY_IPS_V6);
+        m.insert("mullvad-all", MULLVAD_ALL_IPS_V6);
+        m
+    });
 
 // individual http/2 client targeting an encrypted dns endpoint
 #[derive(Clone)]
@@ -91,10 +128,11 @@ impl SingleDoHClient {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let mut client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut client_config =
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let mut builder = reqwest::Client::builder()
@@ -168,7 +206,11 @@ impl SingleDoHClient {
 
         if let Some(content_len) = resp.content_length() {
             if content_len > 65536 {
-                return Err(format!("DoH response length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+                return Err(format!(
+                    "DoH response length {} exceeds maximum allowed (65536 bytes)",
+                    content_len
+                )
+                .into());
             }
         }
 
@@ -240,7 +282,8 @@ impl DoHResolver {
                         if stamp.doh_url.is_empty() {
                             warn!("dns stamp {} does not specify a doh endpoint", u);
                         } else {
-                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc) {
+                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc)
+                            {
                                 Ok(client) => clients.push(client),
                                 Err(e) => warn!("failed to initialize stamp doh {}: {}", name, e),
                             }
@@ -300,6 +343,53 @@ impl DoHResolver {
         }
 
         Err(last_err.unwrap_or_else(|| "no doh upstreams available".into()))
+    }
+
+    // queries multiple highest-ranked upstreams concurrently (happy eyeballs DNS racing),
+    // returning the fastest successful response, canceling slower tasks, and updating latency scores
+    pub async fn resolve_racing(
+        &self,
+        query_wire_bytes: &[u8],
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        let candidates = self.balancer.select_candidates();
+        if candidates.len() <= 1 {
+            return self.resolve(query_wire_bytes).await;
+        }
+
+        let race_candidates: Vec<usize> = candidates.into_iter().take(3).collect();
+        let mut set = tokio::task::JoinSet::new();
+
+        for &idx in &race_candidates {
+            if let Some(client) = self.clients.get(idx) {
+                let client = client.clone();
+                let q_bytes = query_wire_bytes.to_vec();
+                set.spawn(async move {
+                    let start = std::time::Instant::now();
+                    let res = client.resolve(&q_bytes).await;
+                    (idx, client.name, res, start.elapsed())
+                });
+            }
+        }
+
+        let mut last_err = None;
+        while let Some(join_res) = set.join_next().await {
+            if let Ok((idx, name, res, elapsed)) = join_res {
+                match res {
+                    Ok(data) => {
+                        self.balancer.record_result(idx, elapsed, true);
+                        set.abort_all();
+                        return Ok((data, name));
+                    }
+                    Err(e) => {
+                        self.balancer.record_result(idx, elapsed, false);
+                        debug!("Racing DoH upstream {} failed: {}", name, e);
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| "all racing doh upstreams failed".into()))
     }
 }
 
@@ -418,13 +508,21 @@ mod tests {
     #[test]
     fn test_pqc_toggle_true_vs_false_kx_groups() {
         // 1. verify pqc: true contains quantum-resistant KEM hybrid group
-        let client_pqc = SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true);
-        assert!(client_pqc.is_ok(), "PQC client initialization should succeed");
+        let client_pqc =
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true);
+        assert!(
+            client_pqc.is_ok(),
+            "PQC client initialization should succeed"
+        );
         assert!(client_pqc.unwrap().pqc);
 
         // 2. verify pqc: false contains exclusively classical elliptic curves
-        let client_classical = SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false);
-        assert!(client_classical.is_ok(), "Classical client initialization should succeed");
+        let client_classical =
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false);
+        assert!(
+            client_classical.is_ok(),
+            "Classical client initialization should succeed"
+        );
         assert!(!client_classical.unwrap().pqc);
 
         // 3. assert crypto provider kx_groups filtering correctness
@@ -436,8 +534,14 @@ mod tests {
 
         for kx in &classical_provider.kx_groups {
             let name = format!("{:?}", kx.name());
-            assert!(!name.contains("MLKEM"), "Classical provider must not contain ML-KEM");
-            assert!(!name.contains("Kyber"), "Classical provider must not contain Kyber");
+            assert!(
+                !name.contains("MLKEM"),
+                "Classical provider must not contain ML-KEM"
+            );
+            assert!(
+                !name.contains("Kyber"),
+                "Classical provider must not contain Kyber"
+            );
         }
 
         let pqc_provider = rustls::crypto::aws_lc_rs::default_provider();
@@ -445,7 +549,10 @@ mod tests {
             let name = format!("{:?}", kx.name());
             name.contains("MLKEM") || name.contains("Kyber")
         });
-        assert!(has_pq, "PQC provider must contain quantum-resistant ML-KEM or Kyber group");
+        assert!(
+            has_pq,
+            "PQC provider must contain quantum-resistant ML-KEM or Kyber group"
+        );
     }
 
     #[test]
@@ -476,14 +583,15 @@ mod tests {
             0x00, 0x00, // ancount = 0
             0x00, 0x00, // nscount = 0
             0x00, 0x00, // arcount = 0
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,
-            0x00, 0x01, // type a
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, // type a
             0x00, 0x01, // class in
         ];
 
-        let (response_wire, upstream_used) = resolver.resolve(&query_wire).await.expect("quad9 doh should resolve");
+        let (response_wire, upstream_used) = resolver
+            .resolve(&query_wire)
+            .await
+            .expect("quad9 doh should resolve");
         assert_eq!(upstream_used, "quad9");
         assert!(response_wire.len() > 12);
     }
@@ -492,7 +600,10 @@ mod tests {
     fn test_sdns_stamp_resolver_init() {
         let quad9_stamp = "sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ";
         let resolver = DoHResolver::new(quad9_stamp, &[], true);
-        assert!(resolver.is_ok(), "DNS stamp DoHResolver init should succeed");
+        assert!(
+            resolver.is_ok(),
+            "DNS stamp DoHResolver init should succeed"
+        );
         let ips = extract_upstream_ips(quad9_stamp, &[]);
         assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)));
     }

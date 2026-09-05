@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -43,6 +43,7 @@ pub struct DnsServer {
     block_ipv6: bool,
     dnssec: bool,
     pqc: bool,
+    pub racing: bool,
     anti_dns_rebinding: bool,
     block_undelegated: bool,
     edns_padding: bool,
@@ -73,6 +74,7 @@ impl DnsServer {
         block_ipv6: bool,
         dnssec: bool,
         pqc: bool,
+        racing: bool,
         anti_dns_rebinding: bool,
         block_undelegated: bool,
         edns_padding: bool,
@@ -102,6 +104,7 @@ impl DnsServer {
             block_ipv6,
             dnssec,
             pqc,
+            racing,
             anti_dns_rebinding,
             block_undelegated,
             edns_padding,
@@ -141,6 +144,7 @@ impl DnsServer {
             true,
             true,
             true,
+            true,
             Arc::new(CloakEngine::new()),
             Arc::new(RwLock::new(build_seed_blocklist())),
             Arc::new(RwLock::new(DomainAllowlist::new())),
@@ -175,7 +179,9 @@ impl DnsServer {
 }
 
 // creates a Linux kernel socket tuned with IP_FREEBIND, IP_TOS (DSCP 0x70), and enlarged socket buffers
-fn create_tuned_udp_socket(addr: &str) -> Result<tokio::net::UdpSocket, Box<dyn std::error::Error + Send + Sync>> {
+fn create_tuned_udp_socket(
+    addr: &str,
+) -> Result<tokio::net::UdpSocket, Box<dyn std::error::Error + Send + Sync>> {
     let std_sock = std::net::UdpSocket::bind(addr)
         .map_err(|e| format!("failed to bind UDP socket to {}: {}", addr, e))?;
 
@@ -260,7 +266,9 @@ impl DnsServer {
         let socket = match create_tuned_udp_socket("127.0.0.1:53") {
             Ok(s) => s,
             Err(e) => {
-                return Err(format!("failed to bind tuned UDP socket to 127.0.0.1:53: {}", e).into());
+                return Err(
+                    format!("failed to bind tuned UDP socket to 127.0.0.1:53: {}", e).into(),
+                );
             }
         };
 
@@ -420,9 +428,7 @@ impl DnsServer {
                 tcp_bind,
                 move |query, peer| {
                     let s = s_tcp.clone();
-                    async move {
-                        s.resolve_packet(&query, peer.ip()).await
-                    }
+                    async move { s.resolve_packet(&query, peer.ip()).await }
                 },
                 rx,
             );
@@ -436,9 +442,7 @@ impl DnsServer {
                 self.local_doh_addr,
                 move |query, peer| {
                     let s = s_doh.clone();
-                    async move {
-                        s.resolve_packet(&query, peer.ip()).await
-                    }
+                    async move { s.resolve_packet(&query, peer.ip()).await }
                 },
                 rx,
             );
@@ -533,11 +537,18 @@ impl DnsServer {
             match odoh.resolve(outgoing_query).await {
                 Ok(resp) => return Ok((resp, "odoh".to_string())),
                 Err(e) => {
-                    warn!("ODoH resolution failed ({}), falling back to direct DoH upstream", e);
+                    warn!(
+                        "ODoH resolution failed ({}), falling back to direct DoH upstream",
+                        e
+                    );
                 }
             }
         }
-        self.resolver.resolve(outgoing_query).await
+        if self.racing {
+            self.resolver.resolve_racing(outgoing_query).await
+        } else {
+            self.resolver.resolve(outgoing_query).await
+        }
     }
 
     // common unified query resolution pipeline shared across udp, tcp 53 (rfc 7766), and local doh (rfc 8484)
@@ -554,12 +565,22 @@ impl DnsServer {
         // 0. intercept internal dns leak test canary probe
         if is_canary_query(query_data) {
             let canary_resp = build_canary_response(query_data, Ipv4Addr::new(127, 0, 0, 99));
-            self.maybe_log_query(client_ip, "leak-test.albus.internal", 1, QueryStatus::Canary, start_time, None);
+            self.maybe_log_query(
+                client_ip,
+                "leak-test.albus.internal",
+                1,
+                QueryStatus::Canary,
+                start_time,
+                None,
+            );
             return Some(canary_resp);
         }
 
         let query_key = extract_query_key(query_data);
-        let domain = query_key.as_ref().map(|k| k.name.clone()).unwrap_or_default();
+        let domain = query_key
+            .as_ref()
+            .map(|k| k.name.clone())
+            .unwrap_or_default();
         let qtype = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
 
         // 1. intercept mozilla firefox doh canary (use-application-dns.net) to force local proxy
@@ -567,7 +588,14 @@ impl DnsServer {
             if is_firefox_canary(&key.name) {
                 debug!(domain = %key.name, "Intercepted Firefox DoH canary probe; returning NXDOMAIN to force local proxy");
                 self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
-                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Cloak0ms, start_time, Some("firefox_canary"));
+                self.maybe_log_query(
+                    client_ip,
+                    &domain,
+                    qtype,
+                    QueryStatus::Cloak0ms,
+                    start_time,
+                    Some("firefox_canary"),
+                );
                 return Some(build_nxdomain_response(query_data));
             }
         }
@@ -577,17 +605,32 @@ impl DnsServer {
             if let Some(captive_ip) = check_captive_portal(&key.name, key.qtype) {
                 debug!(domain = %key.name, ip = %captive_ip, "Synthesized captive portal detection response");
                 self.stats.captive_probes.fetch_add(1, Ordering::Relaxed);
-                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Captive, start_time, Some("captive_probe"));
+                self.maybe_log_query(
+                    client_ip,
+                    &domain,
+                    qtype,
+                    QueryStatus::Captive,
+                    start_time,
+                    Some("captive_probe"),
+                );
                 return build_captive_response(query_data, captive_ip);
             }
         }
 
         // 3. check local cloaking table (0ms local hosts / synthetic overrides)
         if let Some(key) = &query_key {
-            if let Some(cloaked_resp) = self.cloak.resolve_cloaked(&key.name, key.qtype, query_data) {
+            if let Some(cloaked_resp) = self.cloak.resolve_cloaked(&key.name, key.qtype, query_data)
+            {
                 debug!(domain = %key.name, "Resolved via local cloaking table (0ms)");
                 self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
-                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Cloak0ms, start_time, Some("cloak_override"));
+                self.maybe_log_query(
+                    client_ip,
+                    &domain,
+                    qtype,
+                    QueryStatus::Cloak0ms,
+                    start_time,
+                    Some("cloak_override"),
+                );
                 return Some(cloaked_resp);
             }
         }
@@ -598,7 +641,14 @@ impl DnsServer {
                 match self.cloak.forward_query(query_data, target_forwarder).await {
                     Ok(resp) => {
                         debug!(domain = %key.name, target = %target_forwarder, "Resolved via split-DNS forwarder");
-                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("split_dns"));
+                        self.maybe_log_query(
+                            client_ip,
+                            &domain,
+                            qtype,
+                            QueryStatus::Pass,
+                            start_time,
+                            Some("split_dns"),
+                        );
                         return Some(resp);
                     }
                     Err(e) => {
@@ -613,7 +663,14 @@ impl DnsServer {
             if let Some(key) = &query_key {
                 if is_undelegated_zone(&key.name) {
                     debug!(domain = %key.name, "Blocked undelegated/unqualified domain from leaking upstream");
-                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Undelegated, start_time, Some("undelegated_zone"));
+                    self.maybe_log_query(
+                        client_ip,
+                        &domain,
+                        qtype,
+                        QueryStatus::Undelegated,
+                        start_time,
+                        Some("undelegated_zone"),
+                    );
                     return Some(build_nxdomain_response(query_data));
                 }
             }
@@ -636,7 +693,14 @@ impl DnsServer {
                         qtype = key.qtype,
                         "DNS query blocked by HaGeZi filter"
                     );
-                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::BlockHagezi, start_time, Some("hagezi_block"));
+                    self.maybe_log_query(
+                        client_ip,
+                        &domain,
+                        qtype,
+                        QueryStatus::BlockHagezi,
+                        start_time,
+                        Some("hagezi_block"),
+                    );
                     return Some(build_sinkhole_response(query_data, key.qtype));
                 }
             }
@@ -644,7 +708,14 @@ impl DnsServer {
 
         // 8. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
         if self.block_ipv6 && !self.dns64 && is_aaaa_query(query_data) {
-            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("ipv6_nodata"));
+            self.maybe_log_query(
+                client_ip,
+                &domain,
+                qtype,
+                QueryStatus::Pass,
+                start_time,
+                Some("ipv6_nodata"),
+            );
             return Some(build_nodata_response(query_data));
         }
 
@@ -673,7 +744,14 @@ impl DnsServer {
                     }
                 }
             }
-            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::CacheHit, start_time, Some("cache_0ms"));
+            self.maybe_log_query(
+                client_ip,
+                &domain,
+                qtype,
+                QueryStatus::CacheHit,
+                start_time,
+                Some("cache_0ms"),
+            );
             return Some(cached_resp);
         }
 
@@ -698,7 +776,14 @@ impl DnsServer {
                             "Anti-DNS-Rebinding triggered: public response resolved to private IP! Blocking response."
                         );
                         self.stats.rebinding_drops.fetch_add(1, Ordering::Relaxed);
-                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::RebindRefused, start_time, Some("dns_rebind"));
+                        self.maybe_log_query(
+                            client_ip,
+                            &domain,
+                            qtype,
+                            QueryStatus::RebindRefused,
+                            start_time,
+                            Some("dns_rebind"),
+                        );
                         return Some(build_refused_response(query_data));
                     }
                 }
@@ -706,13 +791,22 @@ impl DnsServer {
                 // Response IP & Bogon blacklist filter
                 if !is_whitelisted {
                     let ips = extract_resolved_ips(&resp_bytes);
-                    if let Some(blocked_ip) = ips.into_iter().find(|ip| self.ip_filter.is_blocked(*ip)) {
+                    if let Some(blocked_ip) =
+                        ips.into_iter().find(|ip| self.ip_filter.is_blocked(*ip))
+                    {
                         warn!(
                             domain = ?query_key.as_ref().map(|k| &k.name),
                             ip = %blocked_ip,
                             "Resolved IP dropped by Bogon/Malicious IP blacklist"
                         );
-                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::BogonDrop, start_time, Some("bogon_filter"));
+                        self.maybe_log_query(
+                            client_ip,
+                            &domain,
+                            qtype,
+                            QueryStatus::BogonDrop,
+                            start_time,
+                            Some("bogon_filter"),
+                        );
                         return Some(build_refused_response(query_data));
                     }
                 }
@@ -734,7 +828,14 @@ impl DnsServer {
                                     "CNAME cloaking tracker detected and blocked"
                                 );
                                 self.stats.uncloaked_cnames.fetch_add(1, Ordering::Relaxed);
-                                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::UncloakedCname, start_time, Some(&target));
+                                self.maybe_log_query(
+                                    client_ip,
+                                    &domain,
+                                    qtype,
+                                    QueryStatus::UncloakedCname,
+                                    start_time,
+                                    Some(&target),
+                                );
                                 let qtype_val = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
                                 return Some(build_sinkhole_response(query_data, qtype_val));
                             }
@@ -756,9 +857,19 @@ impl DnsServer {
                                 if let Ok((a_resp, _)) = self.resolve_upstream(&a_query).await {
                                     if let Some((_, v4_ips)) = parse_dns_response(&a_resp) {
                                         if !v4_ips.is_empty() {
-                                            let dns64_resp = build_dns64_response(query_data, &v4_ips, 300);
-                                            self.stats.dns64_synthesized.fetch_add(1, Ordering::Relaxed);
-                                            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("dns64_synth"));
+                                            let dns64_resp =
+                                                build_dns64_response(query_data, &v4_ips, 300);
+                                            self.stats
+                                                .dns64_synthesized
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            self.maybe_log_query(
+                                                client_ip,
+                                                &domain,
+                                                qtype,
+                                                QueryStatus::Pass,
+                                                start_time,
+                                                Some("dns64_synth"),
+                                            );
                                             return Some(dns64_resp);
                                         }
                                     }
@@ -796,7 +907,14 @@ impl DnsServer {
                     }
                 }
 
-                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some(&via));
+                self.maybe_log_query(
+                    client_ip,
+                    &domain,
+                    qtype,
+                    QueryStatus::Pass,
+                    start_time,
+                    Some(&via),
+                );
                 Some(resp_bytes)
             }
             Err(e) => {
@@ -808,7 +926,14 @@ impl DnsServer {
                         domain = ?query_key.as_ref().map(|k| &k.name),
                         "Serving stale cached DNS response under RFC 8767 during upstream failure"
                     );
-                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::CacheHit, start_time, Some("serve_stale"));
+                    self.maybe_log_query(
+                        client_ip,
+                        &domain,
+                        qtype,
+                        QueryStatus::CacheHit,
+                        start_time,
+                        Some("serve_stale"),
+                    );
                     return Some(stale_resp);
                 }
 
@@ -874,11 +999,10 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     if arcount == 0 {
         // opt rr specification: root domain (0x00), type 41 (opt), udp payload size 4096, do-bit (0x8000)
         let opt_rr: [u8; 11] = [
-            0x00,
-            0x00, 0x29, // type: opt (41)
+            0x00, 0x00, 0x29, // type: opt (41)
             0x10, 0x00, // payload size: 4096
-            0x00,       // extended rcode
-            0x00,       // edns version
+            0x00, // extended rcode
+            0x00, // edns version
             0x80, 0x00, // do bit set (0x8000)
             0x00, 0x00, // rdlen: 0
         ];
@@ -978,7 +1102,8 @@ async fn run_active_canary_probe() {
         let mut resp_buf = [0u8; 512];
         let (len, _) = sock.recv_from(&mut resp_buf).await?;
         Ok::<Vec<u8>, std::io::Error>(resp_buf[..len].to_vec())
-    }).await;
+    })
+    .await;
 
     match probe_res {
         Ok(Ok(resp)) => {
@@ -992,7 +1117,10 @@ async fn run_active_canary_probe() {
             }
         }
         Ok(Err(e)) => {
-            warn!("Active DNS Leak Canary probe network error ({}). Auto-healing system DNS...", e);
+            warn!(
+                "Active DNS Leak Canary probe network error ({}). Auto-healing system DNS...",
+                e
+            );
             if let Err(err) = crate::dns::system::set_system_dns() {
                 warn!("failed to auto-heal /etc/resolv.conf: {}", err);
             }
@@ -1182,8 +1310,14 @@ mod tests {
             q.push_back("second.com".to_string());
         }
 
-        assert_eq!(server.pop_domain(test_ip).await, Some("first.com".to_string()));
-        assert_eq!(server.pop_domain(test_ip).await, Some("second.com".to_string()));
+        assert_eq!(
+            server.pop_domain(test_ip).await,
+            Some("first.com".to_string())
+        );
+        assert_eq!(
+            server.pop_domain(test_ip).await,
+            Some("second.com".to_string())
+        );
         assert_eq!(server.pop_domain(test_ip).await, None);
     }
 
@@ -1196,9 +1330,8 @@ mod tests {
             0x00, 0x00, // ancount
             0x00, 0x00, // nscount
             0x00, 0x00, // arcount
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,       // end of name
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, // end of name
             0x00, 0x1C, // qtype = 28 (aaaa)
             0x00, 0x01, // qclass = in (1)
         ];
@@ -1227,11 +1360,8 @@ mod tests {
             0x00, 0x00, // ancount
             0x00, 0x00, // nscount
             0x00, 0x00, // arcount = 0
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,
-            0x00, 0x01,
-            0x00, 0x01,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01,
         ];
 
         let dnssec_query = enable_dnssec_do(&query);
@@ -1286,9 +1416,9 @@ mod tests {
     #[test]
     fn test_build_servfail_response() {
         let query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
         ];
         let resp = build_servfail_response(&query);
         assert_eq!(resp.len(), query.len());

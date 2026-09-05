@@ -188,7 +188,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let mut stream = tokio::net::TcpStream::connect(bind_addr).await.expect("connect failed");
+        let mut stream = tokio::net::TcpStream::connect(bind_addr)
+            .await
+            .expect("connect failed");
 
         // send length-prefixed query (RFC 7766)
         let query_data = vec![0xAB, 0xCD, 0x01, 0x00];

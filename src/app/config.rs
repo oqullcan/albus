@@ -26,6 +26,8 @@ pub struct Config {
     pub fake_sni: Option<String>,
     #[serde(default)]
     pub fake_bad_checksum: bool,
+    #[serde(default)]
+    pub fake_seq_offset: i32,
     #[serde(default = "default_true")]
     pub auto_ttl: bool,
     #[serde(default = "default_min_ttl")]
@@ -34,6 +36,8 @@ pub struct Config {
     pub max_ttl: u8,
     #[serde(default = "default_true")]
     pub doh_enabled: bool,
+    #[serde(default = "default_true")]
+    pub dns_racing: bool,
     #[serde(default = "default_upstream")]
     pub doh_upstream: String,
     #[serde(default)]
@@ -105,25 +109,47 @@ pub struct Config {
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
-fn default_mss() -> u16 { 88 }
+fn default_mss() -> u16 {
+    88
+}
 // default lower bound for mss jitter randomization (64 bytes)
-fn default_min_mss() -> u16 { 64 }
+fn default_min_mss() -> u16 {
+    64
+}
 // default byte threshold before kernel returns to native line-rate mss
-fn default_restore_bytes() -> u32 { 600 }
+fn default_restore_bytes() -> u32 {
+    600
+}
 // standard https port
-fn default_ports() -> Vec<u16> { vec![443] }
+fn default_ports() -> Vec<u16> {
+    vec![443]
+}
 // default unified cgroup v2 mount point
-fn default_cgroup() -> String { "/sys/fs/cgroup".to_string() }
+fn default_cgroup() -> String {
+    "/sys/fs/cgroup".to_string()
+}
 // fallback hop ttl value
-fn default_ttl() -> u8 { 8 }
+fn default_ttl() -> u8 {
+    8
+}
 // lower bound clamp for auto-ttl
-fn default_min_ttl() -> u8 { 3 }
+fn default_min_ttl() -> u8 {
+    3
+}
 // upper bound clamp for auto-ttl
-fn default_max_ttl() -> u8 { 12 }
-fn default_true() -> bool { true }
-fn default_local_doh_addr() -> String { "127.0.0.1:8053".to_string() }
+fn default_max_ttl() -> u8 {
+    12
+}
+fn default_true() -> bool {
+    true
+}
+fn default_local_doh_addr() -> String {
+    "127.0.0.1:8053".to_string()
+}
 // default upstream resolver
-fn default_upstream() -> String { "quad9".to_string() }
+fn default_upstream() -> String {
+    "quad9".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -137,10 +163,12 @@ impl Default for Config {
             fake_ttl: 8,
             fake_sni: None,
             fake_bad_checksum: false,
+            fake_seq_offset: 0,
             auto_ttl: true,
             min_ttl: 3,
             max_ttl: 12,
             doh_enabled: true,
+            dns_racing: true,
             doh_upstream: "quad9".to_string(),
             doh_bootstrap_ips: Vec::new(),
             block_quic: true,
@@ -192,7 +220,9 @@ pub(crate) fn is_valid_username(username: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
-    bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 // safely resolves the user info (uid, home) from ALBUS_CONFIG_USER environment variable
@@ -273,7 +303,10 @@ impl FsPrivilegeGuard {
         if current_euid == 0 {
             // 1. check SUDO_UID / SUDO_GID
             if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-                if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
+                if let (Ok(uid), Ok(gid)) = (
+                    uid_s.trim().parse::<libc::uid_t>(),
+                    gid_s.trim().parse::<libc::gid_t>(),
+                ) {
                     if uid != 0 {
                         unsafe {
                             libc::setfsgid(gid);
@@ -339,7 +372,10 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     };
 
     let parent = p.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent directory")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
     })?;
 
     fs::create_dir_all(parent)?;
@@ -374,7 +410,9 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
     let write_res = (|| -> std::io::Result<()> {
@@ -470,7 +508,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     if !meta.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("security violation: refusing to read non-regular file at {}", p.display()),
+            format!(
+                "security violation: refusing to read non-regular file at {}",
+                p.display()
+            ),
         ));
     }
 
@@ -478,7 +519,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     if meta.len() > MAX_CONFIG_FILE_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("config file {} exceeds maximum safety limit (10 MB)", p.display()),
+            format!(
+                "config file {} exceeds maximum safety limit (10 MB)",
+                p.display()
+            ),
         ));
     }
 
@@ -552,14 +596,19 @@ impl Config {
     }
 
     // loads configuration payload from a specified filesystem path safely rejecting symlinks
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = safe_read(path)?;
         let cfg: Config = serde_json::from_str(&content)?;
         Ok(cfg)
     }
 
     // writes serialized json payload to disk and volatile tmpfs safely rejecting symlinks
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn save_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json = serde_json::to_string_pretty(self)?;
 
         // 1. write volatile runtime copy (in isolated tmpfs: /run/albus or $XDG_RUNTIME_DIR/albus)
@@ -647,7 +696,8 @@ mod tests {
 
     #[test]
     fn test_safe_read_rejects_symlink() {
-        let temp_dir = std::env::temp_dir().join(format!("albus_test_symlink_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("albus_test_symlink_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let real_file = temp_dir.join("real.json");
@@ -661,7 +711,10 @@ mod tests {
         assert!(result.is_err(), "safe_read must reject symlinks");
 
         let write_result = safe_write(&symlink_file, "{\"mss\": 99}");
-        assert!(write_result.is_err(), "safe_write must reject symlinks via O_NOFOLLOW");
+        assert!(
+            write_result.is_err(),
+            "safe_write must reject symlinks via O_NOFOLLOW"
+        );
 
         let _ = fs::remove_file(&symlink_file);
         let _ = fs::remove_file(&real_file);
@@ -683,8 +736,14 @@ mod tests {
 
             // Case 3: Root daemon without SUDO_UID / ALBUS_CONFIG_USER reading user config owned by attacker -> FORBIDDEN
             let res = verify_file_ownership(path, 0, 1001, false, &[0]);
-            assert!(res.is_err(), "Root daemon must reject untrusted user config without explicit trusted UID");
-            assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                res.is_err(),
+                "Root daemon must reject untrusted user config without explicit trusted UID"
+            );
+            assert_eq!(
+                res.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
 
             // Case 4: Root daemon with trusted user (uid 1000) reading trusted user config -> ALLOWED
             assert!(verify_file_ownership(path, 0, 1000, false, &[0, 1000]).is_ok());
@@ -721,8 +780,14 @@ mod tests {
         }
 
         // Restore env vars
-        if let Some(v) = prev_sudo_user { std::env::set_var("SUDO_USER", v); }
-        if let Some(v) = prev_sudo_uid { std::env::set_var("SUDO_UID", v); }
-        if let Some(v) = prev_cfg_user { std::env::set_var("ALBUS_CONFIG_USER", v); }
+        if let Some(v) = prev_sudo_user {
+            std::env::set_var("SUDO_USER", v);
+        }
+        if let Some(v) = prev_sudo_uid {
+            std::env::set_var("SUDO_UID", v);
+        }
+        if let Some(v) = prev_cfg_user {
+            std::env::set_var("ALBUS_CONFIG_USER", v);
+        }
     }
 }

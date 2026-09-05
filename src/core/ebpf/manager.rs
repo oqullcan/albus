@@ -26,6 +26,7 @@ pub struct BpfManagerConfig {
     pub fake_ttl: u8,
     pub fake_sni: Option<String>,
     pub fake_bad_checksum: bool,
+    pub fake_seq_offset: i32,
     pub pqc: bool,
     pub auto_ttl_estimator: AutoTtlEstimator,
 }
@@ -51,7 +52,10 @@ impl BpfManager {
     }
 
     // reloads ebpf maps live at runtime without stopping or detaching the program
-    pub fn reload_maps(&mut self, new_cfg: &BpfManagerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn reload_maps(
+        &mut self,
+        new_cfg: &BpfManagerConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cfg = new_cfg.clone();
         if let Some(handles) = self.map_handles {
             let bpf_cfg = BpfConfig::new(
@@ -78,7 +82,10 @@ impl BpfManager {
     }
 
     // loads ebpf, attaches to cgroup, initializes maps, and starts event polling loop
-    pub fn start(&mut self, dns_server: Option<Arc<DnsServer>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn start(
+        &mut self,
+        dns_server: Option<Arc<DnsServer>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Loading eBPF sock_ops program");
 
         let engine = BpfEngine::load_and_attach(&self.cfg.cgroup_path)?;
@@ -101,6 +108,7 @@ impl BpfManager {
         let running = self.running.clone();
         let fake_sni = self.cfg.fake_sni.clone();
         let fake_bad_checksum = self.cfg.fake_bad_checksum;
+        let fake_seq_offset = self.cfg.fake_seq_offset;
         let fake_ttl_fallback = self.cfg.fake_ttl;
         running.store(true, Ordering::SeqCst);
 
@@ -123,17 +131,26 @@ impl BpfManager {
         // assemble decoy clienthello payloads: rotate across pool if no custom sni is forced
         let fake_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
             if sni != "www.google.com" && !sni.is_empty() {
-                vec![crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc)]
+                vec![
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc),
+                ]
             } else {
                 crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                     .iter()
-                    .map(|&s| crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc))
+                    .map(|&s| {
+                        crate::core::fake::clienthello::build_fake_client_hello_opts(
+                            s,
+                            self.cfg.pqc,
+                        )
+                    })
                     .collect()
             }
         } else {
             crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                 .iter()
-                .map(|&s| crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc))
+                .map(|&s| {
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc)
+                })
                 .collect()
         };
 
@@ -152,8 +169,10 @@ impl BpfManager {
                         let mut src_octets = [0u8; 16];
                         let mut dst_octets = [0u8; 16];
                         for i in 0..4 {
-                            src_octets[i * 4..(i + 1) * 4].copy_from_slice(&raw_evt.src_ip6[i].to_ne_bytes());
-                            dst_octets[i * 4..(i + 1) * 4].copy_from_slice(&raw_evt.dst_ip6[i].to_ne_bytes());
+                            src_octets[i * 4..(i + 1) * 4]
+                                .copy_from_slice(&raw_evt.src_ip6[i].to_ne_bytes());
+                            dst_octets[i * 4..(i + 1) * 4]
+                                .copy_from_slice(&raw_evt.dst_ip6[i].to_ne_bytes());
                         }
                         ConnInfo::new_v6(
                             Ipv6Addr::from(src_octets),
@@ -187,7 +206,18 @@ impl BpfManager {
                     };
                     decoy_idx = decoy_idx.wrapping_add(1);
 
-                    if let Err(e) = raw_socket.send_fake_opts(&conn, payload, optimal_ttl, fake_bad_checksum) {
+                    let conn_to_inject = if fake_seq_offset != 0 {
+                        conn.with_seq_offset(fake_seq_offset)
+                    } else {
+                        conn
+                    };
+
+                    if let Err(e) = raw_socket.send_fake_opts(
+                        &conn_to_inject,
+                        payload,
+                        optimal_ttl,
+                        fake_bad_checksum,
+                    ) {
                         warn!("Failed to inject fake ClientHello: {}", e);
                     } else {
                         let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);

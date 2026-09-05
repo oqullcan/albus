@@ -5,8 +5,8 @@
 //! domains to detect this condition and trigger the browser login screen. this module synthesizes
 //! instant ip responses so the os http probe proceeds and hits the gateway redirect.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use super::filter::extract_question_end;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 struct CaptiveEntry {
     domain: &'static str,
@@ -148,9 +148,9 @@ mod tests {
     #[test]
     fn test_captive_response_wire() {
         let query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'c', b'a', b'p', b't', b'i', b'v', b'e', 0x05, b'a', b'p', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'c',
+            b'a', b'p', b't', b'i', b'v', b'e', 0x05, b'a', b'p', b'p', b'l', b'e', 0x03, b'c',
+            b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
         let ip = check_captive_portal("captive.apple.com", 1).unwrap();
         let resp = build_captive_response(&query, ip).expect("valid captive response");

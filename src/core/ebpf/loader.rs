@@ -1,6 +1,7 @@
 //! direct linux ebpf elf parser, map creation, cgroup sock_ops attachment, and perf ring buffer poller.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -10,6 +11,8 @@ use tracing::{debug, info, warn};
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 pub const BPF_PROG_LOAD: u32 = 5;
+pub const BPF_OBJ_PIN: u32 = 6;
+pub const BPF_OBJ_GET: u32 = 7;
 pub const BPF_PROG_ATTACH: u32 = 8;
 pub const BPF_PROG_DETACH: u32 = 9;
 
@@ -70,7 +73,13 @@ pub struct BpfConfig {
 }
 
 impl BpfConfig {
-    pub fn new(mss: u16, restore_mss: u16, restore_after_bytes: u32, min_mss: u16, enabled: bool) -> Self {
+    pub fn new(
+        mss: u16,
+        restore_mss: u16,
+        restore_after_bytes: u32,
+        min_mss: u16,
+        enabled: bool,
+    ) -> Self {
         Self {
             mss,
             restore_mss,
@@ -99,16 +108,38 @@ pub struct BpfEngine {
 impl BpfEngine {
     // loads embedded elf bytecode, creates bpf maps, relocates symbols, and attaches to cgroup v2
     pub fn load_and_attach(cgroup_path: &str) -> Result<Self> {
+        Self::load_and_attach_pinned(cgroup_path, Some("/sys/fs/bpf/albus"))
+    }
+
+    // loads ebpf bytecode with optional bpffs map pinning for zero-downtime restarts
+    pub fn load_and_attach_pinned(cgroup_path: &str, pin_dir: Option<&str>) -> Result<Self> {
         let elf_bytes = include_bytes!(env!("ALBUS_BPF_BYTECODE"));
         let num_cpus = get_possible_cpus().max(1);
 
-        // 1. initialize ebpf kernel maps
-        let config_map_fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, 4, std::mem::size_of::<BpfConfig>() as u32, 1, "config_map")?;
-        let target_ports_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 2, 1, 64, "target_ports")?;
-        let exclude_ips_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 4, 1, 64, "exclude_ips")?;
-        let exclude_ips_v6_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 16, 1, 64, "exclude_ips_v6")?;
-        let conn_events_fd = bpf_create_map(BPF_MAP_TYPE_PERF_EVENT_ARRAY, 4, 4, (num_cpus.max(128)) as u32, "conn_events")?;
-        let connections_fd = bpf_create_map(BPF_MAP_TYPE_LRU_HASH, 8, 8, 65536, "connections")?;
+        // 1. initialize ebpf kernel maps (with zero-downtime map reuse if bpffs is available)
+        let config_map_fd = get_or_create_map(
+            pin_dir,
+            BPF_MAP_TYPE_ARRAY,
+            4,
+            std::mem::size_of::<BpfConfig>() as u32,
+            1,
+            "config_map",
+        )?;
+        let target_ports_fd =
+            get_or_create_map(pin_dir, BPF_MAP_TYPE_HASH, 2, 1, 64, "target_ports")?;
+        let exclude_ips_fd =
+            get_or_create_map(pin_dir, BPF_MAP_TYPE_HASH, 4, 1, 64, "exclude_ips")?;
+        let exclude_ips_v6_fd =
+            get_or_create_map(pin_dir, BPF_MAP_TYPE_HASH, 16, 1, 64, "exclude_ips_v6")?;
+        let conn_events_fd = bpf_create_map(
+            BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+            4,
+            4,
+            (num_cpus.max(128)) as u32,
+            "conn_events",
+        )?;
+        let connections_fd =
+            get_or_create_map(pin_dir, BPF_MAP_TYPE_LRU_HASH, 8, 8, 65536, "connections")?;
 
         let mut map_fds = HashMap::new();
         map_fds.insert("config_map".to_string(), config_map_fd);
@@ -125,8 +156,9 @@ impl BpfEngine {
         let prog_fd = bpf_load_program(BPF_PROG_TYPE_SOCK_OPS, &insns, "albus_sockops")?;
 
         // 4. open cgroup hierarchy directory handle and attach program
-        let cgroup_file = File::open(cgroup_path)
-            .map_err(|e| Error::other(format!("failed to open cgroup path {}: {}", cgroup_path, e)))?;
+        let cgroup_file = File::open(cgroup_path).map_err(|e| {
+            Error::other(format!("failed to open cgroup path {}: {}", cgroup_path, e))
+        })?;
         let cgroup_fd = cgroup_file.as_raw_fd();
         std::mem::forget(cgroup_file); // maintain file descriptor lifecycle
 
@@ -308,7 +340,13 @@ fn sys_bpf(cmd: u32, attr: *const libc::c_void, size: usize) -> libc::c_long {
     unsafe { libc::syscall(SYS_BPF, cmd, attr, size) }
 }
 
-fn bpf_create_map(map_type: u32, key_size: u32, value_size: u32, max_entries: u32, name: &str) -> Result<RawFd> {
+fn bpf_create_map(
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    name: &str,
+) -> Result<RawFd> {
     #[repr(C)]
     struct BpfAttrMap {
         map_type: u32,
@@ -337,12 +375,127 @@ fn bpf_create_map(map_type: u32, key_size: u32, value_size: u32, max_entries: u3
     let len = bytes.len().min(15);
     attr.map_name[..len].copy_from_slice(&bytes[..len]);
 
-    let res = sys_bpf(BPF_MAP_CREATE, &attr as *const _ as *const libc::c_void, std::mem::size_of::<BpfAttrMap>());
+    let res = sys_bpf(
+        BPF_MAP_CREATE,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrMap>(),
+    );
     if res < 0 {
-        Err(Error::other(format!("bpf(BPF_MAP_CREATE, {}) failed: {}", name, Error::last_os_error())))
+        Err(Error::other(format!(
+            "bpf(BPF_MAP_CREATE, {}) failed: {}",
+            name,
+            Error::last_os_error()
+        )))
     } else {
         Ok(res as RawFd)
     }
+}
+
+#[repr(C)]
+struct BpfAttrObj {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+}
+
+pub fn bpf_obj_pin(fd: RawFd, path: &str) -> Result<()> {
+    let c_path = CString::new(path).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    let attr = BpfAttrObj {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd: fd as u32,
+        file_flags: 0,
+    };
+    let res = sys_bpf(
+        BPF_OBJ_PIN,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrObj>(),
+    );
+    if res < 0 {
+        Err(Error::other(format!(
+            "bpf(BPF_OBJ_PIN, {}) failed: {}",
+            path,
+            Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn bpf_obj_get(path: &str) -> Result<RawFd> {
+    let c_path = CString::new(path).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    let attr = BpfAttrObj {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd: 0,
+        file_flags: 0,
+    };
+    let res = sys_bpf(
+        BPF_OBJ_GET,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrObj>(),
+    );
+    if res < 0 {
+        Err(Error::other(format!(
+            "bpf(BPF_OBJ_GET, {}) failed: {}",
+            path,
+            Error::last_os_error()
+        )))
+    } else {
+        Ok(res as RawFd)
+    }
+}
+
+pub fn unpin_maps(pin_dir: &str) {
+    if let Ok(entries) = std::fs::read_dir(pin_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let _ = std::fs::remove_dir(pin_dir);
+    }
+}
+
+fn get_or_create_map(
+    pin_dir: Option<&str>,
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    name: &str,
+) -> Result<RawFd> {
+    if let Some(dir) = pin_dir {
+        let pin_path = format!("{}/{}", dir.trim_end_matches('/'), name);
+        if std::path::Path::new(&pin_path).exists() {
+            match bpf_obj_get(&pin_path) {
+                Ok(fd) => {
+                    debug!("Reusing pinned eBPF map '{}' from {}", name, pin_path);
+                    return Ok(fd);
+                }
+                Err(e) => {
+                    debug!(
+                        "Could not open pinned map '{}' at {}: {}; recreating",
+                        name, pin_path, e
+                    );
+                    let _ = std::fs::remove_file(&pin_path);
+                }
+            }
+        }
+    }
+
+    let fd = bpf_create_map(map_type, key_size, value_size, max_entries, name)?;
+
+    if let Some(dir) = pin_dir {
+        let pin_path = format!("{}/{}", dir.trim_end_matches('/'), name);
+        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = bpf_obj_pin(fd, &pin_path) {
+            debug!("Could not pin eBPF map '{}' to {}: {}", name, pin_path, e);
+        } else {
+            debug!("Pinned eBPF map '{}' to {}", name, pin_path);
+        }
+    }
+
+    Ok(fd)
 }
 
 fn bpf_map_update<K, V>(map_fd: RawFd, key: &K, value: &V) -> Result<()> {
@@ -363,9 +516,16 @@ fn bpf_map_update<K, V>(map_fd: RawFd, key: &K, value: &V) -> Result<()> {
         flags: BPF_ANY,
     };
 
-    let res = sys_bpf(BPF_MAP_UPDATE_ELEM, &attr as *const _ as *const libc::c_void, std::mem::size_of::<BpfAttrMapElem>());
+    let res = sys_bpf(
+        BPF_MAP_UPDATE_ELEM,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrMapElem>(),
+    );
     if res < 0 {
-        Err(Error::other(format!("bpf(BPF_MAP_UPDATE_ELEM) failed: {}", Error::last_os_error())))
+        Err(Error::other(format!(
+            "bpf(BPF_MAP_UPDATE_ELEM) failed: {}",
+            Error::last_os_error()
+        )))
     } else {
         Ok(())
     }
@@ -404,11 +564,19 @@ fn bpf_load_program(prog_type: u32, insns: &[BpfInsn], name: &str) -> Result<Raw
     let len = bytes.len().min(15);
     attr.prog_name[..len].copy_from_slice(&bytes[..len]);
 
-    let res = sys_bpf(BPF_PROG_LOAD, &attr as *const _ as *const libc::c_void, std::mem::size_of::<BpfAttrProg>());
+    let res = sys_bpf(
+        BPF_PROG_LOAD,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrProg>(),
+    );
     if res < 0 {
         let log = String::from_utf8_lossy(&log_buf);
         let cleaned_log = log.trim_matches(char::from(0));
-        Err(Error::other(format!("bpf(BPF_PROG_LOAD) failed: {}\nBPF Verifier log:\n{}", Error::last_os_error(), cleaned_log)))
+        Err(Error::other(format!(
+            "bpf(BPF_PROG_LOAD) failed: {}\nBPF Verifier log:\n{}",
+            Error::last_os_error(),
+            cleaned_log
+        )))
     } else {
         Ok(res as RawFd)
     }
@@ -432,9 +600,16 @@ fn bpf_prog_attach(prog_fd: RawFd, target_fd: RawFd, attach_type: u32) -> Result
         replace_bpf_fd: 0,
     };
 
-    let res = sys_bpf(BPF_PROG_ATTACH, &attr as *const _ as *const libc::c_void, std::mem::size_of::<BpfAttrAttach>());
+    let res = sys_bpf(
+        BPF_PROG_ATTACH,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrAttach>(),
+    );
     if res < 0 {
-        Err(Error::other(format!("bpf(BPF_PROG_ATTACH) failed: {}", Error::last_os_error())))
+        Err(Error::other(format!(
+            "bpf(BPF_PROG_ATTACH) failed: {}",
+            Error::last_os_error()
+        )))
     } else {
         Ok(())
     }
@@ -454,9 +629,16 @@ fn bpf_prog_detach(target_fd: RawFd, attach_type: u32) -> Result<()> {
         attach_type,
     };
 
-    let res = sys_bpf(BPF_PROG_DETACH, &attr as *const _ as *const libc::c_void, std::mem::size_of::<BpfAttrDetach>());
+    let res = sys_bpf(
+        BPF_PROG_DETACH,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrDetach>(),
+    );
     if res < 0 {
-        Err(Error::other(format!("bpf(BPF_PROG_DETACH) failed: {}", Error::last_os_error())))
+        Err(Error::other(format!(
+            "bpf(BPF_PROG_DETACH) failed: {}",
+            Error::last_os_error()
+        )))
     } else {
         Ok(())
     }
@@ -483,9 +665,15 @@ impl BpfInsn {
 }
 
 // parses 64-bit elf structure, locates sock_ops bytecode and relocates map indices
-pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> Result<Vec<BpfInsn>> {
+pub fn parse_elf_sockops(
+    elf_bytes: &[u8],
+    map_fds: &HashMap<String, RawFd>,
+) -> Result<Vec<BpfInsn>> {
     if elf_bytes.len() < 64 || &elf_bytes[0..4] != b"\x7FELF" {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid ELF binary format"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF binary format",
+        ));
     }
 
     let e_shoff = u64::from_le_bytes(elf_bytes[40..48].try_into().unwrap()) as usize;
@@ -494,7 +682,10 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
     let e_shstrndx = u16::from_le_bytes(elf_bytes[62..64].try_into().unwrap()) as usize;
 
     if e_shentsize < 64 || e_shnum == 0 || e_shstrndx >= e_shnum {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid ELF section header dimensions"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF section header dimensions",
+        ));
     }
 
     let sh_table_size = e_shnum
@@ -505,18 +696,32 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ELF section table offset overflow"))?;
 
     if sh_table_end > elf_bytes.len() {
-        return Err(Error::new(ErrorKind::InvalidData, "ELF section header table out of bounds"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ELF section header table out of bounds",
+        ));
     }
 
     let shstrtab_hdr_offset = e_shoff + (e_shstrndx * e_shentsize);
-    let shstrtab_offset = u64::from_le_bytes(elf_bytes[shstrtab_hdr_offset + 24..shstrtab_hdr_offset + 32].try_into().unwrap()) as usize;
-    let shstrtab_size = u64::from_le_bytes(elf_bytes[shstrtab_hdr_offset + 32..shstrtab_hdr_offset + 40].try_into().unwrap()) as usize;
+    let shstrtab_offset = u64::from_le_bytes(
+        elf_bytes[shstrtab_hdr_offset + 24..shstrtab_hdr_offset + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let shstrtab_size = u64::from_le_bytes(
+        elf_bytes[shstrtab_hdr_offset + 32..shstrtab_hdr_offset + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let shstrtab_end = shstrtab_offset
         .checked_add(shstrtab_size)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ELF shstrtab offset overflow"))?;
 
     if shstrtab_end > elf_bytes.len() {
-        return Err(Error::new(ErrorKind::InvalidData, "ELF shstrtab section out of bounds"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ELF shstrtab section out of bounds",
+        ));
     }
     let shstrtab = &elf_bytes[shstrtab_offset..shstrtab_end];
 
@@ -537,12 +742,30 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
 
     for i in 0..e_shnum {
         let sh_offset = e_shoff + (i * e_shentsize);
-        let sh_name_off = u32::from_le_bytes(elf_bytes[sh_offset..sh_offset + 4].try_into().unwrap()) as usize;
-        let sh_type = u32::from_le_bytes(elf_bytes[sh_offset + 4..sh_offset + 8].try_into().unwrap());
-        let sh_offset_val = u64::from_le_bytes(elf_bytes[sh_offset + 24..sh_offset + 32].try_into().unwrap()) as usize;
-        let sh_size = u64::from_le_bytes(elf_bytes[sh_offset + 32..sh_offset + 40].try_into().unwrap()) as usize;
-        let sh_link = u32::from_le_bytes(elf_bytes[sh_offset + 40..sh_offset + 44].try_into().unwrap()) as usize;
-        let sh_entsize_val = u64::from_le_bytes(elf_bytes[sh_offset + 56..sh_offset + 64].try_into().unwrap()) as usize;
+        let sh_name_off =
+            u32::from_le_bytes(elf_bytes[sh_offset..sh_offset + 4].try_into().unwrap()) as usize;
+        let sh_type =
+            u32::from_le_bytes(elf_bytes[sh_offset + 4..sh_offset + 8].try_into().unwrap());
+        let sh_offset_val = u64::from_le_bytes(
+            elf_bytes[sh_offset + 24..sh_offset + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_size = u64::from_le_bytes(
+            elf_bytes[sh_offset + 32..sh_offset + 40]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_link = u32::from_le_bytes(
+            elf_bytes[sh_offset + 40..sh_offset + 44]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_entsize_val = u64::from_le_bytes(
+            elf_bytes[sh_offset + 56..sh_offset + 64]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         let name = get_sh_name(sh_name_off);
 
@@ -552,20 +775,38 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
             symtab_section = Some((sh_offset_val, sh_size, sh_link));
         } else if sh_type == 3 && (name == ".strtab" || (strtab_section.is_none() && i == 1)) {
             strtab_section = Some((sh_offset_val, sh_size));
-        } else if (sh_type == 4 || sh_type == 9) && (name == ".relsockops" || name == ".rel.sockops" || name == ".relasockops" || name == ".rela.sockops") {
-            let ent_size = if sh_entsize_val > 0 { sh_entsize_val } else if sh_type == 4 { 24 } else { 16 };
+        } else if (sh_type == 4 || sh_type == 9)
+            && (name == ".relsockops"
+                || name == ".rel.sockops"
+                || name == ".relasockops"
+                || name == ".rela.sockops")
+        {
+            let ent_size = if sh_entsize_val > 0 {
+                sh_entsize_val
+            } else if sh_type == 4 {
+                24
+            } else {
+                16
+            };
             rel_section = Some((sh_type, sh_offset_val, sh_size, ent_size));
         }
     }
 
-    let (_, code_offset, code_size) = sockops_section
-        .ok_or_else(|| Error::new(ErrorKind::NotFound, "could not find 'sockops' program section in BPF ELF"))?;
+    let (_, code_offset, code_size) = sockops_section.ok_or_else(|| {
+        Error::new(
+            ErrorKind::NotFound,
+            "could not find 'sockops' program section in BPF ELF",
+        )
+    })?;
 
     let code_end = code_offset
         .checked_add(code_size)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "code section offset overflow"))?;
     if code_end > elf_bytes.len() {
-        return Err(Error::new(ErrorKind::InvalidData, "code section exceeds ELF binary bounds"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "code section exceeds ELF binary bounds",
+        ));
     }
 
     let code_bytes = &elf_bytes[code_offset..code_end];
@@ -581,31 +822,50 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
     }
 
     // perform map file descriptor relocation for ld_imm64 instructions
-    if let (Some((sym_off, sym_size, sym_link)), Some((_, rel_off, rel_size, entry_size))) = (symtab_section, rel_section) {
+    if let (Some((sym_off, sym_size, sym_link)), Some((_, rel_off, rel_size, entry_size))) =
+        (symtab_section, rel_section)
+    {
         if entry_size == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "invalid zero entry_size in relocation section"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid zero entry_size in relocation section",
+            ));
         }
 
         let rel_end = rel_off
             .checked_add(rel_size)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel section offset overflow"))?;
         if rel_end > elf_bytes.len() {
-            return Err(Error::new(ErrorKind::InvalidData, "rel section exceeds ELF binary bounds"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "rel section exceeds ELF binary bounds",
+            ));
         }
 
         let sym_end = sym_off
             .checked_add(sym_size)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "symtab section offset overflow"))?;
         if sym_end > elf_bytes.len() {
-            return Err(Error::new(ErrorKind::InvalidData, "symtab section exceeds ELF binary bounds"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "symtab section exceeds ELF binary bounds",
+            ));
         }
 
         let strtab = if sym_link < e_shnum {
             let str_hdr = e_shoff + (sym_link * e_shentsize);
             if str_hdr + 40 <= elf_bytes.len() {
-                let s_off = u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap()) as usize;
-                let s_size = u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap()) as usize;
-                if s_off.checked_add(s_size).map(|end| end <= elf_bytes.len()).unwrap_or(false) {
+                let s_off =
+                    u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap())
+                        as usize;
+                let s_size =
+                    u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap())
+                        as usize;
+                if s_off
+                    .checked_add(s_size)
+                    .map(|end| end <= elf_bytes.len())
+                    .unwrap_or(false)
+                {
                     &elf_bytes[s_off..s_off + s_size]
                 } else {
                     &[]
@@ -614,7 +874,11 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
                 &[]
             }
         } else if let Some((str_off, str_size)) = strtab_section {
-            if str_off.checked_add(str_size).map(|end| end <= elf_bytes.len()).unwrap_or(false) {
+            if str_off
+                .checked_add(str_size)
+                .map(|end| end <= elf_bytes.len())
+                .unwrap_or(false)
+            {
                 &elf_bytes[str_off..str_off + str_size]
             } else {
                 &[]
@@ -638,7 +902,8 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
         for i in 0..num_syms {
             let s_off = sym_off + (i * 24);
             if s_off + 4 <= elf_bytes.len() {
-                let st_name = u32::from_le_bytes(elf_bytes[s_off..s_off + 4].try_into().unwrap()) as usize;
+                let st_name =
+                    u32::from_le_bytes(elf_bytes[s_off..s_off + 4].try_into().unwrap()) as usize;
                 symbols.push(get_sym_name(st_name));
             }
         }
@@ -648,15 +913,18 @@ pub fn parse_elf_sockops(elf_bytes: &[u8], map_fds: &HashMap<String, RawFd>) -> 
         for i in 0..num_rels {
             let r_off = rel_off + (i * entry_size);
             if r_off + 16 <= elf_bytes.len() {
-                let r_offset = u64::from_le_bytes(elf_bytes[r_off..r_off + 8].try_into().unwrap()) as usize;
-                let r_info = u64::from_le_bytes(elf_bytes[r_off + 8..r_off + 16].try_into().unwrap());
+                let r_offset =
+                    u64::from_le_bytes(elf_bytes[r_off..r_off + 8].try_into().unwrap()) as usize;
+                let r_info =
+                    u64::from_le_bytes(elf_bytes[r_off + 8..r_off + 16].try_into().unwrap());
                 let sym_idx = (r_info >> 32) as usize;
 
                 let insn_idx = r_offset / 8;
                 if insn_idx < insns.len() && sym_idx < symbols.len() {
                     let sym_name = &symbols[sym_idx];
                     if let Some(&fd) = map_fds.get(sym_name) {
-                        insns[insn_idx].dst_reg = (BPF_PSEUDO_MAP_FD << 4) | (insns[insn_idx].dst_reg & 0x0F);
+                        insns[insn_idx].dst_reg =
+                            (BPF_PSEUDO_MAP_FD << 4) | (insns[insn_idx].dst_reg & 0x0F);
                         insns[insn_idx].imm = fd;
                     }
                 }
@@ -764,7 +1032,9 @@ impl PerfReader {
 
         if mmap_ptr == libc::MAP_FAILED {
             let err = Error::last_os_error();
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(err);
         }
 
@@ -826,7 +1096,12 @@ impl PerfReader {
             let event_type = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap());
             let size = u16::from_ne_bytes(hdr_bytes[6..8].try_into().unwrap()) as usize;
 
-            if size < 8 || tail.checked_add(size as u64).map(|t| t > head).unwrap_or(true) {
+            if size < 8
+                || tail
+                    .checked_add(size as u64)
+                    .map(|t| t > head)
+                    .unwrap_or(true)
+            {
                 break;
             }
 
@@ -839,7 +1114,9 @@ impl PerfReader {
                 if raw_size >= std::mem::size_of::<RawConnEvent>() {
                     let mut evt_bytes = [0u8; std::mem::size_of::<RawConnEvent>()];
                     read_ring_bytes((record_offset + 12) & data_mask, &mut evt_bytes);
-                    let event = unsafe { std::ptr::read_unaligned(evt_bytes.as_ptr() as *const RawConnEvent) };
+                    let event = unsafe {
+                        std::ptr::read_unaligned(evt_bytes.as_ptr() as *const RawConnEvent)
+                    };
                     callback(event);
                 }
             }
@@ -849,7 +1126,9 @@ impl PerfReader {
 
         // smp_mb: ensure all ring data reads have completed before advancing data_tail
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        unsafe { std::ptr::write_volatile(&mut header.data_tail, tail); }
+        unsafe {
+            std::ptr::write_volatile(&mut header.data_tail, tail);
+        }
     }
 }
 
@@ -887,15 +1166,36 @@ mod tests {
         assert!(!insns.is_empty(), "instructions must not be empty");
 
         let imms: Vec<i32> = insns.iter().map(|i| i.imm).collect();
-        assert!(imms.contains(&100), "config_map relocation (fd 100) must be applied");
-        assert!(imms.contains(&101), "exclude_ips relocation (fd 101) must be applied");
-        assert!(imms.contains(&105), "exclude_ips_v6 relocation (fd 105) must be applied");
-        assert!(imms.contains(&102), "target_ports relocation (fd 102) must be applied");
-        assert!(imms.contains(&103), "conn_events relocation (fd 103) must be applied");
-        assert!(imms.contains(&104), "connections relocation (fd 104) must be applied");
+        assert!(
+            imms.contains(&100),
+            "config_map relocation (fd 100) must be applied"
+        );
+        assert!(
+            imms.contains(&101),
+            "exclude_ips relocation (fd 101) must be applied"
+        );
+        assert!(
+            imms.contains(&105),
+            "exclude_ips_v6 relocation (fd 105) must be applied"
+        );
+        assert!(
+            imms.contains(&102),
+            "target_ports relocation (fd 102) must be applied"
+        );
+        assert!(
+            imms.contains(&103),
+            "conn_events relocation (fd 103) must be applied"
+        );
+        assert!(
+            imms.contains(&104),
+            "connections relocation (fd 104) must be applied"
+        );
 
         let conn_count = imms.iter().filter(|&&imm| imm == 104).count();
-        assert_eq!(conn_count, 3, "connections map should be relocated 3 times in bpf bytecode");
+        assert_eq!(
+            conn_count, 3,
+            "connections map should be relocated 3 times in bpf bytecode"
+        );
     }
 
     #[test]
@@ -907,5 +1207,23 @@ mod tests {
             });
             assert_eq!(count, 0);
         }
+    }
+
+    #[test]
+    fn test_unpin_maps_handles_missing_directory() {
+        // should safely no-op without panicking
+        unpin_maps("/tmp/nonexistent_bpf_dir_test_12345");
+    }
+
+    #[test]
+    fn test_bpf_obj_pin_invalid_fd_fails_gracefully() {
+        let res = bpf_obj_pin(-1, "/sys/fs/bpf/test_invalid_fd");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_bpf_obj_get_nonexistent_path_fails_gracefully() {
+        let res = bpf_obj_get("/sys/fs/bpf/nonexistent_pinned_map_99999");
+        assert!(res.is_err());
     }
 }

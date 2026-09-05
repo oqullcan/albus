@@ -3,7 +3,8 @@
 use std::sync::LazyLock;
 
 // static pre-compiled clienthello payload embedding www.google.com sni
-pub static FAKE_TLS_CLIENT_HELLO: LazyLock<Vec<u8>> = LazyLock::new(|| build_fake_client_hello("www.google.com"));
+pub static FAKE_TLS_CLIENT_HELLO: LazyLock<Vec<u8>> =
+    LazyLock::new(|| build_fake_client_hello("www.google.com"));
 
 // constructs valid binary tls record containing handshake protocol and sni extension
 pub fn build_fake_client_hello(sni_host: &str) -> Vec<u8> {

@@ -101,7 +101,7 @@ mod tests {
         assert_eq!(resp[1], 0xcd);
         assert_eq!(resp[2] & 0x80, 0x80); // QR=1
         assert_eq!(resp[7], 1); // 1 answer
-        // Check synthesized IP at end
+                                // Check synthesized IP at end
         let end_bytes = &resp[resp.len() - 16..];
         assert_eq!(&end_bytes[..12], &DNS64_WKP_PREFIX);
         assert_eq!(&end_bytes[12..], &[93, 184, 216, 34]);

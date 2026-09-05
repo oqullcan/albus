@@ -346,9 +346,13 @@ mod tests {
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
 
         assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_private_ip(IpAddr::V6("fd12:3456:789a::1".parse().unwrap())));
+        assert!(is_private_ip(IpAddr::V6(
+            "fd12:3456:789a::1".parse().unwrap()
+        )));
         assert!(is_private_ip(IpAddr::V6("fe80::1".parse().unwrap())));
-        assert!(!is_private_ip(IpAddr::V6("2606:4700:4700::1111".parse().unwrap())));
+        assert!(!is_private_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
     }
 
     #[test]
@@ -361,8 +365,8 @@ mod tests {
     #[test]
     fn test_sinkhole_response() {
         let query = vec![
-            0xAA, 0xBB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x03, b'a', b'd', b's', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+            0xAA, 0xBB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
+            b'd', b's', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
         let resp = build_sinkhole_response(&query, 1);
         assert_eq!(resp[0], 0xAA);
@@ -382,7 +386,9 @@ mod tests {
         ];
         let q_end = query.len();
         // Add fake EDNS0 OPT record (11 bytes: root label 0x00, type 41 (0x0029), udp payload size 4096 (0x1000), ttl 0, rdlen 0)
-        query.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        query.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
 
         let resp = build_sinkhole_response(&query, 1);
         // Answer RR pointer 0xc00c should be located right at q_end, NOT after the EDNS record

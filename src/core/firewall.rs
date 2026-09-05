@@ -6,11 +6,15 @@ use tracing::{debug, info};
 // injects icmp port unreachable / tcp reset via iptables reject on udp 443
 pub fn block_quic() {
     let _ = Command::new("iptables")
-        .args(["-I", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT",
+        ])
         .status();
 
     let _ = Command::new("ip6tables")
-        .args(["-I", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT",
+        ])
         .status();
 
     info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
@@ -28,8 +32,18 @@ fn flush_rule(cmd: &str, args: &[&str]) {
 
 // purges injected reject rules for udp 443
 pub fn unblock_quic() {
-    flush_rule("iptables", &["-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"]);
-    flush_rule("ip6tables", &["-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"]);
+    flush_rule(
+        "iptables",
+        &[
+            "-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT",
+        ],
+    );
+    flush_rule(
+        "ip6tables",
+        &[
+            "-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT",
+        ],
+    );
 
     debug!("QUIC firewall rules cleaned up");
 }
@@ -52,8 +66,14 @@ pub fn block_stun() {
 // purges stun packet filtering rules
 pub fn unblock_stun() {
     for port in &["3478", "5349"] {
-        flush_rule("iptables", &["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"]);
-        flush_rule("ip6tables", &["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"]);
+        flush_rule(
+            "iptables",
+            &["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"],
+        );
+        flush_rule(
+            "ip6tables",
+            &["-D", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT"],
+        );
     }
 
     debug!("STUN firewall rules cleaned up");
@@ -64,17 +84,25 @@ pub fn unblock_stun() {
 pub fn enable_kill_switch() {
     // block unencrypted udp and tcp port 53 leaving non-loopback interfaces
     let _ = Command::new("iptables")
-        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT",
+        ])
         .status();
     let _ = Command::new("iptables")
-        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT",
+        ])
         .status();
 
     let _ = Command::new("ip6tables")
-        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT",
+        ])
         .status();
     let _ = Command::new("ip6tables")
-        .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"])
+        .args([
+            "-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT",
+        ])
         .status();
 
     info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
@@ -82,10 +110,30 @@ pub fn enable_kill_switch() {
 
 // removes dns kill-switch filtering rules
 pub fn disable_kill_switch() {
-    flush_rule("iptables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"]);
-    flush_rule("iptables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"]);
-    flush_rule("ip6tables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT"]);
-    flush_rule("ip6tables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT"]);
+    flush_rule(
+        "iptables",
+        &[
+            "-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT",
+        ],
+    );
+    flush_rule(
+        "iptables",
+        &[
+            "-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT",
+        ],
+    );
+    flush_rule(
+        "ip6tables",
+        &[
+            "-D", "OUTPUT", "!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "REJECT",
+        ],
+    );
+    flush_rule(
+        "ip6tables",
+        &[
+            "-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "REJECT",
+        ],
+    );
 
     debug!("DNS Kill-Switch deactivated");
 }
@@ -95,11 +143,15 @@ pub fn disable_kill_switch() {
 pub fn enable_network_lockdown() {
     for port in &["80", "443"] {
         let _ = Command::new("iptables")
-            .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .args([
+                "-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT",
+            ])
             .status();
 
         let _ = Command::new("ip6tables")
-            .args(["-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"])
+            .args([
+                "-I", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT",
+            ])
             .status();
     }
 
@@ -109,8 +161,18 @@ pub fn enable_network_lockdown() {
 // purges fail-closed network lockdown rules
 pub fn disable_network_lockdown() {
     for port in &["80", "443"] {
-        flush_rule("iptables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"]);
-        flush_rule("ip6tables", &["-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT"]);
+        flush_rule(
+            "iptables",
+            &[
+                "-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT",
+            ],
+        );
+        flush_rule(
+            "ip6tables",
+            &[
+                "-D", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "REJECT",
+            ],
+        );
     }
 
     debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");

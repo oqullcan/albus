@@ -71,7 +71,9 @@ impl AutoTtlEstimator {
         } else if total_hops <= 12 {
             ((total_hops / 2) + 1).clamp(self.config.min_ttl, self.config.max_ttl)
         } else {
-            self.config.default_ttl.clamp(self.config.min_ttl, self.config.max_ttl)
+            self.config
+                .default_ttl
+                .clamp(self.config.min_ttl, self.config.max_ttl)
         }
     }
 
@@ -104,6 +106,28 @@ pub fn resolve_default_network_interface() -> Option<(String, Ipv4Addr)> {
         }
     }
     None
+}
+
+// reads the configured MTU for a given network interface via sysfs
+pub fn detect_interface_mtu(iface: &str) -> Option<u16> {
+    let path = format!("/sys/class/net/{}/mtu", iface);
+    let content = std::fs::read_to_string(path).ok()?;
+    content.trim().parse::<u16>().ok()
+}
+
+// dynamically resolves optimal restore mss based on default interface MTU (PMTUD)
+pub fn resolve_optimal_restore_mss() -> u16 {
+    if let Some((iface, _)) = resolve_default_network_interface() {
+        if let Some(mtu) = detect_interface_mtu(&iface) {
+            if mtu >= 576 {
+                // subtract standard IPv4 header (20) + TCP header (20)
+                let optimal_mss = mtu.saturating_sub(40);
+                debug!(iface = %iface, mtu = mtu, restore_mss = optimal_mss, "dynamically detected interface MTU");
+                return optimal_mss;
+            }
+        }
+    }
+    1460
 }
 
 // sends synthetic traceroute probe to estimate network layer router hop count
@@ -180,5 +204,19 @@ mod tests {
     fn test_resolve_default_network_interface_execution() {
         let route = resolve_default_network_interface();
         let _ = route;
+    }
+
+    #[test]
+    fn test_resolve_optimal_restore_mss() {
+        let mss = resolve_optimal_restore_mss();
+        assert!(mss >= 536 && mss <= 9000);
+    }
+
+    #[test]
+    fn test_detect_interface_mtu_lo() {
+        // loopback interface 'lo' exists on all linux kernels
+        if let Some(mtu) = detect_interface_mtu("lo") {
+            assert!(mtu > 0);
+        }
     }
 }

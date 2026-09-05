@@ -34,21 +34,15 @@ fn configure_resolvectl_dns(dns_ip: &str) {
             .args(["default-route", &iface, "true"])
             .output();
     }
-    let _ = Command::new("resolvectl")
-        .arg("flush-caches")
-        .output();
+    let _ = Command::new("resolvectl").arg("flush-caches").output();
 }
 
 // restores link-specific dns configuration in systemd-resolved
 fn revert_resolvectl_dns() {
     for iface in get_network_interfaces() {
-        let _ = Command::new("resolvectl")
-            .args(["revert", &iface])
-            .output();
+        let _ = Command::new("resolvectl").args(["revert", &iface]).output();
     }
-    let _ = Command::new("resolvectl")
-        .arg("flush-caches")
-        .output();
+    let _ = Command::new("resolvectl").arg("flush-caches").output();
 }
 
 // checks if nameserver line points to a local resolver loopback address (127.0.0.0/8 or ::1)
@@ -145,7 +139,10 @@ pub fn cleanup_system_dns() -> Result<bool> {
 
 pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
     if let Ok(content) = fs::read_to_string(&path) {
-        if content.contains("# albus-saved:") || content.contains("# albus:") || content.contains("nameserver 127.0.0.1") {
+        if content.contains("# albus-saved:")
+            || content.contains("# albus:")
+            || content.contains("nameserver 127.0.0.1")
+        {
             restore_system_dns_at(path)?;
             return Ok(true);
         }
@@ -188,7 +185,10 @@ mod tests {
     #[test]
     fn test_resolv_conf_idempotency_and_loopback_skipping() {
         let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!("test_resolv_conf_idempotent_{}", std::process::id()));
+        let temp_file = temp_dir.join(format!(
+            "test_resolv_conf_idempotent_{}",
+            std::process::id()
+        ));
 
         // Initial setup contains systemd-resolved stub (127.0.0.53) and real DHCP upstream
         let initial_content = "nameserver 127.0.0.53\nnameserver 10.0.0.1\n";
@@ -209,7 +209,12 @@ mod tests {
         // Should NOT save 127.0.0.1 into # albus-saved
         assert!(!after_second.contains("# albus-saved: nameserver 127.0.0.1"));
         // 10.0.0.1 must still be saved once
-        assert_eq!(after_second.matches("# albus-saved: nameserver 10.0.0.1").count(), 1);
+        assert_eq!(
+            after_second
+                .matches("# albus-saved: nameserver 10.0.0.1")
+                .count(),
+            1
+        );
         assert_eq!(after_second.matches("nameserver 127.0.0.1").count(), 1);
 
         // 3. Restore

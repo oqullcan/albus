@@ -47,12 +47,11 @@ impl DnsCache {
         Self {
             entries: Mutex::new(HashMap::with_capacity(max_entries)),
             max_entries,
-            min_ttl: 60,       // clamp minimum ttl to 60s
-            max_ttl: 86400,    // clamp maximum ttl to 24h
-            negative_ttl: 60,  // rfc 2308 negative cache duration: 60s
+            min_ttl: 60,      // clamp minimum ttl to 60s
+            max_ttl: 86400,   // clamp maximum ttl to 24h
+            negative_ttl: 60, // rfc 2308 negative cache duration: 60s
         }
     }
-
 
     pub fn len(&self) -> usize {
         self.entries.lock().map(|m| m.len()).unwrap_or(0)
@@ -413,19 +412,19 @@ mod tests {
         let cache = DnsCache::new(100);
 
         let query1 = vec![
-            0x12, 0x34,
-            0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01,
-            0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
         ];
 
         let mut fake_resp = query1.clone();
         fake_resp[2] = 0x81;
         fake_resp[3] = 0x80;
         fake_resp[7] = 0x01;
-        fake_resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 93, 184, 216, 34]);
+        fake_resp.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 93, 184, 216,
+            34,
+        ]);
 
         cache.insert(&query1, &fake_resp);
 
@@ -442,10 +441,9 @@ mod tests {
     #[test]
     fn test_ttl_decay_and_update() {
         let mut resp = vec![
-            0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
-            // Answer
+            0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01, // Answer
             0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x04, 1, 1, 1, 1,
         ];
 

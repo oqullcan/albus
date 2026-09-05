@@ -4,11 +4,11 @@
 //! without polluting /etc/hosts, while dispatching dedicated enterprise/intranet zones (*.corp)
 //! directly to internal dns servers via standard udp transport.
 
+use super::filter::extract_question_end;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use super::filter::extract_question_end;
 
 #[derive(Debug, Clone)]
 pub struct CloakEngine {
@@ -93,8 +93,16 @@ impl CloakEngine {
     }
 
     // forwards query via one-shot udp socket to dedicated split-dns upstream
-    pub async fn forward_query(&self, query: &[u8], target: SocketAddr) -> Result<Vec<u8>, std::io::Error> {
-        let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    pub async fn forward_query(
+        &self,
+        query: &[u8],
+        target: SocketAddr,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let bind_addr = if target.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let sock = UdpSocket::bind(bind_addr).await?;
         sock.connect(target).await?;
         sock.send(query).await?;
@@ -103,7 +111,9 @@ impl CloakEngine {
         let timeout = Duration::from_millis(2000);
         let len = tokio::time::timeout(timeout, sock.recv(&mut buf))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "split-dns forward timeout"))??;
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "split-dns forward timeout")
+            })??;
 
         Ok(buf[..len].to_vec())
     }
@@ -197,15 +207,18 @@ mod tests {
         engine.add_cloak_rule("*.internal", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
 
         let query = vec![
-            0x11, 0x22, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x03, b'n', b'a', b's', 0x03, b'l', b'a', b'n', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x11, 0x22, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'n',
+            b'a', b's', 0x03, b'l', b'a', b'n', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
 
-        let resp = engine.resolve_cloaked("nas.lan", 1, &query).expect("must resolve cloaked");
+        let resp = engine
+            .resolve_cloaked("nas.lan", 1, &query)
+            .expect("must resolve cloaked");
         assert!(resp.windows(4).any(|w| w == [192, 168, 1, 50]));
 
-        let wild_resp = engine.resolve_cloaked("router.internal", 1, &query).expect("must resolve wildcard");
+        let wild_resp = engine
+            .resolve_cloaked("router.internal", 1, &query)
+            .expect("must resolve wildcard");
         assert!(wild_resp.windows(4).any(|w| w == [10, 0, 0, 1]));
 
         assert!(engine.resolve_cloaked("google.com", 1, &query).is_none());

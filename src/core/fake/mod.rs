@@ -2,4 +2,5 @@
 
 pub mod clienthello;
 pub mod ech;
+pub mod http;
 pub mod sni;

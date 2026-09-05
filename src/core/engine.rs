@@ -7,16 +7,16 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::app::config::Config;
-use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
+use crate::core::autottl::{resolve_optimal_restore_mss, AutoTtlConfig, AutoTtlEstimator};
 use crate::core::ebpf::{is_root, BpfManager, BpfManagerConfig};
 use crate::core::firewall::{
     block_quic, block_stun, disable_kill_switch, disable_network_lockdown, enable_kill_switch,
     enable_network_lockdown, unblock_quic, unblock_stun,
 };
 use crate::dns::{
-    build_seed_blocklist, extract_upstream_ips, extract_upstream_ips_v6,
-    fetch_and_compile_hagezi, restore_system_dns, set_system_dns, CloakEngine, CompactBlocklist,
-    DnsServer, DnsStats, DomainAllowlist, IpFilter,
+    build_seed_blocklist, extract_upstream_ips, extract_upstream_ips_v6, fetch_and_compile_hagezi,
+    restore_system_dns, set_system_dns, CloakEngine, CompactBlocklist, DnsServer, DnsStats,
+    DomainAllowlist, IpFilter,
 };
 
 pub struct Engine {
@@ -41,7 +41,10 @@ impl Engine {
         };
 
         if cfg.odoh_enabled {
-            let relay = cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+            let relay = cfg
+                .odoh_relay
+                .as_deref()
+                .unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
             exclude_ips.extend(extract_upstream_ips(relay, &[]));
             exclude_ips_v6.extend(extract_upstream_ips_v6(relay, &[]));
         }
@@ -59,7 +62,11 @@ impl Engine {
         let bpf_cfg = BpfManagerConfig {
             mss: cfg.mss,
             min_mss: cfg.min_mss,
-            restore_mss: cfg.restore_mss,
+            restore_mss: if cfg.restore_mss == 0 {
+                resolve_optimal_restore_mss()
+            } else {
+                cfg.restore_mss
+            },
             restore_after_bytes: cfg.restore_after_bytes,
             ports: cfg.ports.clone(),
             exclude_ips,
@@ -68,6 +75,7 @@ impl Engine {
             fake_ttl: cfg.fake_ttl,
             fake_sni: cfg.fake_sni.clone(),
             fake_bad_checksum: cfg.fake_bad_checksum,
+            fake_seq_offset: cfg.fake_seq_offset,
             pqc: cfg.pqc,
             auto_ttl_estimator,
         };
@@ -90,7 +98,9 @@ impl Engine {
                 };
                 match addr_res {
                     Ok(addr) => cloak.add_forward_rule(domain, addr),
-                    Err(_) => warn!(domain = %domain, target = %addr_str, "Invalid SocketAddr in forwarding_rules"),
+                    Err(_) => {
+                        warn!(domain = %domain, target = %addr_str, "Invalid SocketAddr in forwarding_rules")
+                    }
                 }
             }
 
@@ -178,35 +188,50 @@ impl Engine {
                     match crate::dns::ipcrypt::IpCrypt::from_hex(hex) {
                         Ok(c) => Some(Arc::new(c)),
                         Err(e) => {
-                            warn!("invalid ipcrypt key: {}; logging client IPs in plaintext", e);
+                            warn!(
+                                "invalid ipcrypt key: {}; logging client IPs in plaintext",
+                                e
+                            );
                             None
                         }
                     }
                 } else {
                     None
                 };
-                let path = cfg.query_log_path.as_deref().unwrap_or(
-                    if cfg.ram_only {
-                        "/run/albus/query.log"
-                    } else {
-                        "/var/log/albus/query.log"
-                    }
-                );
-                Some(crate::dns::logger::QueryLogger::start(path, ip_crypt, 10 * 1024 * 1024, 5))
+                let path = cfg.query_log_path.as_deref().unwrap_or(if cfg.ram_only {
+                    "/run/albus/query.log"
+                } else {
+                    "/var/log/albus/query.log"
+                });
+                Some(crate::dns::logger::QueryLogger::start(
+                    path,
+                    ip_crypt,
+                    10 * 1024 * 1024,
+                    5,
+                ))
             } else {
                 None
             };
 
             let odoh_client = if cfg.odoh_enabled {
-                let relay = cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
-                let target = cfg.odoh_target.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_TARGET);
+                let relay = cfg
+                    .odoh_relay
+                    .as_deref()
+                    .unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+                let target = cfg
+                    .odoh_target
+                    .as_deref()
+                    .unwrap_or(crate::dns::DEFAULT_ODOH_TARGET);
                 match crate::dns::ODoHClient::new(relay, target, reqwest::Client::new()) {
                     Ok(c) => {
                         info!(relay = %relay, target = %target, "Oblivious DoH (RFC 9230) client initialized");
                         Some(Arc::new(c))
                     }
                     Err(e) => {
-                        warn!("failed to initialize odoh client (relay: {}, target: {}): {}", relay, target, e);
+                        warn!(
+                            "failed to initialize odoh client (relay: {}, target: {}): {}",
+                            relay, target, e
+                        );
                         None
                     }
                 }
@@ -220,6 +245,7 @@ impl Engine {
                 cfg.block_ipv6,
                 cfg.dnssec,
                 cfg.pqc,
+                cfg.dns_racing,
                 cfg.anti_dns_rebinding,
                 cfg.block_undelegated,
                 cfg.edns_padding,
@@ -343,7 +369,10 @@ impl Engine {
     // reloads persistent configuration and updates ebpf kernel maps live without process restart
     pub fn reload_config(&mut self) {
         let new_cfg = Config::load_or_default();
-        info!("Reloading configuration from {}", Config::default_config_path().display());
+        info!(
+            "Reloading configuration from {}",
+            Config::default_config_path().display()
+        );
 
         let mut exclude_ips = if new_cfg.doh_enabled {
             extract_upstream_ips(&new_cfg.doh_upstream, &new_cfg.doh_bootstrap_ips)
@@ -357,7 +386,10 @@ impl Engine {
         };
 
         if new_cfg.odoh_enabled {
-            let relay = new_cfg.odoh_relay.as_deref().unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
+            let relay = new_cfg
+                .odoh_relay
+                .as_deref()
+                .unwrap_or(crate::dns::DEFAULT_ODOH_RELAY);
             exclude_ips.extend(extract_upstream_ips(relay, &[]));
             exclude_ips_v6.extend(extract_upstream_ips_v6(relay, &[]));
         }
@@ -373,7 +405,11 @@ impl Engine {
         let bpf_cfg = BpfManagerConfig {
             mss: new_cfg.mss,
             min_mss: new_cfg.min_mss,
-            restore_mss: new_cfg.restore_mss,
+            restore_mss: if new_cfg.restore_mss == 0 {
+                resolve_optimal_restore_mss()
+            } else {
+                new_cfg.restore_mss
+            },
             restore_after_bytes: new_cfg.restore_after_bytes,
             ports: new_cfg.ports.clone(),
             exclude_ips,
@@ -382,6 +418,7 @@ impl Engine {
             fake_ttl: new_cfg.fake_ttl,
             fake_sni: new_cfg.fake_sni.clone(),
             fake_bad_checksum: new_cfg.fake_bad_checksum,
+            fake_seq_offset: new_cfg.fake_seq_offset,
             pqc: new_cfg.pqc,
             auto_ttl_estimator,
         };

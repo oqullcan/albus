@@ -146,7 +146,10 @@ mod tests {
     fn test_parse_sni_empty_or_invalid() {
         assert_eq!(parse_sni(&[]), None);
         assert_eq!(parse_sni(&[0x16, 0x03]), None);
-        assert_eq!(parse_sni(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"), None);
+        assert_eq!(
+            parse_sni(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            None
+        );
     }
 
     #[test]

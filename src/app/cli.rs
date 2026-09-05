@@ -112,6 +112,10 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fake_bad_checksum: bool,
 
+    // sequence number shift offset for overlapping or out-of-order fake packet injection
+    #[arg(long, default_value_t = 0)]
+    pub fake_seq_offset: i32,
+
     // dynamic hop distance estimation and ttl optimization
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub auto_ttl: bool,
@@ -127,6 +131,10 @@ pub struct RunArgs {
     // enable local dns-over-https proxy listener on 127.0.0.1:53
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub doh: bool,
+
+    // query multiple upstreams concurrently (happy eyeballs DNS racing) for lowest latency
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub dns_racing: bool,
 
     // upstream doh resolver preset or explicit https url
     #[arg(long, default_value = "quad9")]

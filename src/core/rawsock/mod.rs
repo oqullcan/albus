@@ -61,15 +61,26 @@ impl RawSocket {
                 None
             };
 
-            Ok(Self { fd, fd_v6: fd_v6_opt })
+            Ok(Self {
+                fd,
+                fd_v6: fd_v6_opt,
+            })
         }
     }
 
     // transmits raw packet payload with custom ip time-to-live and tcp checksum control
-    pub fn send_fake_opts(&self, conn: &ConnInfo, payload: &[u8], ttl: u8, bad_checksum: bool) -> Result<usize> {
+    pub fn send_fake_opts(
+        &self,
+        conn: &ConnInfo,
+        payload: &[u8],
+        ttl: u8,
+        bad_checksum: bool,
+    ) -> Result<usize> {
         let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
         if pkt.is_empty() {
-            return Err(Error::other("synthesized packet exceeds maximum stack buffer length"));
+            return Err(Error::other(
+                "synthesized packet exceeds maximum stack buffer length",
+            ));
         }
 
         match (conn.src_ip, conn.dst_ip) {
@@ -97,7 +108,9 @@ impl RawSocket {
                 }
             }
             (std::net::IpAddr::V6(_), std::net::IpAddr::V6(dst_v6)) => {
-                let fd_v6 = self.fd_v6.ok_or_else(|| Error::other("IPv6 raw socket not available"))?;
+                let fd_v6 = self
+                    .fd_v6
+                    .ok_or_else(|| Error::other("IPv6 raw socket not available"))?;
                 let mut dest_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
                 dest_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 dest_addr.sin6_port = 0;

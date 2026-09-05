@@ -78,7 +78,11 @@ impl DnsStamp {
         pos = next_pos;
 
         let (server_addr, bootstrap_ip) = if let Ok(sa) = server_addr_str.parse::<SocketAddr>() {
-            let v4 = if let std::net::IpAddr::V4(ip) = sa.ip() { Some(ip) } else { None };
+            let v4 = if let std::net::IpAddr::V4(ip) = sa.ip() {
+                Some(ip)
+            } else {
+                None
+            };
             (Some(sa), v4)
         } else if let Ok(ip) = server_addr_str.parse::<Ipv4Addr>() {
             let default_port = match protocol {
@@ -160,7 +164,10 @@ impl DnsStamp {
 }
 
 // reads a 1-byte length-prefixed string
-fn read_lp_string(data: &[u8], pos: usize) -> Result<(String, usize), Box<dyn std::error::Error + Send + Sync>> {
+fn read_lp_string(
+    data: &[u8],
+    pos: usize,
+) -> Result<(String, usize), Box<dyn std::error::Error + Send + Sync>> {
     if pos >= data.len() {
         return Ok((String::new(), pos));
     }
@@ -175,14 +182,19 @@ fn read_lp_string(data: &[u8], pos: usize) -> Result<(String, usize), Box<dyn st
 }
 
 // skips length-prefixed array of variable-length items
-fn skip_vlen_array(data: &[u8], mut pos: usize) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+fn skip_vlen_array(
+    data: &[u8],
+    mut pos: usize,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     while pos < data.len() {
         let item_len = data[pos] as usize;
         pos += 1;
         if (item_len & 0x80) != 0 {
             // last item flag or high bit
             let actual_len = item_len & 0x7f;
-            let next_pos = pos.checked_add(actual_len).ok_or("vlen item length overflow")?;
+            let next_pos = pos
+                .checked_add(actual_len)
+                .ok_or("vlen item length overflow")?;
             if next_pos > data.len() {
                 return Err("vlen item exceeds payload boundary".into());
             }
@@ -190,7 +202,9 @@ fn skip_vlen_array(data: &[u8], mut pos: usize) -> Result<usize, Box<dyn std::er
         } else if item_len == 0 {
             return Ok(pos);
         } else {
-            let next_pos = pos.checked_add(item_len).ok_or("vlen item length overflow")?;
+            let next_pos = pos
+                .checked_add(item_len)
+                .ok_or("vlen item length overflow")?;
             if next_pos > data.len() {
                 return Err("vlen item exceeds payload boundary".into());
             }
@@ -201,18 +215,18 @@ fn skip_vlen_array(data: &[u8], mut pos: usize) -> Result<usize, Box<dyn std::er
 }
 
 // decodes standard, url-safe, padded or unpadded base64
-fn decode_base64_url_lenient(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut clean: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+fn decode_base64_url_lenient(
+    input: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
 
     clean = clean.replace('-', "+").replace('_', "/");
     while clean.len() % 4 != 0 {
         clean.push('=');
     }
 
-    const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const B64_TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut map = [255u8; 256];
     for (i, &b) in B64_TABLE.iter().enumerate() {
         map[b as usize] = i as u8;
@@ -227,8 +241,16 @@ fn decode_base64_url_lenient(input: &str) -> Result<Vec<u8>, Box<dyn std::error:
         }
         let b0 = map[chunk[0] as usize];
         let b1 = map[chunk[1] as usize];
-        let b2 = if chunk[2] == b'=' { 0 } else { map[chunk[2] as usize] };
-        let b3 = if chunk[3] == b'=' { 0 } else { map[chunk[3] as usize] };
+        let b2 = if chunk[2] == b'=' {
+            0
+        } else {
+            map[chunk[2] as usize]
+        };
+        let b3 = if chunk[3] == b'=' {
+            0
+        } else {
+            map[chunk[3] as usize]
+        };
 
         if b0 == 255 || b1 == 255 || b2 == 255 || b3 == 255 {
             return Err("invalid base64 character in dns stamp".into());

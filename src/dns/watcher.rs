@@ -96,7 +96,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_watcher_async_trigger() {
-        let temp_dir = std::env::temp_dir().join(format!("albus_watch_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("albus_watch_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let test_file = temp_dir.join("rules.txt");
         let _ = fs::write(&test_file, "initial");

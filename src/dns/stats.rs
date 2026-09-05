@@ -3,11 +3,11 @@
 //! tracks real-time counts of total queries, cache hits, blocked domains, uncloaked cnames,
 //! anti-rebinding drops, network changes, and publishes periodic runtime snapshots.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DnsStatsSnapshot {

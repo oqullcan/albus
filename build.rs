@@ -30,13 +30,19 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:rustc-env=ALBUS_BPF_BYTECODE={}", bpf_out.to_str().unwrap());
+            println!(
+                "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
+                bpf_out.to_str().unwrap()
+            );
         }
         _ => {
             // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
             let fallback = env::current_dir().unwrap().join("bpf/sockops.bpf.o");
             if fallback.exists() {
-                println!("cargo:rustc-env=ALBUS_BPF_BYTECODE={}", fallback.to_str().unwrap());
+                println!(
+                    "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
+                    fallback.to_str().unwrap()
+                );
             } else {
                 panic!("Failed to compile eBPF bytecode and no fallback sockops.bpf.o found");
             }

@@ -29,7 +29,11 @@ impl UpstreamStats {
 
     pub fn rtt_ms(&self) -> f64 {
         let val = f64::from_bits(self.ewma_rtt_ms.load(Ordering::Relaxed));
-        if val.is_finite() && val > 0.0 { val } else { 50.0 }
+        if val.is_finite() && val > 0.0 {
+            val
+        } else {
+            50.0
+        }
     }
 
     pub fn success_rate(&self) -> f64 {
@@ -48,7 +52,11 @@ impl UpstreamStats {
         let rtt_score = (1.0 - (rtt / 1000.0)).clamp(0.0, 1.0);
         let rel_score = self.success_rate().clamp(0.0, 1.0);
         let res = (rtt_score * 0.7) + (rel_score * 0.3);
-        if res.is_finite() { res } else { 0.5 }
+        if res.is_finite() {
+            res
+        } else {
+            0.5
+        }
     }
 
     // updates moving average latency and success counters
@@ -56,18 +64,27 @@ impl UpstreamStats {
         self.total_queries.fetch_add(1, Ordering::Relaxed);
         let prev_bits = self.ewma_rtt_ms.load(Ordering::Relaxed);
         let prev_raw = f64::from_bits(prev_bits);
-        let prev = if prev_raw.is_finite() && prev_raw > 0.0 { prev_raw } else { 50.0 };
+        let prev = if prev_raw.is_finite() && prev_raw > 0.0 {
+            prev_raw
+        } else {
+            50.0
+        };
 
         if !success {
             self.failed_queries.fetch_add(1, Ordering::Relaxed);
             // penalize rtt on failure by doubling estimated rtt up to 1500ms
             let penalized = (prev * 2.0).min(1500.0);
-            self.ewma_rtt_ms.store(penalized.to_bits(), Ordering::Relaxed);
+            self.ewma_rtt_ms
+                .store(penalized.to_bits(), Ordering::Relaxed);
             return;
         }
 
         let sample_ms = latency.as_secs_f64() * 1000.0;
-        let sample = if sample_ms.is_finite() && sample_ms >= 0.0 { sample_ms } else { 50.0 };
+        let sample = if sample_ms.is_finite() && sample_ms >= 0.0 {
+            sample_ms
+        } else {
+            50.0
+        };
         // ewma smoothing factor: 0.8 * old + 0.2 * new
         let next = (prev * 0.8) + (sample * 0.2);
         self.ewma_rtt_ms.store(next.to_bits(), Ordering::Relaxed);
@@ -122,11 +139,7 @@ impl LoadBalancer {
         let score1 = stats_guard[c1].score();
         let score2 = stats_guard[c2].score();
 
-        let (winner, runner_up) = if score1 >= score2 {
-            (c1, c2)
-        } else {
-            (c2, c1)
-        };
+        let (winner, runner_up) = if score1 >= score2 { (c1, c2) } else { (c2, c1) };
 
         // return prioritized candidates followed by all remaining upstreams sorted by score
         let mut ordered = Vec::with_capacity(count);

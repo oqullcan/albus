@@ -43,10 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.fake_ttl = args.fake_ttl;
                     cfg.fake_sni = args.fake_sni;
                     cfg.fake_bad_checksum = args.fake_bad_checksum;
+                    cfg.fake_seq_offset = args.fake_seq_offset;
                     cfg.auto_ttl = args.auto_ttl;
                     cfg.min_ttl = args.min_ttl;
                     cfg.max_ttl = args.max_ttl;
                     cfg.doh_enabled = args.doh;
+                    cfg.dns_racing = args.dns_racing;
                     cfg.doh_upstream = args.doh_upstream;
                     cfg.doh_bootstrap_ips = args.doh_bootstrap_ips;
                     cfg.block_quic = args.block_quic;
@@ -130,9 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             service::handle_service_command(service_args.command)
         }
         // interactive curses-style terminal monitor
-        Some(Commands::Monitor) => {
-            monitor::run_monitor()
-        }
+        Some(Commands::Monitor) => monitor::run_monitor(),
         // crash recovery: restore system resolv.conf and iptables state
         Some(Commands::Cleanup) => {
             if !is_root() {
@@ -158,12 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
         // start packet fragmentation and desync engine
-        Some(Commands::Run(args)) => {
-            run_engine(args).await
-        }
-        None => {
-            run_engine(cli.run_args).await
-        }
+        Some(Commands::Run(args)) => run_engine(args).await,
+        None => run_engine(cli.run_args).await,
     }
 }
 
@@ -235,6 +231,8 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     if let Some(ref target) = args.odoh_target {
         cfg.odoh_target = Some(target.clone());
     }
+    cfg.fake_seq_offset = args.fake_seq_offset;
+    cfg.dns_racing = args.dns_racing;
 
     if is_root() {
         let _ = cfg.save_to_file("/etc/albus/config.json");

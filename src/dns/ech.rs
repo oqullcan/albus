@@ -35,8 +35,10 @@ pub fn parse_https_ech_config(rdata: &[u8]) -> Option<Vec<u8>> {
     let mut param_pos = 0;
 
     while param_pos + 4 <= params_data.len() {
-        let param_key = ((params_data[param_pos] as u16) << 8) | (params_data[param_pos + 1] as u16);
-        let param_len = ((params_data[param_pos + 2] as usize) << 8) | (params_data[param_pos + 3] as usize);
+        let param_key =
+            ((params_data[param_pos] as u16) << 8) | (params_data[param_pos + 1] as u16);
+        let param_len =
+            ((params_data[param_pos + 2] as usize) << 8) | (params_data[param_pos + 3] as usize);
         param_pos += 4;
 
         if param_pos + param_len > params_data.len() {

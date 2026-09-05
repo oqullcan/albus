@@ -74,7 +74,10 @@ pub fn has_ech_extension(data: &[u8]) -> bool {
             break;
         }
 
-        if ext_type == TLS_EXT_ECH_STANDARD || ext_type == TLS_EXT_ECH_DRAFT || ext_type == TLS_EXT_ECH_GREASE {
+        if ext_type == TLS_EXT_ECH_STANDARD
+            || ext_type == TLS_EXT_ECH_DRAFT
+            || ext_type == TLS_EXT_ECH_GREASE
+        {
             return true;
         }
 

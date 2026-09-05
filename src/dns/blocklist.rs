@@ -142,54 +142,79 @@ impl CompactBlocklist {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
+        Self::read_from(&mut file, file_len)
+    }
 
+    // deserializes compact blocklist directly from in-memory byte slice
+    pub fn load_from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        Self::read_from(bytes, bytes.len() as u64)
+    }
+
+    // common deserializer implementation across files and byte buffers
+    pub fn read_from<R: io::Read>(mut reader: R, file_len: u64) -> io::Result<Self> {
         // Binary header layout: 8B magic + 4B version + 8B total_domains + 4B labels_len + 4B nodes_len = 28B
         const HEADER_LEN: u64 = 28;
         if file_len < HEADER_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "blocklist binary file too short for header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "blocklist binary file too short for header",
+            ));
         }
 
         let mut magic = [0u8; 8];
-        file.read_exact(&mut magic)?;
+        reader.read_exact(&mut magic)?;
         if &magic != b"ALBUSBLK" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid albus blocklist magic header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid albus blocklist magic header",
+            ));
         }
 
         let mut v_buf = [0u8; 4];
-        file.read_exact(&mut v_buf)?;
+        reader.read_exact(&mut v_buf)?;
         let version = u32::from_le_bytes(v_buf);
         if version != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported blocklist binary version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported blocklist binary version",
+            ));
         }
 
         let mut d_buf = [0u8; 8];
-        file.read_exact(&mut d_buf)?;
+        reader.read_exact(&mut d_buf)?;
         let total_domains = u64::from_le_bytes(d_buf) as usize;
 
         let mut l_buf = [0u8; 4];
-        file.read_exact(&mut l_buf)?;
+        reader.read_exact(&mut l_buf)?;
         let labels_len_u32 = u32::from_le_bytes(l_buf);
         if labels_len_u32 > MAX_BLOCKLIST_LABELS_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("blocklist labels length {} exceeds safety ceiling {}", labels_len_u32, MAX_BLOCKLIST_LABELS_LEN),
+                format!(
+                    "blocklist labels length {} exceeds safety ceiling {}",
+                    labels_len_u32, MAX_BLOCKLIST_LABELS_LEN
+                ),
             ));
         }
         let labels_len = labels_len_u32 as usize;
 
         let mut n_buf = [0u8; 4];
-        file.read_exact(&mut n_buf)?;
+        reader.read_exact(&mut n_buf)?;
         let nodes_len_u32 = u32::from_le_bytes(n_buf);
         if nodes_len_u32 > MAX_BLOCKLIST_NODES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("blocklist nodes count {} exceeds safety ceiling {}", nodes_len_u32, MAX_BLOCKLIST_NODES),
+                format!(
+                    "blocklist nodes count {} exceeds safety ceiling {}",
+                    nodes_len_u32, MAX_BLOCKLIST_NODES
+                ),
             ));
         }
         let nodes_len = nodes_len_u32 as usize;
 
         let node_size = std::mem::size_of::<CompactNode>();
-        let payload_len = (labels_len as u64).saturating_add((nodes_len as u64).saturating_mul(node_size as u64));
+        let payload_len =
+            (labels_len as u64).saturating_add((nodes_len as u64).saturating_mul(node_size as u64));
         let remaining_file_len = file_len - HEADER_LEN;
 
         if payload_len > remaining_file_len {
@@ -203,11 +228,11 @@ impl CompactBlocklist {
         }
 
         let mut labels = vec![0u8; labels_len];
-        file.read_exact(&mut labels)?;
+        reader.read_exact(&mut labels)?;
 
         let mut nodes = Vec::with_capacity(nodes_len);
         let mut node_raw = vec![0u8; nodes_len * node_size];
-        file.read_exact(&mut node_raw)?;
+        reader.read_exact(&mut node_raw)?;
 
         for chunk in node_raw.chunks_exact(node_size) {
             let label_offset = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
@@ -237,7 +262,10 @@ impl CompactBlocklist {
                     io::ErrorKind::InvalidData,
                     format!(
                         "node {} label range [{}..{}] exceeds labels pool bounds ({})",
-                        i, node.label_offset, label_end, labels.len()
+                        i,
+                        node.label_offset,
+                        label_end,
+                        labels.len()
                     ),
                 ));
             }
@@ -248,7 +276,10 @@ impl CompactBlocklist {
                     io::ErrorKind::InvalidData,
                     format!(
                         "node {} child range [{}..{}] exceeds nodes count ({})",
-                        i, node.first_child, child_end, nodes.len()
+                        i,
+                        node.first_child,
+                        child_end,
+                        nodes.len()
                     ),
                 ));
             }
@@ -324,7 +355,10 @@ impl BlocklistBuilder {
             }
 
             let is_last = i == labels.len() - 1;
-            curr = curr.children.entry(label.to_string()).or_insert_with(IntermediateNode::new);
+            curr = curr
+                .children
+                .entry(label.to_string())
+                .or_insert_with(IntermediateNode::new);
 
             if is_last {
                 if !curr.is_terminal {
@@ -363,7 +397,8 @@ impl BlocklistBuilder {
             }
 
             // sort children alphabetically for binary search
-            let mut sorted_children: Vec<(&String, &IntermediateNode)> = inter_node.children.iter().collect();
+            let mut sorted_children: Vec<(&String, &IntermediateNode)> =
+                inter_node.children.iter().collect();
             sorted_children.sort_by(|a, b| a.0.cmp(b.0));
 
             let first_child = nodes.len() as u32;
@@ -484,7 +519,9 @@ pub fn build_seed_blocklist() -> CompactBlocklist {
 }
 
 // downloads hagezi multi pro + tif medium feeds, compiles compact blob, and persists to cache_path
-pub async fn fetch_and_compile_hagezi(cache_path: &Path) -> Result<CompactBlocklist, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn fetch_and_compile_hagezi(
+    cache_path: &Path,
+) -> Result<CompactBlocklist, Box<dyn std::error::Error + Send + Sync>> {
     info!("downloading HaGeZi Multi PRO and TIF blocklists from jsdelivr CDN...");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -493,7 +530,8 @@ pub async fn fetch_and_compile_hagezi(cache_path: &Path) -> Result<CompactBlockl
     let mut builder = BlocklistBuilder::new();
 
     // 1. HaGeZi Multi PRO
-    let pro_url = "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt";
+    let pro_url =
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt";
     match client.get(pro_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let text = resp.text().await?;
@@ -626,7 +664,7 @@ mod tests {
             file.write_all(&100u64.to_le_bytes()).unwrap(); // total_domains = 100 (8B)
             file.write_all(&1000u32.to_le_bytes()).unwrap(); // labels_len = 1000 (4B)
             file.write_all(&100_000u32.to_le_bytes()).unwrap(); // nodes_len = 100_000 (4B)
-            // No payload written, so file is only 28 bytes!
+                                                                // No payload written, so file is only 28 bytes!
             file.sync_all().unwrap();
         }
         let res2 = CompactBlocklist::load_from_file(&path2);
@@ -641,7 +679,8 @@ mod tests {
             file.write_all(b"ALBUSBLK").unwrap();
             file.write_all(&1u32.to_le_bytes()).unwrap();
             file.write_all(&100u64.to_le_bytes()).unwrap();
-            file.write_all(&(MAX_BLOCKLIST_LABELS_LEN + 1).to_le_bytes()).unwrap();
+            file.write_all(&(MAX_BLOCKLIST_LABELS_LEN + 1).to_le_bytes())
+                .unwrap();
             file.write_all(&10u32.to_le_bytes()).unwrap();
             file.sync_all().unwrap();
         }

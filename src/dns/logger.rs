@@ -80,18 +80,28 @@ impl QueryLogger {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
             }
 
             let mut file = match options.open(&log_path) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    warn!("failed to open query audit log file {}: {}", log_path.display(), e);
+                    warn!(
+                        "failed to open query audit log file {}: {}",
+                        log_path.display(),
+                        e
+                    );
                     None
                 }
             };
 
-            let mut current_size = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+            let mut current_size = file
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
 
             while let Some(entry) = rx.recv().await {
                 let client_display = match entry.client_ip {
@@ -106,7 +116,10 @@ impl QueryLogger {
                         if ip_crypt.is_some() {
                             // mask host bits of ipv6 for privacy
                             let segs = v6.segments();
-                            format!("{:x}:{:x}:{:x}:{:x}::[masked]", segs[0], segs[1], segs[2], segs[3])
+                            format!(
+                                "{:x}:{:x}:{:x}:{:x}::[masked]",
+                                segs[0], segs[1], segs[2], segs[3]
+                            )
                         } else {
                             v6.to_string()
                         }
@@ -114,7 +127,8 @@ impl QueryLogger {
                 };
 
                 let safe_domain = sanitize_log_field(&entry.domain);
-                let safe_details = sanitize_log_field(&entry.details.unwrap_or_else(|| "-".to_string()));
+                let safe_details =
+                    sanitize_log_field(&entry.details.unwrap_or_else(|| "-".to_string()));
 
                 let line = format!(
                     "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
@@ -137,7 +151,9 @@ impl QueryLogger {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::OpenOptionsExt;
-                        rot_opt.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                        rot_opt
+                            .mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
                     }
                     file = rot_opt.open(&log_path).ok();
                     current_size = 0;
@@ -234,7 +250,11 @@ mod tests {
         let content = fs::read_to_string(&log_file).expect("log file should exist");
         assert!(content.contains("tracker.ad.com?malicious.com"));
         assert!(content.contains("hagezi rule"));
-        assert_eq!(content.lines().count(), 1, "Log injection attempt MUST NOT create extra lines");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "Log injection attempt MUST NOT create extra lines"
+        );
         assert!(content.contains("BLOCK_HAGEZI"));
         assert!(content.contains("ip:")); // pseudonymized with ip: prefix
 

@@ -1,10 +1,10 @@
 //! systemd service unit generator, process supervision, and journal telemetry streaming.
 
+use crate::app::cli::{RunArgs, ServiceCommands};
+use crate::core::ebpf::is_root;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use crate::app::cli::{RunArgs, ServiceCommands};
-use crate::core::ebpf::is_root;
 
 const SERVICE_FILE_PATH: &str = "/etc/systemd/system/albus.service";
 const SYSTEM_BIN_PATH: &str = "/usr/local/bin/albus";
@@ -23,7 +23,9 @@ const POLKIT_RULE_CONTENT: &str = r#"polkit.addRule(function(action, subject) {
 "#;
 
 // dispatches systemd lifecycle actions
-pub fn handle_service_command(cmd: ServiceCommands) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn handle_service_command(
+    cmd: ServiceCommands,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cmd {
         ServiceCommands::Install(args) => install_service(&args),
         ServiceCommands::Uninstall => uninstall_service(),
@@ -62,7 +64,10 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
 
     let env_user_line = if let Ok(user) = std::env::var("SUDO_USER") {
         let trimmed = user.trim();
-        if !trimmed.is_empty() && trimmed != "root" && crate::app::config::is_valid_username(trimmed) {
+        if !trimmed.is_empty()
+            && trimmed != "root"
+            && crate::app::config::is_valid_username(trimmed)
+        {
             format!("Environment=ALBUS_CONFIG_USER={}\n", trimmed)
         } else {
             String::new()
@@ -90,6 +95,14 @@ RestartSec=3
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX AF_PACKET
+ReadWritePaths=-/run -/var/lib/albus -/var/log/albus -/etc/albus -/etc/resolv.conf -/sys/fs/bpf
 
 [Install]
 WantedBy=multi-user.target
@@ -111,7 +124,9 @@ WantedBy=multi-user.target
 
     // reload daemon manager and enable unit
     let _ = Command::new("systemctl").arg("daemon-reload").status()?;
-    let _ = Command::new("systemctl").args(["enable", "--now", "albus.service"]).status()?;
+    let _ = Command::new("systemctl")
+        .args(["enable", "--now", "albus.service"])
+        .status()?;
 
     println!("albus binary copied to /usr/local/bin/albus");
     println!("albus service installed, enabled, and started successfully!");
@@ -129,8 +144,12 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if Path::new(SERVICE_FILE_PATH).exists() {
         println!("Stopping and disabling albus.service...");
-        let _ = Command::new("systemctl").args(["stop", "albus.service"]).status();
-        let _ = Command::new("systemctl").args(["disable", "albus.service"]).status();
+        let _ = Command::new("systemctl")
+            .args(["stop", "albus.service"])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["disable", "albus.service"])
+            .status();
         let _ = fs::remove_file(SERVICE_FILE_PATH);
         let _ = Command::new("systemctl").arg("daemon-reload").status();
         println!("Removed {}", SERVICE_FILE_PATH);
@@ -148,6 +167,7 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::core::firewall::disable_kill_switch();
     crate::core::firewall::disable_network_lockdown();
     let _ = crate::dns::cleanup_system_dns();
+    crate::core::ebpf::loader::unpin_maps("/sys/fs/bpf/albus");
     println!("albus service uninstalled and system settings cleaned up.");
     Ok(())
 }
@@ -156,7 +176,9 @@ fn start_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service start requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["start", "albus.service"]).status()?;
+    let status = Command::new("systemctl")
+        .args(["start", "albus.service"])
+        .status()?;
     if status.success() {
         println!("albus.service started.");
     } else {
@@ -169,7 +191,9 @@ fn stop_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service stop requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["stop", "albus.service"]).status()?;
+    let status = Command::new("systemctl")
+        .args(["stop", "albus.service"])
+        .status()?;
     if status.success() {
         println!("albus.service stopped.");
     } else {
@@ -182,7 +206,9 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service restart requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["restart", "albus.service"]).status()?;
+    let status = Command::new("systemctl")
+        .args(["restart", "albus.service"])
+        .status()?;
     if status.success() {
         println!("albus.service restarted.");
     } else {
@@ -192,7 +218,9 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let status = Command::new("systemctl").args(["kill", "-s", "HUP", "albus.service"]).status()?;
+    let status = Command::new("systemctl")
+        .args(["kill", "-s", "HUP", "albus.service"])
+        .status()?;
     if status.success() {
         println!("albus.service configuration reloaded live via SIGHUP.");
     } else {
@@ -202,11 +230,15 @@ fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn show_service_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new("systemctl").args(["status", "albus.service"]).status()?;
+    let _ = Command::new("systemctl")
+        .args(["status", "albus.service"])
+        .status()?;
     Ok(())
 }
 
 fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new("journalctl").args(["-u", "albus.service", "-f", "-n", "50"]).status()?;
+    let _ = Command::new("journalctl")
+        .args(["-u", "albus.service", "-f", "-n", "50"])
+        .status()?;
     Ok(())
 }

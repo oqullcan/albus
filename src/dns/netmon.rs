@@ -50,7 +50,10 @@ impl NetworkMonitor {
             for entry in entries.flatten() {
                 let state_file = entry.path().join("operstate");
                 let state = fs::read_to_string(state_file).unwrap_or_default();
-                ifaces.push((entry.file_name().to_string_lossy().to_string(), state.trim().to_string()));
+                ifaces.push((
+                    entry.file_name().to_string_lossy().to_string(),
+                    state.trim().to_string(),
+                ));
             }
             ifaces.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             for (name, state) in ifaces {

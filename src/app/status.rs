@@ -1,8 +1,8 @@
 //! kernel feature inspection, cgroup v2 verification, and status bar telemetry emission.
 
+use crate::core::ebpf::features::{have_sock_ops, is_cgroup_v2, is_root};
 use std::env;
 use std::process::Command;
-use crate::core::ebpf::features::{have_sock_ops, is_cgroup_v2, is_root};
 
 // dispatches status query to plaintext or json formatter
 pub fn handle_status_command(json: bool) {
@@ -25,7 +25,10 @@ pub fn show_status() {
     }
 
     println!("  root:       {}", format_bool(is_root()));
-    println!("  cgroup_v2:  {}", format_bool(is_cgroup_v2("/sys/fs/cgroup")));
+    println!(
+        "  cgroup_v2:  {}",
+        format_bool(is_cgroup_v2("/sys/fs/cgroup"))
+    );
     println!("  sock_ops:   {}", format_bool(have_sock_ops()));
     println!("  setsockopt: {}", format_bool(have_sock_ops()));
 }
@@ -44,7 +47,8 @@ pub fn show_status_json() {
         .map(|out| {
             let s = String::from_utf8_lossy(&out.stdout);
             let my_pid = std::process::id().to_string();
-            s.lines().any(|line| line.trim() != my_pid && !line.trim().is_empty())
+            s.lines()
+                .any(|line| line.trim() != my_pid && !line.trim().is_empty())
         })
         .unwrap_or(false);
 

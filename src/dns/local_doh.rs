@@ -247,7 +247,8 @@ pub fn decode_b64url(s: &str) -> Option<Vec<u8>> {
     while clean.len() % 4 != 0 {
         clean.push('=');
     }
-    const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const B64_TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut map = [255u8; 256];
     for (i, &b) in B64_TABLE.iter().enumerate() {
         map[b as usize] = i as u8;
@@ -266,11 +267,23 @@ pub fn decode_b64url(s: &str) -> Option<Vec<u8>> {
 
         let b0 = map[chunk[0] as usize];
         let b1 = map[chunk[1] as usize];
-        let b2 = if chunk[2] == b'=' { 0 } else { map[chunk[2] as usize] };
-        let b3 = if chunk[3] == b'=' { 0 } else { map[chunk[3] as usize] };
+        let b2 = if chunk[2] == b'=' {
+            0
+        } else {
+            map[chunk[2] as usize]
+        };
+        let b3 = if chunk[3] == b'=' {
+            0
+        } else {
+            map[chunk[3] as usize]
+        };
 
         // reject chunk if any character is invalid (255)
-        if b0 == 255 || b1 == 255 || (chunk[2] != b'=' && b2 == 255) || (chunk[3] != b'=' && b3 == 255) {
+        if b0 == 255
+            || b1 == 255
+            || (chunk[2] != b'=' && b2 == 255)
+            || (chunk[3] != b'=' && b3 == 255)
+        {
             return None;
         }
 
@@ -303,7 +316,10 @@ mod tests {
     fn test_parse_post_doh_request() {
         let raw = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\n\r\n\x12\x34\x01\x00";
         let parsed = parse_http_dns_request(raw);
-        assert_eq!(parsed, HttpDnsRequest::Query(b"\x12\x34\x01\x00".to_vec(), true));
+        assert_eq!(
+            parsed,
+            HttpDnsRequest::Query(b"\x12\x34\x01\x00".to_vec(), true)
+        );
     }
 
     #[test]
@@ -311,7 +327,10 @@ mod tests {
         // High byte 0x80, 0xff, 0xfe are invalid UTF-8 sequences in raw wire format
         let raw = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\n\x80\xff\xfe\x01";
         let parsed = parse_http_dns_request(raw);
-        assert_eq!(parsed, HttpDnsRequest::Query(b"\x80\xff\xfe\x01".to_vec(), true));
+        assert_eq!(
+            parsed,
+            HttpDnsRequest::Query(b"\x80\xff\xfe\x01".to_vec(), true)
+        );
     }
 
     #[test]
@@ -373,7 +392,11 @@ mod tests {
         let bad_get = b"GET /dns-query?dns=INVALID!BASE64 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         assert_eq!(parse_http_dns_request(bad_get), HttpDnsRequest::BadRequest);
 
-        let empty_post = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
-        assert_eq!(parse_http_dns_request(empty_post), HttpDnsRequest::BadRequest);
+        let empty_post =
+            b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            parse_http_dns_request(empty_post),
+            HttpDnsRequest::BadRequest
+        );
     }
 }

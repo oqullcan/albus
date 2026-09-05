@@ -3,18 +3,16 @@
 //! decouples client ip address from dns queries using an intermediary oblivious proxy relay
 //! and end-to-end hpke (hybrid public key encryption, rfc 9180) encryption to the target resolver.
 
-use std::sync::Arc;
-use std::time::Duration;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use hpke::{
-    aead::ChaCha20Poly1305 as HpkeAead,
-    kdf::HkdfSha256 as HpkeKdf,
-    kem::X25519HkdfSha256 as HpkeKem,
-    Deserializable, Kem, OpModeS, Serializable,
+    aead::ChaCha20Poly1305 as HpkeAead, kdf::HkdfSha256 as HpkeKdf,
+    kem::X25519HkdfSha256 as HpkeKem, Deserializable, Kem, OpModeS, Serializable,
 };
 use sha2::Sha256;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -72,7 +70,9 @@ pub struct ODoHConfig {
 
 impl ODoHConfig {
     /// parses an obliviousdohconfigs structure (rfc 9230 section 5) from raw bytes
-    pub fn parse_configs(bytes: &[u8]) -> Result<Vec<Self>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn parse_configs(
+        bytes: &[u8],
+    ) -> Result<Vec<Self>, Box<dyn std::error::Error + Send + Sync>> {
         if bytes.len() < 2 {
             return Err("odohconfigs payload too short".into());
         }
@@ -159,7 +159,9 @@ impl ODoHClient {
     }
 
     /// fetches target resolver's public key configuration from `/.well-known/odohconfigs`
-    pub async fn fetch_target_config(&self) -> Result<ODoHConfigContents, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn fetch_target_config(
+        &self,
+    ) -> Result<ODoHConfigContents, Box<dyn std::error::Error + Send + Sync>> {
         // return cached config if already resolved
         {
             let lock = self.cached_config.read().await;
@@ -173,7 +175,9 @@ impl ODoHClient {
         config_url.set_query(None);
 
         debug!(url = %config_url, "fetching odoh target configuration");
-        let mut resp = self.client.get(config_url.as_str())
+        let mut resp = self
+            .client
+            .get(config_url.as_str())
             .timeout(Duration::from_secs(5))
             .send()
             .await?;
@@ -184,7 +188,11 @@ impl ODoHClient {
 
         if let Some(content_len) = resp.content_length() {
             if content_len > 65536 {
-                return Err(format!("odohconfigs length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+                return Err(format!(
+                    "odohconfigs length {} exceeds maximum allowed (65536 bytes)",
+                    content_len
+                )
+                .into());
             }
         }
 
@@ -198,10 +206,16 @@ impl ODoHClient {
         let configs = ODoHConfig::parse_configs(&body)?;
 
         // select best matching configuration (prefer x25519 + chacha20poly1305)
-        let selected = configs.into_iter()
-            .find(|c| c.contents.kem_id == KEM_DHKEM_X25519_HKDF_SHA256 && c.contents.aead_id == AEAD_CHACHA20_POLY1305)
+        let selected = configs
+            .into_iter()
+            .find(|c| {
+                c.contents.kem_id == KEM_DHKEM_X25519_HKDF_SHA256
+                    && c.contents.aead_id == AEAD_CHACHA20_POLY1305
+            })
             .or_else(|| None)
-            .ok_or_else(|| "no compatible X25519+ChaCha20Poly1305 cipher suite found in target odohconfigs")?;
+            .ok_or_else(|| {
+                "no compatible X25519+ChaCha20Poly1305 cipher suite found in target odohconfigs"
+            })?;
 
         let contents = selected.contents;
         {
@@ -258,7 +272,8 @@ impl ODoHClient {
             &OpModeS::Base,
             &server_pk,
             b"odoh query",
-        ).map_err(|e| format!("hpke setup_sender failed: {:?}", e))?;
+        )
+        .map_err(|e| format!("hpke setup_sender failed: {:?}", e))?;
 
         let key_id = target_cfg.compute_key_id();
 
@@ -270,10 +285,9 @@ impl ODoHClient {
 
         // 5. encrypt query plaintext
         let mut ct = q_plain.clone();
-        let tag = sender_ctx.seal_inout_detached(
-            hpke::inout::InOutBuf::from(ct.as_mut_slice()),
-            &aad,
-        ).map_err(|e| format!("hpke seal failed: {:?}", e))?;
+        let tag = sender_ctx
+            .seal_inout_detached(hpke::inout::InOutBuf::from(ct.as_mut_slice()), &aad)
+            .map_err(|e| format!("hpke seal failed: {:?}", e))?;
 
         let mut q_encrypted = encapped_key.to_bytes().to_vec();
         q_encrypted.extend_from_slice(&ct);
@@ -287,7 +301,13 @@ impl ODoHClient {
         msg.extend_from_slice(&(q_encrypted.len() as u16).to_be_bytes());
         msg.extend_from_slice(&q_encrypted);
 
-        Ok((msg, ODoHContext { sender_ctx, q_plain }))
+        Ok((
+            msg,
+            ODoHContext {
+                sender_ctx,
+                q_plain,
+            },
+        ))
     }
 
     /// decrypts an oblivious doh response message (rfc 9230 section 6.2)
@@ -302,7 +322,11 @@ impl ODoHClient {
 
         let msg_type = response_bytes[0];
         if msg_type != 0x02 {
-            return Err(format!("unexpected odoh message type: expected 0x02, got 0x{:02x}", msg_type).into());
+            return Err(format!(
+                "unexpected odoh message type: expected 0x02, got 0x{:02x}",
+                msg_type
+            )
+            .into());
         }
 
         let key_id_len = u16::from_be_bytes([response_bytes[1], response_bytes[2]]) as usize;
@@ -324,7 +348,8 @@ impl ODoHClient {
 
         // derive response decryption secrets per rfc 9230 section 5.2
         let mut secret = [0u8; 32];
-        ctx.sender_ctx.export(b"odoh response", &mut secret)
+        ctx.sender_ctx
+            .export(b"odoh response", &mut secret)
             .map_err(|e| format!("hpke export secret failed: {:?}", e))?;
 
         // salt = Q_plain || len(resp_nonce) || resp_nonce
@@ -357,7 +382,8 @@ impl ODoHClient {
             aad: &aad,
         };
 
-        let r_plain = cipher.decrypt(&nonce, payload)
+        let r_plain = cipher
+            .decrypt(&nonce, payload)
             .map_err(|_| "aead authentication failure during odoh response decryption")?;
 
         if r_plain.len() < 4 {
@@ -370,7 +396,8 @@ impl ODoHClient {
             return Err("dns response length exceeds plaintext bounds".into());
         }
 
-        let pad_len = u16::from_be_bytes([r_plain[padding_offset], r_plain[padding_offset + 1]]) as usize;
+        let pad_len =
+            u16::from_be_bytes([r_plain[padding_offset], r_plain[padding_offset + 1]]) as usize;
         if padding_offset + 2 + pad_len != r_plain.len() {
             return Err("invalid padding length in odoh response plaintext".into());
         }
@@ -398,7 +425,10 @@ impl ODoHClient {
 
     /// performs complete oblivious dns query dispatch through relay proxy to target resolver.
     /// includes automatic target key refresh retry if relay/target reports 401 key rollover.
-    pub async fn resolve(&self, dns_query: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn resolve(
+        &self,
+        dns_query: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         for attempt in 0..2 {
             let config = self.fetch_target_config().await?;
             let (encrypted_body, context) = self.encrypt_query(dns_query, &config)?;
@@ -406,16 +436,22 @@ impl ODoHClient {
             // build proxy request url per rfc 9230 section 4.1:
             // https://proxy.example/dns-query?targethost=target.example&targetpath=/dns-query
             let mut req_url = self.relay_url.clone();
-            let target_host = self.target_url.host_str().unwrap_or("odoh.cloudflare-dns.com");
+            let target_host = self
+                .target_url
+                .host_str()
+                .unwrap_or("odoh.cloudflare-dns.com");
             let target_path = self.target_url.path();
 
-            req_url.query_pairs_mut()
+            req_url
+                .query_pairs_mut()
                 .append_pair("targethost", target_host)
                 .append_pair("targetpath", target_path);
 
             debug!(relay = %self.relay_url, target = %target_host, "dispatching encrypted oblivious doh query");
 
-            let mut response = self.client.post(req_url.as_str())
+            let mut response = self
+                .client
+                .post(req_url.as_str())
                 .header("Content-Type", ODOH_HTTP_HEADER)
                 .header("Accept", ODOH_HTTP_HEADER)
                 .body(encrypted_body)
@@ -435,12 +471,20 @@ impl ODoHClient {
             }
 
             if !response.status().is_success() {
-                return Err(format!("odoh relay returned error status: HTTP {}", response.status()).into());
+                return Err(format!(
+                    "odoh relay returned error status: HTTP {}",
+                    response.status()
+                )
+                .into());
             }
 
             if let Some(content_len) = response.content_length() {
                 if content_len > 65536 {
-                    return Err(format!("odoh response length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+                    return Err(format!(
+                        "odoh response length {} exceeds maximum allowed (65536 bytes)",
+                        content_len
+                    )
+                    .into());
                 }
             }
 
@@ -523,10 +567,17 @@ mod tests {
             public_key: server_pk.to_bytes().to_vec(),
         };
 
-        let client = ODoHClient::new(DEFAULT_ODOH_RELAY, DEFAULT_ODOH_TARGET, reqwest::Client::new()).unwrap();
+        let client = ODoHClient::new(
+            DEFAULT_ODOH_RELAY,
+            DEFAULT_ODOH_TARGET,
+            reqwest::Client::new(),
+        )
+        .unwrap();
         let query_payload = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
 
-        let (encrypted_wire, _ctx) = client.encrypt_query(query_payload, &contents).expect("encryption should succeed");
+        let (encrypted_wire, _ctx) = client
+            .encrypt_query(query_payload, &contents)
+            .expect("encryption should succeed");
         assert_eq!(encrypted_wire[0], 0x01, "message_type must be query (0x01)");
     }
 
@@ -543,11 +594,18 @@ mod tests {
             public_key: server_pk.to_bytes().to_vec(),
         };
 
-        let client = ODoHClient::new(DEFAULT_ODOH_RELAY, DEFAULT_ODOH_TARGET, reqwest::Client::new()).unwrap();
+        let client = ODoHClient::new(
+            DEFAULT_ODOH_RELAY,
+            DEFAULT_ODOH_TARGET,
+            reqwest::Client::new(),
+        )
+        .unwrap();
         let dns_query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
 
         // 2. Client encrypts query
-        let (query_msg, client_ctx) = client.encrypt_query(dns_query, &contents).expect("encrypt query");
+        let (query_msg, client_ctx) = client
+            .encrypt_query(dns_query, &contents)
+            .expect("encrypt query");
         assert_eq!(query_msg[0], 0x01);
 
         let key_id_len = u16::from_be_bytes([query_msg[1], query_msg[2]]) as usize;
@@ -555,17 +613,20 @@ mod tests {
         assert_eq!(key_id, &contents.compute_key_id());
 
         let q_enc_pos = 3 + key_id_len;
-        let q_enc_len = u16::from_be_bytes([query_msg[q_enc_pos], query_msg[q_enc_pos + 1]]) as usize;
+        let q_enc_len =
+            u16::from_be_bytes([query_msg[q_enc_pos], query_msg[q_enc_pos + 1]]) as usize;
         let q_enc = &query_msg[q_enc_pos + 2..q_enc_pos + 2 + q_enc_len];
 
         // 3. Server receives and decrypts query
-        let encapped_key = <HpkeKem as Kem>::EncappedKey::from_bytes(&q_enc[..32]).expect("deserialize encapped pk");
+        let encapped_key = <HpkeKem as Kem>::EncappedKey::from_bytes(&q_enc[..32])
+            .expect("deserialize encapped pk");
         let mut receiver_ctx = hpke::setup_receiver::<HpkeAead, HpkeKdf, HpkeKem>(
             &OpModeR::Base,
             &server_sk,
             &encapped_key,
             b"odoh query",
-        ).expect("hpke setup_receiver");
+        )
+        .expect("hpke setup_receiver");
 
         let mut aad = Vec::with_capacity(1 + 2 + key_id.len());
         aad.push(0x01);
@@ -576,11 +637,9 @@ mod tests {
         let tag = hpke::aead::AeadTag::<HpkeAead>::from_bytes(tag_bytes).expect("tag bytes");
         let mut ct = q_enc[32..q_enc.len() - 16].to_vec();
 
-        receiver_ctx.open_inout_detached(
-            hpke::inout::InOutBuf::from(ct.as_mut_slice()),
-            &aad,
-            &tag,
-        ).expect("receiver open ciphertext");
+        receiver_ctx
+            .open_inout_detached(hpke::inout::InOutBuf::from(ct.as_mut_slice()), &aad, &tag)
+            .expect("receiver open ciphertext");
 
         let q_plain = ct;
         let query_len = u16::from_be_bytes([q_plain[0], q_plain[1]]) as usize;
@@ -598,7 +657,9 @@ mod tests {
 
         let resp_nonce = [0x55u8; 32];
         let mut resp_secret = [0u8; 32];
-        receiver_ctx.export(b"odoh response", &mut resp_secret).expect("export secret");
+        receiver_ctx
+            .export(b"odoh response", &mut resp_secret)
+            .expect("export secret");
 
         let mut salt = Vec::with_capacity(q_plain.len() + 2 + resp_nonce.len());
         salt.extend_from_slice(&q_plain);
@@ -618,7 +679,15 @@ mod tests {
 
         let cipher = ChaCha20Poly1305::new(&Key::from(aead_key));
         let nonce = Nonce::from(aead_nonce);
-        let r_encrypted = cipher.encrypt(&nonce, Payload { msg: &r_plain, aad: &resp_aad }).unwrap();
+        let r_encrypted = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &r_plain,
+                    aad: &resp_aad,
+                },
+            )
+            .unwrap();
 
         let mut resp_msg = Vec::new();
         resp_msg.push(0x02); // type response
@@ -628,8 +697,9 @@ mod tests {
         resp_msg.extend_from_slice(&r_encrypted);
 
         // 5. Client receives and decrypts response
-        let client_decrypted = client.decrypt_response(client_ctx, &resp_msg).expect("client decrypt response");
+        let client_decrypted = client
+            .decrypt_response(client_ctx, &resp_msg)
+            .expect("client decrypt response");
         assert_eq!(client_decrypted, mock_dns_response);
     }
 }
-

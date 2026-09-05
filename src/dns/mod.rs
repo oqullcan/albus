@@ -41,4 +41,3 @@ pub use stats::{DnsStats, DnsStatsSnapshot};
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};
 pub use tcp::DnsTcpServer;
 pub use watcher::FileWatcher;
-

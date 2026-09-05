@@ -52,7 +52,16 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // stream journalctl log entries
     if is_active {
         let mut child = Command::new("journalctl")
-            .args(["-u", "albus.service", "-f", "-n", "30", "--no-pager", "-o", "cat"])
+            .args([
+                "-u",
+                "albus.service",
+                "-f",
+                "-n",
+                "30",
+                "--no-pager",
+                "-o",
+                "cat",
+            ])
             .spawn()?;
 
         let _ = child.wait();
