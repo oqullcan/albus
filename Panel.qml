@@ -392,26 +392,31 @@ Panel {
       var isBad = badCsMatch && (badCsMatch[1] === "true" || badCsMatch[1] === "1")
       detail = isHttp ? "HTTP/1.1 verb fragmented desync" : (isBad ? "0xDEAD bad-checksum middlebox desync" : "Fake SNI desync injected")
       tag = isHttp ? "HTTP/1.1" : ((isBad ? "0xDEAD • " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL"))
-    } else if (clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1 || clean.indexOf("CNAME cloaking") !== -1 || clean.indexOf("Bogon") !== -1 || clean.indexOf("Anti-DNS Rebinding") !== -1 || clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1 || clean.indexOf("undelegated") !== -1) {
+    } else if (clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1 || clean.indexOf("CNAME cloaking") !== -1 || clean.indexOf("uncloaked_target") !== -1 || clean.indexOf("Bogon") !== -1 || clean.indexOf("Anti-DNS") !== -1 || clean.indexOf("Rebinding") !== -1 || clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1 || clean.indexOf("undelegated") !== -1) {
       category = "SHIELD"
       badgeColor = "#10B981"
       var isHagezi = clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1
-      var isCname = clean.indexOf("CNAME cloaking") !== -1
-      var isBogon = clean.indexOf("Bogon") !== -1
-      var isRebind = clean.indexOf("Anti-DNS Rebinding") !== -1
+      var isCname = clean.indexOf("CNAME cloaking") !== -1 || clean.indexOf("uncloaked_target") !== -1
+      var isBogon = clean.indexOf("Bogon") !== -1 || clean.indexOf("bogon") !== -1
+      var isRebind = clean.indexOf("Anti-DNS") !== -1 || clean.indexOf("Rebinding") !== -1
       var isLock = clean.indexOf("Lockdown") !== -1
       var isCanary = clean.indexOf("canary") !== -1
       var isStun = clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1
       var domMatch = clean.match(/domain=([^\s]+)/) || clean.match(/uncloaked_target=([^\s]+)/)
-      var cleanDom = domMatch ? domMatch[1].replace(/["',?]/g, "") : ""
+      var cleanDom = ""
+      if (domMatch) {
+        cleanDom = domMatch[1].replace(/^Some\(/, "").replace(/\)$/, "").replace(/["',?]/g, "")
+      }
+      var targetMatch = clean.match(/uncloaked_target=([^\s]+)/)
+      var cleanTarget = targetMatch ? targetMatch[1].replace(/["',?]/g, "") : ""
 
       if (isHagezi) {
         title = cleanDom !== "" ? cleanDom : "HaGeZi Block"
         detail = "Ad/malware domain filtered"
         tag = "Threat Block"
       } else if (isCname) {
-        title = cleanDom !== "" ? cleanDom : "CNAME Tracker Block"
-        detail = "Uncloaked tracking domain sinkholed"
+        title = cleanTarget !== "" ? cleanTarget : (cleanDom !== "" ? cleanDom : "CNAME Tracker Block")
+        detail = cleanDom !== "" ? "Tracker uncloaked from " + cleanDom : "Uncloaked tracking domain sinkholed"
         tag = "Uncloak"
       } else if (isBogon) {
         title = cleanDom !== "" ? cleanDom : "Bogon IP Dropped"
@@ -510,7 +515,7 @@ Panel {
 
     var list = root.rawStreamEvents.slice()
     list.push(parsed)
-    if (list.length > 120) list.shift()
+    if (list.length > 500) list.shift()
     root.rawStreamEvents = list
 
     updateDisplayEvents()
@@ -898,7 +903,7 @@ Panel {
   // journalctl event stream collector
   Process {
     id: streamProc
-    command: ["journalctl", "-u", "albus.service", "-n", "40", "-f", "--no-pager", "-o", "cat"]
+    command: ["journalctl", "-u", "albus.service", "-n", "200", "-f", "--no-pager", "-o", "cat"]
     running: root.opened && root.activeTab === 1
     stdout: SplitParser {
       onRead: function(line) {
@@ -2402,7 +2407,9 @@ Panel {
                     visible: root.displayEvents.length === 0
                     text: root.streamSearchQuery !== ""
                       ? "No events matching \"" + root.streamSearchQuery + "\""
-                      : (root.isRunning ? "Listening for real-time DPI flows..." : "Service is offline. Start Albus to stream flows.")
+                      : (root.streamFilter !== "ALL"
+                          ? ("No recent " + root.streamFilter + " events in buffer")
+                          : (root.isRunning ? "Listening for real-time DPI flows..." : "Service is offline. Start Albus to stream flows."))
                     textFormat: Text.PlainText
                     color: root.dim
                     font.family: root.fontFamily
