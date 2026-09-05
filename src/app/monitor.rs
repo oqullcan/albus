@@ -30,9 +30,22 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("  \x1b[1mstatus\x1b[0m    \x1b[33m○ standby\x1b[0m \x1b[2m(run 'sudo albus run' or 'sudo albus service start')\x1b[0m");
     }
 
-    println!("  \x1b[1mresolver\x1b[0m  127.0.0.1:53 \x1b[2m(quad9 doh • pqc ml-kem-768 • dnssec)\x1b[0m");
+    println!("  \x1b[1mresolver\x1b[0m  127.0.0.1:53 \x1b[2m(multi-doh wp2 • pqc ml-kem-768 • dnssec • edns padding • ecs-zero • dns64)\x1b[0m");
+    println!("  \x1b[1msecurity\x1b[0m  hagezi pro+tif \x1b[2m(arena radix) • cname uncloaking • allowlist • bogon drop • netmon\x1b[0m");
     println!("  \x1b[1mevasion\x1b[0m   mss 88b \x1b[2m(restore 600b) • auto-ttl • fake sni • quic drop\x1b[0m");
     println!("  \x1b[1mstorage\x1b[0m   volatile tmpfs \x1b[2m(/run — zero-disk footprint)\x1b[0m");
+
+    if let Ok(stats_json) = std::fs::read_to_string("/run/albus/stats.json") {
+        if let Ok(snap) = serde_json::from_str::<crate::dns::DnsStatsSnapshot>(&stats_json) {
+            println!("  \x1b[1mqueries\x1b[0m   {} total • {} cached ({:.1}%) • {} blocked (HaGeZi) • {} CNAME uncloaked",
+                snap.total_queries, snap.cache_hits, snap.cache_hit_ratio, snap.blocked_domains, snap.uncloaked_cnames);
+            if snap.rebinding_drops > 0 || snap.network_changes > 0 || snap.dns64_synthesized > 0 {
+                println!("  \x1b[1mdefense\x1b[0m   {} rebinding drops • {} network transitions • {} DNS64 synthesized",
+                    snap.rebinding_drops, snap.network_changes, snap.dns64_synthesized);
+            }
+        }
+    }
+
     println!("\n\x1b[2m──────────────────────────────────────────────────────────────────────────\x1b[0m\n");
     stdout.flush()?;
 

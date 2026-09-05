@@ -1,8 +1,10 @@
 //! lifecycle orchestrator coordinating doh dns proxy, iptables filtering, and ebpf desync engine.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use crate::app::config::Config;
 use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
@@ -12,7 +14,9 @@ use crate::core::firewall::{
     enable_network_lockdown, unblock_quic, unblock_stun,
 };
 use crate::dns::{
-    extract_upstream_ips, extract_upstream_ips_v6, restore_system_dns, set_system_dns, DnsServer,
+    build_seed_blocklist, extract_upstream_ips, extract_upstream_ips_v6,
+    fetch_and_compile_hagezi, restore_system_dns, set_system_dns, CloakEngine, CompactBlocklist,
+    DnsServer, DnsStats, DomainAllowlist, IpFilter,
 };
 
 pub struct Engine {
@@ -64,12 +68,152 @@ impl Engine {
 
         // instantiate local doh proxy server on 127.0.0.1:53
         let dns_server = if cfg.doh_enabled {
+            let mut cloak = CloakEngine::new();
+            for (domain, ip_str) in &cfg.cloaking_rules {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    cloak.add_cloak_rule(domain, ip);
+                } else {
+                    warn!(domain = %domain, ip = %ip_str, "Invalid IP address in cloaking_rules");
+                }
+            }
+            for (domain, addr_str) in &cfg.forwarding_rules {
+                let addr_res = if addr_str.contains(':') {
+                    addr_str.parse::<SocketAddr>()
+                } else {
+                    format!("{}:53", addr_str).parse::<SocketAddr>()
+                };
+                match addr_res {
+                    Ok(addr) => cloak.add_forward_rule(domain, addr),
+                    Err(_) => warn!(domain = %domain, target = %addr_str, "Invalid SocketAddr in forwarding_rules"),
+                }
+            }
+
+            // initialize compact blocklist (seed or cached binary)
+            let cache_path = if let Some(ref p) = cfg.blocklist_path {
+                std::path::PathBuf::from(p)
+            } else if cfg.ram_only {
+                std::path::PathBuf::from("/run/albus/blocklist.bin")
+            } else {
+                std::path::PathBuf::from("/var/lib/albus/blocklist.bin")
+            };
+
+            let initial_blocklist = if !cfg.blocklist {
+                CompactBlocklist::empty()
+            } else if cache_path.exists() {
+                match CompactBlocklist::load_from_file(&cache_path) {
+                    Ok(bl) => {
+                        info!(rules = bl.total_domains, path = %cache_path.display(), "loaded cached HaGeZi blocklist");
+                        bl
+                    }
+                    Err(e) => {
+                        debug!("failed to load cached blocklist: {}; using seed list", e);
+                        build_seed_blocklist()
+                    }
+                }
+            } else {
+                build_seed_blocklist()
+            };
+
+            let blocklist_arc = Arc::new(RwLock::new(initial_blocklist));
+
+            // if blocklist is enabled and no custom static path was supplied, fetch latest HaGeZi in background
+            if cfg.blocklist && cfg.blocklist_path.is_none() {
+                let bl_updater = blocklist_arc.clone();
+                let cp = cache_path.clone();
+                tokio::spawn(async move {
+                    match fetch_and_compile_hagezi(&cp).await {
+                        Ok(compiled) => {
+                            let mut lock = bl_updater.write().await;
+                            *lock = compiled;
+                            info!("live DNS blocklist upgraded with latest HaGeZi Multi PRO + TIF feeds");
+                        }
+                        Err(e) => {
+                            debug!("HaGeZi background feed update deferred: {}", e);
+                        }
+                    }
+                });
+            }
+
+            // initialize domain allowlist
+            let mut allowlist = DomainAllowlist::from_iter(&cfg.allow_domains);
+            if let Some(path) = &cfg.allowlist_path {
+                match DomainAllowlist::from_file(path) {
+                    Ok(al) => {
+                        info!(rules = al.len(), path = %path, "loaded domain allowlist from file");
+                        for pat in &cfg.allow_domains {
+                            allowlist.add(pat);
+                        }
+                        allowlist = al;
+                    }
+                    Err(e) => warn!("failed to load allowlist file {}: {}", path, e),
+                }
+            }
+            let allowlist_arc = Arc::new(RwLock::new(allowlist));
+
+            // initialize IP filter
+            let blocked_ips: Vec<std::net::IpAddr> = cfg
+                .blocked_ips
+                .iter()
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            let ip_filter_arc = Arc::new(IpFilter::new(cfg.block_bogons, blocked_ips));
+
+            // initialize atomic DNS statistics
+            let dns_stats = DnsStats::new();
+
+            // initialize local DoH address and query audit logger
+            let local_doh_addr: SocketAddr = cfg
+                .local_doh_addr
+                .parse()
+                .unwrap_or_else(|_| "127.0.0.1:8053".parse().unwrap());
+
+            let query_logger = if cfg.query_log {
+                let ip_crypt = if let Some(ref hex) = cfg.ipcrypt_key {
+                    match crate::dns::ipcrypt::IpCrypt::from_hex(hex) {
+                        Ok(c) => Some(Arc::new(c)),
+                        Err(e) => {
+                            warn!("invalid ipcrypt key: {}; logging client IPs in plaintext", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let path = cfg.query_log_path.as_deref().unwrap_or(
+                    if cfg.ram_only {
+                        "/run/albus/query.log"
+                    } else {
+                        "/var/log/albus/query.log"
+                    }
+                );
+                Some(crate::dns::logger::QueryLogger::start(path, ip_crypt, 10 * 1024 * 1024, 5))
+            } else {
+                None
+            };
+
             Some(Arc::new(DnsServer::new(
                 &cfg.doh_upstream,
                 &cfg.doh_bootstrap_ips,
                 cfg.block_ipv6,
                 cfg.dnssec,
                 cfg.pqc,
+                cfg.anti_dns_rebinding,
+                cfg.block_undelegated,
+                cfg.edns_padding,
+                Arc::new(cloak),
+                blocklist_arc,
+                allowlist_arc,
+                ip_filter_arc,
+                cfg.uncloak_cnames,
+                cfg.dns64,
+                cfg.netmon,
+                dns_stats,
+                cfg.tcp_listener,
+                cfg.local_doh,
+                local_doh_addr,
+                query_logger,
+                cfg.allowlist_path.clone(),
+                cfg.blocklist_path.clone(),
             )?))
         } else {
             None

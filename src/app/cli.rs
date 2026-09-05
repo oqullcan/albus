@@ -192,6 +192,74 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub ram_only: bool,
 
+    // drop upstream responses resolving to private/loopback ips (anti-dns-rebinding)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub anti_dns_rebinding: bool,
+
+    // block queries for dotless names, .local, .lan, and undelegated private zones
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub block_undelegated: bool,
+
+    // pad encrypted doh queries to discrete boundaries (rfc 8467)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub edns_padding: bool,
+
+    // enable compact in-memory hagezi multi pro + tif ad/malware blocklist
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub blocklist: bool,
+
+    // path to custom domain blocklist file or compiled binary
+    #[arg(long)]
+    pub blocklist_path: Option<String>,
+
+    // comma-separated domains to allowlist/bypass blocklist
+    #[arg(long, value_delimiter = ',')]
+    pub allow_domains: Option<Vec<String>>,
+
+    // path to custom domain allowlist file
+    #[arg(long)]
+    pub allowlist_path: Option<String>,
+
+    // synthesize rfc 6052 ipv6 aaaa records for ipv4-only domains (dns64)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub dns64: bool,
+
+    // drop upstream responses resolving to bogon ip subnets
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub block_bogons: bool,
+
+    // inspect and uncloak cname / https alias targets against blocklist
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub uncloak_cnames: bool,
+
+    // monitor network interface and routing transitions (netmon)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub netmon: bool,
+
+    // enable local tcp port 53 listener (rfc 7766)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub tcp_listener: bool,
+
+    // enable local doh server (rfc 8484)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub local_doh: bool,
+
+    // bind address for local doh server
+    #[arg(long, default_value = "127.0.0.1:8053")]
+    pub local_doh_addr: String,
+
+    // enable structured query and threat audit logger
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub query_log: bool,
+
+    // output file path for query audit log
+    #[arg(long)]
+    pub query_log_path: Option<String>,
+
+    // 128-bit hex key for client ip pseudonymization (ipcrypt)
+    #[arg(long)]
+    pub ipcrypt_key: Option<String>,
+
     // enable verbose debug logging in tracing subscriber
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,

@@ -1,34 +1,93 @@
 //! udp listener on 127.0.0.1:53 forwarding to encrypted doh with dnssec and ipv6 aaaa filtering.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
-use super::cache::DnsCache;
+use super::allowlist::DomainAllowlist;
+use super::blocklist::{build_seed_blocklist, CompactBlocklist};
+use super::cache::{extract_query_key, DnsCache};
+use super::captive::{build_captive_response, check_captive_portal};
+use super::cloak::CloakEngine;
+use super::dns64::build_dns64_response;
 use super::doh::DoHResolver;
+use super::filter::{
+    build_nxdomain_response, build_refused_response, build_sinkhole_response, detect_dns_rebinding,
+    is_firefox_canary, is_undelegated_zone,
+};
+use super::ip_filter::{extract_resolved_ips, IpFilter};
+use super::local_doh::LocalDoHServer;
+use super::logger::{QueryLogEntry, QueryLogger, QueryStatus};
+use super::netmon::NetworkMonitor;
+use super::padding::apply_edns_options;
+use super::stats::DnsStats;
+use super::tcp::DnsTcpServer;
+use super::uncloak::extract_alias_targets;
+use super::watcher::FileWatcher;
 
 // local dns server instance wrapping doh client pool and response cache
+#[derive(Clone)]
 pub struct DnsServer {
     resolver: DoHResolver,
     upstream_desc: String,
     block_ipv6: bool,
     dnssec: bool,
     pqc: bool,
+    anti_dns_rebinding: bool,
+    block_undelegated: bool,
+    edns_padding: bool,
+    cloak: Arc<CloakEngine>,
+    pub blocklist: Arc<RwLock<CompactBlocklist>>,
+    pub allowlist: Arc<RwLock<DomainAllowlist>>,
+    pub ip_filter: Arc<IpFilter>,
+    pub uncloak_cnames: bool,
+    pub dns64: bool,
+    pub netmon: bool,
+    pub stats: Arc<DnsStats>,
     cache: Arc<DnsCache>,
     ip_queue: Arc<Mutex<HashMap<Ipv4Addr, VecDeque<String>>>>,
+    pub tcp_listener: bool,
+    pub local_doh: bool,
+    pub local_doh_addr: SocketAddr,
+    pub query_logger: Option<Arc<QueryLogger>>,
+    pub allowlist_path: Option<String>,
+    pub blocklist_path: Option<String>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl DnsServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         upstreams_csv: &str,
         custom_bootstrap_ips: &[Ipv4Addr],
         block_ipv6: bool,
         dnssec: bool,
         pqc: bool,
+        anti_dns_rebinding: bool,
+        block_undelegated: bool,
+        edns_padding: bool,
+        cloak: Arc<CloakEngine>,
+        blocklist: Arc<RwLock<CompactBlocklist>>,
+        allowlist: Arc<RwLock<DomainAllowlist>>,
+        ip_filter: Arc<IpFilter>,
+        uncloak_cnames: bool,
+        dns64: bool,
+        netmon: bool,
+        stats: Arc<DnsStats>,
+        tcp_listener: bool,
+        local_doh: bool,
+        local_doh_addr: SocketAddr,
+        query_logger: Option<Arc<QueryLogger>>,
+        allowlist_path: Option<String>,
+        blocklist_path: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let resolver = DoHResolver::new(upstreams_csv, custom_bootstrap_ips, pqc)?;
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -39,10 +98,60 @@ impl DnsServer {
             block_ipv6,
             dnssec,
             pqc,
+            anti_dns_rebinding,
+            block_undelegated,
+            edns_padding,
+            cloak,
+            blocklist,
+            allowlist,
+            ip_filter,
+            uncloak_cnames,
+            dns64,
+            netmon,
+            stats,
             cache: Arc::new(DnsCache::new(2048)),
             ip_queue: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listener,
+            local_doh,
+            local_doh_addr,
+            query_logger,
+            allowlist_path,
+            blocklist_path,
             shutdown_tx,
         })
+    }
+
+    pub fn with_defaults(
+        upstreams_csv: &str,
+        custom_bootstrap_ips: &[Ipv4Addr],
+        block_ipv6: bool,
+        dnssec: bool,
+        pqc: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new(
+            upstreams_csv,
+            custom_bootstrap_ips,
+            block_ipv6,
+            dnssec,
+            pqc,
+            true,
+            true,
+            true,
+            Arc::new(CloakEngine::new()),
+            Arc::new(RwLock::new(build_seed_blocklist())),
+            Arc::new(RwLock::new(DomainAllowlist::new())),
+            Arc::new(IpFilter::default()),
+            true,
+            false,
+            true,
+            DnsStats::new(),
+            true,
+            true,
+            "127.0.0.1:8053".parse().unwrap(),
+            None,
+            None,
+            None,
+        )
     }
 
     // pops oldest recorded domain fqdn associated with resolved destination ipv4 address
@@ -58,13 +167,95 @@ impl DnsServer {
             None
         }
     }
+}
 
+// creates a Linux kernel socket tuned with IP_FREEBIND, IP_TOS (DSCP 0x70), and enlarged socket buffers
+fn create_tuned_udp_socket(addr: &str) -> Result<tokio::net::UdpSocket, Box<dyn std::error::Error + Send + Sync>> {
+    let std_sock = std::net::UdpSocket::bind(addr)
+        .map_err(|e| format!("failed to bind UDP socket to {}: {}", addr, e))?;
+
+    #[cfg(unix)]
+    {
+        let fd = std_sock.as_raw_fd();
+        unsafe {
+            let one: libc::c_int = 1;
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_FREEBIND,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+            }
+
+            let tos: libc::c_int = 0x70; // DSCP Interactive / Low Latency
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                &tos as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tos) as libc::socklen_t,
+            );
+
+            let buf_size: libc::c_int = 256 * 1024;
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+        }
+    }
+
+    std_sock.set_nonblocking(true)?;
+    let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
+    Ok(tokio_sock)
+}
+
+// builds standard rfc 1035 type-a dns query for dns64 fallback queries
+pub fn build_a_query(domain: &str) -> Vec<u8> {
+    let mut query = vec![
+        0x56, 0x78, // Transaction ID
+        0x01, 0x00, // Standard query, RD=1
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    for label in domain.trim_matches('.').split('.') {
+        if !label.is_empty() {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+    }
+    query.push(0x00);
+    query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // Type A (1), Class IN (1)
+    query
+}
+
+impl DnsServer {
     // spawns background asynchronous udp receive loop on loopback interface 127.0.0.1:53
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let socket = match UdpSocket::bind("127.0.0.1:53").await {
+        let socket = match create_tuned_udp_socket("127.0.0.1:53") {
             Ok(s) => s,
             Err(e) => {
-                return Err(format!("failed to bind UDP socket to 127.0.0.1:53: {}", e).into());
+                return Err(format!("failed to bind tuned UDP socket to 127.0.0.1:53: {}", e).into());
             }
         };
 
@@ -74,17 +265,51 @@ impl DnsServer {
             block_ipv6 = self.block_ipv6,
             dnssec = self.dnssec,
             pqc = self.pqc,
+            uncloak_cnames = self.uncloak_cnames,
+            dns64 = self.dns64,
+            netmon = self.netmon,
+            tcp_listener = self.tcp_listener,
+            local_doh = self.local_doh,
+            local_doh_addr = %self.local_doh_addr,
+            query_log = self.query_logger.is_some(),
             cache_capacity = 2048,
             "DNS server started"
         );
 
         let socket = Arc::new(socket);
-        let resolver = self.resolver.clone();
-        let cache = self.cache.clone();
-        let ip_queue = self.ip_queue.clone();
-        let block_ipv6 = self.block_ipv6;
-        let dnssec = self.dnssec;
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // 1. spawn network sentinel (netmon) for interface and routing transitions
+        if self.netmon {
+            let net_mon = NetworkMonitor::new();
+            let cache_ref = self.cache.clone();
+            let resolver_ref = self.resolver.clone();
+            let stats_ref = self.stats.clone();
+            net_mon.start(
+                std::time::Duration::from_secs(5),
+                move |_epoch| {
+                    cache_ref.clear();
+                    resolver_ref.reset_balancer();
+                    stats_ref.network_changes.fetch_add(1, Ordering::Relaxed);
+                },
+                self.shutdown_tx.subscribe(),
+            );
+        }
+
+        // 2. spawn periodic runtime telemetry dump to /run/albus/stats.json
+        let stats_dump = self.stats.clone();
+        let mut stats_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let _ = stats_dump.dump_to_file("/run/albus/stats.json");
+                    }
+                    _ = stats_shutdown_rx.recv() => break,
+                }
+            }
+        });
 
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -97,7 +322,7 @@ impl DnsServer {
                     _ = ticker.tick() => {
                         tick_count = tick_count.wrapping_add(1);
 
-                        // 1. Passive check: verify resolv.conf still directs queries to loopback
+                        // Passive check: verify resolv.conf still directs queries to loopback
                         if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
                             let has_loopback = content.lines().any(|line| {
                                 let trimmed = line.trim();
@@ -115,7 +340,7 @@ impl DnsServer {
                             }
                         }
 
-                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
+                        // Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
                         if tick_count % 4 == 0 {
                             run_active_canary_probe().await;
                         }
@@ -127,9 +352,98 @@ impl DnsServer {
             }
         });
 
+        let server_arc = Arc::new(self.clone());
+
+        // 3. spawn live file watcher for allowlist hot-reload
+        if let Some(ref path_str) = self.allowlist_path {
+            let p = PathBuf::from(path_str);
+            if p.exists() {
+                let al_ref = self.allowlist.clone();
+                let path_clone = path_str.clone();
+                let rx = self.shutdown_tx.subscribe();
+                FileWatcher::watch_async(
+                    p,
+                    Duration::from_secs(3),
+                    move || {
+                        let al = al_ref.clone();
+                        let path = path_clone.clone();
+                        async move {
+                            if let Ok(new_al) = DomainAllowlist::from_file(&path) {
+                                let mut lock = al.write().await;
+                                *lock = new_al;
+                                info!("domain allowlist hot-reloaded successfully from {}", path);
+                            }
+                        }
+                    },
+                    rx,
+                );
+            }
+        }
+
+        // 4. spawn live file watcher for blocklist hot-reload
+        if let Some(ref path_str) = self.blocklist_path {
+            let p = PathBuf::from(path_str);
+            if p.exists() {
+                let bl_ref = self.blocklist.clone();
+                let path_clone = path_str.clone();
+                let rx = self.shutdown_tx.subscribe();
+                FileWatcher::watch_async(
+                    p,
+                    Duration::from_secs(3),
+                    move || {
+                        let bl = bl_ref.clone();
+                        let path = path_clone.clone();
+                        async move {
+                            if let Ok(new_bl) = CompactBlocklist::load_from_file(&path) {
+                                let mut lock = bl.write().await;
+                                *lock = new_bl;
+                                info!("domain blocklist hot-reloaded successfully from {}", path);
+                            }
+                        }
+                    },
+                    rx,
+                );
+            }
+        }
+
+        // 5. spawn RFC 7766 TCP listener on 127.0.0.1:53
+        if self.tcp_listener {
+            let s_tcp = server_arc.clone();
+            let rx = self.shutdown_tx.subscribe();
+            let tcp_bind: SocketAddr = "127.0.0.1:53".parse().unwrap();
+            DnsTcpServer::start(
+                tcp_bind,
+                move |query, peer| {
+                    let s = s_tcp.clone();
+                    async move {
+                        s.resolve_packet(&query, peer.ip()).await
+                    }
+                },
+                rx,
+            );
+        }
+
+        // 6. spawn RFC 8484 Local DoH listener on local_doh_addr (e.g. 127.0.0.1:8053)
+        if self.local_doh {
+            let s_doh = server_arc.clone();
+            let rx = self.shutdown_tx.subscribe();
+            LocalDoHServer::start(
+                self.local_doh_addr,
+                move |query, peer| {
+                    let s = s_doh.clone();
+                    async move {
+                        s.resolve_packet(&query, peer.ip()).await
+                    }
+                },
+                rx,
+            );
+        }
+
+        // 7. spawn UDP receive loop
         const MAX_CONCURRENT_DNS_TASKS: usize = 512;
-        const MAX_IP_QUEUE_ENTRIES: usize = 4096;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_TASKS));
+        let server_udp = server_arc.clone();
+        let mut udp_shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -141,13 +455,10 @@ impl DnsServer {
                             Ok((len, peer_addr)) => {
                                 let query_data = buf[..len].to_vec();
                                 let socket_clone = socket.clone();
-                                let resolver_clone = resolver.clone();
-                                let cache_clone = cache.clone();
-                                let ip_queue_clone = ip_queue.clone();
+                                let s = server_udp.clone();
                                 let sem_clone = semaphore.clone();
 
                                 tokio::spawn(async move {
-                                    // shed load under flooding attacks to prevent unbounded task/socket spawning
                                     let _permit = match sem_clone.try_acquire() {
                                         Ok(permit) => permit,
                                         Err(_) => {
@@ -161,100 +472,8 @@ impl DnsServer {
                                         }
                                     };
 
-                                    // 0. intercept internal dns leak test canary probe
-                                    if is_canary_query(&query_data) {
-                                        let canary_resp = build_canary_response(&query_data, Ipv4Addr::new(127, 0, 0, 99));
-                                        let _ = socket_clone.send_to(&canary_resp, peer_addr).await;
-                                        return;
-                                    }
-
-                                    // 1. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
-                                    if block_ipv6 && is_aaaa_query(&query_data) {
-                                        let nodata = build_nodata_response(&query_data);
-                                        let _ = socket_clone.send_to(&nodata, peer_addr).await;
-                                        return;
-                                    }
-
-                                    // 2. check in-memory wire cache for fast-path 0ms response
-                                    if let Some(cached_resp) = cache_clone.get(&query_data) {
-                                        if let Some((domain, ips)) = parse_dns_response(&cached_resp) {
-                                            if !ips.is_empty() {
-                                                debug!(
-                                                    domain = %domain,
-                                                    ips = ?ips,
-                                                    source = "cache_0ms",
-                                                    "DNS cache hit"
-                                                );
-                                                let mut map = ip_queue_clone.lock().await;
-                                                if map.len() >= MAX_IP_QUEUE_ENTRIES {
-                                                    if let Some(oldest) = map.keys().next().cloned() {
-                                                        map.remove(&oldest);
-                                                    }
-                                                }
-                                                for ip in ips {
-                                                    let queue = map.entry(ip).or_default();
-                                                    if queue.len() < 50 {
-                                                        queue.push_back(domain.clone());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let _ = socket_clone.send_to(&cached_resp, peer_addr).await;
-                                        return;
-                                    }
-
-                                    // 3. append edns0 opt rr with do bit if dnssec is enabled
-                                    let outgoing_query = if dnssec {
-                                        enable_dnssec_do(&query_data)
-                                    } else {
-                                        query_data.clone()
-                                    };
-
-                                    match resolver_clone.resolve(&outgoing_query).await {
-                                        Ok((resp_bytes, via)) => {
-                                            // insert response into cache
-                                            cache_clone.insert(&query_data, &resp_bytes);
-
-                                            let is_ad = is_dnssec_authenticated(&resp_bytes);
-                                            if let Some((domain, ips)) = parse_dns_response(&resp_bytes) {
-                                                if !ips.is_empty() {
-                                                    debug!(
-                                                        domain = %domain,
-                                                        ips = ?ips,
-                                                        via = %via,
-                                                        dnssec_authenticated = is_ad,
-                                                        "DNS resolved"
-                                                    );
-                                                    let mut map = ip_queue_clone.lock().await;
-                                                    if map.len() >= MAX_IP_QUEUE_ENTRIES {
-                                                        if let Some(oldest) = map.keys().next().cloned() {
-                                                            map.remove(&oldest);
-                                                        }
-                                                    }
-                                                    for ip in ips {
-                                                        let queue = map.entry(ip).or_default();
-                                                        if queue.len() < 50 {
-                                                            queue.push_back(domain.clone());
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            if let Err(e) = socket_clone.send_to(&resp_bytes, peer_addr).await {
-                                                debug!("failed to send DNS reply to {}: {}", peer_addr, e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            debug!("DNS resolution error: {}", e);
-                                            if query_data.len() >= 2 {
-                                                let mut fail_resp = query_data.clone();
-                                                if fail_resp.len() >= 4 {
-                                                    fail_resp[2] |= 0x80;
-                                                    fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // servfail rcode
-                                                    let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
-                                                }
-                                            }
-                                        }
+                                    if let Some(resp) = s.resolve_packet(&query_data, peer_addr.ip()).await {
+                                        let _ = socket_clone.send_to(&resp, peer_addr).await;
                                     }
                                 });
                             }
@@ -264,8 +483,8 @@ impl DnsServer {
                             }
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        debug!("DNS server shutting down");
+                    _ = udp_shutdown_rx.recv() => {
+                        debug!("DNS UDP server shutting down");
                         break;
                     }
                 }
@@ -273,6 +492,311 @@ impl DnsServer {
         });
 
         Ok(())
+    }
+
+    // helper to asynchronously forward queries to rotating audit logger with client ip pseudonymization
+    fn maybe_log_query(
+        &self,
+        client_ip: IpAddr,
+        domain: &str,
+        qtype: u16,
+        status: QueryStatus,
+        start_time: std::time::Instant,
+        details: Option<&str>,
+    ) {
+        if let Some(ref logger) = self.query_logger {
+            logger.log(QueryLogEntry {
+                timestamp_epoch_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                client_ip,
+                domain: domain.to_string(),
+                qtype,
+                status,
+                duration_ms: start_time.elapsed().as_millis() as u32,
+                details: details.map(|s| s.to_string()),
+            });
+        }
+    }
+
+    // common unified query resolution pipeline shared across udp, tcp 53 (rfc 7766), and local doh (rfc 8484)
+    pub async fn resolve_packet(&self, query_data: &[u8], client_ip: IpAddr) -> Option<Vec<u8>> {
+        const MAX_IP_QUEUE_ENTRIES: usize = 4096;
+        let start_time = std::time::Instant::now();
+        self.stats.total_queries.fetch_add(1, Ordering::Relaxed);
+
+        // 0. intercept internal dns leak test canary probe
+        if is_canary_query(query_data) {
+            let canary_resp = build_canary_response(query_data, Ipv4Addr::new(127, 0, 0, 99));
+            self.maybe_log_query(client_ip, "leak-test.albus.internal", 1, QueryStatus::Canary, start_time, None);
+            return Some(canary_resp);
+        }
+
+        let query_key = extract_query_key(query_data);
+        let domain = query_key.as_ref().map(|k| k.name.clone()).unwrap_or_default();
+        let qtype = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
+
+        // 1. intercept mozilla firefox doh canary (use-application-dns.net) to force local proxy
+        if let Some(key) = &query_key {
+            if is_firefox_canary(&key.name) {
+                debug!(domain = %key.name, "Intercepted Firefox DoH canary probe; returning NXDOMAIN to force local proxy");
+                self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
+                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Cloak0ms, start_time, Some("firefox_canary"));
+                return Some(build_nxdomain_response(query_data));
+            }
+        }
+
+        // 2. handle wi-fi captive portal detection probes (apple, android, windows, gnome)
+        if let Some(key) = &query_key {
+            if let Some(captive_ip) = check_captive_portal(&key.name, key.qtype) {
+                debug!(domain = %key.name, ip = %captive_ip, "Synthesized captive portal detection response");
+                self.stats.captive_probes.fetch_add(1, Ordering::Relaxed);
+                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Captive, start_time, Some("captive_probe"));
+                return Some(build_captive_response(query_data, captive_ip));
+            }
+        }
+
+        // 3. check local cloaking table (0ms local hosts / synthetic overrides)
+        if let Some(key) = &query_key {
+            if let Some(cloaked_resp) = self.cloak.resolve_cloaked(&key.name, key.qtype, query_data) {
+                debug!(domain = %key.name, "Resolved via local cloaking table (0ms)");
+                self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
+                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Cloak0ms, start_time, Some("cloak_override"));
+                return Some(cloaked_resp);
+            }
+        }
+
+        // 4. check split-dns forwarding rules
+        if let Some(key) = &query_key {
+            if let Some(target_forwarder) = self.cloak.get_forward_target(&key.name) {
+                match self.cloak.forward_query(query_data, target_forwarder).await {
+                    Ok(resp) => {
+                        debug!(domain = %key.name, target = %target_forwarder, "Resolved via split-DNS forwarder");
+                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("split_dns"));
+                        return Some(resp);
+                    }
+                    Err(e) => {
+                        debug!("split-dns forward to {} failed: {}", target_forwarder, e);
+                    }
+                }
+            }
+        }
+
+        // 5. block unqualified dotless hostnames and undelegated private zones (prevent leaks upstream)
+        if self.block_undelegated {
+            if let Some(key) = &query_key {
+                if is_undelegated_zone(&key.name) {
+                    debug!(domain = %key.name, "Blocked undelegated/unqualified domain from leaking upstream");
+                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Undelegated, start_time, Some("undelegated_zone"));
+                    return Some(build_nxdomain_response(query_data));
+                }
+            }
+        }
+
+        // 6. domain allowlist check (whitelisted domains bypass blocklist)
+        let is_whitelisted = self.allowlist.read().await.is_allowed(&domain);
+
+        // 7. check memory-optimized hagezi ad/tracker/malware blocklist
+        if !is_whitelisted {
+            if let Some(key) = &query_key {
+                let is_blocked = {
+                    let bl = self.blocklist.read().await;
+                    bl.check(&key.name)
+                };
+                if is_blocked {
+                    self.stats.blocked_domains.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        domain = %key.name,
+                        qtype = key.qtype,
+                        "DNS query blocked by HaGeZi filter"
+                    );
+                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::BlockHagezi, start_time, Some("hagezi_block"));
+                    return Some(build_sinkhole_response(query_data, key.qtype));
+                }
+            }
+        }
+
+        // 8. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
+        if self.block_ipv6 && !self.dns64 && is_aaaa_query(query_data) {
+            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("ipv6_nodata"));
+            return Some(build_nodata_response(query_data));
+        }
+
+        // 9. check in-memory wire cache for fast-path 0ms response (with dynamic TTL decay!)
+        if let Some(cached_resp) = self.cache.get(query_data) {
+            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            if let Some((domain_parsed, ips)) = parse_dns_response(&cached_resp) {
+                if !ips.is_empty() {
+                    debug!(
+                        domain = %domain_parsed,
+                        ips = ?ips,
+                        source = "cache_0ms",
+                        "DNS cache hit"
+                    );
+                    let mut map = self.ip_queue.lock().await;
+                    if map.len() >= MAX_IP_QUEUE_ENTRIES {
+                        if let Some(oldest) = map.keys().next().cloned() {
+                            map.remove(&oldest);
+                        }
+                    }
+                    for ip in ips {
+                        let queue = map.entry(ip).or_default();
+                        if queue.len() < 50 {
+                            queue.push_back(domain_parsed.clone());
+                        }
+                    }
+                }
+            }
+            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::CacheHit, start_time, Some("cache_0ms"));
+            return Some(cached_resp);
+        }
+
+        // 10. prepare outgoing query with RFC 8467 EDNS Padding, RFC 7871 ECS zero-scope, and DNSSEC DO-bit
+        self.stats.upstream_queries.fetch_add(1, Ordering::Relaxed);
+        let outgoing_query = if self.edns_padding {
+            apply_edns_options(query_data, self.dnssec, true, true)
+        } else if self.dnssec {
+            enable_dnssec_do(query_data)
+        } else {
+            query_data.to_vec()
+        };
+
+        match self.resolver.resolve(&outgoing_query).await {
+            Ok((resp_bytes, via)) => {
+                // Anti-DNS-Rebinding validation
+                if self.anti_dns_rebinding {
+                    if let Some(private_ip) = detect_dns_rebinding(&resp_bytes) {
+                        warn!(
+                            domain = ?query_key.as_ref().map(|k| &k.name),
+                            private_ip = %private_ip,
+                            "Anti-DNS-Rebinding triggered: public response resolved to private IP! Blocking response."
+                        );
+                        self.stats.rebinding_drops.fetch_add(1, Ordering::Relaxed);
+                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::RebindRefused, start_time, Some("dns_rebind"));
+                        return Some(build_refused_response(query_data));
+                    }
+                }
+
+                // Response IP & Bogon blacklist filter
+                if !is_whitelisted {
+                    let ips = extract_resolved_ips(&resp_bytes);
+                    if let Some(blocked_ip) = ips.into_iter().find(|ip| self.ip_filter.is_blocked(*ip)) {
+                        warn!(
+                            domain = ?query_key.as_ref().map(|k| &k.name),
+                            ip = %blocked_ip,
+                            "Resolved IP dropped by Bogon/Malicious IP blacklist"
+                        );
+                        self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::BogonDrop, start_time, Some("bogon_filter"));
+                        return Some(build_refused_response(query_data));
+                    }
+                }
+
+                // CNAME & HTTPS/SVCB AliasMode Uncloaking Defense
+                if self.uncloak_cnames && !is_whitelisted {
+                    let targets = extract_alias_targets(&resp_bytes);
+                    for target in targets {
+                        let is_target_whitelisted = self.allowlist.read().await.is_allowed(&target);
+                        if !is_target_whitelisted {
+                            let is_target_blocked = {
+                                let bl = self.blocklist.read().await;
+                                bl.check(&target)
+                            };
+                            if is_target_blocked {
+                                info!(
+                                    domain = ?query_key.as_ref().map(|k| &k.name),
+                                    uncloaked_target = %target,
+                                    "CNAME cloaking tracker detected and blocked"
+                                );
+                                self.stats.uncloaked_cnames.fetch_add(1, Ordering::Relaxed);
+                                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::UncloakedCname, start_time, Some(&target));
+                                let qtype_val = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
+                                return Some(build_sinkhole_response(query_data, qtype_val));
+                            }
+                        }
+                    }
+                }
+
+                // DNS64 IPv6 synthesis for IPv4-only domains (RFC 6052 / RFC 6147)
+                if self.dns64 {
+                    if let Some(key) = &query_key {
+                        if key.qtype == 28 {
+                            let ancount = if resp_bytes.len() >= 8 {
+                                ((resp_bytes[6] as usize) << 8) | (resp_bytes[7] as usize)
+                            } else {
+                                0
+                            };
+                            if ancount == 0 {
+                                let a_query = build_a_query(&key.name);
+                                if let Ok((a_resp, _)) = self.resolver.resolve(&a_query).await {
+                                    if let Some((_, v4_ips)) = parse_dns_response(&a_resp) {
+                                        if !v4_ips.is_empty() {
+                                            let dns64_resp = build_dns64_response(query_data, &v4_ips, 300);
+                                            self.stats.dns64_synthesized.fetch_add(1, Ordering::Relaxed);
+                                            self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some("dns64_synth"));
+                                            return Some(dns64_resp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // insert response into cache (supports negative caching and serve-stale)
+                self.cache.insert(query_data, &resp_bytes);
+
+                let is_ad = is_dnssec_authenticated(&resp_bytes);
+                if let Some((domain_parsed, ips)) = parse_dns_response(&resp_bytes) {
+                    if !ips.is_empty() {
+                        debug!(
+                            domain = %domain_parsed,
+                            ips = ?ips,
+                            via = %via,
+                            dnssec_authenticated = is_ad,
+                            "DNS resolved"
+                        );
+                        let mut map = self.ip_queue.lock().await;
+                        if map.len() >= MAX_IP_QUEUE_ENTRIES {
+                            if let Some(oldest) = map.keys().next().cloned() {
+                                map.remove(&oldest);
+                            }
+                        }
+                        for ip in ips {
+                            let queue = map.entry(ip).or_default();
+                            if queue.len() < 50 {
+                                queue.push_back(domain_parsed.clone());
+                            }
+                        }
+                    }
+                }
+
+                self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::Pass, start_time, Some(&via));
+                Some(resp_bytes)
+            }
+            Err(e) => {
+                debug!("DNS resolution error: {}", e);
+
+                // Fallback to Serve-Stale (RFC 8767): if upstream fails, serve stale cached response!
+                if let Some(stale_resp) = self.cache.get_stale(query_data) {
+                    debug!(
+                        domain = ?query_key.as_ref().map(|k| &k.name),
+                        "Serving stale cached DNS response under RFC 8767 during upstream failure"
+                    );
+                    self.maybe_log_query(client_ip, &domain, qtype, QueryStatus::CacheHit, start_time, Some("serve_stale"));
+                    return Some(stale_resp);
+                }
+
+                if query_data.len() >= 4 {
+                    let mut fail_resp = query_data.to_vec();
+                    fail_resp[2] |= 0x80;
+                    fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // servfail rcode
+                    Some(fail_resp)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     // signals graceful shutdown to background udp listener task
@@ -613,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_server_queue_fifo() {
-        let server = DnsServer::new("cloudflare", &[], true, true, true).unwrap();
+        let server = DnsServer::with_defaults("cloudflare", &[], true, true, true).unwrap();
         let test_ip = Ipv4Addr::new(10, 0, 0, 1);
 
         {

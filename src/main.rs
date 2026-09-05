@@ -57,6 +57,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.dnssec = args.dnssec;
                     cfg.pqc = args.pqc;
                     cfg.ram_only = args.ram_only;
+                    cfg.anti_dns_rebinding = args.anti_dns_rebinding;
+                    cfg.block_undelegated = args.block_undelegated;
+                    cfg.edns_padding = args.edns_padding;
+                    cfg.blocklist = args.blocklist;
+                    cfg.blocklist_path = args.blocklist_path;
+                    if let Some(ref domains) = args.allow_domains {
+                        cfg.allow_domains = domains.clone();
+                    }
+                    if args.allowlist_path.is_some() {
+                        cfg.allowlist_path = args.allowlist_path;
+                    }
+                    cfg.dns64 = args.dns64;
+                    cfg.block_bogons = args.block_bogons;
+                    cfg.uncloak_cnames = args.uncloak_cnames;
+                    cfg.netmon = args.netmon;
+                    cfg.tcp_listener = args.tcp_listener;
+                    cfg.local_doh = args.local_doh;
+                    cfg.local_doh_addr = args.local_doh_addr;
+                    cfg.query_log = args.query_log;
+                    if args.query_log_path.is_some() {
+                        cfg.query_log_path = args.query_log_path;
+                    }
+                    if args.ipcrypt_key.is_some() {
+                        cfg.ipcrypt_key = args.ipcrypt_key;
+                    }
                     cfg.verbose = args.verbose;
 
                     let path = Config::default_config_path();
@@ -152,11 +177,48 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     // load persistent configuration from json path or default hierarchy
-    let cfg = if let Some(ref path) = args.config {
+    let mut cfg = if let Some(ref path) = args.config {
         Config::load_from_file(path)?
     } else {
         Config::load_or_default()
     };
+
+    if let Some(ref domains) = args.allow_domains {
+        cfg.allow_domains = domains.clone();
+    }
+    if let Some(ref path) = args.allowlist_path {
+        cfg.allowlist_path = Some(path.clone());
+    }
+    if args.dns64 {
+        cfg.dns64 = true;
+    }
+    if !args.block_bogons {
+        cfg.block_bogons = false;
+    }
+    if !args.uncloak_cnames {
+        cfg.uncloak_cnames = false;
+    }
+    if !args.netmon {
+        cfg.netmon = false;
+    }
+    if !args.tcp_listener {
+        cfg.tcp_listener = false;
+    }
+    if !args.local_doh {
+        cfg.local_doh = false;
+    }
+    if args.local_doh_addr != "127.0.0.1:8053" {
+        cfg.local_doh_addr = args.local_doh_addr;
+    }
+    if args.query_log {
+        cfg.query_log = true;
+    }
+    if let Some(ref path) = args.query_log_path {
+        cfg.query_log_path = Some(path.clone());
+    }
+    if let Some(ref key) = args.ipcrypt_key {
+        cfg.ipcrypt_key = Some(key.clone());
+    }
 
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;

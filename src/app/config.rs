@@ -1,6 +1,7 @@
 //! persistent and ephemeral runtime configuration schema, default values, and json persistence.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,46 @@ pub struct Config {
     pub ram_only: bool,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default = "default_true")]
+    pub anti_dns_rebinding: bool,
+    #[serde(default = "default_true")]
+    pub block_undelegated: bool,
+    #[serde(default = "default_true")]
+    pub edns_padding: bool,
+    #[serde(default = "default_true")]
+    pub blocklist: bool,
+    #[serde(default)]
+    pub blocklist_path: Option<String>,
+    #[serde(default)]
+    pub cloaking_rules: HashMap<String, String>,
+    #[serde(default)]
+    pub forwarding_rules: HashMap<String, String>,
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+    #[serde(default)]
+    pub allowlist_path: Option<String>,
+    #[serde(default)]
+    pub dns64: bool,
+    #[serde(default = "default_true")]
+    pub block_bogons: bool,
+    #[serde(default)]
+    pub blocked_ips: Vec<String>,
+    #[serde(default = "default_true")]
+    pub uncloak_cnames: bool,
+    #[serde(default = "default_true")]
+    pub netmon: bool,
+    #[serde(default = "default_true")]
+    pub tcp_listener: bool,
+    #[serde(default = "default_true")]
+    pub local_doh: bool,
+    #[serde(default = "default_local_doh_addr")]
+    pub local_doh_addr: String,
+    #[serde(default)]
+    pub query_log: bool,
+    #[serde(default)]
+    pub query_log_path: Option<String>,
+    #[serde(default)]
+    pub ipcrypt_key: Option<String>,
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -74,6 +115,7 @@ fn default_min_ttl() -> u8 { 3 }
 // upper bound clamp for auto-ttl
 fn default_max_ttl() -> u8 { 12 }
 fn default_true() -> bool { true }
+fn default_local_doh_addr() -> String { "127.0.0.1:8053".to_string() }
 // default upstream resolver
 fn default_upstream() -> String { "quad9".to_string() }
 
@@ -104,6 +146,26 @@ impl Default for Config {
             pqc: true,
             ram_only: false,
             verbose: false,
+            anti_dns_rebinding: true,
+            block_undelegated: true,
+            edns_padding: true,
+            blocklist: true,
+            blocklist_path: None,
+            cloaking_rules: HashMap::new(),
+            forwarding_rules: HashMap::new(),
+            allow_domains: Vec::new(),
+            allowlist_path: None,
+            dns64: false,
+            block_bogons: true,
+            blocked_ips: Vec::new(),
+            uncloak_cnames: true,
+            netmon: true,
+            tcp_listener: true,
+            local_doh: true,
+            local_doh_addr: "127.0.0.1:8053".to_string(),
+            query_log: false,
+            query_log_path: None,
+            ipcrypt_key: None,
         }
     }
 }

@@ -1,11 +1,42 @@
 //! encrypted dns-over-https (doh) subsystem, in-memory wire cache, and resolv.conf manager.
 
+pub mod allowlist;
+pub mod balancer;
+pub mod blocklist;
 pub mod cache;
+pub mod captive;
+pub mod cloak;
+pub mod dns64;
 pub mod doh;
 pub mod ech;
+pub mod filter;
+pub mod ip_filter;
+pub mod ipcrypt;
+pub mod local_doh;
+pub mod logger;
+pub mod netmon;
+pub mod padding;
 pub mod server;
+pub mod stamp;
+pub mod stats;
 pub mod system;
+pub mod tcp;
+pub mod uncloak;
+pub mod watcher;
 
+pub use allowlist::DomainAllowlist;
+pub use blocklist::{build_seed_blocklist, fetch_and_compile_hagezi, CompactBlocklist};
+pub use cloak::CloakEngine;
 pub use doh::{extract_upstream_ips, extract_upstream_ips_v6};
+pub use ip_filter::IpFilter;
+pub use ipcrypt::IpCrypt;
+pub use local_doh::LocalDoHServer;
+pub use logger::{QueryLogEntry, QueryLogger, QueryStatus};
+pub use netmon::NetworkMonitor;
 pub use server::DnsServer;
+pub use stamp::{DnsStamp, StampProtocol};
+pub use stats::{DnsStats, DnsStatsSnapshot};
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};
+pub use tcp::DnsTcpServer;
+pub use watcher::FileWatcher;
+

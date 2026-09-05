@@ -1,4 +1,4 @@
-//! in-memory dns response wire cache with ttl-bounded expiration and transaction id rewriting.
+//! in-memory dns response wire cache with dynamic ttl decay, serve-stale (rfc 8767), and negative caching (rfc 2308).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -11,11 +11,15 @@ pub struct DnsCacheKey {
     pub qtype: u16,
 }
 
-// cached response payload with calculated wall-clock expiry instant
+// cached response payload with dynamic ttl decay and serve-stale boundaries
 #[derive(Clone, Debug)]
 pub struct DnsCacheEntry {
     pub response_wire: Vec<u8>,
+    pub original_ttl: u32,
+    pub inserted_at: Instant,
     pub expires_at: Instant,
+    pub stale_until: Instant,
+    pub is_negative: bool,
 }
 
 impl Drop for DnsCacheEntry {
@@ -33,6 +37,9 @@ impl Drop for DnsCacheEntry {
 pub struct DnsCache {
     entries: Mutex<HashMap<DnsCacheKey, DnsCacheEntry>>,
     max_entries: usize,
+    min_ttl: u32,
+    max_ttl: u32,
+    negative_ttl: u32,
 }
 
 impl DnsCache {
@@ -40,10 +47,18 @@ impl DnsCache {
         Self {
             entries: Mutex::new(HashMap::with_capacity(max_entries)),
             max_entries,
+            min_ttl: 60,       // clamp minimum ttl to 60s
+            max_ttl: 86400,    // clamp maximum ttl to 24h
+            negative_ttl: 60,  // rfc 2308 negative cache duration: 60s
         }
     }
 
-    // retrieves cached response wire bytes and substitutes transaction id to match client query
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    // retrieves active cached response wire bytes with dynamic ttl decay and transaction id rewriting
     pub fn get(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
         if query_bytes.len() < 12 {
             return None;
@@ -56,14 +71,46 @@ impl DnsCache {
         if let Some(entry) = map.get(&key) {
             if entry.expires_at > now {
                 let mut resp = entry.response_wire.clone();
-                if resp.len() >= 2 {
-                    // overwrite header transaction identifier (bytes 0-1) with client query id
+                if resp.len() >= 12 {
                     resp[0] = query_bytes[0];
                     resp[1] = query_bytes[1];
+
+                    // dynamic ttl decay: calculate remaining seconds and update wire records
+                    let elapsed = now.saturating_duration_since(entry.inserted_at).as_secs() as u32;
+                    let remaining_ttl = entry.original_ttl.saturating_sub(elapsed).max(1);
+                    update_response_ttls(&mut resp, remaining_ttl);
                 }
                 return Some(resp);
-            } else {
+            } else if entry.stale_until <= now {
+                // purge entry only if even serve-stale grace period has fully expired
                 map.remove(&key);
+            }
+        }
+
+        None
+    }
+
+    // retrieves expired response under rfc 8767 serve-stale policy during upstream downtime or timeouts
+    pub fn get_stale(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
+        if query_bytes.len() < 12 {
+            return None;
+        }
+
+        let key = extract_query_key(query_bytes)?;
+        let now = Instant::now();
+
+        let map = self.entries.lock().ok()?;
+        if let Some(entry) = map.get(&key) {
+            // serve stale only if expired but still within stale grace window (30s past expiry)
+            if now >= entry.expires_at && now <= entry.stale_until {
+                let mut resp = entry.response_wire.clone();
+                if resp.len() >= 12 {
+                    resp[0] = query_bytes[0];
+                    resp[1] = query_bytes[1];
+                    // rfc 8767: advertise low 30s ttl for stale synthetic responses
+                    update_response_ttls(&mut resp, 30);
+                }
+                return Some(resp);
             }
         }
 
@@ -77,7 +124,7 @@ impl DnsCache {
         }
     }
 
-    // parses minimum ttl across answer section and inserts wire response into cache
+    // parses ttl and inserts wire response into cache (supports negative caching and serve-stale)
     pub fn insert(&self, query_bytes: &[u8], response_bytes: &[u8]) {
         if query_bytes.len() < 12 || response_bytes.len() < 12 {
             return;
@@ -88,8 +135,21 @@ impl DnsCache {
             None => return,
         };
 
-        let ttl_secs = extract_min_ttl(response_bytes).clamp(5, 3600);
-        let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
+        let now = Instant::now();
+        let rcode = response_bytes[3] & 0x0F;
+        let ancount = ((response_bytes[6] as usize) << 8) | (response_bytes[7] as usize);
+
+        // rfc 2308: cache nxdomain (rcode 3) and nodata (ancount 0) responses
+        let is_negative = rcode == 3 || (rcode == 0 && ancount == 0);
+        let ttl_secs = if is_negative {
+            self.negative_ttl
+        } else {
+            extract_min_ttl(response_bytes).clamp(self.min_ttl, self.max_ttl)
+        };
+
+        let expires_at = now + Duration::from_secs(ttl_secs as u64);
+        // rfc 8767: retain stale responses for an extra 30 seconds after expiry
+        let stale_until = expires_at + Duration::from_secs(30);
 
         let mut map = match self.entries.lock() {
             Ok(m) => m,
@@ -97,9 +157,7 @@ impl DnsCache {
         };
 
         if map.len() >= self.max_entries {
-            // purge expired cache entries upon reaching capacity limit
-            let now = Instant::now();
-            map.retain(|_, v| v.expires_at > now);
+            map.retain(|_, v| v.stale_until > now);
             if map.len() >= self.max_entries {
                 if let Some(oldest_key) = map.keys().next().cloned() {
                     map.remove(&oldest_key);
@@ -111,9 +169,84 @@ impl DnsCache {
             key,
             DnsCacheEntry {
                 response_wire: response_bytes.to_vec(),
+                original_ttl: ttl_secs,
+                inserted_at: now,
                 expires_at,
+                stale_until,
+                is_negative,
             },
         );
+    }
+}
+
+// traverses answer section of wire response and overwrites all ttl fields with new_ttl
+pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
+    if data.len() < 12 {
+        return;
+    }
+
+    let qdcount = ((data[4] as usize) << 8) | (data[5] as usize);
+    let ancount = ((data[6] as usize) << 8) | (data[7] as usize);
+
+    if ancount == 0 {
+        return;
+    }
+
+    let mut pos = 12;
+
+    // skip questions
+    for _ in 0..qdcount {
+        while pos < data.len() {
+            let len = data[pos] as usize;
+            if len == 0 {
+                pos += 1;
+                break;
+            }
+            if (len & 0xC0) == 0xC0 {
+                pos += 2;
+                break;
+            }
+            pos += 1 + len;
+        }
+        pos += 4; // qtype + qclass
+    }
+
+    let ttl_bytes = new_ttl.to_be_bytes();
+
+    for _ in 0..ancount {
+        if pos >= data.len() {
+            break;
+        }
+
+        if (data[pos] & 0xC0) == 0xC0 {
+            pos += 2;
+        } else {
+            while pos < data.len() {
+                let len = data[pos] as usize;
+                if len == 0 {
+                    pos += 1;
+                    break;
+                }
+                if (len & 0xC0) == 0xC0 {
+                    pos += 2;
+                    break;
+                }
+                pos += 1 + len;
+            }
+        }
+
+        if pos + 10 > data.len() {
+            break;
+        }
+
+        // overwrite ttl field (bytes 4..8 after record name)
+        data[pos + 4] = ttl_bytes[0];
+        data[pos + 5] = ttl_bytes[1];
+        data[pos + 6] = ttl_bytes[2];
+        data[pos + 7] = ttl_bytes[3];
+
+        let rdlength = ((data[pos + 8] as usize) << 8) | (data[pos + 9] as usize);
+        pos += 10 + rdlength;
     }
 }
 
@@ -177,7 +310,6 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
 
     let mut pos = 12;
 
-    // skip question section records
     for _ in 0..qdcount {
         while pos < data.len() {
             let len = data[pos] as usize;
@@ -191,7 +323,7 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
             }
             pos += 1 + len;
         }
-        pos += 4; // skip qtype and qclass
+        pos += 4;
     }
 
     let mut min_ttl = 300u32;
@@ -246,19 +378,19 @@ mod tests {
         let cache = DnsCache::new(100);
 
         let query1 = vec![
-            0x12, 0x34, // ID 0x1234
+            0x12, 0x34,
             0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
             0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, // Type A
-            0x00, 0x01, // Class IN
+            0x00, 0x01,
+            0x00, 0x01,
         ];
 
         let mut fake_resp = query1.clone();
         fake_resp[2] = 0x81;
         fake_resp[3] = 0x80;
-        fake_resp[7] = 0x01; // ancount = 1
-        fake_resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216, 34]);
+        fake_resp[7] = 0x01;
+        fake_resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 93, 184, 216, 34]);
 
         cache.insert(&query1, &fake_resp);
 
@@ -270,5 +402,20 @@ mod tests {
         assert_eq!(hit[0], 0xAB);
         assert_eq!(hit[1], 0xCD);
         assert_eq!(&hit[hit.len() - 4..], &[93, 184, 216, 34]);
+    }
+
+    #[test]
+    fn test_ttl_decay_and_update() {
+        let mut resp = vec![
+            0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // Answer
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x04, 1, 1, 1, 1,
+        ];
+
+        update_response_ttls(&mut resp, 42);
+        // TTL is at offset 12 (header) + 17 (question) + 6 (name, type, class) = 35..39
+        assert_eq!(&resp[35..39], &42u32.to_be_bytes());
     }
 }

@@ -171,10 +171,14 @@ impl SingleDoHClient {
     }
 }
 
-// multi-upstream client pool providing ordered query dispatch and fallback
+use super::balancer::LoadBalancer;
+use std::sync::Arc;
+
+// multi-upstream client pool providing weighted power of two (wp2) query dispatch and fallback
 #[derive(Clone)]
 pub struct DoHResolver {
     clients: Vec<SingleDoHClient>,
+    balancer: Arc<LoadBalancer>,
 }
 
 impl DoHResolver {
@@ -205,6 +209,31 @@ impl DoHResolver {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize custom doh {}: {}", u, e),
                 }
+            } else if u.starts_with("sdns://") {
+                match crate::dns::stamp::DnsStamp::parse(u) {
+                    Ok(stamp) => {
+                        let name = if !stamp.provider_name.is_empty() {
+                            stamp.provider_name.clone()
+                        } else {
+                            "stamp".to_string()
+                        };
+                        let mut all_bootstraps = stamp.bootstrap_ips.clone();
+                        for ip in custom_bootstrap_ips {
+                            if !all_bootstraps.contains(ip) {
+                                all_bootstraps.push(*ip);
+                            }
+                        }
+                        if stamp.doh_url.is_empty() {
+                            warn!("dns stamp {} does not specify a doh endpoint", u);
+                        } else {
+                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc) {
+                                Ok(client) => clients.push(client),
+                                Err(e) => warn!("failed to initialize stamp doh {}: {}", name, e),
+                            }
+                        }
+                    }
+                    Err(e) => warn!("failed to parse dns stamp {}: {}", u, e),
+                }
             } else {
                 warn!("unknown doh preset or invalid url: {}", u);
             }
@@ -220,24 +249,38 @@ impl DoHResolver {
             clients.push(cf);
         }
 
-        Ok(Self { clients })
+        let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
+        let balancer = Arc::new(LoadBalancer::new(&names));
+
+        Ok(Self { clients, balancer })
     }
 
-    // attempts query resolution sequentially across configured upstream clients
+    // resets upstream performance scoring upon network changes
+    pub fn reset_balancer(&self) {
+        self.balancer.reset();
+    }
+
+    // attempts query resolution dynamically prioritized by weighted power-of-two (wp2) load balancing
     pub async fn resolve(
         &self,
         query_wire_bytes: &[u8],
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        let candidates = self.balancer.select_candidates();
         let mut last_err = None;
 
-        for client in &self.clients {
-            match client.resolve(query_wire_bytes).await {
-                Ok(data) => {
-                    return Ok((data, client.name.clone()));
-                }
-                Err(e) => {
-                    debug!("DoH upstream {} failed: {}", client.name, e);
-                    last_err = Some(e);
+        for idx in candidates {
+            if let Some(client) = self.clients.get(idx) {
+                let start = std::time::Instant::now();
+                match client.resolve(query_wire_bytes).await {
+                    Ok(data) => {
+                        self.balancer.record_result(idx, start.elapsed(), true);
+                        return Ok((data, client.name.clone()));
+                    }
+                    Err(e) => {
+                        self.balancer.record_result(idx, start.elapsed(), false);
+                        debug!("DoH upstream {} failed: {}", client.name, e);
+                        last_err = Some(e);
+                    }
                 }
             }
         }
@@ -264,6 +307,16 @@ pub fn extract_upstream_ips(
 
         if let Some((_, preset_ips)) = DOH_PRESETS.get(u) {
             ips.extend_from_slice(preset_ips);
+            continue;
+        }
+
+        if u.starts_with("sdns://") {
+            if let Ok(stamp) = crate::dns::stamp::DnsStamp::parse(u) {
+                ips.extend_from_slice(&stamp.bootstrap_ips);
+                if let Some(std::net::SocketAddr::V4(v4)) = stamp.server_addr {
+                    ips.push(*v4.ip());
+                }
+            }
             continue;
         }
 
@@ -308,6 +361,15 @@ pub fn extract_upstream_ips_v6(
 
         if let Some(preset_ips) = DOH_PRESETS_V6.get(u) {
             ips.extend_from_slice(preset_ips);
+            continue;
+        }
+
+        if u.starts_with("sdns://") {
+            if let Ok(stamp) = crate::dns::stamp::DnsStamp::parse(u) {
+                if let Some(std::net::SocketAddr::V6(v6)) = stamp.server_addr {
+                    ips.push(*v6.ip());
+                }
+            }
             continue;
         }
 
@@ -410,5 +472,14 @@ mod tests {
         let (response_wire, upstream_used) = resolver.resolve(&query_wire).await.expect("quad9 doh should resolve");
         assert_eq!(upstream_used, "quad9");
         assert!(response_wire.len() > 12);
+    }
+
+    #[test]
+    fn test_sdns_stamp_resolver_init() {
+        let quad9_stamp = "sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ";
+        let resolver = DoHResolver::new(quad9_stamp, &[], true);
+        assert!(resolver.is_ok(), "DNS stamp DoHResolver init should succeed");
+        let ips = extract_upstream_ips(quad9_stamp, &[]);
+        assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)));
     }
 }

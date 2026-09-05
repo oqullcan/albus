@@ -26,7 +26,8 @@
 | **Interface Roaming** | Dynamic Route Resolver | `/proc/net/route` gateway tracking seamlessly preserves state across Wi-Fi (`wlan0`), Ethernet (`eth0`), and VPN (`tailscale0`, `wg0`) transitions. |
 | **Live Map Reload** | Runtime eBPF Reconfiguration | Zero-downtime updates of target ports, exclusion maps, and MSS limits via `SIGHUP` (`albus service reload` / `albus config set`). |
 | **Path Heuristics** | Auto-TTL Estimation | Dynamic hop-distance probing with boundary clamping (3–12 hops) and in-memory TTL caching. |
-| **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
+| **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0), RFC 8467 | Multi-upstream HTTP/2 client pool, RFC 8467 EDNS0 Padding, DO-bit validation, Serve-Stale (RFC 8767), Dynamic TTL decay, Anti-Rebinding, and AAAA filtering. |
+| **Load Balancing & Cloaking** | WP2 & EWMA Latency Probing | Weighted Power of Two multi-upstream balancing, local wildcard cloaking (0ms synthetic A/AAAA), and split-DNS forwarding. |
 | **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs` cryptographic provider. |
 | **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
 | **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` enables passwordless desktop management for `wheel`/`sudo` users. |
@@ -36,28 +37,31 @@
 ## Architecture
 
 ```
-                  ┌──────────────────────────────────────────────────┐
-                  │          Application (Browser / Client)          │
-                  └──────────────┬────────────────────┬──────────────┘
-                    DNS (UDP 53) │                    │ TCP SYN (:443)
-                                 ▼                    ▼
-┌──────────────────────────────────────────┐ ┌──────────────────────────────────────────┐
-│         Local Encrypted Resolver         │ │        Kernel eBPF & Packet Stack        │
-│                                          │ │                                          │
-│ ├─ In-Memory Response Cache (0ms)        │ │ 1. eBPF ACTIVE_ESTABLISHED               │
-│ ├─ Post-Quantum ML-KEM-768 Key Exchange  │ │    Clamps initial TCP MSS = 88 bytes     │
-│ ├─ DNSSEC DO-bit & AD Validation         │ │    Notifies userspace via perf event ring│
-│ ├─ IPv6 (AAAA) Leak Filtering            │ │                                          │
-│ └─ Upstream Dispatch:                    │ │ 2. Raw Socket Packet Injector            │
-│    • Quad9 / Cloudflare / Mullvad        │ │    Emits fake ClientHello (Optimal TTL)  │
-│    • Custom Bootstrap IP Resolution      │ │    Middlebox state table desynchronizes  │
-│                                          │ │                                          │
-│                                          │ │ 3. ClientHello Transmission              │
-│                                          │ │    Segmented records bypass DPI filter   │
-│                                          │ │                                          │
-│                                          │ │ 4. eBPF WRITE_HDR_OPT                    │
-│                                          │ │    Restores native MSS (1460 bytes)      │
-└──────────────────────────────────────────┘ └──────────────────────────────────────────┘
+                  ┌────────────────────────────────────────────────────────┐
+                  │             Application (Browser / Client)             │
+                  └───┬──────────────────────────────────────────────┬─────┘
+        DNS (UDP 53,  │                                              │ TCP SYN (:443)
+        TCP 53, DoH)  ▼                                              ▼
+┌──────────────────────────────────────────────┐ ┌──────────────────────────────────────────────┐
+│        Local High-Tier DNS Subsystem         │ │          Kernel eBPF & Packet Stack          │
+├──────────────────────────────────────────────┤ ├──────────────────────────────────────────────┤
+│ 1. Multi-Listener: Tuned UDP 53, RFC 7766 TCP│ │ 1. eBPF ACTIVE_ESTABLISHED                   │
+│    53 (QUICKACK) & RFC 8484 Local DoH (:8053)│ │    • Clamps initial TCP MSS = 88 bytes       │
+│ 2. Firefox Canary & Captive Interceptor      │ │    • Dynamic MSS Jitter ([min_mss..mss])     │
+│    • use-application-dns.net (0ms NXDOMAIN)  │ │    • Notifies userspace via perf ring        │
+│    • Instant probe response (No Wi-Fi lock)  │ │ 2. Raw Socket Packet Injector                │
+│ 3. Local Cloaking & Split-DNS Forwarder      │ │    • Zero-allocation fake ClientHello        │
+│ 4. Inotify Live Hot-Reload (Watcher)         │ │    • Decoy SNI rotation & Auto-TTL probe     │
+│ 5. Domain Allowlist & HaGeZi Radix Trie      │ │    • Middlebox state desynchronization       │
+│    • 200k+ rules in <5MB RAM (0ms Sinkhole)  │ │ 3. ClientHello Transmission                  │
+│ 6. Wire Cache (TTL Decay & RFC 8767 Stale)   │ │    • Segmented records bypass DPI filter     │
+│ 7. RFC 8467 Padding & RFC 7871 Zero-Scope ECS│ │    • Dual-stack IPv4 and IPv6 support        │
+│ 8. Multi-DoH WP2 Balancer & DNS Stamps (sdns)│ │ 4. eBPF WRITE_HDR_OPT                        │
+│ 9. Anti-Rebinding & Bogon/IP Blacklist Drop  │ │    • Restores native MSS (1460 bytes)        │
+│10. CNAME & HTTPS/SVCB Uncloaking Defense     │ │    • Exceeds restore-after-bytes threshold   │
+│11. RFC 6052 / RFC 6147 DNS64 IPv6 Synthesis  │ │ 5. Network Sentinel (netmon)                 │
+│12. Audit Logger & IPcrypt Pseudonymization   │ │    • Flushes cache & resets EWMA on roaming  │
+└──────────────────────────────────────────────┘ └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -86,6 +90,29 @@ To mitigate "Harvest Now, Decrypt Later" surveillance, the DNS subsystem employs
 - **Active Leak Canary Watchdog**: An autonomous background prober actively queries `leak-test.albus.internal` every 60 seconds over loopback (`127.0.0.1:53`), verifying the synthetic canary record (`127.0.0.99`). If queries fail or return unexpected data (due to VPN route takeovers, network managers overwriting `/etc/resolv.conf`, or DNS hijacking), it triggers instant autonomous self-healing.
 - **Fail-Closed Network Lockdown (`--network-lockdown`)**: Distinct from the DNS Kill-Switch, Network Lockdown drops all outbound non-loopback web traffic (TCP 80 and 443) if the eBPF subsystem fails to attach. This guarantees that unfragmented, unevaded cleartext traffic is never leaked to the ISP if DPI evasion cannot be sustained.
 - **WebRTC STUN Blocking (`--block-stun`)**: Drops outbound UDP traffic on standard STUN/TURN ports 3478 and 5349 to eliminate real IPv4/IPv6 exposure through WebRTC peer connection candidates.
+
+### 7. Enterprise-Grade Hardened DNS Subsystem
+- **CNAME & HTTPS/SVCB AliasMode Uncloaking Defense**: Inspects resolved CNAME chains and RFC 9460 HTTPS/SVCB AliasMode targets against the Radix Trie blocklist, preventing tracking vendors from evading blocklists through first-party subdomain disguises.
+- **Zero-Allocation Domain Allowlist Engine**: Fast exact and wildcard exception engine (`--allow-domains`, `--allowlist-path`) enabling instant false-positive bypass without disabling global threat blocklists.
+- **RFC 8467 EDNS(0) Discrete Padding & RFC 7871 ECS Zero-Scope**: Disguises encrypted DoH payload lengths by padding requests to standardized discrete boundaries (`64, 128, 192, 256, 320, 384, 512, 704, 768, 896, 960, 1024, 1088, 1152, 2688, 4080`), neutralizing side-channel DPI packet size fingerprinting, while appending ECS `source_prefix = 0` to explicitly forbid upstream resolvers from forwarding client subnet info.
+- **Ultra-Compact HaGeZi Blocklist Engine**: High-performance arena-based label-reversed suffix radix trie storing 200,000+ domain rules (HaGeZi Multi PRO + TIF) in < 5 MB of RAM. Features automatic subdomain pruning, sub-millisecond pre-compiled binary cache loading (`blocklist.bin`), and 0ms sinkholing (`0.0.0.0` / `::`).
+- **Response IP & Bogon Filtering (`--block-bogons`)**: Analyzes resolved A/AAAA addresses and drops responses resolving to bogon ranges (RFC 5735 / RFC 6890) or custom malicious IP subnets, thwarting DGAs and bulletproof hosters.
+- **Linux Network Change Sentinel (`netmon`)**: Autonomous background sentinel monitoring interface and routing transitions (Wi-Fi SSID changes, VPN connect/disconnect), automatically purging stale DNS caches and resetting upstream EWMA performance scores.
+- **Kernel Socket Flag Tuning**: Configures socket layer with `IP_FREEBIND` (eliminating boot-time startup race conditions), `IP_TOS 0x70` (interactive low-latency DSCP classification), and 256KB socket buffers.
+- **RFC 7766 Local TCP Port 53 Listener**: Length-prefixed framing and `TCP_QUICKACK` support for large DNSSEC payloads, zone transfers, and stub resolvers (`systemd-resolved`, `dig +tcp`).
+- **RFC 8484 Local DoH Server (`local-doh`)**: High-performance HTTP/1.1 endpoint on `127.0.0.1:8053/dns-query` accepting POST (`application/dns-message`) and GET (`?dns=<base64url>`), eliminating the need to modify `/etc/resolv.conf` for modern browsers.
+- **DNS Stamp Parser (`sdns://`)**: Native decoder for standardized DNS Stamps (DoH, ODoH), resolving upstream URLs, ports, bootstrap IPs, and cryptographic attributes.
+- **Structured Threat & Query Audit Logger (IPcrypt)**: Non-blocking asynchronous rotating query logger (TSV) with 32-bit format-preserving Feistel cipher (`IPcrypt`) to pseudonymize client IPv4/IPv6 addresses while preserving grouping semantics.
+- **Zero-Downtime Rule Hot-Reload (`FileWatcher`)**: Inotify-based file watcher monitoring allowlist and blocklist paths, automatically hot-reloading rules into the active resolver without daemon interruption.
+- **RFC 6052 / RFC 6147 DNS64 IPv6 Synthesis**: Automatically synthesizes standard `64:ff9b::/96` IPv6 AAAA answers for IPv4-only domains in NAT64 environments.
+- **Firefox DoH Canary Interception**: Intercepts `use-application-dns.net`, forcing Mozilla Firefox to disable internal bypass DoH and route 100% of DNS traffic through Albus.
+- **Captive Portal Detection**: Synthesizes instant probe responses for Apple, Android, Windows, and Linux connectivity probes, preventing Wi-Fi captive portal lockouts in airports, hotels, and public venues.
+- **Undelegated & Unqualified Domain Blocking**: Automatically filters dotless names, `.local`, `.lan`, `.home`, `.internal`, `.corp`, and private reverse lookup zones (`in-addr.arpa`, `ip6.arpa`), returning immediate 0ms `NXDOMAIN` to prevent private topology exposure upstream.
+- **Advanced Dynamic Cache & Serve-Stale (RFC 8767)**: Real-time dynamic TTL decay accurately decrements remaining TTL. Implements RFC 2308 negative caching (60s), min/max TTL clamping (60s–86400s), and fallback to expired stale cache records during upstream outages or network instability.
+- **Anti-DNS-Rebinding Protection**: Validates responses from public upstream resolvers. If a public domain resolves to RFC 1918 private, loopback, or link-local subnets, the response is dropped with `REFUSED` to protect internal services and IoT devices from rebinding attacks.
+- **Weighted Power of Two (WP2) Load Balancing**: Tracks exponential moving average (EWMA) latency and error rates across multi-upstreams. Evaluates pairs of upstream candidates and routes queries to the optimal resolver, eliminating herd behavior.
+- **Local Cloaking & Split-DNS Forwarding**: Directs exact and wildcard hosts (`*.home`, `app.local`) to local synthetic IPs without altering `/etc/hosts`, and dispatches dedicated internal zones directly to company DNS forwarders over UDP.
+- **Live Threat Telemetry & TUI Integration**: Publishes atomic metric snapshots to volatile tmpfs (`/run/albus/stats.json`), rendering real-time query counts, cache hit ratios, and blocked tracker telemetry in `albus monitor`.
 
 ---
 
@@ -124,8 +151,11 @@ sudo albus run --ram-only=true --pqc=true
 # Configure Mullvad upstream with malware and tracker blocking
 sudo albus run --doh-upstream mullvad-base
 
-# Custom DoH endpoint with dedicated bootstrap IP addressing
-sudo albus run --doh-upstream "https://doh.example.com/dns-query" --doh-bootstrap-ips "93.184.216.34"
+# Custom DoH endpoint with dedicated bootstrap IP addressing or DNS Stamp
+sudo albus run --doh-upstream "sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ"
+
+# Enable structured query logger with IPcrypt pseudonymization
+sudo albus run --query-log=true --query-log-path=/var/log/albus/query.log --ipcrypt-key=0123456789abcdef0123456789abcdef
 ```
 
 ### Daemon & Configuration Management
@@ -152,8 +182,14 @@ sudo albus cleanup           # Restore original /etc/resolv.conf and purge firew
 | `--fake-sni` | `String` | `None` | Server Name Indication override (defaults to rotating high-reputation pool) |
 | `--fake-bad-checksum` | `bool` | `false` | Invalidate TCP checksum (`0xDEAD`) for middlebox corruption |
 | `--doh` | `bool` | `true` | Spawn local DNS-over-HTTPS resolver on `127.0.0.1:53` |
-| `--doh-upstream` | `String` | `"quad9"` | Upstream resolver (`quad9`, `cloudflare`, `mullvad-*`, URL) |
+| `--doh-upstream` | `String` | `"quad9"` | Upstream resolver (`quad9`, `cloudflare`, `mullvad-*`, `sdns://...`, URL) |
 | `--doh-bootstrap-ips` | `Vec<IPv4>`| `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
+| `--tcp-listener` | `bool` | `true` | Local TCP port 53 listener with RFC 7766 length-prefixed framing |
+| `--local-doh` | `bool` | `true` | Local DoH HTTP/1.1 endpoint (RFC 8484) on `127.0.0.1:8053/dns-query` |
+| `--local-doh-addr` | `String` | `"127.0.0.1:8053"` | Local DoH server bind address |
+| `--query-log` | `bool` | `false` | Structured query and threat audit logger |
+| `--query-log-path` | `String` | `None` | File path for rotating query log output |
+| `--ipcrypt-key` | `String` | `None` | 128-bit hex key for client IP pseudonymization (IPcrypt) |
 | `--dnssec` | `bool` | `true` | Enforce EDNS0 DO-bit and Authenticated Data validation |
 | `--pqc` | `bool` | `true` | Enable hybrid ML-KEM-768 post-quantum key exchange |
 | `--ram-only` | `bool` | `false` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |
@@ -162,6 +198,17 @@ sudo albus cleanup           # Restore original /etc/resolv.conf and purge firew
 | `--kill-switch` | `bool` | `true` | Strict DNS kill-switch dropping non-loopback UDP/TCP 53 |
 | `--network-lockdown` | `bool` | `false` | Fail-closed network kill-switch dropping TCP 80/443 if eBPF fails |
 | `--block-ipv6` | `bool` | `true` | Filter AAAA queries to prevent IPv6 inspection bypass leaks |
+| `--anti-dns-rebinding` | `bool` | `true` | Drop upstream responses resolving to private/loopback IPs |
+| `--block-undelegated` | `bool` | `true` | Block queries for dotless names, `.local`, `.lan`, and private zones |
+| `--edns-padding` | `bool` | `true` | Pad encrypted DoH queries to discrete block boundaries (RFC 8467) |
+| `--blocklist` | `bool` | `true` | Enable compact in-memory HaGeZi Multi PRO + TIF ad/malware filter |
+| `--blocklist-path` | `String` | `None` | Path to custom domain blocklist file or compiled binary |
+| `--allow-domains` | `Vec<String>` | `[]` | Comma-separated list of domains to whitelist / bypass blocklists |
+| `--allowlist-path` | `String` | `None` | Path to custom plain-text domain whitelist file |
+| `--uncloak-cnames` | `bool` | `true` | Uncloak CNAME & HTTPS/SVCB alias chains against blocklist |
+| `--block-bogons` | `bool` | `true` | Drop upstream responses resolving to bogon / reserved IP subnets |
+| `--dns64` | `bool` | `false` | Synthesize RFC 6052 `64:ff9b::/96` IPv6 addresses for IPv4-only domains |
+| `--netmon` | `bool` | `true` | Monitor network changes and flush DNS cache / reset EWMA scores on roaming |
 
 ---
 
