@@ -39,9 +39,10 @@ fn main() {
             // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
             let fallback = env::current_dir().unwrap().join("bpf/sockops.bpf.o");
             if fallback.exists() {
+                let _ = std::fs::copy(&fallback, &bpf_out);
                 println!(
                     "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
-                    fallback.to_str().unwrap()
+                    bpf_out.to_str().unwrap()
                 );
             } else {
                 panic!("Failed to compile eBPF bytecode and no fallback sockops.bpf.o found");

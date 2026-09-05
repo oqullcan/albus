@@ -1,3 +1,4 @@
 /target
 **/*.rs.bk
 *.bpf.o
+!bpf/sockops.bpf.o

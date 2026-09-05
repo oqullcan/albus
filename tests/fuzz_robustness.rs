@@ -95,7 +95,7 @@ fn test_fuzz_parse_elf_sockops() {
     }
 
     // 1c. Mutated valid ELF header with scrambled fields
-    let valid_elf = include_bytes!(concat!(env!("OUT_DIR"), "/sockops.bpf.o"));
+    let valid_elf = include_bytes!(env!("ALBUS_BPF_BYTECODE"));
     for _ in 0..100 {
         let mut mutated = valid_elf.to_vec();
         let num_mutations = rng.next_range(1, 20);
