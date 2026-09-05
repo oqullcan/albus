@@ -381,7 +381,8 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     fs::create_dir_all(parent)?;
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        let dir_mode = if is_system_path { 0o755 } else { 0o700 };
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(dir_mode));
     }
 
     // reject writing if destination is a symlink
@@ -398,24 +399,25 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     // atomic write via temporary file in the same directory followed by atomic rename
     let tmp_name = format!(
         ".{}.tmp.{}",
-        p.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        p.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
         std::process::id()
     );
     let tmp_path = parent.join(tmp_name);
 
-    use std::io::Write;
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let file_mode = if is_system_path { 0o644 } else { 0o600 };
         options
-            .mode(0o600)
+            .mode(file_mode)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
     let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
         let mut file = options.open(&tmp_path)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;

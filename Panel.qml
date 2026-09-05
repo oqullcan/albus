@@ -45,6 +45,17 @@ Panel {
   property bool blockIpv6Enabled: true
   property string toastMessage: ""
   property bool isConfigLoading: false
+  property string serviceUptime: ""
+  property double activeStartTime: 0
+
+  onIsRunningChanged: {
+    if (isRunning) {
+      refreshUptime()
+    } else {
+      root.serviceUptime = ""
+      root.activeStartTime = 0
+    }
+  }
 
   // accordion section state: "upstream", "dpi", "security", "dns"
   property string activeSection: "dpi"
@@ -88,29 +99,30 @@ Panel {
   property int storedMaxTtl: 12
   property var storedAllowDomains: []
   property string storedAllowlistPath: ""
+  property string lastDaemonAction: ""
 
   onOpenedChanged: if (opened) {
     loadConfig()
     refreshStatus()
+    refreshUptime()
   }
 
   Component.onCompleted: {
     loadConfig()
     refreshStatus()
+    refreshUptime()
   }
 
   // event stream telemetry state
   property var rawStreamEvents: []
   property var displayEvents: []
+  property var pendingStreamEvents: []
   property string streamFilter: "ALL"
   property string streamSearchQuery: ""
   property bool isStreamPaused: false
-  property int countInjected: 0
-  property int countDns: 0
-  property int countQuic: 0
-  property int countShield: 0
   property bool isAtBottom: true
   property int copiedEventId: -1
+  property int selectedLogIndex: -1
   property int recentEventCount: 0
   property string eventRateText: "idle"
 
@@ -134,6 +146,7 @@ Panel {
 
     width: parent.width
     implicitHeight: descText.visible ? Style.space(40) : Style.space(32)
+    radius: Style.cornerRadius
     color: ctMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent"
 
     Behavior on color { ColorAnimation { duration: 90 } }
@@ -214,8 +227,8 @@ Panel {
     width: parent.width
     height: Style.space(34)
     radius: Style.cornerRadius
-    color: isOpen ? Qt.rgba(1, 1, 1, 0.07) : (ashMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : Qt.rgba(1, 1, 1, 0.015))
-    border.color: isOpen ? Qt.rgba(1, 1, 1, 0.18) : (ashMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.09) : root.borderMuted)
+    color: isOpen ? Qt.rgba(1, 1, 1, 0.05) : (ashMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.03) : "transparent")
+    border.color: isOpen ? Qt.rgba(1, 1, 1, 0.12) : (ashMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.06) : "transparent")
     border.width: 1
 
     Behavior on color { ColorAnimation { duration: 90 } }
@@ -237,10 +250,11 @@ Panel {
 
       Rectangle {
         width: 3
-        height: Style.space(14)
+        height: ashRoot.isOpen ? Style.space(14) : Style.space(8)
         radius: 1.5
-        color: ashRoot.isOpen ? ashRoot.accent : Qt.rgba(1, 1, 1, 0.2)
+        color: ashRoot.isOpen ? ashRoot.accent : Qt.rgba(1, 1, 1, 0.15)
         Layout.alignment: Qt.AlignVCenter
+        Behavior on height { NumberAnimation { duration: 120; easing.type: Easing.OutQuad } }
         Behavior on color { ColorAnimation { duration: 90 } }
       }
 
@@ -258,7 +272,7 @@ Panel {
         text: ashRoot.subtitle
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption - 2
-        color: ashRoot.isOpen ? Qt.darker(root.foreground, 1.6) : root.subtle
+        color: ashRoot.isOpen ? Qt.darker(root.foreground, 1.5) : root.subtle
         textFormat: Text.PlainText
         elide: Text.ElideRight
         Layout.fillWidth: true
@@ -266,12 +280,16 @@ Panel {
       }
 
       Text {
-        text: ashRoot.isOpen ? "▲" : "▼"
-        font.family: "monospace"
-        font.pixelSize: Style.font.caption - 1
+        text: "›"
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
         font.bold: true
         color: ashRoot.isOpen ? ashRoot.accent : root.subtle
         Layout.alignment: Qt.AlignVCenter
+        transformOrigin: Item.Center
+        rotation: ashRoot.isOpen ? 90 : 0
+        Behavior on rotation { NumberAnimation { duration: 120; easing.type: Easing.OutQuad } }
+        Behavior on color { ColorAnimation { duration: 90 } }
       }
     }
   }
@@ -307,9 +325,32 @@ Panel {
   }
 
   Timer {
+    id: uptimeTimer
+    interval: 1000
+    running: root.opened && root.isRunning
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (root.activeStartTime > 0) {
+        var diffSec = Math.max(0, Math.floor((Date.now() - root.activeStartTime) / 1000))
+        root.serviceUptime = root.formatUptime(diffSec)
+      } else if (root.isRunning && !uptimeProc.running) {
+        uptimeProc.running = true
+      }
+    }
+  }
+
+  Timer {
     id: copiedFeedbackTimer
     interval: 1200
     onTriggered: root.copiedEventId = -1
+  }
+
+  Timer {
+    id: streamBatchTimer
+    interval: 35
+    repeat: false
+    onTriggered: root.flushStreamBatch()
   }
 
   function scheduleAutoApply() {
@@ -390,8 +431,8 @@ Panel {
       var badCsMatch = clean.match(/bad_csum=([^\s]+)/) || clean.match(/bad_cs=([^\s]+)/)
       title = isHttp ? "HTTP Request Split" : (dstMatch ? dstMatch[1] : "TLS ClientHello")
       var isBad = badCsMatch && (badCsMatch[1] === "true" || badCsMatch[1] === "1")
-      detail = isHttp ? "HTTP/1.1 verb fragmented desync" : (isBad ? "0xDEAD bad-checksum middlebox desync" : "Fake SNI desync injected")
-      tag = isHttp ? "HTTP/1.1" : ((isBad ? "0xDEAD • " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL"))
+      detail = isHttp ? "HTTP verb fragmented" : (isBad ? "0xDEAD desync" : "Desync injected")
+      tag = isHttp ? "HTTP/1.1" : ((isBad ? "0xDEAD · " : "") + (ttlMatch ? "TTL " + ttlMatch[1] : "TTL"))
     } else if (clean.indexOf("HaGeZi") !== -1 || clean.indexOf("blocked by HaGeZi") !== -1 || clean.indexOf("CNAME cloaking") !== -1 || clean.indexOf("uncloaked_target") !== -1 || clean.indexOf("Bogon") !== -1 || clean.indexOf("Anti-DNS") !== -1 || clean.indexOf("Rebinding") !== -1 || clean.indexOf("STUN") !== -1 || clean.indexOf("WebRTC") !== -1 || clean.indexOf("canary") !== -1 || clean.indexOf("Kill-Switch") !== -1 || clean.indexOf("Lockdown") !== -1 || clean.indexOf("undelegated") !== -1) {
       category = "SHIELD"
       badgeColor = "#10B981"
@@ -412,35 +453,35 @@ Panel {
 
       if (isHagezi) {
         title = cleanDom !== "" ? cleanDom : "HaGeZi Block"
-        detail = "Ad/malware domain filtered"
+        detail = "Threat filtered"
         tag = "Threat Block"
       } else if (isCname) {
         title = cleanTarget !== "" ? cleanTarget : (cleanDom !== "" ? cleanDom : "CNAME Tracker Block")
-        detail = cleanDom !== "" ? "Tracker uncloaked from " + cleanDom : "Uncloaked tracking domain sinkholed"
+        detail = "Uncloaked tracker"
         tag = "Uncloak"
       } else if (isBogon) {
         title = cleanDom !== "" ? cleanDom : "Bogon IP Dropped"
-        detail = "Unroutable / martian IP filtered"
+        detail = "Bogon IP dropped"
         tag = "Bogon Drop"
       } else if (isRebind) {
         title = cleanDom !== "" ? cleanDom : "DNS Rebinding Shield"
-        detail = "RFC 1918 private IP leak blocked"
+        detail = "Private IP blocked"
         tag = "Anti-Rebind"
       } else if (isLock) {
         title = "Network Lockdown Rule"
-        detail = "Fail-closed TCP 80/443 protection"
+        detail = "TCP 80/443 lockdown"
         tag = "Lockdown"
       } else if (isCanary) {
         title = "DNS Leak Canary Probe"
-        detail = "Internal leak detection intercepted"
+        detail = "Leak probe intercepted"
         tag = "Canary"
       } else if (isStun) {
         title = "WebRTC STUN Block"
-        detail = "UDP 3478/5349 IP leak prevented"
+        detail = "STUN IP leak blocked"
         tag = "STUN Drop"
       } else {
         title = cleanDom !== "" ? cleanDom : "Privacy Shield Block"
-        detail = "Undelegated query / leak drop"
+        detail = "Undelegated query drop"
         tag = "Shield"
       }
     } else if (clean.indexOf("DNS cache hit") !== -1 || clean.indexOf("cache_0ms") !== -1 || clean.indexOf("cloaking table") !== -1) {
@@ -448,13 +489,13 @@ Panel {
       badgeColor = "#A855F7"
       var domMatch = clean.match(/domain=([^\s]+)/)
       title = domMatch ? domMatch[1].replace(/["',]/g, "") : "DNS Cache Hit"
-      detail = "Resolved via in-memory 0ms cache"
+      detail = "0ms memory cache"
       tag = "0ms Cache"
     } else if (clean.indexOf("DNS server started") !== -1 || clean.indexOf("DNS-over-HTTPS proxy listening") !== -1) {
       category = "SYS"
       badgeColor = "#A855F7"
       title = "DoH Resolver Online"
-      detail = "127.0.0.1:53 proxy listener ready"
+      detail = "127.0.0.1:53 ready"
       tag = "127.0.0.1"
     } else if (clean.indexOf("DNS resolved") !== -1 || clean.indexOf("DNS") !== -1 || clean.indexOf("query") !== -1 || clean.indexOf("resolved") !== -1) {
       category = "DNS"
@@ -462,20 +503,21 @@ Panel {
       var domMatch = clean.match(/domain=([^\s]+)/) || clean.match(/upstream=([^\s]+)/)
       var dnssecMatch = clean.match(/dnssec_authenticated=true/) || clean.match(/is_ad=true/)
       title = domMatch ? domMatch[1].replace(/["',]/g, "") : "DoH Query"
-      detail = "Encrypted upstream resolution"
+      detail = "Encrypted DoH"
       tag = dnssecMatch ? "DNSSEC" : "DoH"
     } else if (clean.indexOf("QUIC") !== -1) {
       category = "QUIC"
       badgeColor = "#F59E0B"
       title = "QUIC (UDP 443) Blocked"
-      detail = "Forced browser fallback to TCP"
+      detail = "Forced TCP fallback"
       tag = "UDP 443"
-    } else if (clean.indexOf("Error") !== -1 || clean.indexOf("Failed") !== -1) {
+    } else if (clean.indexOf("Error") !== -1 || clean.indexOf("Failed") !== -1 || clean.indexOf("ERROR") !== -1 || clean.indexOf("WARN") !== -1 || clean.indexOf("panicked") !== -1) {
       category = "ERROR"
       badgeColor = "#EF4444"
-      title = clean.replace(/.*Error:\s*/, "")
+      var errTitle = clean.replace(/.*(?:Error|ERROR|WARN|panicked):\s*/, "")
+      title = errTitle !== "" ? errTitle : clean
       detail = "Service warning / alert"
-      tag = "ERROR"
+      tag = "ALERT"
     } else if (clean.indexOf("SIGHUP") !== -1 || clean.indexOf("reloading") !== -1 || clean.indexOf("Reloading") !== -1) {
       category = "SYS"
       badgeColor = "#94A3B8"
@@ -506,16 +548,27 @@ Panel {
 
     root.recentEventCount++
 
-    if (parsed.category === "INJECT") root.countInjected++
-    else if (parsed.category === "DNS") root.countDns++
-    else if (parsed.category === "QUIC") root.countQuic++
-    else if (parsed.category === "SHIELD") root.countShield++
-
     if (root.isStreamPaused) return
 
+    root.pendingStreamEvents.push(parsed)
+    if (!streamBatchTimer.running) {
+      streamBatchTimer.start()
+    }
+  }
+
+  function flushStreamBatch() {
+    if (root.pendingStreamEvents.length === 0) return
+
+    var batch = root.pendingStreamEvents
+    root.pendingStreamEvents = []
+
     var list = root.rawStreamEvents.slice()
-    list.push(parsed)
-    if (list.length > 500) list.shift()
+    for (var i = 0; i < batch.length; i++) {
+      list.push(batch[i])
+    }
+    if (list.length > 500) {
+      list = list.slice(list.length - 500)
+    }
     root.rawStreamEvents = list
 
     updateDisplayEvents()
@@ -565,15 +618,14 @@ Panel {
   }
 
   function clearStream() {
+    root.pendingStreamEvents = []
+    streamBatchTimer.stop()
     root.rawStreamEvents = []
     root.displayEvents = []
-    root.countInjected = 0
-    root.countDns = 0
-    root.countQuic = 0
-    root.countShield = 0
     root.recentEventCount = 0
     root.eventRateText = "idle"
     root.copiedEventId = -1
+    root.selectedLogIndex = -1
     root.isAtBottom = true
   }
 
@@ -602,6 +654,23 @@ Panel {
   // background process execution controllers
   function refreshStatus() {
     if (!statusProc.running) statusProc.running = true
+    if (root.isRunning && root.activeStartTime === 0) refreshUptime()
+  }
+
+  function refreshUptime() {
+    if (!uptimeProc.running) uptimeProc.running = true
+  }
+
+  function formatUptime(sec) {
+    if (sec < 0) sec = 0
+    var m = Math.floor(sec / 60)
+    var s = sec % 60
+    var h = Math.floor(m / 60)
+    var d = Math.floor(h / 24)
+    if (d > 0) return d + "d " + (h % 24) + "h"
+    if (h > 0) return h + "h " + (m % 60) + "m"
+    if (m > 0) return m + "m " + s + "s"
+    return s + "s"
   }
 
   function loadConfig() {
@@ -735,6 +804,7 @@ Panel {
 
   function restartDaemon() {
     root.isBusy = true
+    root.lastDaemonAction = "restart"
     daemonActionProc.command = ["systemctl", "restart", "albus.service"]
     daemonActionProc.running = true
   }
@@ -768,6 +838,27 @@ Panel {
         var s = root.parseStatusJson(text)
         if (s) {
           root.isRunning = s.active
+        }
+      }
+    }
+  }
+
+  Process {
+    id: uptimeProc
+    command: ["systemctl", "show", "albus.service", "--property=ActiveEnterTimestamp", "--value"]
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var clean = text ? text.trim() : ""
+        var m = clean.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/)
+        if (m) {
+          var d = new Date(m[1] + "T" + m[2])
+          if (!isNaN(d.getTime())) {
+            root.activeStartTime = d.getTime()
+            var diffSec = Math.max(0, Math.floor((Date.now() - root.activeStartTime) / 1000))
+            root.serviceUptime = root.formatUptime(diffSec)
+          }
         }
       }
     }
@@ -883,8 +974,14 @@ Panel {
     running: false
     onExited: function(code) {
       root.isBusy = false
+      root.activeStartTime = 0
       root.refreshStatus()
+      root.refreshUptime()
       root.loadConfig()
+      if (root.lastDaemonAction === "restart") {
+        root.showToast("Service restarted")
+      }
+      root.lastDaemonAction = ""
     }
   }
 
@@ -904,7 +1001,7 @@ Panel {
   Process {
     id: streamProc
     command: ["journalctl", "-u", "albus.service", "-n", "200", "-f", "--no-pager", "-o", "cat"]
-    running: root.opened && root.activeTab === 1
+    running: root.opened
     stdout: SplitParser {
       onRead: function(line) {
         root.appendStreamEvent(line)
@@ -937,7 +1034,13 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.selectedLogIndex !== -1) {
+          root.selectedLogIndex = -1
+        } else {
+          root.close()
+        }
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       onTextKey: function(t) {
@@ -988,7 +1091,7 @@ Panel {
 
               Row {
                 spacing: Style.space(6)
-                height: Math.max(albusTitle.implicitHeight, statusText.implicitHeight)
+                height: Math.max(albusTitle.implicitHeight, statusPill.height)
 
                 Text {
                   id: albusTitle
@@ -1000,20 +1103,49 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                 }
 
-                Text {
-                  id: statusText
-                  text: root.isRunning ? "● ACTIVE" : "○ STANDBY"
-                  font.family: "monospace"
-                  font.pixelSize: Style.font.caption - 1
-                  font.bold: true
-                  color: root.isRunning ? "#10B981" : root.dim
+                Rectangle {
+                  id: statusPill
                   anchors.verticalCenter: parent.verticalCenter
+                  height: Style.space(18)
+                  width: statusRow.implicitWidth + Style.space(10)
+                  radius: Style.cornerRadius
+                  color: root.isRunning ? Qt.rgba(0.06, 0.72, 0.51, 0.12) : Qt.rgba(1, 1, 1, 0.04)
+                  border.color: root.isRunning ? Qt.rgba(0.06, 0.72, 0.51, 0.28) : Qt.rgba(1, 1, 1, 0.08)
+                  border.width: 1
+
+                  Row {
+                    id: statusRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+
+                    Rectangle {
+                      width: 5
+                      height: 5
+                      radius: 2.5
+                      color: root.isRunning ? "#10B981" : root.dim
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      id: statusText
+                      text: root.isRunning ? "ACTIVE" : "STANDBY"
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption - 2
+                      font.bold: true
+                      color: root.isRunning ? "#10B981" : root.dim
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
                 }
               }
 
               Text {
                 width: parent.width
-                text: root.isBusy ? "Applying rules..." : (root.isRunning ? ("eBPF sock_ops • ML-KEM-768 • " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent")) : "Engine is offline")
+                text: root.isBusy
+                  ? "Applying rules..."
+                  : (root.isRunning
+                      ? ((root.serviceUptime !== "" ? ("Uptime " + root.serviceUptime + " · ") : "") + "eBPF sock_ops · ML-KEM-768 · " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent"))
+                      : "Engine is offline")
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption - 1
                 color: root.dim
@@ -1058,11 +1190,12 @@ Panel {
                   height: parent.height
                   radius: Style.cornerRadius > 0 ? Style.cornerRadius - 1 : 0
                   readonly property bool isSelected: root.activeTab === modelData.index
-                  color: isSelected ? Qt.rgba(1, 1, 1, 0.10) : (mainTabMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent")
-                  border.color: isSelected ? Qt.rgba(1, 1, 1, 0.22) : "transparent"
+                  color: isSelected ? Qt.rgba(1, 1, 1, 0.12) : (mainTabMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.05) : "transparent")
+                  border.color: isSelected ? Qt.rgba(1, 1, 1, 0.20) : "transparent"
                   border.width: isSelected ? 1 : 0
 
                   Behavior on color { ColorAnimation { duration: 90 } }
+                  Behavior on border.color { ColorAnimation { duration: 90 } }
 
                   MouseArea {
                     id: mainTabMouse
@@ -1072,14 +1205,28 @@ Panel {
                     onClicked: root.activeTab = modelData.index
                   }
 
-                  Text {
+                  Row {
                     anchors.centerIn: parent
-                    text: modelData.label
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption - 1
-                    font.bold: mainTabPill.isSelected
-                    color: mainTabPill.isSelected ? root.foreground : root.dim
-                    textFormat: Text.PlainText
+                    spacing: Style.space(5)
+
+                    Text {
+                      text: modelData.label
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption - 1
+                      font.bold: mainTabPill.isSelected
+                      color: mainTabPill.isSelected ? root.foreground : root.dim
+                      textFormat: Text.PlainText
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Rectangle {
+                      visible: modelData.index === 1 && root.isRunning
+                      width: 5
+                      height: 5
+                      radius: 2.5
+                      color: "#10B981"
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
                   }
                 }
               }
@@ -1112,7 +1259,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "UPSTREAM RESOLVER"
-                subtitle: root.activeDnsLabel + (root.activeDnsKey.indexOf("mullvad") !== -1 ? " (" + root.mullvadProfile + ")" : "") + (root.dnsRacingEnabled ? " • Racing" : "")
+                subtitle: root.activeDnsLabel + (root.activeDnsKey.indexOf("mullvad") !== -1 ? " · " + root.mullvadProfile : "") + (root.dnsRacingEnabled ? " · Racing" : "")
                 sectionKey: "upstream"
               }
 
@@ -1211,7 +1358,7 @@ Panel {
                     spacing: Style.space(4)
 
                     PanelSectionHeader {
-                      text: "MULLVAD BLOCKER PROFILE"
+                      text: "Mullvad Filter Profile"
                       foreground: root.foreground
                       fontFamily: root.fontFamily
                     }
@@ -1227,6 +1374,8 @@ Panel {
                         selected: root.mullvadProfile === "standard"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "standard"
                           root.activeDnsKey = "mullvad"
@@ -1240,6 +1389,8 @@ Panel {
                         selected: root.mullvadProfile === "adblock"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "adblock"
                           root.activeDnsKey = "mullvad-adblock"
@@ -1253,6 +1404,8 @@ Panel {
                         selected: root.mullvadProfile === "base"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "base"
                           root.activeDnsKey = "mullvad-base"
@@ -1266,6 +1419,8 @@ Panel {
                         selected: root.mullvadProfile === "extended"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "extended"
                           root.activeDnsKey = "mullvad-extended"
@@ -1279,6 +1434,8 @@ Panel {
                         selected: root.mullvadProfile === "family"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "family"
                           root.activeDnsKey = "mullvad-family"
@@ -1292,6 +1449,8 @@ Panel {
                         selected: root.mullvadProfile === "all"
                         bordered: true
                         fontSize: Style.font.caption - 1
+                        verticalPadding: Style.space(3)
+                        horizontalPadding: Style.space(4)
                         onClicked: {
                           root.mullvadProfile = "all"
                           root.activeDnsKey = "mullvad-all"
@@ -1307,7 +1466,7 @@ Panel {
                     visible: root.activeDnsKey === "custom"
                     spacing: Style.space(4)
 
-                    Text { text: "Endpoint URL or DNS Stamp (sdns://...)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                    Text { text: "DoH Endpoint URL or DNS Stamp"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
                       placeholderText: "https://doh.example.com/dns-query or sdns://..."
@@ -1325,7 +1484,7 @@ Panel {
                       Column {
                         width: (parent.width - Style.space(6)) / 2
                         spacing: 2
-                        Text { text: "Bootstrap IP 1"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                        Text { text: "Bootstrap IP (Primary)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                         TextField {
                           width: parent.width
                           placeholderText: "e.g. 45.90.28.0"
@@ -1343,7 +1502,7 @@ Panel {
                       Column {
                         width: (parent.width - Style.space(6)) / 2
                         spacing: 2
-                        Text { text: "Bootstrap IP 2"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                        Text { text: "Bootstrap IP (Secondary)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                         TextField {
                           width: parent.width
                           placeholderText: "e.g. 45.90.30.0"
@@ -1375,8 +1534,8 @@ Panel {
                       width: parent.width
 
                       CompactToggle {
-                        label: "Happy Eyeballs DNS Racing"
-                        description: "Concurrent upstream racing across top resolvers for minimal latency"
+                        label: "DNS Racing (Happy Eyeballs)"
+                        description: "Race queries across top resolvers concurrently for lowest latency"
                         checked: root.dnsRacingEnabled
                         showDivider: false
                         onClicked: {
@@ -1391,7 +1550,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "DPI EVASION"
-                subtitle: "MSS " + root.customMss + " • " + (root.fakeBadChecksum ? "0xDEAD • " : "") + (root.blockQuicEnabled ? "No-QUIC" : "QUIC")
+                subtitle: ["MSS " + root.customMss, root.fakeBadChecksum ? "Desync" : "", root.blockQuicEnabled ? "No-QUIC" : ""].filter(Boolean).join(" · ")
                 sectionKey: "dpi"
               }
 
@@ -1453,7 +1612,7 @@ Panel {
                     Column {
                       width: (parent.width - Style.space(12)) / 3
                       spacing: 2
-                      Text { text: "TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                      Text { text: "Fake TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                       TextField {
                         width: parent.width
                         text: root.customFakeTtl
@@ -1472,11 +1631,11 @@ Panel {
                   Column {
                     width: parent.width
                     spacing: 2
-                    Text { text: "Fake SNI (Pool / Custom)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                    Text { text: "Decoy SNI Domain"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
                       text: root.customFakeSni
-                      placeholderText: "Default pool (rotating)"
+                      placeholderText: "Default rotating pool"
                       font.family: "monospace"
                       font.pixelSize: Style.font.caption
                       accent: "#10B981"
@@ -1502,8 +1661,8 @@ Panel {
                       width: parent.width
 
                       CompactToggle {
-                        label: "Bad checksum desync (0xDEAD)"
-                        description: "Poison stateful DPI inspection tables"
+                        label: "TCP Checksum Desync"
+                        description: "Invalidate TCP checksums on decoy packets to evade DPI"
                         checked: root.fakeBadChecksum
                         onClicked: {
                           root.fakeBadChecksum = !root.fakeBadChecksum
@@ -1513,7 +1672,7 @@ Panel {
 
                       CompactToggle {
                         label: "Block QUIC (UDP 443)"
-                        description: "Force browser HTTPS fallback to TCP"
+                        description: "Force browser HTTPS fallback to inspectable TCP"
                         checked: root.blockQuicEnabled
                         onClicked: {
                           root.blockQuicEnabled = !root.blockQuicEnabled
@@ -1523,7 +1682,7 @@ Panel {
 
                       CompactToggle {
                         label: "Block WebRTC STUN"
-                        description: "Drop UDP 3478/5349 to prevent browser IP leaks"
+                        description: "Prevent real IP leaks via browser WebRTC (UDP 3478/5349)"
                         checked: root.blockStunEnabled
                         showDivider: false
                         onClicked: {
@@ -1538,7 +1697,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "SECURITY POLICIES"
-                subtitle: (root.dnssecEnabled ? "DNSSEC • " : "") + (root.pqcEnabled ? "PQC • " : "") + (root.killSwitchEnabled ? "Kill-Switch" : "")
+                subtitle: [root.dnssecEnabled ? "DNSSEC" : "", root.pqcEnabled ? "PQC" : "", root.killSwitchEnabled ? "Kill-Switch" : "", root.networkLockdownEnabled ? "Lockdown" : ""].filter(Boolean).join(" · ")
                 sectionKey: "security"
               }
 
@@ -1574,8 +1733,8 @@ Panel {
                       width: parent.width
 
                       CompactToggle {
-                        label: "DNSSEC cryptographic validation"
-                        description: "Enforce DO-bit & Authenticated Data verification"
+                        label: "DNSSEC Validation"
+                        description: "Cryptographically verify DNS records against tampering"
                         checked: root.dnssecEnabled
                         onClicked: {
                           root.dnssecEnabled = !root.dnssecEnabled
@@ -1584,8 +1743,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Post-Quantum Kyber768 (PQC)"
-                        description: "Hybrid ML-KEM-768 quantum-safe key exchange"
+                        label: "Quantum-Safe Encryption (PQC)"
+                        description: "Hybrid ML-KEM-768 post-quantum key exchange for DoH"
                         checked: root.pqcEnabled
                         onClicked: {
                           root.pqcEnabled = !root.pqcEnabled
@@ -1594,8 +1753,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Strict DNS Kill-Switch"
-                        description: "Block non-loopback plaintext port 53 DNS leaks"
+                        label: "DNS Leak Kill-Switch"
+                        description: "Block unencrypted plaintext port 53 DNS leaks"
                         checked: root.killSwitchEnabled
                         onClicked: {
                           root.killSwitchEnabled = !root.killSwitchEnabled
@@ -1604,8 +1763,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Fail-Closed Network Lockdown"
-                        description: "Block outbound web traffic (ports 80/443) if eBPF fails"
+                        label: "Fail-Closed Protection"
+                        description: "Block outbound web traffic if bypass engine stops unexpectedly"
                         checked: root.networkLockdownEnabled
                         onClicked: {
                           root.networkLockdownEnabled = !root.networkLockdownEnabled
@@ -1614,8 +1773,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Filter AAAA (IPv6 drop)"
-                        description: "Prevent unfragmented IPv6 inspection bypass leaks"
+                        label: "IPv6 Leak Prevention"
+                        description: "Filter AAAA queries to avoid unbypassed IPv6 traffic leaks"
                         checked: root.blockIpv6Enabled
                         onClicked: {
                           root.blockIpv6Enabled = !root.blockIpv6Enabled
@@ -1624,8 +1783,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Only-RAM volatile storage"
-                        description: "Isolate state in volatile memory /run (wipes settings on reboot)"
+                        label: "Ephemeral RAM-Only Storage"
+                        description: "Store state in RAM; reset all configuration upon reboot"
                         checked: root.ramOnlyEnabled
                         showDivider: false
                         onClicked: {
@@ -1640,7 +1799,7 @@ Panel {
 
               AccordionSectionHeader {
                 title: "HARDENED DNS & FILTERS"
-                subtitle: (root.odohEnabled ? "ODoH • " : "") + (root.blocklistEnabled ? "Blocklist • " : "") + (root.localDohEnabled ? "Local DoH • " : "") + (root.tcpListenerEnabled ? "TCP:53" : "")
+                subtitle: [root.blocklistEnabled ? "Blocklist" : "", root.antiRebindingEnabled ? "Shield" : "", root.odohEnabled ? "ODoH" : "", root.localDohEnabled ? "Local DoH" : ""].filter(Boolean).join(" · ")
                 sectionKey: "dns"
               }
 
@@ -1677,7 +1836,7 @@ Panel {
 
                       CompactToggle {
                         label: "Local TCP Port 53 Listener"
-                        description: "RFC 7766 length-prefixed framing and pipelining"
+                        description: "Accept standard DNS queries locally over TCP"
                         checked: root.tcpListenerEnabled
                         onClicked: {
                           root.tcpListenerEnabled = !root.tcpListenerEnabled
@@ -1696,8 +1855,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Dynamic Network Monitor (Netmon)"
-                        description: "Live interface and routing transitions monitor"
+                        label: "Network Interface Monitor"
+                        description: "Automatically adapt routing on network interface changes"
                         checked: root.netmonEnabled
                         showDivider: false
                         onClicked: {
@@ -1744,7 +1903,7 @@ Panel {
 
                       CompactToggle {
                         label: "Oblivious DoH (RFC 9230)"
-                        description: "Decouple client IP from DNS via HPKE proxy relay"
+                        description: "Hide client IP from DNS resolver via proxy relay"
                         checked: root.odohEnabled
                         showDivider: root.odohEnabled
                         onClicked: {
@@ -1763,7 +1922,7 @@ Panel {
                         rightPadding: Style.space(8)
 
                         Text {
-                          text: "ODoH Relay Proxy URL (Intermediary)"
+                          text: "ODoH Relay Proxy URL"
                           color: root.dim
                           font.pixelSize: Style.font.caption - 1
                           font.family: root.fontFamily
@@ -1782,7 +1941,7 @@ Panel {
                         }
 
                         Text {
-                          text: "ODoH Target Resolver URL (Decryption Endpoint)"
+                          text: "ODoH Target Resolver URL"
                           color: root.dim
                           font.pixelSize: Style.font.caption - 1
                           font.family: root.fontFamily
@@ -1883,8 +2042,8 @@ Panel {
                       width: parent.width
 
                       CompactToggle {
-                        label: "Structured Query Audit Log"
-                        description: "Asynchronous rotating TSV query logger"
+                        label: "DNS Query Audit Log"
+                        description: "Write DNS queries to a local rotating log file"
                         checked: root.queryLogEnabled
                         onClicked: {
                           root.queryLogEnabled = !root.queryLogEnabled
@@ -1893,8 +2052,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "EDNS0 Padding (RFC 8467)"
-                        description: "Discretize encrypted query lengths against analysis"
+                        label: "EDNS0 Request Padding"
+                        description: "Pad query sizes to prevent traffic size analysis"
                         checked: root.ednsPaddingEnabled
                         showDivider: false
                         onClicked: {
@@ -1955,8 +2114,8 @@ Panel {
                       width: parent.width
 
                       CompactToggle {
-                        label: "Threat Blocklist"
-                        description: "HaGeZi Multi PRO + TIF in-memory Bloom filter"
+                        label: "Threat & Ad Blocklist"
+                        description: "In-memory HaGeZi Multi PRO + TIF Bloom filter"
                         checked: root.blocklistEnabled
                         onClicked: {
                           root.blocklistEnabled = !root.blocklistEnabled
@@ -1966,7 +2125,7 @@ Panel {
 
                       CompactToggle {
                         label: "Anti-DNS Rebinding Shield"
-                        description: "Drop responses resolving to RFC 1918 private IPs"
+                        description: "Block responses resolving to private LAN IP addresses"
                         checked: root.antiRebindingEnabled
                         onClicked: {
                           root.antiRebindingEnabled = !root.antiRebindingEnabled
@@ -1986,7 +2145,7 @@ Panel {
 
                       CompactToggle {
                         label: "CNAME / HTTPS Uncloaking"
-                        description: "Inspect canonical name targets against blocklist"
+                        description: "Inspect canonical alias targets against blocklist"
                         checked: root.uncloakCnamesEnabled
                         onClicked: {
                           root.uncloakCnamesEnabled = !root.uncloakCnamesEnabled
@@ -1995,8 +2154,8 @@ Panel {
                       }
 
                       CompactToggle {
-                        label: "Block Undelegated & Dotless"
-                        description: "Sinkhole .local, .lan, and single-label queries"
+                        label: "Block Undelegated Domains"
+                        description: "Sinkhole .local, .lan, and dotless query names"
                         checked: root.blockUndelegatedEnabled
                         onClicked: {
                           root.blockUndelegatedEnabled = !root.blockUndelegatedEnabled
@@ -2006,7 +2165,7 @@ Panel {
 
                       CompactToggle {
                         label: "DNS64 IPv6 Synthesis"
-                        description: "Synthesize RFC 6052 AAAA records for IPv4 hosts"
+                        description: "Synthesize IPv6 addresses for IPv4-only hosts"
                         checked: root.dns64Enabled
                         showDivider: false
                         onClicked: {
@@ -2016,28 +2175,6 @@ Panel {
                       }
                     }
                   }
-                }
-              }
-
-              // operational triggers
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-
-                Button {
-                  width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Restart Service"
-                  bordered: true
-                  fontSize: Style.font.caption
-                  onClicked: root.restartDaemon()
-                }
-
-                Button {
-                  width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Flush Cache"
-                  bordered: true
-                  fontSize: Style.font.caption
-                  onClicked: root.purgeDnsCache()
                 }
               }
             }
@@ -2054,86 +2191,51 @@ Panel {
                 NumberAnimation { duration: 160; easing.type: Easing.OutQuad }
               }
 
-              // telemetry counters header (4 interactive metric cards)
-              Row {
+              // search input
+              Item {
                 width: parent.width
-                spacing: Style.space(4)
+                implicitHeight: searchField.implicitHeight
 
-                Repeater {
-                  model: [
-                    { key: "INJECT", label: "Injected", count: root.countInjected, color: "#38BDF8" },
-                    { key: "DNS",    label: "DoH Resolv", count: root.countDns,      color: "#A855F7" },
-                    { key: "QUIC",   label: "QUIC Block", count: root.countQuic,     color: "#F59E0B" },
-                    { key: "SHIELD", label: "Shield",     count: root.countShield,   color: "#10B981" }
-                  ]
-
-                  Rectangle {
-                    id: metricCard
-                    width: (mainColumn.width - Style.space(12)) / 4
-                    height: Style.space(38)
-                    radius: Style.cornerRadius
-                    readonly property color cardCol: modelData.color
-                    readonly property bool isSelected: root.streamFilter === modelData.key
-                    color: isSelected 
-                      ? Qt.rgba(cardCol.r, cardCol.g, cardCol.b, 0.16)
-                      : (cardMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(1, 1, 1, 0.02))
-                    border.color: isSelected 
-                      ? cardCol 
-                      : (cardMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : root.borderMuted)
-                    border.width: isSelected ? 1.5 : 1
-
-                    Behavior on color { ColorAnimation { duration: 90 } }
-                    Behavior on border.color { ColorAnimation { duration: 90 } }
-
-                    MouseArea {
-                      id: cardMouse
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        if (root.streamFilter === modelData.key) {
-                          root.setFilter("ALL")
-                        } else {
-                          root.setFilter(modelData.key)
-                        }
-                      }
-                    }
-
-                    ColumnLayout {
-                      anchors.centerIn: parent
-                      spacing: 0
-
-                      Text {
-                        text: String(modelData.count)
-                        font.bold: true
-                        font.family: "monospace"
-                        font.pixelSize: Style.font.bodySmall
-                        color: modelData.color
-                        Layout.alignment: Qt.AlignHCenter
-                      }
-
-                      Text {
-                        text: modelData.label
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption - 2
-                        font.bold: metricCard.isSelected
-                        color: metricCard.isSelected ? root.foreground : root.dim
-                        Layout.alignment: Qt.AlignHCenter
-                      }
-                    }
+                TextField {
+                  id: searchField
+                  width: parent.width
+                  placeholderText: "Search domain (e.g. discord, chatgpt)..."
+                  text: root.streamSearchQuery
+                  font.pixelSize: Style.font.caption
+                  onTextChanged: {
+                    root.streamSearchQuery = text
+                    root.updateDisplayEvents()
                   }
                 }
-              }
 
-              // search input
-              TextField {
-                width: parent.width
-                placeholderText: "Search domain (e.g. discord, chatgpt)..."
-                text: root.streamSearchQuery
-                font.pixelSize: Style.font.caption
-                onTextChanged: {
-                  root.streamSearchQuery = text
-                  root.updateDisplayEvents()
+                Rectangle {
+                  id: clearSearchBtn
+                  visible: root.streamSearchQuery.length > 0
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(18)
+                  height: Style.space(18)
+                  radius: Style.cornerRadius
+                  color: clearSearchMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.12) : Qt.rgba(1, 1, 1, 0.04)
+
+                  MouseArea {
+                    id: clearSearchMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      searchField.text = ""
+                    }
+                  }
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "✕"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption - 2
+                    color: root.dim
+                  }
                 }
               }
 
@@ -2197,6 +2299,16 @@ Panel {
                     verticalPadding: Style.space(2)
                     onClicked: root.setFilter("SHIELD")
                   }
+
+                  Button {
+                    text: "Error"
+                    selected: root.streamFilter === "ERROR"
+                    bordered: true
+                    fontSize: Style.font.caption - 1
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    onClicked: root.setFilter("ERROR")
+                  }
                 }
 
                 Row {
@@ -2222,7 +2334,7 @@ Panel {
                       Rectangle {
                         width: 5
                         height: 5
-                        radius: 0
+                        radius: 2.5
                         anchors.verticalCenter: parent.verticalCenter
                         color: (root.isRunning && !root.isStreamPaused) ? "#10B981" : root.dim
                       }
@@ -2271,7 +2383,7 @@ Panel {
               // borderless terminal stream list with smart pinning
               BorderSurface {
                 width: parent.width
-                height: Style.space(330)
+                height: Style.space(370)
                 color: Style.normalFillFor(root.foreground, root.accent)
                 borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
                 radius: Style.cornerRadius
@@ -2279,11 +2391,12 @@ Panel {
 
                 ListView {
                   id: streamListView
+                  reuseItems: true
                   anchors.fill: parent
                   anchors.leftMargin: Style.space(6)
                   anchors.rightMargin: Style.space(6)
                   anchors.topMargin: Style.space(6)
-                  anchors.bottomMargin: Style.space(6)
+                  anchors.bottomMargin: logInspector.visible ? Style.space(38) : Style.space(6)
                   model: root.displayEvents
                   spacing: Style.space(3)
                   boundsBehavior: Flickable.StopAtBounds
@@ -2300,11 +2413,17 @@ Panel {
                     radius: Style.cornerRadius
                     readonly property color badgeCol: modelData.badgeColor
                     readonly property bool isCopied: root.copiedEventId === index
+                    readonly property bool isSelected: root.selectedLogIndex === index
                     color: isCopied
                       ? Qt.rgba(0.06, 0.72, 0.5, 0.16)
-                      : (eventMouse.containsMouse ? Style.hoverFillFor(root.foreground, modelData.badgeColor) : "transparent")
+                      : (isSelected
+                          ? Qt.rgba(1, 1, 1, 0.08)
+                          : (eventMouse.containsMouse ? Style.hoverFillFor(root.foreground, modelData.badgeColor) : "transparent"))
+                    border.color: isSelected ? Qt.rgba(1, 1, 1, 0.25) : "transparent"
+                    border.width: isSelected ? 1 : 0
 
                     Behavior on color { ColorAnimation { duration: 90 } }
+                    Behavior on border.color { ColorAnimation { duration: 90 } }
 
                     MouseArea {
                       id: eventMouse
@@ -2315,6 +2434,7 @@ Panel {
                         root.copyToClipboard(modelData.title + (modelData.tag ? " " + modelData.tag : ""))
                         root.copiedEventId = index
                         copiedFeedbackTimer.restart()
+                        root.selectedLogIndex = (root.selectedLogIndex === index ? -1 : index)
                       }
                     }
 
@@ -2326,7 +2446,7 @@ Panel {
 
                       // 1. Sleek category micro badge pill
                       Rectangle {
-                        implicitWidth: catText.implicitWidth + Style.space(8)
+                        Layout.preferredWidth: Style.space(48)
                         implicitHeight: Style.space(18)
                         radius: Style.cornerRadius
                         color: Qt.rgba(badgeCol.r, badgeCol.g, badgeCol.b, 0.14)
@@ -2366,6 +2486,7 @@ Panel {
                         color: root.dim
                         visible: eventCard.width > Style.space(340)
                         elide: Text.ElideRight
+                        Layout.maximumWidth: Style.space(130)
                       }
 
                       // 4. Tag pill (TTL, DNSSEC, 0ms Cache, etc.)
@@ -2391,6 +2512,8 @@ Panel {
 
                       // 5. Copied badge or Timestamp
                       Text {
+                        Layout.preferredWidth: Style.space(52)
+                        horizontalAlignment: Text.AlignRight
                         text: eventCard.isCopied ? "COPIED" : modelData.time
                         textFormat: Text.PlainText
                         font.family: "monospace"
@@ -2417,21 +2540,142 @@ Panel {
                   }
                 }
 
+                // Raw event inspector strip (appears when a log item is selected)
+                Rectangle {
+                  id: logInspector
+                  visible: root.selectedLogIndex >= 0 && root.selectedLogIndex < root.displayEvents.length
+                  anchors.bottom: parent.bottom
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.margins: Style.space(6)
+                  height: Style.space(28)
+                  color: Qt.rgba(0.06, 0.06, 0.08, 0.96)
+                  border.color: Qt.rgba(1, 1, 1, 0.18)
+                  border.width: 1
+                  radius: Style.cornerRadius
+                  z: 15
+
+                  RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    spacing: Style.space(6)
+
+                    Rectangle {
+                      Layout.preferredWidth: Style.space(34)
+                      implicitHeight: Style.space(18)
+                      radius: Style.cornerRadius
+                      color: Qt.rgba(0.22, 0.74, 0.97, 0.15)
+                      border.color: Qt.rgba(0.22, 0.74, 0.97, 0.35)
+                      border.width: 1
+                      Layout.alignment: Qt.AlignVCenter
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: "RAW"
+                        font.family: "monospace"
+                        font.pixelSize: Style.font.caption - 2
+                        font.bold: true
+                        color: "#38BDF8"
+                      }
+                    }
+
+                    Text {
+                      Layout.fillWidth: true
+                      text: (root.selectedLogIndex >= 0 && root.selectedLogIndex < root.displayEvents.length)
+                        ? root.displayEvents[root.selectedLogIndex].raw
+                        : ""
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption - 2
+                      color: root.foreground
+                      elide: Text.ElideMiddle
+                      textFormat: Text.PlainText
+                      Layout.alignment: Qt.AlignVCenter
+                    }
+
+                    Rectangle {
+                      height: Style.space(18)
+                      width: copyRawText.implicitWidth + Style.space(10)
+                      radius: Style.cornerRadius - 2
+                      color: copyRawMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.14) : Qt.rgba(1, 1, 1, 0.06)
+                      border.color: Qt.rgba(1, 1, 1, 0.12)
+                      border.width: 1
+                      Layout.alignment: Qt.AlignVCenter
+
+                      MouseArea {
+                        id: copyRawMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          if (root.selectedLogIndex >= 0 && root.selectedLogIndex < root.displayEvents.length) {
+                            root.copyToClipboard(root.displayEvents[root.selectedLogIndex].raw)
+                          }
+                        }
+                      }
+
+                      Text {
+                        id: copyRawText
+                        anchors.centerIn: parent
+                        text: "Copy"
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption - 2
+                        font.bold: true
+                        color: root.foreground
+                      }
+                    }
+
+                    Rectangle {
+                      height: Style.space(18)
+                      width: Style.space(18)
+                      radius: Style.cornerRadius - 2
+                      color: closeInspMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.14) : "transparent"
+                      Layout.alignment: Qt.AlignVCenter
+
+                      MouseArea {
+                        id: closeInspMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          root.selectedLogIndex = -1
+                        }
+                      }
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: "✕"
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption - 2
+                        color: root.dim
+                      }
+                    }
+                  }
+                }
+
                 // Floating Jump to latest button when user scrolls up
                 Rectangle {
+                  id: jumpBtn
                   visible: !root.isAtBottom && root.displayEvents.length > 0
                   anchors.bottom: parent.bottom
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  anchors.bottomMargin: Style.space(8)
+                  anchors.right: parent.right
+                  anchors.bottomMargin: logInspector.visible ? Style.space(42) : Style.space(8)
+                  anchors.rightMargin: Style.space(10)
                   width: jumpText.implicitWidth + Style.space(16)
                   height: Style.space(22)
                   radius: Style.cornerRadius
-                  color: Qt.rgba(0.08, 0.08, 0.10, 0.95)
-                  border.color: root.borderMuted
+                  color: jumpMouse.containsMouse ? Qt.rgba(0.12, 0.12, 0.16, 0.96) : Qt.rgba(0.06, 0.06, 0.08, 0.90)
+                  border.color: jumpMouse.containsMouse ? "#38BDF8" : Qt.rgba(1, 1, 1, 0.16)
                   border.width: 1
+                  z: 10
+
+                  Behavior on color { ColorAnimation { duration: 90 } }
+                  Behavior on border.color { ColorAnimation { duration: 90 } }
 
                   MouseArea {
+                    id: jumpMouse
                     anchors.fill: parent
+                    hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
                       streamListView.positionViewAtEnd()
@@ -2442,7 +2686,7 @@ Panel {
                   Text {
                     id: jumpText
                     anchors.centerIn: parent
-                    text: "Jump to latest"
+                    text: "↓ Latest"
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption - 1
                     font.bold: true
@@ -2482,7 +2726,7 @@ Panel {
               id: leftHint
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              text: "1-2 tabs • space toggle"
+              text: "1-2 tabs · space toggle"
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption - 1
               color: root.dim
@@ -2492,7 +2736,7 @@ Panel {
               id: rightHint
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              text: "p pause • j/k scroll • esc close"
+              text: "p pause · j/k scroll · esc close"
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption - 1
               color: root.dim

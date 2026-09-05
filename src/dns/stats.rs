@@ -75,11 +75,21 @@ impl DnsStats {
 
         if let Some(parent) = path.as_ref().parent() {
             let _ = fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+            }
         }
 
         // atomic write via temporary file
         let tmp_path = format!("{}.tmp.{}", path.as_ref().display(), std::process::id());
         fs::write(&tmp_path, json.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644));
+        }
         let res = fs::rename(&tmp_path, path);
         if res.is_err() {
             let _ = fs::remove_file(&tmp_path);
