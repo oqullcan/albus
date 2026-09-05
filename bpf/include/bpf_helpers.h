@@ -20,6 +20,13 @@ BPF_HELPER(__u64, get_socket_cookie, (void *ctx), 46);
 BPF_HELPER(long, setsockopt, (struct bpf_sock_ops *skops, int level, int optname, void *optval, int optlen), 49);
 BPF_HELPER(long, sock_ops_cb_flags_set, (struct bpf_sock_ops *skops, int flags), 59);
 BPF_HELPER(long, reserve_hdr_opt, (struct bpf_sock_ops *skops, __u32 len, __u32 flags), 144);
+BPF_HELPER(long, trace_printk, (const char *fmt, __u32 fmt_size, ...), 6);
+
+#define bpf_printk(fmt, ...)                                    \
+({                                                              \
+    char ____fmt[] = fmt;                                      \
+    bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__);  \
+})
 
 /* SockOps program success return value */
 #define BPF_OK 1

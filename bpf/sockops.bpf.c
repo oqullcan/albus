@@ -115,6 +115,9 @@ static inline int handle_established(struct bpf_sock_ops *skops, struct albus_co
         }
     }
 
+    // Verified on Linux kernel 7.1.9-arch1-2 (and 5.10+): skops->remote_port is a __u32
+    // stored in network byte order; bpf_ntohl(skops->remote_port) yields the host port in
+    // the lower 16 bits. Live trace and perf events confirm dst_port == 443.
     __u16 dst_port = (__u16)bpf_ntohl(skops->remote_port);
     __u8 *is_target = bpf_map_lookup_elem(&target_ports, &dst_port);
     if (!is_target) {

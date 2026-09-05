@@ -55,6 +55,17 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
     let exec_start = format!("{} run", exe_str);
     let exec_stop = format!("{} cleanup", exe_str);
 
+    let env_user_line = if let Ok(user) = std::env::var("SUDO_USER") {
+        let trimmed = user.trim();
+        if !trimmed.is_empty() && trimmed != "root" {
+            format!("Environment=ALBUS_CONFIG_USER={}\n", trimmed)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     // format systemd service specification
     let unit_content = format!(
         r#"[Unit]
@@ -65,7 +76,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exec_start}
+EnvironmentFile=-/etc/albus/albus.env
+{env_user_line}ExecStart={exec_start}
 ExecReload=/bin/kill -s HUP $MAINPID
 ExecStopPost={exec_stop}
 Restart=always

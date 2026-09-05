@@ -195,46 +195,69 @@ fn is_valid_username(username: &str) -> bool {
     bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-// safely resolves the home directory of SUDO_USER validating format and passwd entry
-fn get_sudo_user_home() -> Option<PathBuf> {
-    let sudo_user = std::env::var("SUDO_USER").ok()?;
-
-    // 1. Validate username format (standard POSIX / Linux username conventions)
-    if !is_valid_username(&sudo_user) {
-        return None;
-    }
-
-    // 2. Query system user database via libc::getpwnam
+// safely resolves the user info (uid, home) from ALBUS_CONFIG_USER environment variable
+pub fn get_configured_user_info() -> Option<(libc::uid_t, PathBuf)> {
     #[cfg(unix)]
     {
+        if let Ok(user) = std::env::var("ALBUS_CONFIG_USER") {
+            let user = user.trim();
+            if is_valid_username(user) {
+                if let Ok(c_user) = std::ffi::CString::new(user) {
+                    let pwd = unsafe { libc::getpwnam(c_user.as_ptr()) };
+                    if !pwd.is_null() {
+                        let uid = unsafe { (*pwd).pw_uid };
+                        let dir_cstr = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_dir) };
+                        if let Ok(dir_str) = dir_cstr.to_str() {
+                            let home_path = PathBuf::from(dir_str);
+                            if home_path.is_absolute() && !dir_str.contains('\0') {
+                                return Some((uid, home_path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// safely resolves the sudo caller's user info (uid, home) with format and passwd validation
+pub fn get_sudo_user_info() -> Option<(libc::uid_t, PathBuf)> {
+    #[cfg(unix)]
+    {
+        let sudo_user = std::env::var("SUDO_USER").ok()?;
+        if !is_valid_username(&sudo_user) {
+            return None;
+        }
         let c_user = std::ffi::CString::new(sudo_user).ok()?;
         let pwd = unsafe { libc::getpwnam(c_user.as_ptr()) };
         if pwd.is_null() {
             return None;
         }
-
-        // 3. Cross-check SUDO_UID if present
+        let uid = unsafe { (*pwd).pw_uid };
         if let Ok(uid_str) = std::env::var("SUDO_UID") {
             if let Ok(expected_uid) = uid_str.trim().parse::<libc::uid_t>() {
-                if unsafe { (*pwd).pw_uid } != expected_uid {
+                if uid != expected_uid {
                     return None;
                 }
             }
         }
-
-        // 4. Extract canonical home directory path from passwd
         let dir_cstr = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_dir) };
         let dir_str = dir_cstr.to_str().ok()?;
         let home_path = PathBuf::from(dir_str);
-
         if home_path.is_absolute() && !dir_str.contains('\0') {
-            Some(home_path)
+            Some((uid, home_path))
         } else {
             None
         }
     }
     #[cfg(not(unix))]
     None
+}
+
+// safely resolves the home directory of SUDO_USER validating format and passwd entry
+pub fn get_sudo_user_home() -> Option<PathBuf> {
+    get_sudo_user_info().map(|(_, home)| home)
 }
 
 #[cfg(unix)]
@@ -312,6 +335,57 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// validates file ownership against strict security policies depending on execution context
+#[cfg(unix)]
+pub(crate) fn verify_file_ownership(
+    path: &Path,
+    current_uid: libc::uid_t,
+    file_uid: libc::uid_t,
+    is_system_path: bool,
+    trusted_uids: &[libc::uid_t],
+) -> std::io::Result<()> {
+    if current_uid == 0 {
+        // Root daemon execution context
+        if is_system_path {
+            if file_uid != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: system config {} owned by untrusted uid {}",
+                        path.display(),
+                        file_uid
+                    ),
+                ));
+            }
+        } else {
+            // Non-system path read by root: MUST belong to a trusted UID (root or explicitly configured user)
+            if !trusted_uids.contains(&file_uid) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: config {} owned by untrusted uid {} (allowed uids: {:?})",
+                        path.display(),
+                        file_uid,
+                        trusted_uids
+                    ),
+                ));
+            }
+        }
+    } else if file_uid != current_uid && file_uid != 0 {
+        // Non-root execution context: only allow current user or root files
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: config {} owned by untrusted uid {}",
+                path.display(),
+                file_uid
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 // safely reads content while atomically rejecting symlinks and enforcing strict ownership checks
 fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     let p = path.as_ref();
@@ -348,30 +422,19 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
         let file_uid = meta.uid();
         let current_uid = unsafe { libc::getuid() };
 
-        if current_uid == 0 {
-            if is_system_path {
-                if file_uid != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("security violation: system config {} owned by untrusted uid {}", p.display(), file_uid),
-                    ));
-                }
-            } else if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
-                if let Ok(sudo_uid) = sudo_uid_str.trim().parse::<libc::uid_t>() {
-                    if file_uid != 0 && file_uid != sudo_uid {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!("security violation: user config {} owned by untrusted uid {}", p.display(), file_uid),
-                        ));
-                    }
-                }
+        let mut trusted_uids = vec![0 as libc::uid_t];
+        if let Some((sudo_uid, _)) = get_sudo_user_info() {
+            if !trusted_uids.contains(&sudo_uid) {
+                trusted_uids.push(sudo_uid);
             }
-        } else if file_uid != current_uid && file_uid != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("security violation: config {} owned by untrusted uid {}", p.display(), file_uid),
-            ));
         }
+        if let Some((cfg_uid, _)) = get_configured_user_info() {
+            if !trusted_uids.contains(&cfg_uid) {
+                trusted_uids.push(cfg_uid);
+            }
+        }
+
+        verify_file_ownership(p, current_uid, file_uid, is_system_path, &trusted_uids)?;
     }
 
     use std::io::Read;
@@ -395,21 +458,30 @@ impl Config {
 
     // resolves durable persistent configuration path on physical disk (never returns volatile memory)
     pub fn default_config_path() -> PathBuf {
-        // 1. check sudo user environment with strict format and passwd validation
-        if let Some(sudo_home) = get_sudo_user_home() {
+        // 1. check explicit ALBUS_CONFIG_USER environment variable
+        if let Some((_uid, home)) = get_configured_user_info() {
+            let cfg = home.join(".config/albus/config.json");
+            if !cfg.starts_with("/root") {
+                return cfg;
+            }
+        }
+        // 2. check sudo user environment with strict format and passwd validation
+        if let Some((_uid, sudo_home)) = get_sudo_user_info() {
             let sudo_cfg = sudo_home.join(".config/albus/config.json");
             if !sudo_cfg.starts_with("/root") {
                 return sudo_cfg;
             }
         }
-        // 2. check current process home (for user-level execution)
-        if let Ok(home) = std::env::var("HOME") {
-            let user_cfg = PathBuf::from(&home).join(".config/albus/config.json");
-            if !user_cfg.starts_with("/root") {
-                return user_cfg;
+        // 3. check current process home (for user-level execution only)
+        if !crate::core::ebpf::is_root() {
+            if let Ok(home) = std::env::var("HOME") {
+                let user_cfg = PathBuf::from(&home).join(".config/albus/config.json");
+                if !user_cfg.starts_with("/root") {
+                    return user_cfg;
+                }
             }
         }
-        // 3. system-wide fallback (never arbitrarily guess a user from /home when root)
+        // 4. system-wide fallback (never arbitrarily guess a user from /home when root)
         PathBuf::from("/etc/albus/config.json")
     }
 
@@ -464,7 +536,7 @@ impl Config {
             }
         }
 
-        // 3. load from durable user configuration path on disk
+        // 3. load from default config path on disk (ALBUS_CONFIG_USER, SUDO_USER, $HOME if unprivileged, or /etc/albus/config.json)
         let path = Self::default_config_path();
         if path.exists() {
             if let Ok(cfg) = Self::load_from_file(&path) {
@@ -477,32 +549,6 @@ impl Config {
         if etc_path.exists() {
             if let Ok(cfg) = Self::load_from_file(&etc_path) {
                 return cfg;
-            }
-        }
-
-        // 5. if running as root system daemon, discover active desktop user runtime config (/run/user/*/albus/config.json)
-        if crate::core::ebpf::is_root() {
-            if let Ok(entries) = std::fs::read_dir("/run/user") {
-                for entry in entries.flatten() {
-                    let user_run_cfg = entry.path().join("albus/config.json");
-                    if user_run_cfg.exists() {
-                        if let Ok(cfg) = Self::load_from_file(&user_run_cfg) {
-                            return cfg;
-                        }
-                    }
-                }
-            }
-
-            // 6. also check user persistent configs (/home/*/.config/albus/config.json)
-            if let Ok(entries) = std::fs::read_dir("/home") {
-                for entry in entries.flatten() {
-                    let user_disk_cfg = entry.path().join(".config/albus/config.json");
-                    if user_disk_cfg.exists() {
-                        if let Ok(cfg) = Self::load_from_file(&user_disk_cfg) {
-                            return cfg;
-                        }
-                    }
-                }
             }
         }
 
@@ -554,5 +600,63 @@ mod tests {
         let _ = fs::remove_file(&symlink_file);
         let _ = fs::remove_file(&real_file);
         let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_file_ownership_verification() {
+        #[cfg(unix)]
+        {
+            let path = Path::new("/home/attacker/.config/albus/config.json");
+            let sys_path = Path::new("/etc/albus/config.json");
+
+            // Case 1: Root daemon reading /etc/albus/config.json owned by root (uid 0) -> ALLOWED
+            assert!(verify_file_ownership(sys_path, 0, 0, true, &[0]).is_ok());
+
+            // Case 2: Root daemon reading /etc/albus/config.json owned by attacker (uid 1001) -> FORBIDDEN
+            assert!(verify_file_ownership(sys_path, 0, 1001, true, &[0]).is_err());
+
+            // Case 3: Root daemon without SUDO_UID / ALBUS_CONFIG_USER reading user config owned by attacker -> FORBIDDEN
+            let res = verify_file_ownership(path, 0, 1001, false, &[0]);
+            assert!(res.is_err(), "Root daemon must reject untrusted user config without explicit trusted UID");
+            assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+
+            // Case 4: Root daemon with trusted user (uid 1000) reading trusted user config -> ALLOWED
+            assert!(verify_file_ownership(path, 0, 1000, false, &[0, 1000]).is_ok());
+
+            // Case 5: Root daemon with trusted user (uid 1000) reading attacker's config (uid 1001) -> FORBIDDEN
+            assert!(verify_file_ownership(path, 0, 1001, false, &[0, 1000]).is_err());
+
+            // Case 6: Unprivileged process (uid 1000) reading other user's file (uid 1001) -> FORBIDDEN
+            assert!(verify_file_ownership(path, 1000, 1001, false, &[1000]).is_err());
+
+            // Case 7: Unprivileged process (uid 1000) reading own file (uid 1000) -> ALLOWED
+            assert!(verify_file_ownership(path, 1000, 1000, false, &[1000]).is_ok());
+
+            // Case 8: Unprivileged process (uid 1000) reading root-owned template (uid 0) -> ALLOWED
+            assert!(verify_file_ownership(path, 1000, 0, false, &[1000]).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_root_does_not_load_untrusted_home_config() {
+        // Ensure no leftover environment variables interfere with test
+        let prev_sudo_user = std::env::var("SUDO_USER").ok();
+        let prev_sudo_uid = std::env::var("SUDO_UID").ok();
+        let prev_cfg_user = std::env::var("ALBUS_CONFIG_USER").ok();
+
+        std::env::remove_var("SUDO_USER");
+        std::env::remove_var("SUDO_UID");
+        std::env::remove_var("ALBUS_CONFIG_USER");
+
+        // When running as root without explicit user env, default_config_path must return /etc/albus/config.json
+        if crate::core::ebpf::is_root() {
+            let def_path = Config::default_config_path();
+            assert_eq!(def_path, PathBuf::from("/etc/albus/config.json"));
+        }
+
+        // Restore env vars
+        if let Some(v) = prev_sudo_user { std::env::set_var("SUDO_USER", v); }
+        if let Some(v) = prev_sudo_uid { std::env::set_var("SUDO_UID", v); }
+        if let Some(v) = prev_cfg_user { std::env::set_var("ALBUS_CONFIG_USER", v); }
     }
 }

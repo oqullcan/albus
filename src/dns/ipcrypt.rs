@@ -3,6 +3,7 @@
 //! transforms 32-bit ipv4 addresses into deterministic pseudo-ipv4 addresses using a 16-byte key,
 //! preventing client ip disclosure in dns audit logs while preserving analytical grouping.
 
+use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 
 pub struct IpCrypt {
@@ -14,13 +15,15 @@ impl IpCrypt {
         Self { key }
     }
 
-    // creates deterministic default key from arbitrary string / seed
+    /// Derives a deterministic 128-bit key from an arbitrary human-readable passphrase using SHA-256.
+    ///
+    /// This method is intended for configuration convenience, human-readable passphrases, and
+    /// deterministic testing. For production audit log pseudonymization where maximum security
+    /// and entropy are required, a random 16-byte hex key should be provided via [`IpCrypt::from_hex`].
     pub fn from_passphrase(passphrase: &str) -> Self {
-        let mut key = [0x5cu8; 16];
-        let bytes = passphrase.as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            key[i % 16] ^= b;
-        }
+        let hash = Sha256::digest(passphrase.as_bytes());
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&hash[..16]);
         Self { key }
     }
 
@@ -147,5 +150,28 @@ mod tests {
         let pass_crypt = IpCrypt::from_passphrase("albus-secret-audit-key");
         let pass_enc = pass_crypt.encrypt(ip);
         assert_eq!(pass_crypt.decrypt(pass_enc), ip);
+    }
+
+    #[test]
+    fn test_passphrase_derivation_deterministic() {
+        let crypt1 = IpCrypt::from_passphrase("albus-secret-audit-key");
+        let crypt2 = IpCrypt::from_passphrase("albus-secret-audit-key");
+        let crypt3 = IpCrypt::from_passphrase("different-passphrase");
+
+        // deterministic: same passphrase produces identical key and ciphertext
+        assert_eq!(crypt1.key, crypt2.key);
+        // different passphrase produces different key
+        assert_ne!(crypt1.key, crypt3.key);
+
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        let enc1 = crypt1.encrypt(ip);
+        let enc2 = crypt2.encrypt(ip);
+        let enc3 = crypt3.encrypt(ip);
+
+        assert_eq!(enc1, enc2);
+        assert_ne!(enc1, enc3);
+
+        assert_eq!(crypt1.decrypt(enc1), ip);
+        assert_eq!(crypt3.decrypt(enc3), ip);
     }
 }

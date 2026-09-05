@@ -34,7 +34,7 @@ fn main() {
         }
         _ => {
             // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
-            let fallback = PathBuf::from("bpf/sockops.bpf.o");
+            let fallback = env::current_dir().unwrap().join("bpf/sockops.bpf.o");
             if fallback.exists() {
                 println!("cargo:rustc-env=ALBUS_BPF_BYTECODE={}", fallback.to_str().unwrap());
             } else {

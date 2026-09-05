@@ -23,6 +23,10 @@ pub struct CompactNode {
     pub _padding: u16,
 }
 
+// safety limits to protect against unbounded allocations and DoS attacks via crafted cache files
+pub const MAX_BLOCKLIST_NODES: u32 = 10_000_000;
+pub const MAX_BLOCKLIST_LABELS_LEN: u32 = 128 * 1024 * 1024; // 128 MB maximum label string pool
+
 #[derive(Clone, Debug)]
 pub struct CompactBlocklist {
     pub labels: Vec<u8>,
@@ -126,6 +130,14 @@ impl CompactBlocklist {
     // deserializes compact blocklist from binary disk blob in < 1ms
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut file = fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+
+        // Binary header layout: 8B magic + 4B version + 8B total_domains + 4B labels_len + 4B nodes_len = 28B
+        const HEADER_LEN: u64 = 28;
+        if file_len < HEADER_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "blocklist binary file too short for header"));
+        }
+
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
         if &magic != b"ALBUSBLK" {
@@ -145,17 +157,44 @@ impl CompactBlocklist {
 
         let mut l_buf = [0u8; 4];
         file.read_exact(&mut l_buf)?;
-        let labels_len = u32::from_le_bytes(l_buf) as usize;
+        let labels_len_u32 = u32::from_le_bytes(l_buf);
+        if labels_len_u32 > MAX_BLOCKLIST_LABELS_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("blocklist labels length {} exceeds safety ceiling {}", labels_len_u32, MAX_BLOCKLIST_LABELS_LEN),
+            ));
+        }
+        let labels_len = labels_len_u32 as usize;
 
         let mut n_buf = [0u8; 4];
         file.read_exact(&mut n_buf)?;
-        let nodes_len = u32::from_le_bytes(n_buf) as usize;
+        let nodes_len_u32 = u32::from_le_bytes(n_buf);
+        if nodes_len_u32 > MAX_BLOCKLIST_NODES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("blocklist nodes count {} exceeds safety ceiling {}", nodes_len_u32, MAX_BLOCKLIST_NODES),
+            ));
+        }
+        let nodes_len = nodes_len_u32 as usize;
+
+        let node_size = std::mem::size_of::<CompactNode>();
+        let payload_len = (labels_len as u64).saturating_add((nodes_len as u64).saturating_mul(node_size as u64));
+        let remaining_file_len = file_len - HEADER_LEN;
+
+        if payload_len > remaining_file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "declared blocklist payload size ({} bytes) exceeds physical file bounds ({} bytes)",
+                    payload_len, remaining_file_len
+                ),
+            ));
+        }
 
         let mut labels = vec![0u8; labels_len];
         file.read_exact(&mut labels)?;
 
         let mut nodes = Vec::with_capacity(nodes_len);
-        let node_size = std::mem::size_of::<CompactNode>();
         let mut node_raw = vec![0u8; nodes_len * node_size];
         file.read_exact(&mut node_raw)?;
 
@@ -507,5 +546,59 @@ mod tests {
         assert!(!loaded.check("rust-lang.org"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_blocklist_load_rejects_oversized_allocation() {
+        let temp_dir = std::env::temp_dir();
+
+        // 1. File declaring nodes_len > MAX_BLOCKLIST_NODES (e.g. 50_000_000)
+        let path1 = temp_dir.join("test_oversized_nodes.bin");
+        {
+            let mut file = fs::File::create(&path1).unwrap();
+            file.write_all(b"ALBUSBLK").unwrap(); // magic (8B)
+            file.write_all(&1u32.to_le_bytes()).unwrap(); // version = 1 (4B)
+            file.write_all(&100u64.to_le_bytes()).unwrap(); // total_domains = 100 (8B)
+            file.write_all(&10u32.to_le_bytes()).unwrap(); // labels_len = 10 (4B)
+            file.write_all(&50_000_000u32.to_le_bytes()).unwrap(); // nodes_len = 50M (4B) > MAX_BLOCKLIST_NODES
+            file.sync_all().unwrap();
+        }
+        let res1 = CompactBlocklist::load_from_file(&path1);
+        assert!(res1.is_err());
+        assert_eq!(res1.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path1);
+
+        // 2. File declaring nodes_len within ceiling, but payload exceeds physical file size
+        let path2 = temp_dir.join("test_truncated_payload.bin");
+        {
+            let mut file = fs::File::create(&path2).unwrap();
+            file.write_all(b"ALBUSBLK").unwrap(); // magic (8B)
+            file.write_all(&1u32.to_le_bytes()).unwrap(); // version = 1 (4B)
+            file.write_all(&100u64.to_le_bytes()).unwrap(); // total_domains = 100 (8B)
+            file.write_all(&1000u32.to_le_bytes()).unwrap(); // labels_len = 1000 (4B)
+            file.write_all(&100_000u32.to_le_bytes()).unwrap(); // nodes_len = 100_000 (4B)
+            // No payload written, so file is only 28 bytes!
+            file.sync_all().unwrap();
+        }
+        let res2 = CompactBlocklist::load_from_file(&path2);
+        assert!(res2.is_err());
+        assert_eq!(res2.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path2);
+
+        // 3. File declaring labels_len > MAX_BLOCKLIST_LABELS_LEN
+        let path3 = temp_dir.join("test_oversized_labels.bin");
+        {
+            let mut file = fs::File::create(&path3).unwrap();
+            file.write_all(b"ALBUSBLK").unwrap();
+            file.write_all(&1u32.to_le_bytes()).unwrap();
+            file.write_all(&100u64.to_le_bytes()).unwrap();
+            file.write_all(&(MAX_BLOCKLIST_LABELS_LEN + 1).to_le_bytes()).unwrap();
+            file.write_all(&10u32.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        let res3 = CompactBlocklist::load_from_file(&path3);
+        assert!(res3.is_err());
+        assert_eq!(res3.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path3);
     }
 }
