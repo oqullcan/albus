@@ -11,42 +11,53 @@ fn main() {
     println!("cargo:rerun-if-changed=bpf/include/bpf_helpers.h");
     println!("cargo:rerun-if-changed=bpf/include/bpf_endian.h");
 
-    let status = Command::new("clang")
-        .args([
-            "-target",
-            "bpf",
-            "-O2",
-            "-g",
-            "-Wall",
-            "-Werror",
-            "-I",
-            "bpf",
-            "-c",
-            bpf_src.to_str().unwrap(),
-            "-o",
-            bpf_out.to_str().unwrap(),
-        ])
-        .status();
+    let mut cmd = Command::new("clang");
+    cmd.args([
+        "-target", "bpf", "-O2", "-g", "-Wall", "-Werror", "-I", "bpf",
+    ]);
 
-    match status {
-        Ok(s) if s.success() => {
+    // On Debian/Ubuntu multiarch systems, arch-specific headers like <asm/types.h>
+    // are located in /usr/include/<arch>-linux-gnu rather than /usr/include
+    for multiarch_path in &[
+        "/usr/include/x86_64-linux-gnu",
+        "/usr/include/aarch64-linux-gnu",
+        "/usr/include/arm-linux-gnueabihf",
+    ] {
+        if std::path::Path::new(multiarch_path).exists() {
+            cmd.arg("-I").arg(multiarch_path);
+        }
+    }
+
+    cmd.args([
+        "-c",
+        bpf_src.to_str().unwrap(),
+        "-o",
+        bpf_out.to_str().unwrap(),
+    ]);
+
+    let output = cmd.output();
+
+    match output {
+        Ok(out) if out.status.success() => {
             println!(
                 "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
                 bpf_out.to_str().unwrap()
             );
         }
-        Ok(s) => {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             panic!(
-                    "clang failed to compile eBPF bytecode (exit code: {:?}). Please ensure 'clang', 'llvm', and kernel headers ('linux-libc-dev') are installed.\n\
-                     Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev",
-                    s.code()
-                );
+                "clang failed to compile eBPF bytecode (exit code: {:?}):\n{stderr}\n\
+                 Please ensure 'clang', 'llvm', and kernel headers ('linux-libc-dev') are installed.\n\
+                 Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev",
+                out.status.code()
+            );
         }
         Err(e) => {
             panic!(
-                    "Failed to execute clang ({e}). Please ensure 'clang' is installed and available in PATH.\n\
-                     Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev"
-                );
+                "Failed to execute clang ({e}). Please ensure 'clang' is installed and available in PATH.\n\
+                 Run: sudo apt-get install clang llvm libelf-dev linux-libc-dev"
+            );
         }
     }
 }
