@@ -21,7 +21,7 @@ use super::dns64::build_dns64_response;
 use super::doh::DoHResolver;
 use super::filter::{
     build_nxdomain_response, build_refused_response, build_sinkhole_response, detect_dns_rebinding,
-    is_firefox_canary, is_undelegated_zone,
+    extract_question_end, is_firefox_canary, is_undelegated_zone,
 };
 use super::ip_filter::{extract_resolved_ips, IpFilter};
 use super::local_doh::LocalDoHServer;
@@ -915,27 +915,13 @@ pub fn build_canary_response(query: &[u8], canary_ip: Ipv4Addr) -> Vec<u8> {
         return query.to_vec();
     }
 
-    // locate the end of question section
-    let mut pos = 12;
-    while pos < query.len() {
-        let len = query[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if (len & 0xC0) == 0xC0 {
-            pos += 2;
-            break;
-        }
-        pos += 1 + len;
-    }
-    pos += 4; // qtype (2) + qclass (2)
-    if pos > query.len() {
-        pos = query.len();
-    }
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return query.to_vec(),
+    };
 
-    let mut resp = Vec::with_capacity(pos + 16);
-    resp.extend_from_slice(&query[..pos]);
+    let mut resp = Vec::with_capacity(q_end + 16);
+    resp.extend_from_slice(&query[..q_end]);
 
     resp[2] = 0x81; // qr=1, rd=1
     resp[3] = 0x80; // ra=1, rcode=0

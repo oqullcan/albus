@@ -9,10 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, error, info, warn};
 
 pub struct LocalDoHServer;
+
+const MAX_CONCURRENT_DOH_CONNS: usize = 256;
+const MAX_DOH_REQUEST_SIZE: usize = 65536;
 
 impl LocalDoHServer {
     // spawns local doh http/1.1 listener on specified address (e.g. 127.0.0.1:8053)
@@ -25,6 +28,7 @@ impl LocalDoHServer {
         Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
     {
         let handler_arc = Arc::new(handler);
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DOH_CONNS));
 
         tokio::spawn(async move {
             let listener = match TcpListener::bind(bind_addr).await {
@@ -43,16 +47,68 @@ impl LocalDoHServer {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((mut stream, peer_addr)) => {
+                                let permit = match sem.clone().try_acquire_owned() {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        debug!("local DoH max connection limit reached; dropping connection");
+                                        continue;
+                                    }
+                                };
                                 let handler_clone = handler_arc.clone();
+
                                 tokio::spawn(async move {
-                                    let mut buf = [0u8; 4096];
-                                    let n = match stream.read(&mut buf).await {
-                                        Ok(n) if n > 0 => n,
+                                    let _permit = permit;
+                                    let mut buf = vec![0u8; MAX_DOH_REQUEST_SIZE];
+                                    let mut total_read = 0;
+
+                                    // read http request with strict timeout and content-length boundary check
+                                    let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+                                        loop {
+                                            let n = stream.read(&mut buf[total_read..]).await?;
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            total_read += n;
+
+                                            // check if header delimiter \r\n\r\n is received
+                                            if let Some(pos) = buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n") {
+                                                let header_str = String::from_utf8_lossy(&buf[..pos]);
+                                                if header_str.starts_with("POST") {
+                                                    let mut cl_opt = None;
+                                                    for line in header_str.lines() {
+                                                        let lower = line.to_ascii_lowercase();
+                                                        if let Some(val) = lower.strip_prefix("content-length:") {
+                                                            if let Ok(cl) = val.trim().parse::<usize>() {
+                                                                cl_opt = Some(cl);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(cl) = cl_opt {
+                                                        if total_read >= pos + 4 + cl {
+                                                            break;
+                                                        }
+                                                    } else {
+                                                        break;
+                                                    }
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            if total_read >= buf.len() {
+                                                break;
+                                            }
+                                        }
+                                        Ok::<usize, std::io::Error>(total_read)
+                                    }).await;
+
+                                    let n = match read_res {
+                                        Ok(Ok(n)) if n > 0 => n,
                                         _ => return,
                                     };
 
                                     let req = &buf[..n];
-                                    let (query_bytes, is_post) = match parse_http_dns_request(req) {
+                                    let (query_bytes, _is_post) = match parse_http_dns_request(req) {
                                         Some(parsed) => parsed,
                                         None => {
                                             // return simple 200 health check info page for browser visits
@@ -62,7 +118,7 @@ impl LocalDoHServer {
                                                 body.len(),
                                                 body
                                             );
-                                            let _ = stream.write_all(resp.as_bytes()).await;
+                                            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
                                             return;
                                         }
                                     };
@@ -72,10 +128,16 @@ impl LocalDoHServer {
                                             "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n",
                                             dns_resp.len()
                                         );
-                                        let _ = stream.write_all(header.as_bytes()).await;
-                                        let _ = stream.write_all(&dns_resp).await;
+                                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                                            stream.write_all(header.as_bytes()).await?;
+                                            stream.write_all(&dns_resp).await?;
+                                            stream.flush().await
+                                        }).await;
                                     } else {
-                                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await;
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"),
+                                        ).await;
                                     }
                                 });
                             }
@@ -95,19 +157,41 @@ impl LocalDoHServer {
     }
 }
 
-// parses incoming http/1.1 request into raw dns query bytes
+// parses incoming http/1.1 request headers and separates raw binary dns query bytes
 fn parse_http_dns_request(req: &[u8]) -> Option<(Vec<u8>, bool)> {
-    let req_str = std::str::from_utf8(req).ok()?;
-    let mut lines = req_str.lines();
+    // locate header delimiter \r\n\r\n or \n\n without assuming entire body is utf-8
+    let (header_end, delim_len) = if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+        (p, 4)
+    } else if let Some(p) = req.windows(2).position(|w| w == b"\n\n") {
+        (p, 2)
+    } else {
+        return None;
+    };
+
+    let header_str = std::str::from_utf8(&req[..header_end]).ok()?;
+    let mut lines = header_str.lines();
     let first_line = lines.next()?;
     let mut parts = first_line.split_whitespace();
     let method = parts.next()?;
     let uri = parts.next()?;
 
     if method == "POST" && uri.starts_with("/dns-query") {
-        // locate http body delimiter \r\n\r\n
-        let body_pos = req.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let body = &req[body_pos + 4..];
+        let body_start = header_end + delim_len;
+        let mut body = &req[body_start..];
+
+        // check Content-Length if present to avoid reading trailing pipeline bytes
+        for line in lines {
+            let lower = line.to_ascii_lowercase();
+            if let Some(val) = lower.strip_prefix("content-length:") {
+                if let Ok(cl) = val.trim().parse::<usize>() {
+                    if body.len() > cl {
+                        body = &body[..cl];
+                    }
+                    break;
+                }
+            }
+        }
+
         if !body.is_empty() {
             return Some((body.to_vec(), true));
         }
@@ -141,9 +225,12 @@ fn decode_b64url(s: &str) -> Option<Vec<u8>> {
         let b1 = map[chunk[1] as usize];
         let b2 = if chunk[2] == b'=' { 0 } else { map[chunk[2] as usize] };
         let b3 = if chunk[3] == b'=' { 0 } else { map[chunk[3] as usize] };
-        if b0 == 255 || b1 == 255 {
+
+        // reject chunk if any character is invalid (255)
+        if b0 == 255 || b1 == 255 || (chunk[2] != b'=' && b2 == 255) || (chunk[3] != b'=' && b3 == 255) {
             return None;
         }
+
         let t = ((b0 as u32) << 18) | ((b1 as u32) << 12) | ((b2 as u32) << 6) | (b3 as u32);
         out.push(((t >> 16) & 0xff) as u8);
         if chunk[2] != b'=' {
@@ -168,6 +255,24 @@ mod tests {
         let (bytes, is_post) = parsed.unwrap();
         assert!(is_post);
         assert_eq!(&bytes, b"\x12\x34\x01\x00");
+    }
+
+    #[test]
+    fn test_parse_post_doh_request_binary_non_utf8() {
+        // High byte 0x80, 0xff, 0xfe are invalid UTF-8 sequences in raw wire format
+        let raw = b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\n\x80\xff\xfe\x01";
+        let parsed = parse_http_dns_request(raw);
+        assert!(parsed.is_some(), "Binary non-UTF-8 DNS query MUST be successfully parsed");
+        let (bytes, is_post) = parsed.unwrap();
+        assert!(is_post);
+        assert_eq!(&bytes, b"\x80\xff\xfe\x01");
+    }
+
+    #[test]
+    fn test_decode_b64url_rejects_invalid_chars() {
+        assert!(decode_b64url("Ej!Q").is_none());
+        assert!(decode_b64url("EjQ@").is_none());
+        assert!(decode_b64url("EjQ=").is_some());
     }
 
     #[test]

@@ -74,11 +74,21 @@ impl DnsTcpServer {
                 }
             };
 
+            const MAX_CONCURRENT_TCP_CONNS: usize = 256;
+            let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TCP_CONNS));
+
             loop {
                 tokio::select! {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((mut stream, peer_addr)) => {
+                                let permit = match sem.clone().try_acquire_owned() {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        debug!("TCP DNS max connection limit reached; dropping connection");
+                                        continue;
+                                    }
+                                };
                                 let handler_clone = handler_arc.clone();
 
                                 #[cfg(unix)]
@@ -98,11 +108,12 @@ impl DnsTcpServer {
                                 }
 
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     let mut len_buf = [0u8; 2];
 
                                     // handle pipelined consecutive queries over persistent tcp connection
                                     loop {
-                                        // read 2-byte rfc 7766 big-endian length prefix
+                                        // read 2-byte rfc 7766 big-endian length prefix with timeout
                                         let read_len = tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf)).await;
                                         let msg_len = match read_len {
                                             Ok(Ok(2)) => u16::from_be_bytes(len_buf) as usize,
@@ -114,16 +125,19 @@ impl DnsTcpServer {
                                         }
 
                                         let mut msg_buf = vec![0u8; msg_len];
-                                        if stream.read_exact(&mut msg_buf).await.is_err() {
+                                        let read_msg = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut msg_buf)).await;
+                                        if !matches!(read_msg, Ok(Ok(_))) {
                                             break;
                                         }
 
                                         if let Some(resp_bytes) = handler_clone(msg_buf, peer_addr).await {
                                             let resp_len = (resp_bytes.len() as u16).to_be_bytes();
-                                            if stream.write_all(&resp_len).await.is_err() {
-                                                break;
-                                            }
-                                            if stream.write_all(&resp_bytes).await.is_err() {
+                                            let write_res = tokio::time::timeout(Duration::from_secs(5), async {
+                                                stream.write_all(&resp_len).await?;
+                                                stream.write_all(&resp_bytes).await?;
+                                                stream.flush().await
+                                            }).await;
+                                            if !matches!(write_res, Ok(Ok(_))) {
                                                 break;
                                             }
                                         }

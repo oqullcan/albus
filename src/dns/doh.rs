@@ -153,7 +153,7 @@ impl SingleDoHClient {
         &self,
         query_wire_bytes: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = self
+        let mut resp = self
             .client
             .post(&self.url)
             .header("Content-Type", "application/dns-message")
@@ -166,8 +166,20 @@ impl SingleDoHClient {
             return Err(format!("DoH server {} returned HTTP {}", self.name, resp.status()).into());
         }
 
-        let body = resp.bytes().await?;
-        Ok(body.to_vec())
+        if let Some(content_len) = resp.content_length() {
+            if content_len > 65536 {
+                return Err(format!("DoH response length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+            }
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if body.len() + chunk.len() > 65536 {
+                return Err("DoH response body exceeds 64 KB limit".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 

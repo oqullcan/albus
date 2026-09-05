@@ -267,10 +267,11 @@ struct FsPrivilegeGuard {
 
 #[cfg(unix)]
 impl FsPrivilegeGuard {
-    // temporarily drops filesystem credentials (fsuid/fsgid) to the unprivileged caller when running under sudo
-    fn drop_to_sudo_user() -> Self {
+    // temporarily drops filesystem credentials (fsuid/fsgid) to the unprivileged caller when running under sudo or ALBUS_CONFIG_USER
+    fn drop_to_user() -> Self {
         let current_euid = unsafe { libc::geteuid() };
         if current_euid == 0 {
+            // 1. check SUDO_UID / SUDO_GID
             if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
                 if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
                     if uid != 0 {
@@ -280,6 +281,32 @@ impl FsPrivilegeGuard {
                         }
                         return Self { active: true };
                     }
+                }
+            }
+
+            // 2. check ALBUS_CONFIG_USER
+            if let Some((uid, _)) = get_configured_user_info() {
+                if uid != 0 {
+                    let gid = if let Ok(u_str) = std::env::var("ALBUS_CONFIG_USER") {
+                        if let Ok(c_user) = std::ffi::CString::new(u_str.trim()) {
+                            let pwd = unsafe { libc::getpwnam(c_user.as_ptr()) };
+                            if !pwd.is_null() {
+                                unsafe { (*pwd).pw_gid }
+                            } else {
+                                uid as libc::gid_t
+                            }
+                        } else {
+                            uid as libc::gid_t
+                        }
+                    } else {
+                        uid as libc::gid_t
+                    };
+
+                    unsafe {
+                        libc::setfsgid(gid);
+                        libc::setfsuid(uid);
+                    }
+                    return Self { active: true };
                 }
             }
         }
@@ -306,18 +333,39 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
 
     #[cfg(unix)]
     let _guard = if !is_system_path {
-        FsPrivilegeGuard::drop_to_sudo_user()
+        FsPrivilegeGuard::drop_to_user()
     } else {
         FsPrivilegeGuard { active: false }
     };
 
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    let parent = p.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+
+    // reject writing if destination is a symlink
+    #[cfg(unix)]
+    if let Ok(meta) = fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to write through symlink",
+            ));
         }
     }
+
+    // atomic write via temporary file in the same directory followed by atomic rename
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        p.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
 
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
@@ -329,10 +377,20 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
-    let mut file = options.open(p)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, p)?;
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    write_res
 }
 
 // validates file ownership against strict security policies depending on execution context
@@ -393,7 +451,7 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
     #[cfg(unix)]
     let _guard = if !is_system_path {
-        FsPrivilegeGuard::drop_to_sudo_user()
+        FsPrivilegeGuard::drop_to_user()
     } else {
         FsPrivilegeGuard { active: false }
     };

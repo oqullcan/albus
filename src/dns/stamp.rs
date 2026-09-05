@@ -178,12 +178,19 @@ fn skip_vlen_array(data: &[u8], mut pos: usize) -> Result<usize, Box<dyn std::er
         if (item_len & 0x80) != 0 {
             // last item flag or high bit
             let actual_len = item_len & 0x7f;
-            pos += actual_len;
-            break;
+            let next_pos = pos.checked_add(actual_len).ok_or("vlen item length overflow")?;
+            if next_pos > data.len() {
+                return Err("vlen item exceeds payload boundary".into());
+            }
+            return Ok(next_pos);
         } else if item_len == 0 {
-            break;
+            return Ok(pos);
         } else {
-            pos += item_len;
+            let next_pos = pos.checked_add(item_len).ok_or("vlen item length overflow")?;
+            if next_pos > data.len() {
+                return Err("vlen item exceeds payload boundary".into());
+            }
+            pos = next_pos;
         }
     }
     Ok(pos)
@@ -219,8 +226,11 @@ fn decode_base64_url_lenient(input: &str) -> Result<Vec<u8>, Box<dyn std::error:
         let b2 = if chunk[2] == b'=' { 0 } else { map[chunk[2] as usize] };
         let b3 = if chunk[3] == b'=' { 0 } else { map[chunk[3] as usize] };
 
-        if b0 == 255 || b1 == 255 {
+        if b0 == 255 || b1 == 255 || b2 == 255 || b3 == 255 {
             return Err("invalid base64 character in dns stamp".into());
+        }
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return Err("invalid base64 padding in dns stamp".into());
         }
 
         let triple = ((b0 as u32) << 18) | ((b1 as u32) << 12) | ((b2 as u32) << 6) | (b3 as u32);
@@ -270,5 +280,36 @@ mod tests {
         assert!(stamp.no_log);
         assert_eq!(stamp.provider_name, "cloudflare-dns.com");
         assert_eq!(stamp.doh_url, "https://cloudflare-dns.com/dns-query");
+    }
+
+    #[test]
+    fn test_decode_base64_url_lenient_rejects_invalid_chars() {
+        // Invalid char at chunk position 2
+        assert!(decode_base64_url_lenient("AA!A").is_err());
+        assert!(decode_base64_url_lenient("AA@A").is_err());
+
+        // Invalid char at chunk position 3
+        assert!(decode_base64_url_lenient("AAA!").is_err());
+        assert!(decode_base64_url_lenient("AAA#").is_err());
+
+        // Invalid padding (= followed by non-=)
+        assert!(decode_base64_url_lenient("AA=A").is_err());
+    }
+
+    #[test]
+    fn test_skip_vlen_array_bounds_check() {
+        // Declared item length 50 exceeds remaining payload length (2)
+        let malformed_data = [50u8, 1, 2];
+        assert!(skip_vlen_array(&malformed_data, 0).is_err());
+
+        // Declared high-bit item length 0x80 | 10 exceeds remaining payload (1)
+        let malformed_last = [0x8au8, 1];
+        assert!(skip_vlen_array(&malformed_last, 0).is_err());
+
+        // Valid vlen array: item of length 2, then zero terminator
+        let valid_data = [2u8, 0xAA, 0xBB, 0u8];
+        let res = skip_vlen_array(&valid_data, 0);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 4);
     }
 }

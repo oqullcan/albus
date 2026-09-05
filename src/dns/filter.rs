@@ -181,9 +181,41 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
     None
 }
 
+// extracts the byte offset marking the end of the question section in a DNS query
+pub fn extract_question_end(query: &[u8]) -> Option<usize> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut pos = 12;
+    let mut jumps = 0;
+    while pos < query.len() {
+        let len = query[pos] as usize;
+        if len == 0 {
+            pos += 1;
+            break;
+        }
+        if (len & 0xC0) == 0xC0 {
+            pos += 2;
+            break;
+        }
+        pos += 1 + len;
+        jumps += 1;
+        if jumps > 128 {
+            return None;
+        }
+    }
+    let end = pos.checked_add(4)?; // qtype (2) + qclass (2)
+    if end <= query.len() {
+        Some(end)
+    } else {
+        None
+    }
+}
+
 // builds synthetic nxdomain response (rcode = 3)
 pub fn build_nxdomain_response(query: &[u8]) -> Vec<u8> {
-    let mut resp = query.to_vec();
+    let q_end = extract_question_end(query).unwrap_or(query.len().min(12));
+    let mut resp = query[..q_end].to_vec();
     if resp.len() >= 12 {
         resp[2] = (resp[2] | 0x80) | 0x01; // qr=1 (response) + rd=1
         resp[3] = 0x83; // ra=1 + nxdomain (rcode=3)
@@ -199,7 +231,8 @@ pub fn build_nxdomain_response(query: &[u8]) -> Vec<u8> {
 
 // builds synthetic refused response (rcode = 5) for security policy violations
 pub fn build_refused_response(query: &[u8]) -> Vec<u8> {
-    let mut resp = query.to_vec();
+    let q_end = extract_question_end(query).unwrap_or(query.len().min(12));
+    let mut resp = query[..q_end].to_vec();
     if resp.len() >= 12 {
         resp[2] = (resp[2] | 0x80) | 0x01; // qr=1 + rd=1
         resp[3] = 0x85; // ra=1 + refused (rcode=5)
@@ -229,8 +262,13 @@ pub fn build_sinkhole_response(query: &[u8], qtype: u16) -> Vec<u8> {
         return build_nxdomain_response(query);
     }
 
-    let mut resp = Vec::with_capacity(query.len() + 16);
-    resp.extend_from_slice(query);
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return build_nxdomain_response(query),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 32);
+    resp.extend_from_slice(&query[..q_end]);
 
     // standard response, qr=1, aa=1, ra=1, rcode=0
     resp[2] = 0x85;
@@ -239,6 +277,12 @@ pub fn build_sinkhole_response(query: &[u8], qtype: u16) -> Vec<u8> {
     // ancount = 1
     resp[6] = 0x00;
     resp[7] = 0x01;
+
+    // nscount = 0, arcount = 0
+    resp[8] = 0x00;
+    resp[9] = 0x00;
+    resp[10] = 0x00;
+    resp[11] = 0x00;
 
     // pointer to question name at offset 12
     resp.push(0xc0);
@@ -320,5 +364,31 @@ mod tests {
         assert_eq!(resp[2] & 0x80, 0x80);
         assert_eq!(resp[7], 1); // ancount = 1
         assert!(resp.windows(4).any(|w| w == [0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_sinkhole_response_truncates_edns_and_places_answer() {
+        // Query with 1 Question AND 1 Additional RR (arcount = 1, e.g. EDNS0 OPT)
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            // Question: test.org IN A
+            0x04, b't', b'e', b's', b't', 0x03, b'o', b'r', b'g', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let q_end = query.len();
+        // Add fake EDNS0 OPT record (11 bytes: root label 0x00, type 41 (0x0029), udp payload size 4096 (0x1000), ttl 0, rdlen 0)
+        query.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        let resp = build_sinkhole_response(&query, 1);
+        // Answer RR pointer 0xc00c should be located right at q_end, NOT after the EDNS record
+        assert_eq!(resp[q_end], 0xc0);
+        assert_eq!(resp[q_end + 1], 0x0c);
+        // arcount must be 0
+        assert_eq!(resp[10], 0);
+        assert_eq!(resp[11], 0);
+        // ancount must be 1
+        assert_eq!(resp[6], 0);
+        assert_eq!(resp[7], 1);
+        // Total length should be q_end + 16 (pointer(2) + type(2) + class(2) + ttl(4) + rdlen(2) + rdata(4))
+        assert_eq!(resp.len(), q_end + 16);
     }
 }

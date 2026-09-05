@@ -784,7 +784,7 @@ impl PerfReader {
                 if raw_size >= std::mem::size_of::<RawConnEvent>() {
                     let mut evt_bytes = [0u8; std::mem::size_of::<RawConnEvent>()];
                     read_ring_bytes((record_offset + 12) & data_mask, &mut evt_bytes);
-                    let event = unsafe { std::ptr::read(evt_bytes.as_ptr() as *const RawConnEvent) };
+                    let event = unsafe { std::ptr::read_unaligned(evt_bytes.as_ptr() as *const RawConnEvent) };
                     callback(event);
                 }
             }

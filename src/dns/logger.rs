@@ -75,11 +75,15 @@ impl QueryLogger {
         }
 
         tokio::spawn(async move {
-            let mut file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+
+            let mut file = match options.open(&log_path) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     warn!("failed to open query audit log file {}: {}", log_path.display(), e);
@@ -109,15 +113,18 @@ impl QueryLogger {
                     }
                 };
 
+                let safe_domain = sanitize_log_field(&entry.domain);
+                let safe_details = sanitize_log_field(&entry.details.unwrap_or_else(|| "-".to_string()));
+
                 let line = format!(
                     "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
                     entry.timestamp_epoch_secs,
                     client_display,
-                    entry.domain,
+                    safe_domain,
                     entry.qtype,
                     entry.status.as_str(),
                     entry.duration_ms,
-                    entry.details.unwrap_or_else(|| "-".to_string())
+                    safe_details
                 );
 
                 let line_len = line.len() as u64;
@@ -125,7 +132,14 @@ impl QueryLogger {
                     // rotate logs
                     drop(file.take());
                     rotate_files(&log_path, max_backups);
-                    file = OpenOptions::new().create(true).append(true).open(&log_path).ok();
+                    let mut rot_opt = OpenOptions::new();
+                    rot_opt.create(true).append(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        rot_opt.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                    }
+                    file = rot_opt.open(&log_path).ok();
                     current_size = 0;
                 }
 
@@ -144,6 +158,18 @@ impl QueryLogger {
     pub fn log(&self, entry: QueryLogEntry) {
         let _ = self.tx.try_send(entry);
     }
+}
+
+// sanitizes log fields by neutralizing control characters, newlines, and tabs
+fn sanitize_log_field(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\t' => ' ',
+            '\n' | '\r' => '?',
+            c if c.is_control() => '?',
+            c => c,
+        })
+        .collect()
 }
 
 // rotates file.log -> file.log.1 -> file.log.2
@@ -170,6 +196,16 @@ mod tests {
         assert_eq!(QueryStatus::UncloakedCname.as_str(), "UNCLOAKED_CNAME");
     }
 
+    #[test]
+    fn test_query_logger_field_sanitization() {
+        let malicious = "evil.com\n1700000000\tip:10.0.0.1\tinjected\r\n";
+        let sanitized = sanitize_log_field(malicious);
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\t'));
+        assert_eq!(sanitized, "evil.com?1700000000 ip:10.0.0.1 injected??");
+    }
+
     #[tokio::test]
     async fn test_query_logger_file_write_and_ipcrypt() {
         let temp_dir = std::env::temp_dir().join(format!("albus_log_test_{}", std::process::id()));
@@ -182,17 +218,19 @@ mod tests {
         logger.log(QueryLogEntry {
             timestamp_epoch_secs: 1700000000,
             client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
-            domain: "tracker.ad.com".to_string(),
+            domain: "tracker.ad.com\nmalicious.com".to_string(),
             qtype: 1,
             status: QueryStatus::BlockHagezi,
             duration_ms: 2,
-            details: Some("hagezi".to_string()),
+            details: Some("hagezi\trule".to_string()),
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let content = fs::read_to_string(&log_file).expect("log file should exist");
-        assert!(content.contains("tracker.ad.com"));
+        assert!(content.contains("tracker.ad.com?malicious.com"));
+        assert!(content.contains("hagezi rule"));
+        assert_eq!(content.lines().count(), 1, "Log injection attempt MUST NOT create extra lines");
         assert!(content.contains("BLOCK_HAGEZI"));
         assert!(content.contains("ip:")); // pseudonymized with ip: prefix
 

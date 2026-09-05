@@ -169,7 +169,7 @@ impl ODoHClient {
         config_url.set_query(None);
 
         debug!(url = %config_url, "fetching odoh target configuration");
-        let resp = self.client.get(config_url.as_str())
+        let mut resp = self.client.get(config_url.as_str())
             .timeout(Duration::from_secs(5))
             .send()
             .await?;
@@ -178,7 +178,19 @@ impl ODoHClient {
             return Err(format!("failed to fetch odohconfigs: HTTP {}", resp.status()).into());
         }
 
-        let body = resp.bytes().await?;
+        if let Some(content_len) = resp.content_length() {
+            if content_len > 65536 {
+                return Err(format!("odohconfigs length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+            }
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if body.len() + chunk.len() > 65536 {
+                return Err("odohconfigs body exceeds 64 KB limit".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
         let configs = ODoHConfig::parse_configs(&body)?;
 
         // select best matching configuration (prefer x25519 + chacha20poly1305)
@@ -395,7 +407,7 @@ impl ODoHClient {
 
             debug!(relay = %self.relay_url, target = %target_host, "dispatching encrypted oblivious doh query");
 
-            let response = self.client.post(req_url.as_str())
+            let mut response = self.client.post(req_url.as_str())
                 .header("Content-Type", ODOH_HTTP_HEADER)
                 .header("Accept", ODOH_HTTP_HEADER)
                 .body(encrypted_body)
@@ -418,7 +430,19 @@ impl ODoHClient {
                 return Err(format!("odoh relay returned error status: HTTP {}", response.status()).into());
             }
 
-            let resp_bytes = response.bytes().await?;
+            if let Some(content_len) = response.content_length() {
+                if content_len > 65536 {
+                    return Err(format!("odoh response length {} exceeds maximum allowed (65536 bytes)", content_len).into());
+                }
+            }
+
+            let mut resp_bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if resp_bytes.len() + chunk.len() > 65536 {
+                    return Err("odoh response body exceeds 64 KB limit".into());
+                }
+                resp_bytes.extend_from_slice(&chunk);
+            }
             if resp_bytes.is_empty() {
                 if attempt == 0 {
                     warn!("odoh relay returned empty response body; invalidating cached key and retrying");

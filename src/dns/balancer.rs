@@ -85,18 +85,17 @@ impl LoadBalancer {
 
     // resets all upstream moving averages upon network roaming transitions
     pub fn reset(&self) {
-        if let Ok(stats_guard) = self.stats.read() {
-            for stat in stats_guard.iter() {
-                stat.ewma_rtt_ms.store(50.0f64.to_bits(), Ordering::Relaxed);
-                stat.total_queries.store(0, Ordering::Relaxed);
-                stat.failed_queries.store(0, Ordering::Relaxed);
-            }
+        let stats_guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
+        for stat in stats_guard.iter() {
+            stat.ewma_rtt_ms.store(50.0f64.to_bits(), Ordering::Relaxed);
+            stat.total_queries.store(0, Ordering::Relaxed);
+            stat.failed_queries.store(0, Ordering::Relaxed);
         }
     }
 
     // selects dispatch order of upstream candidate indices using weighted power-of-two (wp2)
     pub fn select_candidates(&self) -> Vec<usize> {
-        let stats_guard = self.stats.read().unwrap();
+        let stats_guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
         let count = stats_guard.len();
         if count == 0 {
             return Vec::new();
@@ -141,10 +140,9 @@ impl LoadBalancer {
     }
 
     pub fn record_result(&self, index: usize, latency: Duration, success: bool) {
-        if let Ok(guard) = self.stats.read() {
-            if let Some(target) = guard.get(index) {
-                target.record_outcome(latency, success);
-            }
+        let guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(target) = guard.get(index) {
+            target.record_outcome(latency, success);
         }
     }
 }

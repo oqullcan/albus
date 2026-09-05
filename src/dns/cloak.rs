@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use super::filter::extract_question_end;
 
 #[derive(Debug, Clone)]
 pub struct CloakEngine {
@@ -93,7 +94,8 @@ impl CloakEngine {
 
     // forwards query via one-shot udp socket to dedicated split-dns upstream
     pub async fn forward_query(&self, query: &[u8], target: SocketAddr) -> Result<Vec<u8>, std::io::Error> {
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = UdpSocket::bind(bind_addr).await?;
         sock.connect(target).await?;
         sock.send(query).await?;
 
@@ -109,10 +111,13 @@ impl CloakEngine {
 
 // synthesizes type A response record with 60s TTL pointing to cloaked IPv4
 fn build_synthetic_a_response(query: &[u8], ip: Ipv4Addr) -> Vec<u8> {
-    let mut resp = query.to_vec();
-    if resp.len() < 12 {
-        return resp;
-    }
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return query.to_vec(),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 16);
+    resp.extend_from_slice(&query[..q_end]);
 
     resp[2] = 0x81; // qr=1, rd=1
     resp[3] = 0x80; // ra=1, rcode=0
@@ -137,10 +142,13 @@ fn build_synthetic_a_response(query: &[u8], ip: Ipv4Addr) -> Vec<u8> {
 
 // synthesizes type AAAA response record with 60s TTL pointing to cloaked IPv6
 fn build_synthetic_aaaa_response(query: &[u8], ip: Ipv6Addr) -> Vec<u8> {
-    let mut resp = query.to_vec();
-    if resp.len() < 12 {
-        return resp;
-    }
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return query.to_vec(),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 28);
+    resp.extend_from_slice(&query[..q_end]);
 
     resp[2] = 0x81;
     resp[3] = 0x80;
@@ -163,7 +171,8 @@ fn build_synthetic_aaaa_response(query: &[u8], ip: Ipv6Addr) -> Vec<u8> {
 }
 
 fn build_synthetic_nodata_response(query: &[u8]) -> Vec<u8> {
-    let mut resp = query.to_vec();
+    let q_end = extract_question_end(query).unwrap_or(query.len().min(12));
+    let mut resp = query[..q_end].to_vec();
     if resp.len() >= 12 {
         resp[2] = 0x81;
         resp[3] = 0x80;

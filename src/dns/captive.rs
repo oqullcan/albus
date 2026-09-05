@@ -6,6 +6,7 @@
 //! instant ip responses so the os http probe proceeds and hits the gateway redirect.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use super::filter::extract_question_end;
 
 struct CaptiveEntry {
     domain: &'static str,
@@ -89,8 +90,13 @@ pub fn build_captive_response(query: &[u8], ip: IpAddr) -> Vec<u8> {
         return query.to_vec();
     }
 
-    let mut resp = Vec::with_capacity(query.len() + 16);
-    resp.extend_from_slice(query);
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return query.to_vec(),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 32);
+    resp.extend_from_slice(&query[..q_end]);
 
     // standard response, qr=1, aa=1, ra=1, rcode=0 (noerror)
     resp[2] = 0x85;
@@ -99,6 +105,12 @@ pub fn build_captive_response(query: &[u8], ip: IpAddr) -> Vec<u8> {
     // ancount = 1
     resp[6] = 0x00;
     resp[7] = 0x01;
+
+    // nscount = 0, arcount = 0
+    resp[8] = 0x00;
+    resp[9] = 0x00;
+    resp[10] = 0x00;
+    resp[11] = 0x00;
 
     // pointer to question name at offset 12
     resp.push(0xc0);

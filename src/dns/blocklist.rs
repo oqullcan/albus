@@ -68,25 +68,36 @@ impl CompactBlocklist {
         let mut curr_node_idx = 0usize;
 
         for label in labels {
+            if curr_node_idx >= self.nodes.len() {
+                return false;
+            }
             let curr = &self.nodes[curr_node_idx];
             if curr.child_count == 0 {
                 return false;
             }
 
             let start = curr.first_child as usize;
-            let end = start + curr.child_count as usize;
-            if end > self.nodes.len() {
+            let count = curr.child_count as usize;
+            let end = start.saturating_add(count);
+            if start >= self.nodes.len() || end > self.nodes.len() {
                 return false;
             }
 
             let children = &self.nodes[start..end];
             match children.binary_search_by(|child| {
-                let clabel = &self.labels
-                    [child.label_offset as usize..child.label_offset as usize + child.label_len as usize];
+                let l_start = child.label_offset as usize;
+                let l_end = l_start.saturating_add(child.label_len as usize);
+                if l_end > self.labels.len() || l_start > self.labels.len() {
+                    return std::cmp::Ordering::Less;
+                }
+                let clabel = &self.labels[l_start..l_end];
                 clabel.cmp(label.as_bytes())
             }) {
                 Ok(child_pos) => {
-                    let matched_idx = start + child_pos;
+                    let matched_idx = start.saturating_add(child_pos);
+                    if matched_idx >= self.nodes.len() {
+                        return false;
+                    }
                     let matched_node = &self.nodes[matched_idx];
                     if matched_node.is_terminal {
                         // suffix matched (e.g. doubleclick.net matches ad.doubleclick.net)
@@ -202,6 +213,31 @@ impl CompactBlocklist {
             let ptr = node_raw.as_ptr() as *const CompactNode;
             for i in 0..nodes_len {
                 nodes.push(*ptr.add(i));
+            }
+        }
+
+        // validate consistency of every node to prevent out-of-bounds panics or corrupt state
+        for (i, node) in nodes.iter().enumerate() {
+            let label_end = (node.label_offset as usize).saturating_add(node.label_len as usize);
+            if label_end > labels.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "node {} label range [{}..{}] exceeds labels pool bounds ({})",
+                        i, node.label_offset, label_end, labels.len()
+                    ),
+                ));
+            }
+
+            let child_end = (node.first_child as usize).saturating_add(node.child_count as usize);
+            if child_end > nodes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "node {} child range [{}..{}] exceeds nodes count ({})",
+                        i, node.first_child, child_end, nodes.len()
+                    ),
+                ));
             }
         }
 
@@ -600,5 +636,100 @@ mod tests {
         assert!(res3.is_err());
         assert_eq!(res3.unwrap_err().kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_file(&path3);
+    }
+
+    #[test]
+    fn test_blocklist_load_rejects_corrupted_node_offsets() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_corrupted_node_offsets.bin");
+
+        // 1. Label offset out of bounds
+        {
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(b"ALBUSBLK").unwrap();
+            file.write_all(&1u32.to_le_bytes()).unwrap();
+            file.write_all(&1u64.to_le_bytes()).unwrap();
+            file.write_all(&10u32.to_le_bytes()).unwrap(); // 10 bytes label pool
+            file.write_all(&1u32.to_le_bytes()).unwrap(); // 1 node
+            file.write_all(b"0123456789").unwrap(); // 10 bytes
+
+            let bad_node = CompactNode {
+                label_offset: 20, // > 10!
+                label_len: 5,
+                is_terminal: true,
+                _reserved: 0,
+                first_child: 0,
+                child_count: 0,
+                _padding: 0,
+            };
+            let slice = unsafe {
+                std::slice::from_raw_parts(
+                    &bad_node as *const _ as *const u8,
+                    std::mem::size_of::<CompactNode>(),
+                )
+            };
+            file.write_all(slice).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let res = CompactBlocklist::load_from_file(&path);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path);
+
+        // 2. Child offset out of bounds
+        {
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(b"ALBUSBLK").unwrap();
+            file.write_all(&1u32.to_le_bytes()).unwrap();
+            file.write_all(&1u64.to_le_bytes()).unwrap();
+            file.write_all(&10u32.to_le_bytes()).unwrap();
+            file.write_all(&1u32.to_le_bytes()).unwrap();
+            file.write_all(b"0123456789").unwrap();
+
+            let bad_node = CompactNode {
+                label_offset: 0,
+                label_len: 4,
+                is_terminal: false,
+                _reserved: 0,
+                first_child: 5, // exceeds nodes.len() = 1
+                child_count: 2,
+                _padding: 0,
+            };
+            let slice = unsafe {
+                std::slice::from_raw_parts(
+                    &bad_node as *const _ as *const u8,
+                    std::mem::size_of::<CompactNode>(),
+                )
+            };
+            file.write_all(slice).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let res = CompactBlocklist::load_from_file(&path);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_malformed_blocklist_check_safe() {
+        // Construct malformed blocklist directly and ensure check() returns false instead of panicking
+        let malformed = CompactBlocklist {
+            labels: b"malicious".to_vec(),
+            nodes: vec![CompactNode {
+                label_offset: 50, // out of bounds
+                label_len: 100,   // out of bounds
+                is_terminal: false,
+                _reserved: 0,
+                first_child: 999, // out of bounds
+                child_count: 50,  // out of bounds
+                _padding: 0,
+            }],
+            total_domains: 1,
+        };
+
+        assert!(!malformed.check("example.com"));
+        assert!(!malformed.check("test.org"));
     }
 }

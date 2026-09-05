@@ -45,6 +45,11 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
     // copy binary to standard system execution path
     let exe_path = std::env::current_exe()?;
     let _ = fs::copy(&exe_path, SYSTEM_BIN_PATH);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(SYSTEM_BIN_PATH, fs::Permissions::from_mode(0o755));
+    }
 
     let exe_str = if Path::new(SYSTEM_BIN_PATH).exists() {
         SYSTEM_BIN_PATH
@@ -139,6 +144,9 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     crate::core::firewall::unblock_quic();
+    crate::core::firewall::unblock_stun();
+    crate::core::firewall::disable_kill_switch();
+    crate::core::firewall::disable_network_lockdown();
     let _ = crate::dns::cleanup_system_dns();
     println!("albus service uninstalled and system settings cleaned up.");
     Ok(())

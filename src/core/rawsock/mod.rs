@@ -68,6 +68,9 @@ impl RawSocket {
     // transmits raw packet payload with custom ip time-to-live and tcp checksum control
     pub fn send_fake_opts(&self, conn: &ConnInfo, payload: &[u8], ttl: u8, bad_checksum: bool) -> Result<usize> {
         let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+        if pkt.is_empty() {
+            return Err(Error::other("synthesized packet exceeds maximum stack buffer length"));
+        }
 
         match (conn.src_ip, conn.dst_ip) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(dst_v4)) => {
