@@ -4,12 +4,12 @@ version = "2.1.0"
 edition = "2021"
 authors = ["oqullcan"]
 description = "Pure Rust DPI bypass and encrypted DNS tool for Linux"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.40", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12"] }
 url = "2.5"
 tracing = "0.1"
