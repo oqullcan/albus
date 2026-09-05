@@ -214,6 +214,28 @@ Panel {
     }
   }
 
+  component StyledTextField: TextField {
+    id: stfRoot
+    verticalPadding: Style.space(4)
+    horizontalPadding: Style.space(8)
+    selectByMouse: true
+    font.family: "monospace"
+    font.pixelSize: Style.font.caption
+    color: root.foreground
+    placeholderTextColor: root.subtle
+    selectionColor: Qt.rgba(0.06, 0.72, 0.51, 0.3)
+    selectedTextColor: root.foreground
+    accent: "#10B981"
+    background: Rectangle {
+      radius: Style.cornerRadius
+      color: stfRoot.activeFocus ? Qt.rgba(0.06, 0.72, 0.51, 0.08) : (stfRoot.hovered ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(1, 1, 1, 0.02))
+      border.color: stfRoot.activeFocus ? "#10B981" : (stfRoot.hovered ? Qt.rgba(1, 1, 1, 0.18) : Qt.rgba(1, 1, 1, 0.08))
+      border.width: 1
+      Behavior on border.color { ColorAnimation { duration: 90 } }
+      Behavior on color { ColorAnimation { duration: 90 } }
+    }
+  }
+
   component AccordionSectionHeader: Rectangle {
     id: ashRoot
     property string title: ""
@@ -1460,38 +1482,72 @@ Panel {
                     }
                   }
 
-                  // custom endpoint parameters
+                  // custom endpoint parameters form
                   Column {
                     width: parent.width
                     visible: root.activeDnsKey === "custom"
-                    spacing: Style.space(4)
+                    spacing: Style.space(6)
 
-                    Text { text: "DoH Endpoint URL or DNS Stamp"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                    TextField {
+                    // DoH URL / Stamp full width
+                    ColumnLayout {
                       width: parent.width
-                      placeholderText: "https://doh.example.com/dns-query or sdns://..."
-                      text: root.customDnsUrl
-                      onTextEdited: {
-                        root.customDnsUrl = text
-                        root.scheduleAutoApply()
+                      spacing: Style.space(3)
+
+                      RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(4)
+
+                        Text {
+                          text: "Custom DoH URL or DNS Stamp"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        Text {
+                          text: "HTTPS endpoint or DNSCrypt sdns stamp"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                          elide: Text.ElideRight
+                          Layout.fillWidth: true
+                        }
+                      }
+
+                      StyledTextField {
+                        Layout.fillWidth: true
+                        text: root.customDnsUrl
+                        placeholderText: "https://doh.example.com/dns-query or sdns://..."
+                        onTextEdited: {
+                          root.customDnsUrl = text
+                          root.scheduleAutoApply()
+                        }
                       }
                     }
 
-                    Row {
+                    // 2-column Bootstrap IP row
+                    RowLayout {
                       width: parent.width
-                      spacing: Style.space(6)
+                      spacing: Style.space(8)
 
-                      Column {
-                        width: (parent.width - Style.space(6)) / 2
-                        spacing: 2
-                        Text { text: "Bootstrap IP (Primary)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                        TextField {
-                          width: parent.width
-                          placeholderText: "e.g. 45.90.28.0"
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        spacing: Style.space(3)
+
+                        Text {
+                          text: "Primary Bootstrap IP"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        StyledTextField {
+                          Layout.fillWidth: true
                           text: root.customBootstrapPrimary
-                          font.family: "monospace"
-                          font.pixelSize: Style.font.caption
-                          accent: "#10B981"
+                          placeholderText: "45.90.28.0"
                           onTextEdited: {
                             root.customBootstrapPrimary = text
                             root.scheduleAutoApply()
@@ -1499,17 +1555,23 @@ Panel {
                         }
                       }
 
-                      Column {
-                        width: (parent.width - Style.space(6)) / 2
-                        spacing: 2
-                        Text { text: "Bootstrap IP (Secondary)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                        TextField {
-                          width: parent.width
-                          placeholderText: "e.g. 45.90.30.0"
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        spacing: Style.space(3)
+
+                        Text {
+                          text: "Secondary Bootstrap IP"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        StyledTextField {
+                          Layout.fillWidth: true
                           text: root.customBootstrapSecondary
-                          font.family: "monospace"
-                          font.pixelSize: Style.font.caption
-                          accent: "#10B981"
+                          placeholderText: "45.90.30.0"
                           onTextEdited: {
                             root.customBootstrapSecondary = text
                             root.scheduleAutoApply()
@@ -1571,82 +1633,135 @@ Panel {
                   width: parent.width
                   spacing: Style.space(6)
 
-                  Row {
-                    width: parent.width
-                    spacing: Style.space(6)
-
-                    Column {
-                      width: (parent.width - Style.space(12)) / 3
-                      spacing: 2
-                      Text { text: "TCP MSS"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                      TextField {
-                        width: parent.width
-                        text: root.customMss
-                        font.family: "monospace"
-                        font.pixelSize: Style.font.caption
-                        accent: "#10B981"
-                        onTextEdited: {
-                          root.customMss = text
-                          root.scheduleAutoApply()
-                        }
-                      }
-                    }
-
-                    Column {
-                      width: (parent.width - Style.space(12)) / 3
-                      spacing: 2
-                      Text { text: "Min MSS (Jitter)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                      TextField {
-                        width: parent.width
-                        text: root.customMinMss
-                        font.family: "monospace"
-                        font.pixelSize: Style.font.caption
-                        accent: "#10B981"
-                        onTextEdited: {
-                          root.customMinMss = text
-                          root.scheduleAutoApply()
-                        }
-                      }
-                    }
-
-                    Column {
-                      width: (parent.width - Style.space(12)) / 3
-                      spacing: 2
-                      Text { text: "Fake TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                      TextField {
-                        width: parent.width
-                        text: root.customFakeTtl
-                        placeholderText: "0"
-                        font.family: "monospace"
-                        font.pixelSize: Style.font.caption
-                        accent: "#10B981"
-                        onTextEdited: {
-                          root.customFakeTtl = text
-                          root.scheduleAutoApply()
-                        }
-                      }
-                    }
-                  }
-
+                  // DPI Evasion Parameters Form
                   Column {
                     width: parent.width
-                    spacing: 2
-                    Text { text: "Decoy SNI Domain"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                    TextField {
+                    spacing: Style.space(8)
+
+                    // 3-column MSS & TTL row
+                    RowLayout {
                       width: parent.width
-                      text: root.customFakeSni
-                      placeholderText: "Default rotating pool"
-                      font.family: "monospace"
-                      font.pixelSize: Style.font.caption
-                      accent: "#10B981"
-                      onTextEdited: {
-                        root.customFakeSni = text
-                        root.scheduleAutoApply()
+                      spacing: Style.space(8)
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        spacing: Style.space(3)
+
+                        Text {
+                          text: "TCP MSS"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        StyledTextField {
+                          Layout.fillWidth: true
+                          horizontalAlignment: Text.AlignHCenter
+                          text: root.customMss
+                          placeholderText: "1200"
+                          inputMethodHints: Qt.ImhDigitsOnly
+                          onTextEdited: {
+                            root.customMss = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        spacing: Style.space(3)
+
+                        Text {
+                          text: "Min MSS (Jitter)"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        StyledTextField {
+                          Layout.fillWidth: true
+                          horizontalAlignment: Text.AlignHCenter
+                          text: root.customMinMss
+                          placeholderText: "88"
+                          inputMethodHints: Qt.ImhDigitsOnly
+                          onTextEdited: {
+                            root.customMinMss = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        spacing: Style.space(3)
+
+                        Text {
+                          text: "Fake TTL (0 = Auto)"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        StyledTextField {
+                          Layout.fillWidth: true
+                          horizontalAlignment: Text.AlignHCenter
+                          text: root.customFakeTtl
+                          placeholderText: "0"
+                          inputMethodHints: Qt.ImhDigitsOnly
+                          onTextEdited: {
+                            root.customFakeTtl = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+                    }
+
+                    // Full-width Decoy SNI domain
+                    ColumnLayout {
+                      width: parent.width
+                      spacing: Style.space(3)
+
+                      RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(4)
+
+                        Text {
+                          text: "Decoy SNI Domain"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        Text {
+                          text: "Injected fake hostname for SNI splitting"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                          elide: Text.ElideRight
+                          Layout.fillWidth: true
+                        }
+                      }
+
+                      StyledTextField {
+                        Layout.fillWidth: true
+                        text: root.customFakeSni
+                        placeholderText: "Default rotating pool (e.g. www.google.com)"
+                        onTextEdited: {
+                          root.customFakeSni = text
+                          root.scheduleAutoApply()
+                        }
                       }
                     }
                   }
 
-                  // grouped DPI evasion card
+                  // DPI Evasion Pure Toggles Card
                   Rectangle {
                     width: parent.width
                     implicitHeight: dpiCol.implicitHeight
@@ -1848,10 +1963,61 @@ Panel {
                         label: "Local DoH Server (RFC 8484)"
                         description: "Local HTTP/1.1 endpoint for browsers and apps"
                         checked: root.localDohEnabled
+                        showDivider: !root.localDohEnabled
                         onClicked: {
                           root.localDohEnabled = !root.localDohEnabled
                           root.applyAndSave()
                         }
+                      }
+
+                      Column {
+                        visible: root.localDohEnabled
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Local DoH Listen Address"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Binding host and port"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.localDohAddr
+                          placeholderText: "127.0.0.1:8053"
+                          onTextEdited: {
+                            root.localDohAddr = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      Rectangle {
+                        visible: root.localDohEnabled
+                        width: parent.width - Style.space(24)
+                        x: Style.space(12)
+                        height: 1
+                        color: Qt.rgba(1, 1, 1, 0.05)
                       }
 
                       CompactToggle {
@@ -1863,26 +2029,6 @@ Panel {
                           root.netmonEnabled = !root.netmonEnabled
                           root.applyAndSave()
                         }
-                      }
-                    }
-                  }
-
-                  // Local DoH address row
-                  Column {
-                    width: parent.width
-                    visible: root.localDohEnabled
-                    spacing: 2
-                    Text { text: "Local DoH Listen Address"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                    TextField {
-                      width: parent.width
-                      text: root.localDohAddr
-                      placeholderText: "127.0.0.1:8053"
-                      font.family: "monospace"
-                      font.pixelSize: Style.font.caption
-                      accent: "#10B981"
-                      onTextEdited: {
-                        root.localDohAddr = text
-                        root.scheduleAutoApply()
                       }
                     }
                   }
@@ -1913,113 +2059,153 @@ Panel {
                       }
 
                       Column {
-                        width: parent.width
                         visible: root.odohEnabled
-                        spacing: Style.space(4)
+                        width: parent.width
+                        spacing: Style.space(6)
+                        topPadding: Style.space(6)
+                        bottomPadding: Style.space(4)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        ColumnLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(3)
+
+                          RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Style.space(4)
+
+                            Text {
+                              text: "ODoH Relay Proxy URL"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 1
+                              font.bold: true
+                              color: root.foreground
+                            }
+
+                            Text {
+                              text: "Intermediary relay proxy endpoint"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.subtle
+                              elide: Text.ElideRight
+                              Layout.fillWidth: true
+                            }
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.odohRelay
+                            placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
+                            onTextEdited: {
+                              root.odohRelay = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+
+                        ColumnLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(3)
+
+                          RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Style.space(4)
+
+                            Text {
+                              text: "ODoH Target Resolver URL"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 1
+                              font.bold: true
+                              color: root.foreground
+                            }
+
+                            Text {
+                              text: "Final target resolver endpoint"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.subtle
+                              elide: Text.ElideRight
+                              Layout.fillWidth: true
+                            }
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.odohTarget
+                            placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
+                            onTextEdited: {
+                              root.odohTarget = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+                      }
+
+                      Row {
+                        visible: root.odohEnabled
+                        spacing: Style.space(6)
                         topPadding: Style.space(4)
                         bottomPadding: Style.space(8)
-                        leftPadding: Style.space(8)
-                        rightPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
 
-                        Text {
-                          text: "ODoH Relay Proxy URL"
-                          color: root.dim
-                          font.pixelSize: Style.font.caption - 1
-                          font.family: root.fontFamily
-                        }
-                        TextField {
-                          width: parent.width
-                          text: root.odohRelay
-                          placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
-                          font.family: "monospace"
-                          font.pixelSize: Style.font.caption
-                          accent: "#10B981"
-                          onTextEdited: {
-                            root.odohRelay = text
-                            root.scheduleAutoApply()
-                          }
-                        }
+                        Rectangle {
+                          height: Style.space(22)
+                          width: presetBtnText.implicitWidth + Style.space(12)
+                          radius: Style.cornerRadius - 2
+                          color: presetBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                          border.color: Qt.rgba(1, 1, 1, 0.1)
+                          border.width: 1
 
-                        Text {
-                          text: "ODoH Target Resolver URL"
-                          color: root.dim
-                          font.pixelSize: Style.font.caption - 1
-                          font.family: root.fontFamily
-                        }
-                        TextField {
-                          width: parent.width
-                          text: root.odohTarget
-                          placeholderText: "https://odoh.cloudflare-dns.com/dns-query"
-                          font.family: "monospace"
-                          font.pixelSize: Style.font.caption
-                          accent: "#10B981"
-                          onTextEdited: {
-                            root.odohTarget = text
-                            root.scheduleAutoApply()
-                          }
-                        }
-
-                        Row {
-                          spacing: Style.space(6)
-                          topPadding: Style.space(2)
-
-                          Rectangle {
-                            height: Style.space(22)
-                            width: presetBtnText.implicitWidth + Style.space(12)
-                            radius: Style.cornerRadius - 2
-                            color: presetBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
-                            border.color: Qt.rgba(1, 1, 1, 0.1)
-                            border.width: 1
-
-                            Text {
-                              id: presetBtnText
-                              anchors.centerIn: parent
-                              text: "Fill Cloudflare Preset"
-                              color: root.foreground
-                              font.pixelSize: Style.font.caption - 1
-                              font.family: root.fontFamily
-                            }
-
-                            MouseArea {
-                              id: presetBtnMouse
-                              anchors.fill: parent
-                              hoverEnabled: true
-                              cursorShape: Qt.PointingHandCursor
-                              onClicked: {
-                                root.odohRelay = "https://odoh.cloudflare-dns.com/dns-query"
-                                root.odohTarget = "https://odoh.cloudflare-dns.com/dns-query"
-                                root.applyAndSave()
-                              }
-                            }
+                          Text {
+                            id: presetBtnText
+                            anchors.centerIn: parent
+                            text: "Fill Cloudflare Preset"
+                            color: root.foreground
+                            font.pixelSize: Style.font.caption - 1
+                            font.family: root.fontFamily
                           }
 
-                          Rectangle {
-                            height: Style.space(22)
-                            width: clearBtnText.implicitWidth + Style.space(12)
-                            radius: Style.cornerRadius - 2
-                            color: clearBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
-                            border.color: Qt.rgba(1, 1, 1, 0.1)
-                            border.width: 1
-
-                            Text {
-                              id: clearBtnText
-                              anchors.centerIn: parent
-                              text: "Reset Defaults"
-                              color: root.dim
-                              font.pixelSize: Style.font.caption - 1
-                              font.family: root.fontFamily
+                          MouseArea {
+                            id: presetBtnMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                              root.odohRelay = "https://odoh.cloudflare-dns.com/dns-query"
+                              root.odohTarget = "https://odoh.cloudflare-dns.com/dns-query"
+                              root.applyAndSave()
                             }
+                          }
+                        }
 
-                            MouseArea {
-                              id: clearBtnMouse
-                              anchors.fill: parent
-                              hoverEnabled: true
-                              cursorShape: Qt.PointingHandCursor
-                              onClicked: {
-                                root.odohRelay = ""
-                                root.odohTarget = ""
-                                root.applyAndSave()
-                              }
+                        Rectangle {
+                          height: Style.space(22)
+                          width: clearBtnText.implicitWidth + Style.space(12)
+                          radius: Style.cornerRadius - 2
+                          color: clearBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                          border.color: Qt.rgba(1, 1, 1, 0.1)
+                          border.width: 1
+
+                          Text {
+                            id: clearBtnText
+                            anchors.centerIn: parent
+                            text: "Reset Defaults"
+                            color: root.dim
+                            font.pixelSize: Style.font.caption - 1
+                            font.family: root.fontFamily
+                          }
+
+                          MouseArea {
+                            id: clearBtnMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                              root.odohRelay = ""
+                              root.odohTarget = ""
+                              root.applyAndSave()
                             }
                           }
                         }
@@ -2045,10 +2231,103 @@ Panel {
                         label: "DNS Query Audit Log"
                         description: "Write DNS queries to a local rotating log file"
                         checked: root.queryLogEnabled
+                        showDivider: !root.queryLogEnabled
                         onClicked: {
                           root.queryLogEnabled = !root.queryLogEnabled
                           root.applyAndSave()
                         }
+                      }
+
+                      Column {
+                        visible: root.queryLogEnabled
+                        width: parent.width
+                        spacing: Style.space(6)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        ColumnLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(3)
+
+                          RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Style.space(4)
+
+                            Text {
+                              text: "Query Log Output Path"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 1
+                              font.bold: true
+                              color: root.foreground
+                            }
+
+                            Text {
+                              text: "Destination file path"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.subtle
+                              elide: Text.ElideRight
+                              Layout.fillWidth: true
+                            }
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.queryLogPath
+                            placeholderText: "/var/log/albus/query.log"
+                            onTextEdited: {
+                              root.queryLogPath = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+
+                        ColumnLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(3)
+
+                          RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Style.space(4)
+
+                            Text {
+                              text: "IPcrypt Client IP Key"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 1
+                              font.bold: true
+                              color: root.foreground
+                            }
+
+                            Text {
+                              text: "32-hex key or passphrase"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.subtle
+                              elide: Text.ElideRight
+                              Layout.fillWidth: true
+                            }
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.ipcryptKey
+                            placeholderText: "1234567890abcdef..."
+                            onTextEdited: {
+                              root.ipcryptKey = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+                      }
+
+                      Rectangle {
+                        visible: root.queryLogEnabled
+                        width: parent.width - Style.space(24)
+                        x: Style.space(12)
+                        height: 1
+                        color: Qt.rgba(1, 1, 1, 0.05)
                       }
 
                       CompactToggle {
@@ -2060,41 +2339,6 @@ Panel {
                           root.ednsPaddingEnabled = !root.ednsPaddingEnabled
                           root.applyAndSave()
                         }
-                      }
-                    }
-                  }
-
-                  // Query log path & IPcrypt key inputs
-                  Column {
-                    width: parent.width
-                    visible: root.queryLogEnabled
-                    spacing: Style.space(4)
-
-                    Text { text: "Query Log Output Path (Optional)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                    TextField {
-                      width: parent.width
-                      text: root.queryLogPath
-                      placeholderText: "Default: /var/log/albus/query.log"
-                      font.family: "monospace"
-                      font.pixelSize: Style.font.caption
-                      accent: "#10B981"
-                      onTextEdited: {
-                        root.queryLogPath = text
-                        root.scheduleAutoApply()
-                      }
-                    }
-
-                    Text { text: "IPcrypt Client IP Key (Optional 32-hex / Passphrase)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
-                    TextField {
-                      width: parent.width
-                      text: root.ipcryptKey
-                      placeholderText: "e.g. 1234567890abcdef1234567890abcdef"
-                      font.family: "monospace"
-                      font.pixelSize: Style.font.caption
-                      accent: "#10B981"
-                      onTextEdited: {
-                        root.ipcryptKey = text
-                        root.scheduleAutoApply()
                       }
                     }
                   }
