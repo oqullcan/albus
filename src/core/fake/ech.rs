@@ -96,4 +96,62 @@ mod tests {
         use crate::core::fake::clienthello::FAKE_TLS_CLIENT_HELLO;
         assert!(!has_ech_extension(&FAKE_TLS_CLIENT_HELLO));
     }
+
+    #[test]
+    fn test_has_ech_extension_invalid_inputs() {
+        assert!(!has_ech_extension(&[]));
+        assert!(!has_ech_extension(&[0x16, 0x03, 0x01])); // too short (< 5)
+        assert!(!has_ech_extension(&[0x17, 0x03, 0x03, 0x00, 0x10])); // application data (0x17)
+        assert!(!has_ech_extension(&[0x16, 0x03, 0x01, 0x00, 0x10, 0x02])); // handshake type 0x02 (ServerHello)
+    }
+
+    fn build_synthetic_client_hello_with_ext(ext_type: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        // client version (2) + random (32)
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x42; 32]);
+        // session id
+        body.push(0);
+        // cipher suites (2 bytes len + 2 bytes suite)
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        // compression
+        body.extend_from_slice(&[0x01, 0x00]);
+
+        // extension: ext_type, len 4, data [1, 2, 3, 4]
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&ext_type.to_be_bytes());
+        exts.extend_from_slice(&[0x00, 0x04, 0x01, 0x02, 0x03, 0x04]);
+
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01); // ClientHello
+        let hs_len = body.len();
+        hs.push((hs_len >> 16) as u8);
+        hs.push((hs_len >> 8) as u8);
+        hs.push(hs_len as u8);
+        hs.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&[0x16, 0x03, 0x01]);
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    #[test]
+    fn test_has_ech_extension_synthetic_types() {
+        let std_ech = build_synthetic_client_hello_with_ext(TLS_EXT_ECH_STANDARD);
+        assert!(has_ech_extension(&std_ech));
+
+        let draft_ech = build_synthetic_client_hello_with_ext(TLS_EXT_ECH_DRAFT);
+        assert!(has_ech_extension(&draft_ech));
+
+        let grease_ech = build_synthetic_client_hello_with_ext(TLS_EXT_ECH_GREASE);
+        assert!(has_ech_extension(&grease_ech));
+
+        let other_ext = build_synthetic_client_hello_with_ext(0x0000); // ServerName
+        assert!(!has_ech_extension(&other_ext));
+    }
 }

@@ -211,4 +211,54 @@ mod tests {
         let targets = extract_alias_targets(&resp);
         assert_eq!(targets, vec!["tracker.adtech.com"]);
     }
+
+    #[test]
+    fn test_extract_https_svcb_alias_target() {
+        // synthesize response with HTTPS record (type 65) in AliasMode (priority 0)
+        let mut resp = vec![
+            0xAB, 0xCD, // ID
+            0x81, 0x80, // Response
+            0x00, 0x01, // 1 question
+            0x00, 0x01, // 1 answer
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        // Question: example.com
+        resp.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ]);
+        resp.extend_from_slice(&[0x00, 0x41, 0x00, 0x01]); // Type HTTPS (65), Class IN (1)
+
+        // Answer RR:
+        resp.extend_from_slice(&[0xc0, 0x0c]); // pointer to example.com
+        resp.extend_from_slice(&[0x00, 0x41]); // Type HTTPS (65)
+        resp.extend_from_slice(&[0x00, 0x01]); // Class IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL 60s
+
+        // RDATA: priority (0 = AliasMode) + Target Name "cdn.tracker.net"
+        let mut rdata = vec![0x00, 0x00]; // Priority 0
+        for label in ["cdn", "tracker", "net"] {
+            rdata.push(label.len() as u8);
+            rdata.extend_from_slice(label.as_bytes());
+        }
+        rdata.push(0x00);
+
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+
+        let targets = extract_alias_targets(&resp);
+        assert_eq!(targets, vec!["cdn.tracker.net"]);
+    }
+
+    #[test]
+    fn test_extract_alias_targets_empty_and_truncated() {
+        assert!(extract_alias_targets(&[]).is_empty());
+        assert!(extract_alias_targets(&[0x00; 10]).is_empty());
+
+        // Header with ancount = 0
+        let header_no_answers = [
+            0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(extract_alias_targets(&header_no_answers).is_empty());
+    }
 }

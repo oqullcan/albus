@@ -108,4 +108,37 @@ mod tests {
         assert_eq!(snap.uncloaked_cnames, 1);
         assert!((snap.cache_hit_ratio - 40.0).abs() < 0.001);
     }
+
+    #[test]
+    fn test_dns_stats_zero_queries_ratio() {
+        let stats = DnsStats::new();
+        let snap = stats.snapshot();
+        assert_eq!(snap.total_queries, 0);
+        assert_eq!(snap.cache_hit_ratio, 0.0);
+    }
+
+    #[test]
+    fn test_dns_stats_dump_to_file_roundtrip() {
+        let stats = DnsStats::new();
+        stats.total_queries.fetch_add(50, Ordering::Relaxed);
+        stats.cache_hits.fetch_add(25, Ordering::Relaxed);
+        stats.dns64_synthesized.fetch_add(7, Ordering::Relaxed);
+
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!("albus_test_stats_{}.json", std::process::id()));
+
+        let res = stats.dump_to_file(&test_file);
+        assert!(res.is_ok(), "dump_to_file should succeed");
+
+        let read_json =
+            fs::read_to_string(&test_file).expect("should read back written stats file");
+        let snap: DnsStatsSnapshot = serde_json::from_str(&read_json).expect("should parse json");
+
+        assert_eq!(snap.total_queries, 50);
+        assert_eq!(snap.cache_hits, 25);
+        assert_eq!(snap.dns64_synthesized, 7);
+        assert!((snap.cache_hit_ratio - 50.0).abs() < 0.001);
+
+        let _ = fs::remove_file(&test_file);
+    }
 }

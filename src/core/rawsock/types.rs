@@ -104,4 +104,31 @@ mod tests {
         let wrapping = conn.with_seq_offset(-1500);
         assert_eq!(wrapping.seq, 1000u32.wrapping_sub(1500));
     }
+
+    #[test]
+    fn test_conn_info_ipv6_and_constructors() {
+        let v6_src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let v6_dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let conn6 = ConnInfo::new_v6(v6_src, v6_dst, 54321, 443, 5000, 6000);
+
+        assert!(conn6.is_ipv6());
+        assert_eq!(conn6.src_port, 54321);
+        assert_eq!(conn6.dst_port, 443);
+        assert_eq!(conn6.seq, 5000);
+        assert_eq!(conn6.ack, 6000);
+
+        let offset_v6 = conn6.with_seq_offset(250);
+        assert_eq!(offset_v6.seq, 5250);
+
+        let conn4_compat = ConnInfo::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            8080,
+            80,
+            1,
+            2,
+        );
+        assert!(!conn4_compat.is_ipv6());
+        assert_eq!(conn4_compat.src_port, 8080);
+    }
 }

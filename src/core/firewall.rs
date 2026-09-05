@@ -187,4 +187,12 @@ mod tests {
         // flush_rule should terminate quickly without panic even if the binary does not exist
         flush_rule("nonexistent_firewall_cmd_xyz", &["-D", "OUTPUT"]);
     }
+
+    #[test]
+    fn test_flush_rule_loop_termination() {
+        // "false" immediately exits with non-zero status; flush_rule terminates on first attempt
+        flush_rule("false", &[]);
+        // "true" exits with 0; flush_rule terminates after at most 50 iterations
+        flush_rule("true", &[]);
+    }
 }

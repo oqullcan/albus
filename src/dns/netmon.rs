@@ -116,4 +116,16 @@ mod tests {
         let fp = NetworkMonitor::compute_network_fingerprint();
         assert!(fp != 0 || true); // valid hash computation
     }
+
+    #[tokio::test]
+    async fn test_network_monitor_start_and_shutdown() {
+        let monitor = NetworkMonitor::new();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        monitor.start(Duration::from_millis(50), |_epoch| {}, shutdown_rx);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }

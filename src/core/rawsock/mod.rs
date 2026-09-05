@@ -76,15 +76,15 @@ impl RawSocket {
         ttl: u8,
         bad_checksum: bool,
     ) -> Result<usize> {
-        let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
-        if pkt.is_empty() {
-            return Err(Error::other(
-                "synthesized packet exceeds maximum stack buffer length",
-            ));
-        }
-
         match (conn.src_ip, conn.dst_ip) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(dst_v4)) => {
+                let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+                if pkt.is_empty() {
+                    return Err(Error::other(
+                        "synthesized packet exceeds maximum stack buffer length",
+                    ));
+                }
+
                 let mut dest_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
                 dest_addr.sin_family = libc::AF_INET as libc::sa_family_t;
                 dest_addr.sin_port = 0;
@@ -111,6 +111,14 @@ impl RawSocket {
                 let fd_v6 = self
                     .fd_v6
                     .ok_or_else(|| Error::other("IPv6 raw socket not available"))?;
+
+                let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+                if pkt.is_empty() {
+                    return Err(Error::other(
+                        "synthesized packet exceeds maximum stack buffer length",
+                    ));
+                }
+
                 let mut dest_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
                 dest_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 dest_addr.sin6_port = 0;
@@ -160,3 +168,74 @@ impl Drop for RawSocket {
 
 unsafe impl Send for RawSocket {}
 unsafe impl Sync for RawSocket {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_raw_socket_creation_graceful() {
+        // in unprivileged environments without CAP_NET_RAW, RawSocket::new() should gracefully return
+        // an OS error (EPERM / EACCES) rather than panicking.
+        match RawSocket::new() {
+            Ok(sock) => {
+                assert!(sock.fd >= 0);
+            }
+            Err(e) => {
+                assert!(
+                    e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(libc::EPERM)
+                        || e.raw_os_error() == Some(libc::EACCES),
+                    "unexpected error from raw socket creation: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_raw_socket_mismatched_ip_families_error() {
+        let dummy_sock = RawSocket {
+            fd: -1,
+            fd_v6: None,
+        };
+        let mismatched_conn = ConnInfo {
+            src_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            src_port: 1234,
+            dst_port: 80,
+            seq: 100,
+            ack: 200,
+        };
+
+        let res = dummy_sock.send_fake_opts(&mismatched_conn, b"GET / HTTP/1.1\r\n\r\n", 64, false);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Mismatched IP families"));
+    }
+
+    #[test]
+    fn test_raw_socket_oversized_payload_error() {
+        let dummy_sock = RawSocket {
+            fd: -1,
+            fd_v6: None,
+        };
+        let conn = ConnInfo::new_v4(
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 1),
+            1234,
+            80,
+            100,
+            200,
+        );
+        let huge_payload = vec![0xAA; 1600];
+        let res = dummy_sock.send_fake_opts(&conn, &huge_payload, 64, false);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum stack buffer"));
+    }
+}

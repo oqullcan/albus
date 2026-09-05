@@ -90,4 +90,40 @@ mod tests {
         cache.insert(ip, 6);
         assert_eq!(cache.get(&ip), Some(6));
     }
+
+    #[test]
+    fn test_ttl_cache_len_and_is_empty_and_default() {
+        let cache = TtlCache::default();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        let ip1 = Ipv4Addr::new(1, 1, 1, 1);
+        cache.insert(ip1, 12);
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&ip1), Some(12));
+
+        // overwrite existing ip
+        cache.insert(ip1, 14);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&ip1), Some(14));
+    }
+
+    #[test]
+    fn test_ttl_cache_capacity_and_entry_drop() {
+        let cache = TtlCache::new();
+        // verify cache entry drop zeroization doesn't panic
+        let entry = CacheEntry {
+            ttl: 64,
+            inserted_at: Instant::now(),
+        };
+        drop(entry);
+
+        // insert a few IPs
+        for i in 1..=5 {
+            cache.insert(Ipv4Addr::new(10, 0, 0, i), i);
+        }
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.get(&Ipv4Addr::new(10, 0, 0, 3)), Some(3));
+    }
 }
