@@ -5,6 +5,8 @@ on:
     branches: [ "main", "master", "dev" ]
   pull_request:
     branches: [ "main", "master", "dev" ]
+  schedule:
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 concurrency:
@@ -16,8 +18,9 @@ env:
 
 jobs:
   quality:
-    name: Lint, Test & Fuzz
+    name: Lint, Test, Audit & Fuzz
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -41,15 +44,29 @@ jobs:
       - name: Run Clippy Linter (-D warnings)
         run: cargo clippy --release --all-targets -- -D warnings
 
+      - name: Run Security Advisory Audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: License & Advisory Policy Check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
       - name: Run Unit & Integration Tests
         run: cargo test --release --all-targets --verbose
 
       - name: Run Fuzz & Robustness Harness
         run: cargo test --release --test fuzz_robustness --verbose
 
+      - name: Verify eBPF Program Loads on CI Kernel
+        run: sudo -E $(which cargo) test --release --test ebpf_load_integration -- --ignored
+
   build:
     name: Release Binary Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [quality]
     steps:
       - name: Checkout Source Code
@@ -74,9 +91,19 @@ jobs:
           ls -lh target/release/albus
           file target/release/albus
 
+      - name: Generate SHA-256 Checksum
+        run: sha256sum target/release/albus > target/release/albus.sha256
+
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
           name: albus-linux-x86_64
           path: target/release/albus
+          retention-days: 14
+
+      - name: Upload Checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: albus-linux-x86_64-checksum
+          path: target/release/albus.sha256
           retention-days: 14
