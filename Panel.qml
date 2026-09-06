@@ -1023,7 +1023,7 @@ Panel {
           root.negMinTtl = cfg.cache_neg_min_ttl !== undefined ? String(cfg.cache_neg_min_ttl) : "60"
           root.negMaxTtl = cfg.cache_neg_max_ttl !== undefined ? String(cfg.cache_neg_max_ttl) : "600"
           root.webUiEnabled = !!cfg.web_ui
-          root.webUiAddr = cfg.web_ui_addr || "127.0.0.1:8080"
+          root.webUiAddr = cfg.web_ui_addr || "127.0.0.1:205"
           root.webUiUser = cfg.web_ui_user || ""
           root.webUiPassword = cfg.web_ui_pass || cfg.web_ui_password || ""
           root.dnscryptRelays = (cfg.dnscrypt_relays && Array.isArray(cfg.dnscrypt_relays)) ? cfg.dnscrypt_relays.join(",") : ""

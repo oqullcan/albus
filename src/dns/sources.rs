@@ -121,16 +121,22 @@ impl MinisignPublicKey {
             .verify(data, raw_signature)
             .map_err(|e| format!("minisign signature verification failed: {:?}", e))?;
 
-        // If trusted comment and global signature are present, verify them too
+        // If trusted comment and global signature are present, verify them for replay protection
         if lines.len() >= 4 && lines[2].starts_with("trusted comment:") {
-            if let Ok(global_sig) = decode_b64(lines[3]) {
-                if global_sig.len() == 64 {
-                    let mut signed_data = Vec::with_capacity(64 + lines[2].len());
-                    signed_data.extend_from_slice(raw_signature);
-                    signed_data.extend_from_slice(lines[2].as_bytes());
-                    let _ = peer_pk.verify(&signed_data, &global_sig);
-                }
+            let global_sig = decode_b64(lines[3])
+                .map_err(|e| format!("invalid minisign global signature base64: {}", e))?;
+            if global_sig.len() != 64 {
+                return Err("invalid minisign global signature length (must be 64 bytes)".into());
             }
+            let mut signed_data = Vec::with_capacity(64 + lines[2].as_bytes().len());
+            signed_data.extend_from_slice(raw_signature);
+            signed_data.extend_from_slice(lines[2].as_bytes());
+            peer_pk.verify(&signed_data, &global_sig).map_err(|e| {
+                format!(
+                    "minisign trusted comment global signature verification failed: {:?}",
+                    e
+                )
+            })?;
         }
 
         Ok(())
@@ -447,5 +453,97 @@ trusted comment: timestamp:1788418738	file:public-resolvers.md
         let test_data = b"tampered data content";
         let res = pubkey.verify(test_data, bad_sig);
         assert!(res.is_err(), "verification must fail on tampered data");
+    }
+
+    #[cfg(test)]
+    fn encode_b64(data: &[u8]) -> String {
+        const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut result = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+            let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+            result.push(B64[((n >> 18) & 0x3f) as usize] as char);
+            result.push(B64[((n >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                result.push(B64[((n >> 6) & 0x3f) as usize] as char);
+            } else {
+                result.push('=');
+            }
+            if chunk.len() > 2 {
+                result.push(B64[(n & 0x3f) as usize] as char);
+            } else {
+                result.push('=');
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_minisign_trusted_comment_verification_and_tamper() {
+        use aws_lc_rs::signature::KeyPair;
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey_bytes: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
+
+        let key_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let pubkey = MinisignPublicKey {
+            key_id,
+            public_key: pubkey_bytes,
+        };
+
+        let data = b"hello minisign world";
+        let raw_sig = key_pair.sign(data);
+
+        let mut sig_record = Vec::with_capacity(74);
+        sig_record.extend_from_slice(b"Ed");
+        sig_record.extend_from_slice(&key_id);
+        sig_record.extend_from_slice(raw_sig.as_ref());
+        let sig_line = encode_b64(&sig_record);
+
+        let trusted_comment = "trusted comment: timestamp:123456\tfile:test.txt";
+        let mut signed_data = Vec::with_capacity(64 + trusted_comment.len());
+        signed_data.extend_from_slice(raw_sig.as_ref());
+        signed_data.extend_from_slice(trusted_comment.as_bytes());
+
+        let global_sig = key_pair.sign(&signed_data);
+        let global_sig_line = encode_b64(global_sig.as_ref());
+
+        // 1. Valid signature with trusted comment must pass
+        let valid_sig_doc = format!(
+            "untrusted comment: test\n{}\n{}\n{}\n",
+            sig_line, trusted_comment, global_sig_line
+        );
+        assert!(pubkey.verify(data, &valid_sig_doc).is_ok());
+
+        // 2. Tampered trusted comment must fail!
+        let tampered_comment = "trusted comment: timestamp:999999\tfile:test.txt";
+        let tampered_sig_doc = format!(
+            "untrusted comment: test\n{}\n{}\n{}\n",
+            sig_line, tampered_comment, global_sig_line
+        );
+        let tamper_res = pubkey.verify(data, &tampered_sig_doc);
+        assert!(
+            tamper_res.is_err(),
+            "tampered trusted comment must be rejected"
+        );
+        assert!(tamper_res
+            .unwrap_err()
+            .to_string()
+            .contains("trusted comment global signature verification failed"));
+
+        // 3. Corrupted global signature must fail!
+        let corrupted_global_sig_line = encode_b64(&[0xff; 64]);
+        let corrupted_sig_doc = format!(
+            "untrusted comment: test\n{}\n{}\n{}\n",
+            sig_line, trusted_comment, corrupted_global_sig_line
+        );
+        let corrupt_res = pubkey.verify(data, &corrupted_sig_doc);
+        assert!(
+            corrupt_res.is_err(),
+            "corrupted global signature must be rejected"
+        );
     }
 }

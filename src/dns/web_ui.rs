@@ -1,4 +1,4 @@
-//! lightweight embedded web monitoring dashboard (http://127.0.0.1:8080) for albus.
+//! lightweight embedded web monitoring dashboard (http://127.0.0.1:205) for albus.
 //!
 //! provides a zero-external-dependency, real-time web interface for inspecting
 //! dns query statistics, cache performance, blocking actions, and latency telemetry.
@@ -12,6 +12,26 @@ use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, info, warn};
 
 use super::stats::DnsStats;
+
+/// Constant-time comparison of byte slices to prevent timing side-channels (CWE-208).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Constant-time string comparison by first computing SHA-256 digests of both inputs.
+/// This prevents both character-by-character timing leaks (CWE-208) and length-dependent leakage.
+pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let hash_a = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, a.as_bytes());
+    let hash_b = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b.as_bytes());
+    constant_time_eq(hash_a.as_ref(), hash_b.as_ref())
+}
 
 pub struct WebUiServer;
 
@@ -102,7 +122,9 @@ impl WebUiServer {
                                                 if let Ok(decoded) = decode_base64(b64) {
                                                     if let Ok(cred_str) = std::str::from_utf8(&decoded) {
                                                         if let Some((user, pass)) = cred_str.split_once(':') {
-                                                            if user == exp_user && pass == exp_pass {
+                                                            if constant_time_eq_str(user, exp_user)
+                                                                && constant_time_eq_str(pass, exp_pass)
+                                                            {
                                                                 authenticated = true;
                                                                 break;
                                                             }
@@ -413,5 +435,25 @@ mod tests {
         assert!(html.contains("Albus DNS Telemetry"));
         assert!(html.contains("/api/stats"));
         assert!(html.contains("TOTAL QUERIES"));
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"password123", b"password123"));
+        assert!(!constant_time_eq(b"password123", b"password124"));
+        assert!(!constant_time_eq(b"short", b"longer_password"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_constant_time_eq_str() {
+        assert!(constant_time_eq_str("admin", "admin"));
+        assert!(constant_time_eq_str(
+            "supersecretpassword",
+            "supersecretpassword"
+        ));
+        assert!(!constant_time_eq_str("admin", "root"));
+        assert!(!constant_time_eq_str("password123", "password124"));
+        assert!(!constant_time_eq_str("", "admin"));
     }
 }

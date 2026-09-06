@@ -10,8 +10,9 @@ use crate::app::config::Config;
 use crate::core::autottl::{resolve_optimal_restore_mss, AutoTtlConfig, AutoTtlEstimator};
 use crate::core::ebpf::{is_root, BpfManager, BpfManagerConfig};
 use crate::core::firewall::{
-    block_quic, block_stun, disable_kill_switch, disable_network_lockdown, enable_kill_switch,
-    enable_network_lockdown, unblock_quic, unblock_stun,
+    block_quic, block_stun, disable_kill_switch, disable_network_lockdown,
+    disable_network_lockdown_with_exemptions, enable_kill_switch, enable_network_lockdown,
+    enable_network_lockdown_with_exemptions, unblock_quic, unblock_stun,
 };
 use crate::dns::{
     build_seed_blocklist, extract_upstream_ips, extract_upstream_ips_v6, fetch_and_compile_hagezi,
@@ -23,6 +24,8 @@ pub struct Engine {
     cfg: Config,
     dns_server: Option<Arc<DnsServer>>,
     bpf_manager: BpfManager,
+    upstream_ips: Vec<std::net::Ipv4Addr>,
+    upstream_ips_v6: Vec<std::net::Ipv6Addr>,
 }
 
 impl Engine {
@@ -69,8 +72,8 @@ impl Engine {
             },
             restore_after_bytes: cfg.restore_after_bytes,
             ports: cfg.ports.clone(),
-            exclude_ips,
-            exclude_ips_v6,
+            exclude_ips: exclude_ips.clone(),
+            exclude_ips_v6: exclude_ips_v6.clone(),
             cgroup_path: cfg.cgroup_path.clone(),
             fake_ttl: cfg.fake_ttl,
             fake_sni: cfg.fake_sni.clone(),
@@ -401,6 +404,8 @@ impl Engine {
             cfg,
             dns_server,
             bpf_manager,
+            upstream_ips: exclude_ips,
+            upstream_ips_v6: exclude_ips_v6,
         })
     }
 
@@ -436,7 +441,10 @@ impl Engine {
                     unblock_quic();
                 }
                 if self.cfg.network_lockdown {
-                    disable_network_lockdown();
+                    disable_network_lockdown_with_exemptions(
+                        &self.upstream_ips,
+                        &self.upstream_ips_v6,
+                    );
                 }
                 return Err(format!("failed to configure /etc/resolv.conf: {}", e).into());
             }
@@ -447,10 +455,31 @@ impl Engine {
                     .cfg
                     .web_ui_addr
                     .parse()
-                    .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
+                    .unwrap_or_else(|_| "127.0.0.1:205".parse().unwrap());
                 let auth = match (&self.cfg.web_ui_user, &self.cfg.web_ui_pass) {
-                    (Some(u), Some(p)) => Some((u.clone(), p.clone())),
-                    _ => None,
+                    (Some(u), Some(p)) if !u.trim().is_empty() && !p.trim().is_empty() => {
+                        Some((u.clone(), p.clone()))
+                    }
+                    _ => {
+                        // Multi-user security hardening: Never expose unauthenticated dashboard.
+                        // Ephemeral secure credentials auto-generated when none configured.
+                        let mut token_bytes = [0u8; 16];
+                        let _ = aws_lc_rs::rand::fill(&mut token_bytes);
+                        let token: String =
+                            token_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                        let user = "admin".to_string();
+                        info!(
+                            user = %user,
+                            "Web Monitoring Dashboard enabled without credentials; generated ephemeral password: {}",
+                            token
+                        );
+                        let token_path = std::path::Path::new("/run/albus/web_ui.token");
+                        if let Some(parent) = token_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(token_path, format!("{}:{}\n", user, token));
+                        Some((user, token))
+                    }
                 };
                 crate::dns::WebUiServer::start(
                     web_addr,
@@ -472,7 +501,10 @@ impl Engine {
                     e
                 );
                 if self.cfg.network_lockdown {
-                    enable_network_lockdown();
+                    enable_network_lockdown_with_exemptions(
+                        &self.upstream_ips,
+                        &self.upstream_ips_v6,
+                    );
                 }
             }
         }
@@ -556,8 +588,8 @@ impl Engine {
             },
             restore_after_bytes: new_cfg.restore_after_bytes,
             ports: new_cfg.ports.clone(),
-            exclude_ips,
-            exclude_ips_v6,
+            exclude_ips: exclude_ips.clone(),
+            exclude_ips_v6: exclude_ips_v6.clone(),
             cgroup_path: new_cfg.cgroup_path.clone(),
             fake_ttl: new_cfg.fake_ttl,
             fake_sni: new_cfg.fake_sni.clone(),
@@ -573,13 +605,15 @@ impl Engine {
             info!("Live eBPF map reload successful (target ports & exclusion IPs updated)");
         }
 
+        self.upstream_ips = exclude_ips;
+        self.upstream_ips_v6 = exclude_ips_v6;
         self.cfg = new_cfg;
     }
 
     // restores kernel socket options, removes iptables rules, and restores system dns
     pub fn shutdown(&mut self) {
         if self.cfg.network_lockdown {
-            disable_network_lockdown();
+            disable_network_lockdown_with_exemptions(&self.upstream_ips, &self.upstream_ips_v6);
         }
 
         if self.cfg.kill_switch {

@@ -161,7 +161,7 @@ fn default_timeout_load_reduction() -> f64 {
 }
 
 fn default_web_ui() -> bool {
-    true
+    false
 }
 
 fn default_metrics_addr() -> String {
@@ -291,7 +291,7 @@ impl Default for Config {
             cache_neg_max_ttl: 600,
             tls_key_log_file: None,
             timeout_load_reduction: 0.75,
-            web_ui: true,
+            web_ui: false,
             web_ui_addr: "127.0.0.1:205".to_string(),
             web_ui_user: None,
             web_ui_pass: None,

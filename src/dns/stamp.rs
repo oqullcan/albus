@@ -5,7 +5,9 @@
 //! and protocol attributes (dnssec, nolog, nofilter).
 
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use super::ssrf::{is_ssrf_risk, is_ssrf_risk_ip};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StampProtocol {
@@ -101,8 +103,25 @@ impl DnsStamp {
             (None, None)
         };
 
+        if let Some(ref sa) = server_addr {
+            if is_ssrf_risk_ip(&sa.ip()) {
+                return Err(format!(
+                    "dns stamp rejected: server address {} is a reserved/private SSRF risk",
+                    sa.ip()
+                )
+                .into());
+            }
+        }
+
         let mut bootstrap_ips = Vec::new();
         if let Some(v4) = bootstrap_ip {
+            if is_ssrf_risk_ip(&IpAddr::V4(v4)) {
+                return Err(format!(
+                    "dns stamp rejected: bootstrap IP {} is a reserved/private SSRF risk",
+                    v4
+                )
+                .into());
+            }
             bootstrap_ips.push(v4);
         }
 
@@ -135,6 +154,14 @@ impl DnsStamp {
                 let (name, _) = read_lp_string(&decoded, pos)?;
                 provider_name = name;
             }
+        }
+
+        if !provider_name.is_empty() && is_ssrf_risk(&provider_name) {
+            return Err(format!(
+                "dns stamp rejected: provider hostname '{}' is a reserved/private SSRF risk",
+                provider_name
+            )
+            .into());
         }
 
         let doh_url = if !provider_name.is_empty() {
@@ -338,5 +365,28 @@ mod tests {
         let res = skip_vlen_array(&valid_data, 0);
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 4);
+    }
+
+    #[test]
+    fn test_stamp_rejects_loopback_and_private_ssrf() {
+        // Stamp pointing to 127.0.0.1 / localhost
+        let stamp_str = "sdns://AgAAAAAAAAAACTEyNy4wLjAuMQAJbG9jYWxob3N0AA";
+        let err = DnsStamp::parse(stamp_str);
+        assert!(
+            err.is_err(),
+            "stamp pointing to 127.0.0.1 / localhost must be rejected"
+        );
+        let err_msg = err.err().unwrap().to_string();
+        assert!(err_msg.contains("SSRF risk"));
+    }
+
+    #[test]
+    fn test_stamp_rejects_cloud_metadata_imds() {
+        // Stamp pointing to 169.254.169.254 / instance-data
+        let stamp_str = "sdns://AgAAAAAAAAAADzE2OS4yNTQuMTY5LjI1NAAOaW5zdGFuY2UtZGF0YQA";
+        let err = DnsStamp::parse(stamp_str);
+        assert!(err.is_err(), "stamp pointing to IMDS must be rejected");
+        let err_msg = err.err().unwrap().to_string();
+        assert!(err_msg.contains("SSRF risk"));
     }
 }

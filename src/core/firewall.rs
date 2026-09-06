@@ -1,5 +1,6 @@
 //! iptables and ip6tables packet filtering rules for quic fallback, webrtc stun drop, and dns leak kill-switch.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use tracing::{debug, info};
 
@@ -138,9 +139,24 @@ pub fn disable_kill_switch() {
     debug!("DNS Kill-Switch deactivated");
 }
 
-// enables fail-closed network lockdown: blocks outbound non-loopback tcp traffic on ports 80 and 443
-// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails
-pub fn enable_network_lockdown() {
+/// Enables fail-closed network lockdown with connection state tracking and DoH resolver exemptions.
+///
+/// # Architecture & Threat Model
+/// When the eBPF subsystem fails or is intentionally disabled while `network_lockdown = true`
+/// is configured, Albus enters a strict "fail-closed" state to prevent unfragmented/unprotected
+/// HTTP/HTTPS traffic from leaking to the ISP.
+///
+/// # Connection State & DoH Exemption Mechanism
+/// 1. Stateful Conntrack: Injects `-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT`
+///    to ensure active sessions and protocol handshakes are not abruptly severed.
+/// 2. DoH Resolver Exceptions: Explicitly allows outbound TCP port 443 traffic destined
+///    to the configured upstream DoH resolver IP endpoints (`exempt_v4` and `exempt_v6`).
+///    Without these exemptions, blocking port 443 would kill the daemon's own DoH connections,
+///    causing total DNS failure and breaking connectivity entirely.
+/// 3. Fail-Closed Web Quarantine: Rejects all other outbound TCP traffic on ports 80 and 443
+///    originating from non-loopback interfaces.
+pub fn enable_network_lockdown_with_exemptions(exempt_v4: &[Ipv4Addr], exempt_v6: &[Ipv6Addr]) {
+    // 1. Inject blanket REJECT rules for non-loopback HTTP/HTTPS (ports 80, 443)
     for port in &["80", "443"] {
         let _ = Command::new("iptables")
             .args([
@@ -155,11 +171,145 @@ pub fn enable_network_lockdown() {
             .status();
     }
 
-    info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
+    // 2. Prepend DoH resolver IP exemptions so they take precedence over the REJECT rules
+    for ip in exempt_v4 {
+        let _ = Command::new("iptables")
+            .args([
+                "-I",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip.to_string(),
+                "--dport",
+                "443",
+                "-j",
+                "ACCEPT",
+            ])
+            .status();
+    }
+    for ip in exempt_v6 {
+        let _ = Command::new("ip6tables")
+            .args([
+                "-I",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip.to_string(),
+                "--dport",
+                "443",
+                "-j",
+                "ACCEPT",
+            ])
+            .status();
+    }
+
+    // 3. Prepend conntrack state matching at the very top of OUTPUT chain
+    let _ = Command::new("iptables")
+        .args([
+            "-I",
+            "OUTPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ])
+        .status();
+    let _ = Command::new("ip6tables")
+        .args([
+            "-I",
+            "OUTPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ])
+        .status();
+
+    info!(
+        exempt_v4_count = exempt_v4.len(),
+        exempt_v6_count = exempt_v6.len(),
+        "Network Lockdown ACTIVE (fail-closed) — stateful conntrack active, upstream DoH endpoints exempted, outbound HTTP/HTTPS blocked"
+    );
 }
 
-// purges fail-closed network lockdown rules
-pub fn disable_network_lockdown() {
+/// Convenience wrapper for enabling network lockdown without explicit exemptions.
+pub fn enable_network_lockdown() {
+    enable_network_lockdown_with_exemptions(&[], &[]);
+}
+
+/// Purges fail-closed network lockdown rules, connection tracking filters, and resolver exemptions.
+pub fn disable_network_lockdown_with_exemptions(exempt_v4: &[Ipv4Addr], exempt_v6: &[Ipv6Addr]) {
+    // 1. Flush conntrack state filter
+    flush_rule(
+        "iptables",
+        &[
+            "-D",
+            "OUTPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+    );
+    flush_rule(
+        "ip6tables",
+        &[
+            "-D",
+            "OUTPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+    );
+
+    // 2. Flush DoH exemptions
+    for ip in exempt_v4 {
+        flush_rule(
+            "iptables",
+            &[
+                "-D",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip.to_string(),
+                "--dport",
+                "443",
+                "-j",
+                "ACCEPT",
+            ],
+        );
+    }
+    for ip in exempt_v6 {
+        flush_rule(
+            "ip6tables",
+            &[
+                "-D",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip.to_string(),
+                "--dport",
+                "443",
+                "-j",
+                "ACCEPT",
+            ],
+        );
+    }
+
+    // 3. Flush REJECT rules
     for port in &["80", "443"] {
         flush_rule(
             "iptables",
@@ -176,6 +326,11 @@ pub fn disable_network_lockdown() {
     }
 
     debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");
+}
+
+/// Convenience wrapper for disabling network lockdown.
+pub fn disable_network_lockdown() {
+    disable_network_lockdown_with_exemptions(&[], &[]);
 }
 
 #[cfg(test)]

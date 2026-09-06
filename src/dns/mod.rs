@@ -25,6 +25,7 @@ pub mod pattern;
 pub mod schedule;
 pub mod server;
 pub mod sources;
+pub mod ssrf;
 pub mod stamp;
 pub mod stats;
 pub mod system;
@@ -54,6 +55,7 @@ pub use server::DnsServer;
 pub use sources::{
     parse_resolver_markdown, MinisignPublicKey, RemoteResolverEntry, SourceConfig, SourceManager,
 };
+pub use ssrf::{is_ssrf_risk, is_ssrf_risk_ip};
 pub use stamp::{DnsStamp, StampProtocol};
 pub use stats::{DnsStats, DnsStatsSnapshot};
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};

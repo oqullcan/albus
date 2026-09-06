@@ -198,6 +198,14 @@ impl SingleDoHClient {
 
         if let Ok(parsed) = Url::parse(upstream) {
             if let Some(host_str) = parsed.host_str() {
+                if !DOH_PRESETS.contains_key(name) && crate::dns::ssrf::is_ssrf_risk(host_str) {
+                    return Err(format!(
+                        "SSRF risk: upstream host '{}' is in a private/reserved network range",
+                        host_str
+                    )
+                    .into());
+                }
+
                 let port = parsed.port().unwrap_or(443);
                 let mut bootstrap_addrs = Vec::new();
 
@@ -210,6 +218,13 @@ impl SingleDoHClient {
 
                 // 2. append user-specified custom bootstrap endpoints
                 for ip in custom_bootstrap_ips {
+                    if crate::dns::ssrf::is_ssrf_risk_ip(&std::net::IpAddr::V4(*ip)) {
+                        return Err(format!(
+                            "SSRF risk: custom bootstrap IP '{}' is in a private/reserved network range",
+                            ip
+                        )
+                        .into());
+                    }
                     bootstrap_addrs.push(SocketAddr::from((*ip, port)));
                 }
 
@@ -805,5 +820,45 @@ MC4CAQAwBQYDK2VwBCIEII1my9yC6gDHipAN+m87pQ1AECzquF5mj3NU+c6Yg7a7
         assert!(client.is_ok(), "DoHClient with keylog file should succeed");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_custom_doh_ssrf_rejection() {
+        // Localhost URL
+        let client_res = SingleDoHClient::new(
+            "https://127.0.0.1/dns-query",
+            "local",
+            &[],
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(client_res.is_err());
+        assert!(client_res.err().unwrap().to_string().contains("SSRF risk"));
+
+        // Cloud metadata IMDS
+        let imds_res = SingleDoHClient::new(
+            "https://169.254.169.254/dns-query",
+            "imds",
+            &[],
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(imds_res.is_err());
+
+        // Private IP in bootstrap list
+        let priv_boot_res = SingleDoHClient::new(
+            "https://example.com/dns-query",
+            "example",
+            &[Ipv4Addr::new(10, 0, 0, 1)],
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(priv_boot_res.is_err());
     }
 }
