@@ -456,4 +456,68 @@ mod tests {
         assert!(!constant_time_eq_str("password123", "password124"));
         assert!(!constant_time_eq_str("", "admin"));
     }
+
+    #[tokio::test]
+    async fn test_web_ui_server_http_end_to_end() {
+        use std::sync::atomic::Ordering;
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let stats = DnsStats::new();
+        stats.total_queries.fetch_add(1, Ordering::Relaxed);
+        stats.blocked_bogon.fetch_add(1, Ordering::Relaxed);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let auth = Some(("testuser".to_string(), "testpass".to_string()));
+        tokio::spawn(WebUiServer::run_listener(listener, stats, auth, shutdown_rx));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        // 1. Unauthenticated request -> 401 Unauthorized
+        let unauth_resp = client
+            .get(format!("http://127.0.0.1:{}/", port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 2. Wrong credentials -> 401 Unauthorized
+        let bad_auth_resp = client
+            .get(format!("http://127.0.0.1:{}/", port))
+            .basic_auth("testuser", Some("wrongpass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_auth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 3. Valid credentials -> 200 OK HTML
+        let ok_resp = client
+            .get(format!("http://127.0.0.1:{}/", port))
+            .basic_auth("testuser", Some("testpass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+        let html_body = ok_resp.text().await.unwrap();
+        assert!(html_body.contains("Albus DNS Telemetry"));
+
+        // 4. Valid credentials /api/stats -> 200 OK JSON
+        let stats_resp = client
+            .get(format!("http://127.0.0.1:{}/api/stats", port))
+            .basic_auth("testuser", Some("testpass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stats_resp.status(), reqwest::StatusCode::OK);
+        let body_text = stats_resp.text().await.unwrap();
+        let json_body: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(json_body["total_queries"], 1);
+        assert_eq!(json_body["blocked_bogon"], 1);
+
+        // 5. Clean shutdown
+        let _ = shutdown_tx.send(());
+    }
 }
