@@ -358,12 +358,12 @@ pub struct RunArgs {
     pub timeout_load_reduction: f64,
 
     // enable embedded web monitoring dashboard (http://127.0.0.1:205)
-    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
-    pub web_ui: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub web_ui: Option<bool>,
 
     // embedded web monitoring dashboard listen address
-    #[arg(long, default_value = "127.0.0.1:205")]
-    pub web_ui_addr: String,
+    #[arg(long)]
+    pub web_ui_addr: Option<String>,
 
     // optional basic authentication username for web monitoring dashboard
     #[arg(long)]

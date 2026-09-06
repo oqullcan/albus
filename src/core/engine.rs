@@ -451,11 +451,8 @@ impl Engine {
             info!("encrypted DNS active");
 
             if self.cfg.web_ui {
-                let web_addr: SocketAddr = self
-                    .cfg
-                    .web_ui_addr
-                    .parse()
-                    .unwrap_or_else(|_| "127.0.0.1:205".parse().unwrap());
+                let web_addr: SocketAddr =
+                    crate::dns::web_ui::parse_web_ui_addr(&self.cfg.web_ui_addr);
                 let auth = match (&self.cfg.web_ui_user, &self.cfg.web_ui_pass) {
                     (Some(u), Some(p)) if !u.trim().is_empty() && !p.trim().is_empty() => {
                         Some((u.clone(), p.clone()))

@@ -177,7 +177,7 @@ fn default_cache_neg_max_ttl() -> u32 {
 }
 
 fn default_web_ui_addr() -> String {
-    "127.0.0.1:205".to_string()
+    "127.0.0.1:0205".to_string()
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -292,7 +292,7 @@ impl Default for Config {
             tls_key_log_file: None,
             timeout_load_reduction: 0.75,
             web_ui: false,
-            web_ui_addr: "127.0.0.1:205".to_string(),
+            web_ui_addr: "127.0.0.1:0205".to_string(),
             web_ui_user: None,
             web_ui_pass: None,
             dnscrypt_servers: Vec::new(),

@@ -109,7 +109,7 @@ Panel {
   property string negMinTtl: "60"
   property string negMaxTtl: "600"
   property bool webUiEnabled: true
-  property string webUiAddr: "127.0.0.1:205"
+  property string webUiAddr: "127.0.0.1:0205"
   property string webUiUser: ""
   property string webUiPassword: ""
   property string dnscryptRelays: ""
@@ -1023,7 +1023,7 @@ Panel {
           root.negMinTtl = cfg.cache_neg_min_ttl !== undefined ? String(cfg.cache_neg_min_ttl) : "60"
           root.negMaxTtl = cfg.cache_neg_max_ttl !== undefined ? String(cfg.cache_neg_max_ttl) : "600"
           root.webUiEnabled = !!cfg.web_ui
-          root.webUiAddr = cfg.web_ui_addr || "127.0.0.1:205"
+          root.webUiAddr = cfg.web_ui_addr || "127.0.0.1:0205"
           root.webUiUser = cfg.web_ui_user || ""
           root.webUiPassword = cfg.web_ui_pass || cfg.web_ui_password || ""
           root.dnscryptRelays = (cfg.dnscrypt_relays && Array.isArray(cfg.dnscrypt_relays)) ? cfg.dnscrypt_relays.join(",") : ""
@@ -1111,7 +1111,7 @@ Panel {
 
   Process {
     id: browserProc
-    command: ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:205")]
+    command: ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:0205")]
     running: false
   }
 
@@ -2543,7 +2543,7 @@ Panel {
                         StyledTextField {
                           width: parent.width - Style.space(24)
                           text: root.webUiAddr
-                          placeholderText: "127.0.0.1:205"
+                          placeholderText: "127.0.0.1:0205"
                           onTextEdited: {
                             root.webUiAddr = text
                             root.scheduleAutoApply()
@@ -2625,7 +2625,7 @@ Panel {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
-                              browserProc.command = ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:205")]
+                              browserProc.command = ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:0205")]
                               browserProc.running = true
                             }
                           }

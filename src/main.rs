@@ -163,8 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         };
                     }
                     cfg.timeout_load_reduction = args.timeout_load_reduction;
-                    cfg.web_ui = args.web_ui;
-                    cfg.web_ui_addr = args.web_ui_addr;
+                    if let Some(w) = args.web_ui {
+                        cfg.web_ui = w;
+                    }
+                    if let Some(ref addr) = args.web_ui_addr {
+                        cfg.web_ui_addr = addr.clone();
+                    }
                     if let Some(ref user) = args.web_ui_user {
                         cfg.web_ui_user = if user.trim().is_empty() {
                             None
@@ -369,8 +373,12 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
         cfg.tls_key_log_file = Some(path.clone());
     }
     cfg.timeout_load_reduction = args.timeout_load_reduction;
-    cfg.web_ui = args.web_ui;
-    cfg.web_ui_addr = args.web_ui_addr;
+    if let Some(w) = args.web_ui {
+        cfg.web_ui = w;
+    }
+    if let Some(ref addr) = args.web_ui_addr {
+        cfg.web_ui_addr = addr.clone();
+    }
     if let Some(ref user) = args.web_ui_user {
         cfg.web_ui_user = Some(user.clone());
     }

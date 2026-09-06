@@ -33,6 +33,24 @@ pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     constant_time_eq(hash_a.as_ref(), hash_b.as_ref())
 }
 
+/// Safely parses a web UI address or port string (e.g. "127.0.0.1:205", "127.0.0.1:0205", "205", "0205", ":205", ":0205").
+pub fn parse_web_ui_addr(input: &str) -> SocketAddr {
+    let clean = input.trim();
+    if let Ok(addr) = clean.parse::<SocketAddr>() {
+        return addr;
+    }
+    if clean.starts_with(':') {
+        if let Ok(addr) = format!("127.0.0.1{}", clean).parse::<SocketAddr>() {
+            return addr;
+        }
+    } else if clean.chars().all(|c| c.is_ascii_digit()) && !clean.is_empty() {
+        if let Ok(addr) = format!("127.0.0.1:{}", clean).parse::<SocketAddr>() {
+            return addr;
+        }
+    }
+    "127.0.0.1:205".parse().unwrap()
+}
+
 pub struct WebUiServer;
 
 const MAX_CONCURRENT_WEB_CONNS: usize = 32;
@@ -151,6 +169,13 @@ impl WebUiServer {
                                             html
                                         )
                                     }
+                                    ("HEAD", "/") | ("HEAD", "/index.html") => {
+                                        let html = render_dashboard_html();
+                                        format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                            html.len()
+                                        )
+                                    }
                                     ("GET", "/api/stats") => {
                                         let snap = stats_clone.snapshot();
                                         let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
@@ -160,8 +185,19 @@ impl WebUiServer {
                                             json
                                         )
                                     }
+                                    ("HEAD", "/api/stats") => {
+                                        let snap = stats_clone.snapshot();
+                                        let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
+                                        format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                            json.len()
+                                        )
+                                    }
                                     ("GET", "/api/health") | ("GET", "/live") => {
                                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_string()
+                                    }
+                                    ("HEAD", "/api/health") | ("HEAD", "/live") => {
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n".to_string()
                                     }
                                     _ => {
                                         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found".to_string()
@@ -517,7 +553,32 @@ mod tests {
         assert_eq!(json_body["total_queries"], 1);
         assert_eq!(json_body["blocked_bogon"], 1);
 
-        // 5. Clean shutdown
+        // 5. Valid credentials HEAD request
+        let head_resp = client
+            .head(format!("http://127.0.0.1:{}/", port))
+            .basic_auth("testuser", Some("testpass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head_resp.status(), reqwest::StatusCode::OK);
+
+        // 6. Clean shutdown
         let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn test_parse_web_ui_addr() {
+        let expected: SocketAddr = "127.0.0.1:205".parse().unwrap();
+        assert_eq!(parse_web_ui_addr("127.0.0.1:205"), expected);
+        assert_eq!(parse_web_ui_addr("127.0.0.1:0205"), expected);
+        assert_eq!(parse_web_ui_addr("0205"), expected);
+        assert_eq!(parse_web_ui_addr("205"), expected);
+        assert_eq!(parse_web_ui_addr(":0205"), expected);
+        assert_eq!(parse_web_ui_addr(":205"), expected);
+        assert_eq!(parse_web_ui_addr("  0205  "), expected);
+
+        let custom: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert_eq!(parse_web_ui_addr("0.0.0.0:8080"), custom);
+        assert_eq!(parse_web_ui_addr("invalid_addr"), expected);
     }
 }
