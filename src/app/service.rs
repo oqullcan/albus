@@ -76,6 +76,12 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
         String::new()
     };
 
+    let protect_home_val = if env_user_line.is_empty() {
+        "yes"
+    } else {
+        "read-only"
+    };
+
     // format systemd service specification
     let unit_content = format!(
         r#"[Unit]
@@ -97,7 +103,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome={protect_home_val}
 ProtectKernelTunables=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
