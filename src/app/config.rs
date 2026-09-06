@@ -106,6 +106,78 @@ pub struct Config {
     pub odoh_relay: Option<String>,
     #[serde(default)]
     pub odoh_target: Option<String>,
+    #[serde(default)]
+    pub socks5_proxy: Option<String>,
+    #[serde(default)]
+    pub tor: bool,
+    #[serde(default)]
+    pub nx_log: bool,
+    #[serde(default)]
+    pub nx_log_path: Option<String>,
+    #[serde(default)]
+    pub schedules: HashMap<String, crate::dns::ScheduleConfig>,
+    #[serde(default)]
+    pub edns_client_subnet: Option<String>,
+    #[serde(default)]
+    pub metrics: bool,
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
+    #[serde(default)]
+    pub tls_client_cert: Option<String>,
+    #[serde(default)]
+    pub tls_client_key: Option<String>,
+    #[serde(default)]
+    pub sources: HashMap<String, crate::dns::SourceConfig>,
+    #[serde(default = "default_forwarding_rules_path")]
+    pub forwarding_rules_path: Option<String>,
+    #[serde(default = "default_cache_neg_min_ttl")]
+    pub cache_neg_min_ttl: u32,
+    #[serde(default = "default_cache_neg_max_ttl")]
+    pub cache_neg_max_ttl: u32,
+    #[serde(default)]
+    pub tls_key_log_file: Option<String>,
+    #[serde(default = "default_timeout_load_reduction")]
+    pub timeout_load_reduction: f64,
+    #[serde(default = "default_web_ui")]
+    pub web_ui: bool,
+    #[serde(default = "default_web_ui_addr")]
+    pub web_ui_addr: String,
+    #[serde(default)]
+    pub web_ui_user: Option<String>,
+    #[serde(default)]
+    pub web_ui_pass: Option<String>,
+    #[serde(default)]
+    pub dnscrypt_servers: Vec<String>,
+    #[serde(default)]
+    pub dnscrypt_relays: Vec<String>,
+}
+
+fn default_forwarding_rules_path() -> Option<String> {
+    Some("/etc/albus/forwarding-rules.txt".to_string())
+}
+
+fn default_timeout_load_reduction() -> f64 {
+    0.75
+}
+
+fn default_web_ui() -> bool {
+    true
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9153".to_string()
+}
+
+fn default_cache_neg_min_ttl() -> u32 {
+    60
+}
+
+fn default_cache_neg_max_ttl() -> u32 {
+    600
+}
+
+fn default_web_ui_addr() -> String {
+    "127.0.0.1:205".to_string()
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -203,6 +275,28 @@ impl Default for Config {
             odoh_enabled: false,
             odoh_relay: None,
             odoh_target: None,
+            socks5_proxy: None,
+            tor: false,
+            nx_log: false,
+            nx_log_path: None,
+            schedules: HashMap::new(),
+            edns_client_subnet: None,
+            metrics: false,
+            metrics_addr: "127.0.0.1:9153".to_string(),
+            tls_client_cert: None,
+            tls_client_key: None,
+            sources: HashMap::new(),
+            forwarding_rules_path: Some("/etc/albus/forwarding-rules.txt".to_string()),
+            cache_neg_min_ttl: 60,
+            cache_neg_max_ttl: 600,
+            tls_key_log_file: None,
+            timeout_load_reduction: 0.75,
+            web_ui: true,
+            web_ui_addr: "127.0.0.1:205".to_string(),
+            web_ui_user: None,
+            web_ui_pass: None,
+            dnscrypt_servers: Vec::new(),
+            dnscrypt_relays: Vec::new(),
         }
     }
 }
@@ -671,11 +765,126 @@ impl Config {
 
         Self::default()
     }
+
+    // returns the effective upstream socks5 proxy url if explicit socks5_proxy or tor mode is configured
+    pub fn effective_proxy(&self) -> Option<String> {
+        if let Some(ref p) = self.socks5_proxy {
+            let clean = p.trim();
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+        if self.tor {
+            return Some("socks5://127.0.0.1:9050".to_string());
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_default_values() {
+        let cfg = Config::default();
+        assert_eq!(cfg.mss, 88);
+        assert_eq!(cfg.min_mss, 64);
+        assert_eq!(cfg.restore_mss, 0);
+        assert_eq!(cfg.restore_after_bytes, 600);
+        assert_eq!(cfg.ports, vec![443]);
+        assert_eq!(cfg.cgroup_path, "/sys/fs/cgroup");
+        assert_eq!(cfg.fake_ttl, 8);
+        assert_eq!(cfg.fake_sni, None);
+        assert_eq!(cfg.fake_bad_checksum, false);
+        assert_eq!(cfg.fake_seq_offset, 0);
+        assert_eq!(cfg.auto_ttl, true);
+        assert_eq!(cfg.min_ttl, 3);
+        assert_eq!(cfg.max_ttl, 12);
+        assert_eq!(cfg.doh_enabled, true);
+        assert_eq!(cfg.dns_racing, true);
+        assert_eq!(cfg.doh_upstream, "quad9");
+        assert!(cfg.doh_bootstrap_ips.is_empty());
+        assert_eq!(cfg.block_quic, true);
+        assert_eq!(cfg.block_stun, true);
+        assert_eq!(cfg.kill_switch, true);
+        assert_eq!(cfg.network_lockdown, false);
+        assert_eq!(cfg.block_ipv6, true);
+        assert_eq!(cfg.dnssec, true);
+        assert_eq!(cfg.pqc, true);
+        assert_eq!(cfg.ram_only, false);
+        assert_eq!(cfg.verbose, false);
+        assert_eq!(cfg.anti_dns_rebinding, true);
+        assert_eq!(cfg.block_undelegated, true);
+        assert_eq!(cfg.edns_padding, true);
+        assert_eq!(cfg.blocklist, true);
+        assert_eq!(cfg.blocklist_path, None);
+        assert_eq!(cfg.dns64, false);
+        assert_eq!(cfg.block_bogons, true);
+        assert_eq!(cfg.uncloak_cnames, true);
+        assert_eq!(cfg.netmon, true);
+        assert_eq!(cfg.tcp_listener, true);
+        assert_eq!(cfg.local_doh, true);
+        assert_eq!(cfg.local_doh_addr, "127.0.0.1:8053");
+        assert_eq!(cfg.query_log, false);
+        assert_eq!(cfg.odoh_enabled, false);
+        assert_eq!(cfg.socks5_proxy, None);
+        assert_eq!(cfg.tor, false);
+        assert_eq!(cfg.nx_log, false);
+        assert_eq!(cfg.nx_log_path, None);
+        assert!(cfg.schedules.is_empty());
+        assert_eq!(cfg.edns_client_subnet, None);
+        assert_eq!(cfg.metrics, false);
+        assert_eq!(cfg.metrics_addr, "127.0.0.1:9153");
+        assert_eq!(cfg.tls_client_cert, None);
+        assert_eq!(cfg.tls_client_key, None);
+        assert!(cfg.sources.is_empty());
+
+        // Verify serde deserialization of empty json "{}" yields identical defaults
+        let from_empty: Config =
+            serde_json::from_str("{}").expect("empty json must parse with all defaults");
+        assert_eq!(from_empty.mss, 88);
+        assert_eq!(from_empty.min_mss, 64);
+        assert_eq!(from_empty.doh_upstream, "quad9");
+        assert_eq!(from_empty.auto_ttl, true);
+        assert_eq!(from_empty.block_quic, true);
+        assert_eq!(from_empty.block_stun, true);
+        assert_eq!(from_empty.kill_switch, true);
+        assert_eq!(from_empty.network_lockdown, false);
+        assert_eq!(from_empty.blocklist, true);
+        assert_eq!(from_empty.local_doh, true);
+        assert_eq!(from_empty.local_doh_addr, "127.0.0.1:8053");
+        assert_eq!(from_empty.socks5_proxy, None);
+        assert_eq!(from_empty.tor, false);
+        assert_eq!(from_empty.nx_log, false);
+        assert_eq!(from_empty.nx_log_path, None);
+        assert!(from_empty.schedules.is_empty());
+        assert_eq!(from_empty.edns_client_subnet, None);
+        assert_eq!(from_empty.metrics, false);
+        assert_eq!(from_empty.metrics_addr, "127.0.0.1:9153");
+        assert_eq!(from_empty.tls_client_cert, None);
+        assert_eq!(from_empty.tls_client_key, None);
+        assert!(from_empty.sources.is_empty());
+    }
+
+    #[test]
+    fn test_effective_proxy() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_proxy(), None);
+
+        cfg.tor = true;
+        assert_eq!(
+            cfg.effective_proxy().as_deref(),
+            Some("socks5://127.0.0.1:9050")
+        );
+
+        // explicit socks5_proxy takes precedence over tor default
+        cfg.socks5_proxy = Some("socks5://10.0.0.1:1080".to_string());
+        assert_eq!(
+            cfg.effective_proxy().as_deref(),
+            Some("socks5://10.0.0.1:1080")
+        );
+    }
 
     #[test]
     fn test_username_validation() {

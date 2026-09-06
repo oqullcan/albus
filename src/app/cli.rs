@@ -37,6 +37,29 @@ pub enum Commands {
 
     // cleanup firewall rules and restore original resolv.conf
     Cleanup,
+
+    // list, fetch, and verify remote resolver lists with cryptographic minisign signatures
+    Resolvers(ResolversArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ResolversArgs {
+    #[command(subcommand)]
+    pub command: Option<ResolversCommands>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ResolversCommands {
+    // list available resolvers from local cache or remote source
+    List,
+
+    // update and cryptographically verify remote resolver lists
+    Update,
+
+    // show details and stamp for a specific resolver
+    Show {
+        name: String,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -264,6 +287,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub query_log_path: Option<String>,
 
+    // enable dedicated audit log for nxdomain responses (dga malware detection)
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub nx_log: bool,
+
+    // output file path for nxdomain audit log
+    #[arg(long)]
+    pub nx_log_path: Option<String>,
+
     // 128-bit hex key for client ip pseudonymization (ipcrypt)
     #[arg(long)]
     pub ipcrypt_key: Option<String>,
@@ -279,6 +310,78 @@ pub struct RunArgs {
     // oblivious doh target resolver url
     #[arg(long)]
     pub odoh_target: Option<String>,
+
+    // edns client subnet (rfc 7871) cidr prefix for geo-optimization (e.g. 1.2.3.0/24 or 0.0.0.0/0 for zero-scope)
+    #[arg(long)]
+    pub edns_client_subnet: Option<String>,
+
+    // enable prometheus metrics http server endpoint (/metrics)
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub metrics: bool,
+
+    // prometheus metrics listen address
+    #[arg(long, default_value = "127.0.0.1:9153")]
+    pub metrics_addr: String,
+
+    // route upstream encrypted doh/odoh queries via socks5 proxy (e.g. socks5://127.0.0.1:9050)
+    #[arg(long)]
+    pub socks5_proxy: Option<String>,
+
+    // route upstream encrypted queries through local tor socks5 proxy (socks5://127.0.0.1:9050)
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub tor: bool,
+
+    // client x.509 certificate file in pem format for mtls upstream authentication
+    #[arg(long)]
+    pub tls_client_cert: Option<String>,
+
+    // client private key file in pem format (pkcs#8, pkcs#1, or sec1) for mtls upstream authentication
+    #[arg(long)]
+    pub tls_client_key: Option<String>,
+
+    // path to external split-dns forwarding rules file (e.g. forwarding-rules.txt)
+    #[arg(long, visible_alias = "forward-rules-path")]
+    pub forwarding_rules_path: Option<String>,
+
+    // minimum ttl clamp in seconds for negative responses (rfc 2308 nxdomain/nodata)
+    #[arg(long, default_value_t = 60, visible_alias = "neg-min-ttl")]
+    pub cache_neg_min_ttl: u32,
+
+    // maximum ttl clamp in seconds for negative responses (rfc 2308 nxdomain/nodata)
+    #[arg(long, default_value_t = 600, visible_alias = "neg-max-ttl")]
+    pub cache_neg_max_ttl: u32,
+
+    // write tls secrets (nss key log format) to file for wireshark debugging
+    #[arg(long)]
+    pub tls_key_log_file: Option<String>,
+
+    // dynamic query timeout reduction factor under high load (0.0 to 1.0, e.g. 0.75)
+    #[arg(long, default_value_t = 0.75)]
+    pub timeout_load_reduction: f64,
+
+    // enable embedded web monitoring dashboard (http://127.0.0.1:205)
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub web_ui: bool,
+
+    // embedded web monitoring dashboard listen address
+    #[arg(long, default_value = "127.0.0.1:205")]
+    pub web_ui_addr: String,
+
+    // optional basic authentication username for web monitoring dashboard
+    #[arg(long)]
+    pub web_ui_user: Option<String>,
+
+    // optional basic authentication password for web monitoring dashboard
+    #[arg(long, visible_alias = "web-ui-password")]
+    pub web_ui_pass: Option<String>,
+
+    // comma-separated list of dnscrypt resolver names or sdns stamps
+    #[arg(long, value_delimiter = ',')]
+    pub dnscrypt_servers: Option<Vec<String>>,
+
+    // comma-separated list of anonymized dnscrypt relay names or sdns stamps
+    #[arg(long, value_delimiter = ',')]
+    pub dnscrypt_relays: Option<Vec<String>>,
 
     // enable verbose debug logging in tracing subscriber
     #[arg(short, long, default_value_t = false)]
@@ -314,6 +417,121 @@ mod tests {
         assert!(cli.run_args.kill_switch);
         assert!(!cli.run_args.network_lockdown);
         assert_eq!(cli.run_args.doh_upstream, "quad9");
+        assert_eq!(cli.run_args.socks5_proxy, None);
+        assert!(!cli.run_args.tor);
+        assert!(!cli.run_args.nx_log);
+        assert_eq!(cli.run_args.nx_log_path, None);
+        assert_eq!(cli.run_args.edns_client_subnet, None);
+        assert!(!cli.run_args.metrics);
+        assert_eq!(cli.run_args.metrics_addr, "127.0.0.1:9153");
+        assert_eq!(cli.run_args.tls_client_cert, None);
+        assert_eq!(cli.run_args.tls_client_key, None);
+    }
+
+    #[test]
+    fn test_cli_tls_client_auth_flags() {
+        let cli = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--tls-client-cert",
+            "/etc/ssl/client.crt",
+            "--tls-client-key",
+            "/etc/ssl/client.key",
+        ])
+        .expect("mtls flags should parse");
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.tls_client_cert.as_deref(), Some("/etc/ssl/client.crt"));
+                assert_eq!(args.tls_client_key.as_deref(), Some("/etc/ssl/client.key"));
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_cli_metrics_flags() {
+        let cli = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--metrics",
+            "--metrics-addr",
+            "0.0.0.0:9090",
+        ])
+        .expect("metrics flags should parse");
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.metrics);
+                assert_eq!(args.metrics_addr, "0.0.0.0:9090");
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_cli_proxy_flags() {
+        let cli_tor =
+            Cli::try_parse_from(["albus", "run", "--tor"]).expect("tor flag should parse");
+        match cli_tor.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.tor);
+                assert_eq!(args.socks5_proxy, None);
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+
+        let cli_socks = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--socks5-proxy",
+            "socks5://127.0.0.1:1080",
+        ])
+        .expect("socks5 flag should parse");
+        match cli_socks.command {
+            Some(Commands::Run(args)) => {
+                assert!(!args.tor);
+                assert_eq!(
+                    args.socks5_proxy.as_deref(),
+                    Some("socks5://127.0.0.1:1080")
+                );
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_cli_nx_log_flags() {
+        let cli_nx = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--nx-log",
+            "--nx-log-path",
+            "/tmp/test_nx.log",
+        ])
+        .expect("nx-log flags should parse");
+        match cli_nx.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.nx_log);
+                assert_eq!(args.nx_log_path.as_deref(), Some("/tmp/test_nx.log"));
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ecs_flag() {
+        let cli_ecs = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--edns-client-subnet",
+            "1.2.3.0/24",
+        ])
+        .expect("ecs flag should parse");
+        match cli_ecs.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.edns_client_subnet.as_deref(), Some("1.2.3.0/24"));
+            }
+            _ => panic!("expected Commands::Run"),
+        }
     }
 
     #[test]
@@ -445,6 +663,24 @@ mod tests {
 
         let cli_clean = Cli::try_parse_from(["albus", "cleanup"]).unwrap();
         assert!(matches!(cli_clean.command, Some(Commands::Cleanup)));
+
+        let cli_res_list = Cli::try_parse_from(["albus", "resolvers", "list"]).unwrap();
+        match cli_res_list.command {
+            Some(Commands::Resolvers(ResolversArgs {
+                command: Some(ResolversCommands::List),
+            })) => {}
+            _ => panic!("expected ResolversCommands::List"),
+        }
+
+        let cli_res_show = Cli::try_parse_from(["albus", "resolvers", "show", "quad9"]).unwrap();
+        match cli_res_show.command {
+            Some(Commands::Resolvers(ResolversArgs {
+                command: Some(ResolversCommands::Show { name }),
+            })) => {
+                assert_eq!(name, "quad9");
+            }
+            _ => panic!("expected ResolversCommands::Show"),
+        }
     }
 
     #[test]

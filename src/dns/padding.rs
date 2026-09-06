@@ -28,6 +28,8 @@ pub fn calculate_padded_len(unpadded_len: usize) -> usize {
     }
 }
 
+use super::ecs::ClientSubnet;
+
 // backward-compatible wrapper enabling both edns padding and ecs zero-scope anonymity
 pub fn apply_edns_padding(query: &[u8], dnssec: bool) -> Vec<u8> {
     apply_edns_options(query, dnssec, true, true)
@@ -35,6 +37,21 @@ pub fn apply_edns_padding(query: &[u8], dnssec: bool) -> Vec<u8> {
 
 // applies rfc 8467 padding and rfc 7871 ecs zero-scope anonymity to outgoing queries
 pub fn apply_edns_options(query: &[u8], dnssec: bool, padding: bool, ecs_zero: bool) -> Vec<u8> {
+    let ecs = if ecs_zero {
+        Some(ClientSubnet::zero_scope())
+    } else {
+        None
+    };
+    apply_edns_options_with_ecs(query, dnssec, padding, ecs.as_ref())
+}
+
+// applies rfc 8467 padding and optional custom / zero-scope rfc 7871 ecs subnet to outgoing queries
+pub fn apply_edns_options_with_ecs(
+    query: &[u8],
+    dnssec: bool,
+    padding: bool,
+    ecs: Option<&ClientSubnet>,
+) -> Vec<u8> {
     if query.len() < 12 || query.len() > 65500 {
         return query.to_vec();
     }
@@ -45,13 +62,12 @@ pub fn apply_edns_options(query: &[u8], dnssec: bool, padding: bool, ecs_zero: b
     if arcount == 0 {
         let mut rdata = Vec::new();
 
-        // 1. rfc 7871 ecs zero-scope option (source prefix-len = 0 requests upstream anonymity)
-        if ecs_zero {
+        // 1. rfc 7871 ecs option (custom subnet or zero-scope anonymity)
+        if let Some(subnet) = ecs {
+            let opt_rdata = subnet.to_option_rdata();
             rdata.extend_from_slice(&ECS_OPTION_CODE.to_be_bytes()); // option code 8
-            rdata.extend_from_slice(&4u16.to_be_bytes()); // option length 4
-            rdata.extend_from_slice(&1u16.to_be_bytes()); // family: 1 (ipv4)
-            rdata.push(0); // source prefix-len: 0
-            rdata.push(0); // scope prefix-len: 0
+            rdata.extend_from_slice(&(opt_rdata.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(&opt_rdata);
         }
 
         // 2. rfc 8467 edns0 padding option 12
@@ -148,5 +164,23 @@ mod tests {
         // verify padding option code 12 is present
         let pad_code = u16::from_be_bytes([padded[opt_start + 19], padded[opt_start + 20]]);
         assert_eq!(pad_code, 12);
+    }
+
+    #[test]
+    fn test_apply_edns_custom_ecs() {
+        let mut query = vec![
+            0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        query.extend_from_slice(b"\x06google\x03com\x00\x00\x01\x00\x01");
+
+        let ecs = ClientSubnet::parse_cidr("1.2.3.0/24").unwrap();
+        let formatted = apply_edns_options_with_ecs(&query, true, false, Some(&ecs));
+
+        let opt_start = query.len();
+        let ecs_code = u16::from_be_bytes([formatted[opt_start + 11], formatted[opt_start + 12]]);
+        assert_eq!(ecs_code, 8);
+        let ecs_len = u16::from_be_bytes([formatted[opt_start + 13], formatted[opt_start + 14]]);
+        assert_eq!(ecs_len, 7);
+        assert_eq!(&formatted[opt_start + 15..opt_start + 15 + 7], &[0x00, 0x01, 24, 0, 1, 2, 3]);
     }
 }

@@ -5,8 +5,9 @@
 //! and protocol attributes (dnssec, nolog, nofilter).
 
 use std::net::{Ipv4Addr, SocketAddr};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StampProtocol {
     PlainDns,
     CryptDns,
@@ -18,7 +19,7 @@ pub enum StampProtocol {
     Unknown(u8),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsStamp {
     pub protocol: StampProtocol,
     pub dnssec: bool,

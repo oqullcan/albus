@@ -109,12 +109,50 @@ pub struct SingleDoHClient {
     client: reqwest::Client,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileKeyLog {
+    path: std::path::PathBuf,
+}
+
+impl FileKeyLog {
+    pub fn new<P: Into<std::path::PathBuf>>(path: P) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl rustls::KeyLog for FileKeyLog {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        use std::io::Write;
+        let mut hex_client_random = String::with_capacity(client_random.len() * 2);
+        for &b in client_random {
+            use std::fmt::Write;
+            let _ = write!(hex_client_random, "{:02x}", b);
+        }
+        let mut hex_secret = String::with_capacity(secret.len() * 2);
+        for &b in secret {
+            use std::fmt::Write;
+            let _ = write!(hex_secret, "{:02x}", b);
+        }
+        let line = format!("{} {} {}\n", label, hex_client_random, hex_secret);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
 impl SingleDoHClient {
     pub fn new(
         upstream: &str,
         name: &str,
         custom_bootstrap_ips: &[Ipv4Addr],
         pqc: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
         if !pqc {
@@ -128,16 +166,36 @@ impl SingleDoHClient {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let mut client_config =
+        let builder =
             rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
                 .with_safe_default_protocol_versions()?
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
+                .with_root_certificates(root_store);
+
+        let mut client_config = if let Some(auth) = tls_auth {
+            builder.with_client_auth_cert(auth.certs.clone(), auth.key.clone_key())?
+        } else {
+            builder.with_no_client_auth()
+        };
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        if let Some(keylog_path) = tls_key_log_file {
+            client_config.key_log = std::sync::Arc::new(FileKeyLog::new(keylog_path));
+        } else if let Ok(env_path) = std::env::var("SSLKEYLOGFILE") {
+            if !env_path.trim().is_empty() {
+                client_config.key_log = std::sync::Arc::new(FileKeyLog::new(env_path));
+            }
+        }
 
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(client_config)
             .timeout(Duration::from_secs(5));
+
+        if let Some(proxy_str) = proxy {
+            let clean = proxy_str.trim();
+            if !clean.is_empty() {
+                builder = builder.proxy(reqwest::Proxy::all(clean)?);
+            }
+        }
 
         if let Ok(parsed) = Url::parse(upstream) {
             if let Some(host_str) = parsed.host_str() {
@@ -160,8 +218,8 @@ impl SingleDoHClient {
                 if bootstrap_addrs.is_empty() {
                     if let Ok(ip) = host_str.parse::<Ipv4Addr>() {
                         bootstrap_addrs.push(SocketAddr::from((ip, port)));
-                    } else {
-                        // 4. resolve fqdn via system resolver prior to resolv.conf modification
+                    } else if proxy.is_none() {
+                        // 4. resolve fqdn via system resolver prior to resolv.conf modification (skip when using proxy to avoid leaks)
                         let host_with_port = format!("{}:{}", host_str, port);
                         if let Ok(resolved) = host_with_port.to_socket_addrs() {
                             for addr in resolved {
@@ -240,6 +298,9 @@ impl DoHResolver {
         upstreams_csv: &str,
         custom_bootstrap_ips: &[Ipv4Addr],
         pqc: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut clients = Vec::new();
 
@@ -250,7 +311,7 @@ impl DoHResolver {
             }
 
             if let Some((url, _)) = DOH_PRESETS.get(u) {
-                match SingleDoHClient::new(url, u, custom_bootstrap_ips, pqc) {
+                match SingleDoHClient::new(url, u, custom_bootstrap_ips, pqc, proxy, tls_auth, tls_key_log_file) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize doh preset {}: {}", u, e),
                 }
@@ -259,7 +320,7 @@ impl DoHResolver {
                     .ok()
                     .and_then(|p| p.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "custom".to_string());
-                match SingleDoHClient::new(u, &name, custom_bootstrap_ips, pqc) {
+                match SingleDoHClient::new(u, &name, custom_bootstrap_ips, pqc, proxy, tls_auth, tls_key_log_file) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize custom doh {}: {}", u, e),
                 }
@@ -282,7 +343,7 @@ impl DoHResolver {
                         if stamp.doh_url.is_empty() {
                             warn!("dns stamp {} does not specify a doh endpoint", u);
                         } else {
-                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc)
+                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc, proxy, tls_auth, tls_key_log_file)
                             {
                                 Ok(client) => clients.push(client),
                                 Err(e) => warn!("failed to initialize stamp doh {}: {}", name, e),
@@ -302,6 +363,9 @@ impl DoHResolver {
                 "cloudflare",
                 custom_bootstrap_ips,
                 pqc,
+                proxy,
+                tls_auth,
+                tls_key_log_file,
             )?;
             clients.push(cf);
         }
@@ -509,7 +573,7 @@ mod tests {
     fn test_pqc_toggle_true_vs_false_kx_groups() {
         // 1. verify pqc: true contains quantum-resistant KEM hybrid group
         let client_pqc =
-            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true);
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true, None, None, None);
         assert!(
             client_pqc.is_ok(),
             "PQC client initialization should succeed"
@@ -518,7 +582,7 @@ mod tests {
 
         // 2. verify pqc: false contains exclusively classical elliptic curves
         let client_classical =
-            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false);
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false, None, None, None);
         assert!(
             client_classical.is_ok(),
             "Classical client initialization should succeed"
@@ -575,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_quad9_live_query() {
-        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let resolver = DoHResolver::new("quad9", &[], true, None, None, None).expect("resolver init should succeed");
         let query_wire = [
             0x12, 0x34, // id
             0x01, 0x00, // standard query
@@ -597,12 +661,105 @@ mod tests {
     #[test]
     fn test_sdns_stamp_resolver_init() {
         let quad9_stamp = "sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ";
-        let resolver = DoHResolver::new(quad9_stamp, &[], true);
+        let resolver = DoHResolver::new(quad9_stamp, &[], true, None, None, None);
         assert!(
             resolver.is_ok(),
             "DNS stamp DoHResolver init should succeed"
         );
         let ips = extract_upstream_ips(quad9_stamp, &[]);
         assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)));
+    }
+
+    #[test]
+    fn test_doh_socks5_proxy_initialization() {
+        let client = SingleDoHClient::new(
+            "https://dns.quad9.net/dns-query",
+            "quad9",
+            &[],
+            true,
+            Some("socks5://127.0.0.1:9050"),
+            None,
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "SOCKS5 proxy client initialization should succeed"
+        );
+
+        let resolver = DoHResolver::new("quad9", &[], true, Some("socks5://127.0.0.1:9050"), None, None);
+        assert!(
+            resolver.is_ok(),
+            "SOCKS5 resolver initialization should succeed"
+        );
+    }
+
+    #[test]
+    fn test_doh_mtls_client_auth_initialization() {
+        use crate::dns::tls_auth::{parse_pem_certificates, parse_pem_private_key, TlsClientAuth};
+
+        let cert_pem = "\
+-----BEGIN CERTIFICATE-----
+MIIBMjCB5aADAgECAhRiGYeiUl4eSpC3v2h93QMnVA4ELjAFBgMrZXAwDzENMAsG
+A1UEAwwEdGVzdDAeFw0yNjA5MDYxMDA5NTBaFw0yNzA5MDYxMDA5NTBaMA8xDTAL
+BgNVBAMMBHRlc3QwKjAFBgMrZXADIQDUlp3l8cIqw86L1Z/uGZgbVKSeykhplytm
+aj78Ya+DU6NTMFEwHQYDVR0OBBYEFG2a8XoMhubcMTzlwTIBQrDTHvuHMB8GA1Ud
+IwQYMBaAFG2a8XoMhubcMTzlwTIBQrDTHvuHMA8GA1UdEwEB/wQFMAMBAf8wBQYD
+K2VwA0EA5v0N/77fyRgBxS4syXPL8ioqnZI08XxgFkHvw4knTseLMpQlHFS1A3gB
+yMTicETKeL9NPUtbnt4DlQ3biPeOCg==
+-----END CERTIFICATE-----
+";
+        let key_pem = "\
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEII1my9yC6gDHipAN+m87pQ1AECzquF5mj3NU+c6Yg7a7
+-----END PRIVATE KEY-----
+";
+        let certs = parse_pem_certificates(cert_pem).unwrap();
+        let key = parse_pem_private_key(key_pem).unwrap();
+        let auth = TlsClientAuth { certs, key };
+
+        let client = SingleDoHClient::new(
+            "https://dns.quad9.net/dns-query",
+            "quad9",
+            &[],
+            true,
+            None,
+            Some(&auth),
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "mTLS client initialization should succeed with valid cert and key"
+        );
+
+        let resolver = DoHResolver::new("quad9", &[], true, None, Some(&auth), None);
+        assert!(
+            resolver.is_ok(),
+            "mTLS resolver initialization should succeed"
+        );
+    }
+
+    #[test]
+    fn test_tls_keylog_export() {
+        use rustls::KeyLog;
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_tls_keylog.txt");
+        let keylog = FileKeyLog::new(&path);
+
+        keylog.log("CLIENT_RANDOM", &[0xaa, 0xbb], &[0x11, 0x22]);
+        let content = std::fs::read_to_string(&path).expect("keylog file must exist");
+        assert_eq!(content, "CLIENT_RANDOM aabb 1122\n");
+
+        let client = SingleDoHClient::new(
+            "https://dns.quad9.net/dns-query",
+            "quad9",
+            &[],
+            true,
+            None,
+            None,
+            Some(path.to_str().unwrap()),
+        );
+        assert!(client.is_ok(), "DoHClient with keylog file should succeed");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

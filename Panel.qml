@@ -89,6 +89,32 @@ Panel {
   property string odohTarget: ""
   property bool dnsRacingEnabled: true
 
+  // upstream proxy, tor & mtls runtime state
+  property bool torEnabled: false
+  property string socks5Proxy: ""
+  property string tlsClientCert: ""
+  property string tlsClientKey: ""
+
+  // security audit, ecs & telemetry runtime state
+  property bool nxLogEnabled: false
+  property string nxLogPath: ""
+  property string ednsClientSubnet: ""
+  property bool metricsEnabled: false
+  property string metricsAddr: "127.0.0.1:9153"
+
+  // split dns, cache tuning, web ui & dnscrypt relays
+  property string forwardRulesPath: "/etc/albus/forwarding-rules.txt"
+  property string tlsKeyLogFile: ""
+  property bool loadAdaptiveTimeoutEnabled: true
+  property string negMinTtl: "60"
+  property string negMaxTtl: "600"
+  property bool webUiEnabled: true
+  property string webUiAddr: "127.0.0.1:205"
+  property string webUiUser: ""
+  property string webUiPassword: ""
+  property string dnscryptRelays: ""
+  property string dnscryptServers: ""
+
   // preserved CLI configuration parameters not directly exposed in UI
   property var storedPorts: [443]
   property int storedRestoreAfterBytes: 600
@@ -791,6 +817,50 @@ Panel {
 
     args.push("--dns-racing", root.dnsRacingEnabled ? "true" : "false")
 
+    // upstream proxy, tor & mtls parameters
+    args.push("--tor", root.torEnabled ? "true" : "false")
+    args.push("--socks5-proxy", root.socks5Proxy.trim())
+    args.push("--tls-client-cert", root.tlsClientCert.trim())
+    args.push("--tls-client-key", root.tlsClientKey.trim())
+
+    // security audit, ecs & telemetry parameters
+    args.push("--nx-log", root.nxLogEnabled ? "true" : "false")
+    args.push("--nx-log-path", root.nxLogPath.trim())
+    args.push("--edns-client-subnet", root.ednsClientSubnet.trim())
+    args.push("--metrics", root.metricsEnabled ? "true" : "false")
+    args.push("--metrics-addr", root.metricsAddr.trim() !== "" ? root.metricsAddr.trim() : "127.0.0.1:9153")
+
+    // split dns, cache tuning, web ui & dnscrypt relays
+    if (root.forwardRulesPath.trim() !== "") {
+      args.push("--forward-rules-path", root.forwardRulesPath.trim())
+    }
+    if (root.tlsKeyLogFile.trim() !== "") {
+      args.push("--tls-key-log-file", root.tlsKeyLogFile.trim())
+    }
+    args.push("--timeout-load-reduction", root.loadAdaptiveTimeoutEnabled ? "0.75" : "0.0")
+    if (root.negMinTtl.trim() !== "") {
+      args.push("--neg-min-ttl", root.negMinTtl.trim())
+    }
+    if (root.negMaxTtl.trim() !== "") {
+      args.push("--neg-max-ttl", root.negMaxTtl.trim())
+    }
+    args.push("--web-ui", root.webUiEnabled ? "true" : "false")
+    if (root.webUiAddr.trim() !== "") {
+      args.push("--web-ui-addr", root.webUiAddr.trim())
+    }
+    if (root.webUiUser.trim() !== "") {
+      args.push("--web-ui-user", root.webUiUser.trim())
+    }
+    if (root.webUiPassword.trim() !== "") {
+      args.push("--web-ui-password", root.webUiPassword.trim())
+    }
+    if (root.dnscryptRelays.trim() !== "") {
+      args.push("--dnscrypt-relays", root.dnscryptRelays.trim())
+    }
+    if (root.dnscryptServers.trim() !== "") {
+      args.push("--dnscrypt-servers", root.dnscryptServers.trim())
+    }
+
     // preserve backend tuning parameters
     if (root.storedPorts && root.storedPorts.length > 0) {
       args.push("--ports", root.storedPorts.join(","))
@@ -933,6 +1003,32 @@ Panel {
           root.odohTarget = cfg.odoh_target || ""
           root.dnsRacingEnabled = cfg.dns_racing !== false
 
+          // load upstream proxy, tor & mtls
+          root.torEnabled = !!cfg.tor
+          root.socks5Proxy = cfg.socks5_proxy || ""
+          root.tlsClientCert = cfg.tls_client_cert || ""
+          root.tlsClientKey = cfg.tls_client_key || ""
+
+          // load security audit, ecs & telemetry
+          root.nxLogEnabled = !!cfg.nx_log
+          root.nxLogPath = cfg.nx_log_path || ""
+          root.ednsClientSubnet = cfg.edns_client_subnet || ""
+          root.metricsEnabled = !!cfg.metrics
+          root.metricsAddr = cfg.metrics_addr || "127.0.0.1:9153"
+
+          // load split dns, cache tuning, web ui & dnscrypt relays
+          root.forwardRulesPath = cfg.forwarding_rules_path || cfg.forward_rules_path || ""
+          root.tlsKeyLogFile = cfg.tls_key_log_file || ""
+          root.loadAdaptiveTimeoutEnabled = (cfg.timeout_load_reduction !== undefined) ? (cfg.timeout_load_reduction > 0) : true
+          root.negMinTtl = cfg.cache_neg_min_ttl !== undefined ? String(cfg.cache_neg_min_ttl) : "60"
+          root.negMaxTtl = cfg.cache_neg_max_ttl !== undefined ? String(cfg.cache_neg_max_ttl) : "600"
+          root.webUiEnabled = !!cfg.web_ui
+          root.webUiAddr = cfg.web_ui_addr || "127.0.0.1:8080"
+          root.webUiUser = cfg.web_ui_user || ""
+          root.webUiPassword = cfg.web_ui_pass || cfg.web_ui_password || ""
+          root.dnscryptRelays = (cfg.dnscrypt_relays && Array.isArray(cfg.dnscrypt_relays)) ? cfg.dnscrypt_relays.join(",") : ""
+          root.dnscryptServers = (cfg.dnscrypt_servers && Array.isArray(cfg.dnscrypt_servers)) ? cfg.dnscrypt_servers.join(",") : ""
+
           if (cfg.ports && Array.isArray(cfg.ports)) root.storedPorts = cfg.ports
           if (cfg.restore_after_bytes !== undefined) root.storedRestoreAfterBytes = cfg.restore_after_bytes
           if (cfg.restore_mss !== undefined) root.storedRestoreMss = cfg.restore_mss
@@ -1011,6 +1107,25 @@ Panel {
     id: terminalProc
     command: ["xdg-terminal-exec", "albus", "monitor"]
     running: false
+  }
+
+  Process {
+    id: browserProc
+    command: ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:205")]
+    running: false
+  }
+
+  Process {
+    id: updateResolversProc
+    command: ["albus", "resolvers", "update"]
+    running: false
+    onExited: function(code) {
+      if (code === 0) {
+        root.showToast("Resolver lists updated and verified")
+      } else {
+        root.showToast("Failed to update resolver lists")
+      }
+    }
   }
 
   Process {
@@ -1607,6 +1722,275 @@ Panel {
                       }
                     }
                   }
+
+                  // SOCKS5 & Tor Proxy Routing Card
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: proxyCardCol.implicitHeight
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: root.torEnabled ? Qt.rgba(0.06, 0.72, 0.51, 0.3) : Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+                    clip: true
+
+                    Column {
+                      id: proxyCardCol
+                      width: parent.width
+
+                      CompactToggle {
+                        label: "Tor Onion Network Routing"
+                        description: "Tunnel upstream queries through local Tor socks5://127.0.0.1:9050"
+                        checked: root.torEnabled
+                        showDivider: !root.torEnabled || root.socks5Proxy.trim() !== ""
+                        onClicked: {
+                          root.torEnabled = !root.torEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        visible: !root.torEnabled
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Custom SOCKS5 Proxy"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "socks5:// or socks5h:// URL"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.socks5Proxy
+                          placeholderText: "socks5://127.0.0.1:1080"
+                          onTextEdited: {
+                            root.socks5Proxy = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+
+                        Rectangle {
+                          width: parent.width - Style.space(24)
+                          height: 1
+                          color: Qt.rgba(1, 1, 1, 0.05)
+                        }
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Anonymized DNSCrypt Relays"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Relay stamps or names"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.dnscryptRelays
+                          placeholderText: "sdns://... (comma separated)"
+                          onTextEdited: {
+                            root.dnscryptRelays = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Client mTLS X.509 Authentication Card
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: mtlsCardCol.implicitHeight
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: (root.tlsClientCert.trim() !== "" && root.tlsClientKey.trim() !== "") ? Qt.rgba(0.06, 0.72, 0.51, 0.3) : Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+                    clip: true
+
+                    Column {
+                      id: mtlsCardCol
+                      width: parent.width
+                      spacing: Style.space(6)
+                      topPadding: Style.space(8)
+                      bottomPadding: Style.space(8)
+                      leftPadding: Style.space(12)
+                      rightPadding: Style.space(12)
+
+                      RowLayout {
+                        width: parent.width - Style.space(24)
+                        spacing: Style.space(4)
+
+                        Text {
+                          text: "Client mTLS Authentication (X.509)"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        Text {
+                          text: "For private DoH upstream"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                          elide: Text.ElideRight
+                          Layout.fillWidth: true
+                        }
+                      }
+
+                      RowLayout {
+                        width: parent.width - Style.space(24)
+                        spacing: Style.space(8)
+
+                        ColumnLayout {
+                          Layout.fillWidth: true
+                          Layout.preferredWidth: 1
+                          spacing: Style.space(3)
+
+                          Text {
+                            text: "Client Certificate"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.tlsClientCert
+                            placeholderText: "/etc/ssl/client.crt"
+                            onTextEdited: {
+                              root.tlsClientCert = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+
+                        ColumnLayout {
+                          Layout.fillWidth: true
+                          Layout.preferredWidth: 1
+                          spacing: Style.space(3)
+
+                          Text {
+                            text: "Client Private Key"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          StyledTextField {
+                            Layout.fillWidth: true
+                            text: root.tlsClientKey
+                            placeholderText: "/etc/ssl/client.key"
+                            onTextEdited: {
+                              root.tlsClientKey = text
+                              root.scheduleAutoApply()
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Remote Resolvers Minisign Action Card
+                  Rectangle {
+                    width: parent.width
+                    height: Style.space(32)
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+
+                    RowLayout {
+                      anchors.fill: parent
+                      anchors.leftMargin: Style.space(12)
+                      anchors.rightMargin: Style.space(8)
+                      spacing: Style.space(8)
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+
+                        Text {
+                          text: "Public Resolver Lists"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        Text {
+                          text: "Cryptographically verified with Minisign Ed25519"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                        }
+                      }
+
+                      Rectangle {
+                        height: Style.space(22)
+                        width: updateBtnText.implicitWidth + Style.space(14)
+                        radius: Style.cornerRadius - 2
+                        color: updateBtnMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                        border.color: Qt.rgba(1, 1, 1, 0.1)
+                        border.width: 1
+
+                        Text {
+                          id: updateBtnText
+                          anchors.centerIn: parent
+                          text: "Update Lists"
+                          color: root.foreground
+                          font.pixelSize: Style.font.caption - 1
+                          font.family: root.fontFamily
+                        }
+
+                        MouseArea {
+                          id: updateBtnMouse
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: {
+                            updateResolversProc.running = true
+                            root.showToast("Updating resolver lists...")
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
               }
 
@@ -2024,10 +2408,204 @@ Panel {
                         label: "Network Interface Monitor"
                         description: "Automatically adapt routing on network interface changes"
                         checked: root.netmonEnabled
-                        showDivider: false
+                        showDivider: true
                         onClicked: {
                           root.netmonEnabled = !root.netmonEnabled
                           root.applyAndSave()
+                        }
+                      }
+
+                      CompactToggle {
+                        label: "Prometheus Metrics Endpoint (/metrics)"
+                        description: "Expose OpenMetrics telemetries on local HTTP server"
+                        checked: root.metricsEnabled
+                        showDivider: !root.metricsEnabled
+                        onClicked: {
+                          root.metricsEnabled = !root.metricsEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        visible: root.metricsEnabled
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Metrics Listen Address"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Binding host and port"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.metricsAddr
+                          placeholderText: "127.0.0.1:9153"
+                          onTextEdited: {
+                            root.metricsAddr = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      Rectangle {
+                        width: parent.width - Style.space(24)
+                        x: Style.space(12)
+                        height: 1
+                        color: Qt.rgba(1, 1, 1, 0.05)
+                      }
+
+                      CompactToggle {
+                        label: "Web Monitoring Dashboard"
+                        description: "Embedded zero-dependency HTTP dashboard and live telemetry"
+                        checked: root.webUiEnabled
+                        showDivider: !root.webUiEnabled
+                        onClicked: {
+                          root.webUiEnabled = !root.webUiEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        visible: root.webUiEnabled
+                        width: parent.width
+                        spacing: Style.space(4)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Dashboard Listen Address"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "HTTP bind address"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.webUiAddr
+                          placeholderText: "127.0.0.1:205"
+                          onTextEdited: {
+                            root.webUiAddr = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(8)
+
+                          ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            spacing: Style.space(2)
+
+                            Text {
+                              text: "Auth Username"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.dim
+                            }
+
+                            StyledTextField {
+                              Layout.fillWidth: true
+                              text: root.webUiUser
+                              placeholderText: "admin (optional)"
+                              onTextEdited: {
+                                root.webUiUser = text
+                                root.scheduleAutoApply()
+                              }
+                            }
+                          }
+
+                          ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            spacing: Style.space(2)
+
+                            Text {
+                              text: "Auth Password"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.dim
+                            }
+
+                            StyledTextField {
+                              Layout.fillWidth: true
+                              text: root.webUiPassword
+                              placeholderText: "password (optional)"
+                              echoMode: TextInput.Password
+                              onTextEdited: {
+                                root.webUiPassword = text
+                                root.scheduleAutoApply()
+                              }
+                            }
+                          }
+                        }
+
+                        Rectangle {
+                          height: Style.space(22)
+                          width: openWebUiText.implicitWidth + Style.space(16)
+                          radius: Style.cornerRadius - 2
+                          color: openWebUiMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(1, 1, 1, 0.04)
+                          border.color: Qt.rgba(1, 1, 1, 0.15)
+                          border.width: 1
+
+                          Text {
+                            id: openWebUiText
+                            anchors.centerIn: parent
+                            text: "Open Web Dashboard"
+                            color: root.foreground
+                            font.pixelSize: Style.font.caption - 1
+                            font.family: root.fontFamily
+                          }
+
+                          MouseArea {
+                            id: openWebUiMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                              browserProc.command = ["xdg-open", "http://" + (root.webUiAddr.trim() || "127.0.0.1:205")]
+                              browserProc.running = true
+                            }
+                          }
                         }
                       }
                     }
@@ -2213,6 +2791,68 @@ Panel {
                     }
                   }
 
+                  // Split DNS Forwarding Card
+                  Rectangle {
+                    width: parent.width
+                    implicitHeight: forwardCardCol.implicitHeight
+                    radius: Style.cornerRadius
+                    color: Qt.rgba(1, 1, 1, 0.02)
+                    border.color: root.forwardRulesPath.trim() !== "" ? Qt.rgba(0.06, 0.72, 0.51, 0.3) : Qt.rgba(1, 1, 1, 0.07)
+                    border.width: 1
+                    clip: true
+
+                    Column {
+                      id: forwardCardCol
+                      width: parent.width
+                      spacing: Style.space(4)
+                      topPadding: Style.space(8)
+                      bottomPadding: Style.space(8)
+                      leftPadding: Style.space(12)
+                      rightPadding: Style.space(12)
+
+                      RowLayout {
+                        width: parent.width - Style.space(24)
+                        spacing: Style.space(4)
+
+                        Text {
+                          text: "Split DNS Domain Forwarding"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 1
+                          font.bold: true
+                          color: root.foreground
+                        }
+
+                        Text {
+                          text: "Forward rules path"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                          elide: Text.ElideRight
+                          Layout.fillWidth: true
+                        }
+                      }
+
+                      Text {
+                        width: parent.width - Style.space(24)
+                        text: "Route internal domains to specific resolvers (example: company.lan 192.168.1.1:53)"
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption - 2
+                        color: root.dim
+                        wrapMode: Text.WordWrap
+                      }
+
+                      StyledTextField {
+                        width: parent.width - Style.space(24)
+                        text: root.forwardRulesPath
+                        placeholderText: "/etc/albus/forwarding-rules.txt"
+                        onTextEdited: {
+                          root.forwardRulesPath = text
+                          root.scheduleAutoApply()
+                        }
+                      }
+                    }
+                  }
+
                   // Logging & Privacy Card
                   Rectangle {
                     width: parent.width
@@ -2323,7 +2963,66 @@ Panel {
                       }
 
                       Rectangle {
-                        visible: root.queryLogEnabled
+                        width: parent.width - Style.space(24)
+                        x: Style.space(12)
+                        height: 1
+                        color: Qt.rgba(1, 1, 1, 0.05)
+                      }
+
+                      CompactToggle {
+                        label: "NXDomain Security Audit Log"
+                        description: "Track nonexistent domain queries to detect botnet and DGA malware"
+                        checked: root.nxLogEnabled
+                        showDivider: !root.nxLogEnabled
+                        onClicked: {
+                          root.nxLogEnabled = !root.nxLogEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        visible: root.nxLogEnabled
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "NXDomain Log Output Path"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Destination file path"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.nxLogPath
+                          placeholderText: "/var/log/albus/nx.log"
+                          onTextEdited: {
+                            root.nxLogPath = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      Rectangle {
                         width: parent.width - Style.space(24)
                         x: Style.space(12)
                         height: 1
@@ -2334,10 +3033,99 @@ Panel {
                         label: "EDNS0 Request Padding"
                         description: "Pad query sizes to prevent traffic size analysis"
                         checked: root.ednsPaddingEnabled
-                        showDivider: false
+                        showDivider: true
                         onClicked: {
                           root.ednsPaddingEnabled = !root.ednsPaddingEnabled
                           root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "EDNS Client Subnet (RFC 7871)"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Prefix CIDR or 0.0.0.0/0 for zero-scope"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.ednsClientSubnet
+                          placeholderText: "0.0.0.0/0 or 198.51.100.0/24"
+                          onTextEdited: {
+                            root.ednsClientSubnet = text
+                            root.scheduleAutoApply()
+                          }
+                        }
+                      }
+
+                      Rectangle {
+                        width: parent.width - Style.space(24)
+                        x: Style.space(12)
+                        height: 1
+                        color: Qt.rgba(1, 1, 1, 0.05)
+                      }
+
+                      Column {
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "TLS Master Keylog (Wireshark/NSS)"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Export secrets path"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        StyledTextField {
+                          width: parent.width - Style.space(24)
+                          text: root.tlsKeyLogFile
+                          placeholderText: "/tmp/sslkeylog.log (or SSLKEYLOGFILE)"
+                          onTextEdited: {
+                            root.tlsKeyLogFile = text
+                            root.scheduleAutoApply()
+                          }
                         }
                       }
                     }
@@ -2411,10 +3199,103 @@ Panel {
                         label: "DNS64 IPv6 Synthesis"
                         description: "Synthesize IPv6 addresses for IPv4-only hosts"
                         checked: root.dns64Enabled
-                        showDivider: false
+                        showDivider: true
                         onClicked: {
                           root.dns64Enabled = !root.dns64Enabled
                           root.applyAndSave()
+                        }
+                      }
+
+                      CompactToggle {
+                        label: "Load-Adaptive Query Timeout"
+                        description: "Dynamically scale resolver timeout curve under high query concurrency"
+                        checked: root.loadAdaptiveTimeoutEnabled
+                        showDivider: true
+                        onClicked: {
+                          root.loadAdaptiveTimeoutEnabled = !root.loadAdaptiveTimeoutEnabled
+                          root.applyAndSave()
+                        }
+                      }
+
+                      Column {
+                        width: parent.width
+                        spacing: Style.space(3)
+                        topPadding: Style.space(4)
+                        bottomPadding: Style.space(8)
+                        leftPadding: Style.space(12)
+                        rightPadding: Style.space(12)
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(4)
+
+                          Text {
+                            text: "Negative Cache TTL Clamping (Seconds)"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 1
+                            font.bold: true
+                            color: root.foreground
+                          }
+
+                          Text {
+                            text: "Min and Max SOA TTL"
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption - 2
+                            color: root.subtle
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+
+                        RowLayout {
+                          width: parent.width - Style.space(24)
+                          spacing: Style.space(8)
+
+                          ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            spacing: Style.space(2)
+
+                            Text {
+                              text: "Min TTL (e.g. 60)"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.dim
+                            }
+
+                            StyledTextField {
+                              Layout.fillWidth: true
+                              text: root.negMinTtl
+                              placeholderText: "60"
+                              onTextEdited: {
+                                root.negMinTtl = text
+                                root.scheduleAutoApply()
+                              }
+                            }
+                          }
+
+                          ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            spacing: Style.space(2)
+
+                            Text {
+                              text: "Max TTL (e.g. 600)"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 2
+                              color: root.dim
+                            }
+
+                            StyledTextField {
+                              Layout.fillWidth: true
+                              text: root.negMaxTtl
+                              placeholderText: "600"
+                              onTextEdited: {
+                                root.negMaxTtl = text
+                                root.scheduleAutoApply()
+                              }
+                            }
+                          }
                         }
                       }
                     }

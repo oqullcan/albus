@@ -19,18 +19,23 @@ use super::captive::{build_captive_response, check_captive_portal};
 use super::cloak::CloakEngine;
 use super::dns64::build_dns64_response;
 use super::doh::DoHResolver;
+use super::ecs::ClientSubnet;
 use super::filter::{
     build_nxdomain_response, build_refused_response, build_sinkhole_response, detect_dns_rebinding,
     extract_question_end, is_firefox_canary, is_undelegated_zone,
 };
+use super::forward::ForwardingEngine;
 use super::ip_filter::{extract_resolved_ips, IpFilter};
 use super::local_doh::LocalDoHServer;
 use super::logger::{QueryLogEntry, QueryLogger, QueryStatus};
+use super::metrics_server::MetricsServer;
 use super::netmon::NetworkMonitor;
 use super::odoh::ODoHClient;
-use super::padding::apply_edns_options;
+use super::padding::{apply_edns_options, apply_edns_options_with_ecs};
+use super::schedule::ScheduleManager;
 use super::stats::DnsStats;
 use super::tcp::DnsTcpServer;
+use super::tls_auth::TlsClientAuth;
 use super::uncloak::extract_alias_targets;
 use super::watcher::FileWatcher;
 
@@ -63,6 +68,14 @@ pub struct DnsServer {
     pub query_logger: Option<Arc<QueryLogger>>,
     pub allowlist_path: Option<String>,
     pub blocklist_path: Option<String>,
+    pub schedule_manager: Arc<RwLock<ScheduleManager>>,
+    pub edns_client_subnet: Option<ClientSubnet>,
+    pub metrics: bool,
+    pub metrics_addr: SocketAddr,
+    pub tls_auth: Option<Arc<TlsClientAuth>>,
+    pub forwarding: Arc<RwLock<ForwardingEngine>>,
+    pub forwarding_rules_path: Option<String>,
+    pub timeout_load_reduction: f64,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -93,8 +106,27 @@ impl DnsServer {
         allowlist_path: Option<String>,
         blocklist_path: Option<String>,
         odoh_client: Option<Arc<ODoHClient>>,
+        proxy: Option<&str>,
+        schedule_manager: Arc<RwLock<ScheduleManager>>,
+        edns_client_subnet: Option<ClientSubnet>,
+        metrics: bool,
+        metrics_addr: SocketAddr,
+        tls_auth: Option<Arc<TlsClientAuth>>,
+        forwarding: Arc<RwLock<ForwardingEngine>>,
+        forwarding_rules_path: Option<String>,
+        tls_key_log_file: Option<String>,
+        timeout_load_reduction: f64,
+        cache_neg_min_ttl: u32,
+        cache_neg_max_ttl: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let resolver = DoHResolver::new(upstreams_csv, custom_bootstrap_ips, pqc)?;
+        let resolver = DoHResolver::new(
+            upstreams_csv,
+            custom_bootstrap_ips,
+            pqc,
+            proxy,
+            tls_auth.as_deref(),
+            tls_key_log_file.as_deref(),
+        )?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
@@ -116,7 +148,7 @@ impl DnsServer {
             dns64,
             netmon,
             stats,
-            cache: Arc::new(DnsCache::new(2048)),
+            cache: Arc::new(DnsCache::new(2048).with_neg_ttl(cache_neg_min_ttl, cache_neg_max_ttl)),
             ip_queue: Arc::new(Mutex::new(HashMap::new())),
             tcp_listener,
             local_doh,
@@ -124,6 +156,14 @@ impl DnsServer {
             query_logger,
             allowlist_path,
             blocklist_path,
+            schedule_manager,
+            edns_client_subnet,
+            metrics,
+            metrics_addr,
+            tls_auth,
+            forwarding,
+            forwarding_rules_path,
+            timeout_load_reduction,
             shutdown_tx,
         })
     }
@@ -160,6 +200,18 @@ impl DnsServer {
             None,
             None,
             None,
+            None,
+            Arc::new(RwLock::new(ScheduleManager::new())),
+            None,
+            false,
+            "127.0.0.1:9153".parse().unwrap(),
+            None,
+            Arc::new(RwLock::new(ForwardingEngine::new())),
+            None,
+            None,
+            0.0,
+            60,
+            600,
         )
     }
 
@@ -419,6 +471,37 @@ impl DnsServer {
             }
         }
 
+        // spawn live file watcher for split-dns forwarding rules hot-reload
+        if let Some(ref path_str) = self.forwarding_rules_path {
+            let p = PathBuf::from(path_str);
+            if p.exists() {
+                let fw_ref = self.forwarding.clone();
+                let path_clone = path_str.clone();
+                let rx = self.shutdown_tx.subscribe();
+                FileWatcher::watch_async(
+                    p,
+                    Duration::from_secs(3),
+                    move || {
+                        let fw = fw_ref.clone();
+                        let path = path_clone.clone();
+                        async move {
+                            match ForwardingEngine::from_file(&path) {
+                                Ok(new_fw) => {
+                                    let mut lock = fw.write().await;
+                                    *lock = new_fw;
+                                    info!("split-dns forwarding rules hot-reloaded successfully from {}", path);
+                                }
+                                Err(e) => {
+                                    warn!("failed to hot-reload forwarding rules from {}: {}", path, e);
+                                }
+                            }
+                        }
+                    },
+                    rx,
+                );
+            }
+        }
+
         // 5. spawn RFC 7766 TCP listener on 127.0.0.1:53
         if self.tcp_listener {
             let s_tcp = server_arc.clone();
@@ -428,7 +511,10 @@ impl DnsServer {
                 tcp_bind,
                 move |query, peer| {
                     let s = s_tcp.clone();
-                    async move { s.resolve_packet(&query, peer.ip()).await }
+                    async move {
+                        s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
+                        s.resolve_packet(&query, peer.ip()).await
+                    }
                 },
                 rx,
             );
@@ -442,10 +528,19 @@ impl DnsServer {
                 self.local_doh_addr,
                 move |query, peer| {
                     let s = s_doh.clone();
-                    async move { s.resolve_packet(&query, peer.ip()).await }
+                    async move {
+                        s.stats.queries_doh.fetch_add(1, Ordering::Relaxed);
+                        s.resolve_packet(&query, peer.ip()).await
+                    }
                 },
                 rx,
             );
+        }
+
+        // 6.1. spawn Prometheus metrics endpoint (/metrics) on metrics_addr (e.g. 127.0.0.1:9153)
+        if self.metrics {
+            let rx = self.shutdown_tx.subscribe();
+            MetricsServer::start(self.metrics_addr, self.stats.clone(), rx);
         }
 
         // 7. spawn UDP receive loop
@@ -479,6 +574,7 @@ impl DnsServer {
                                         }
                                     };
 
+                                    s.stats.queries_udp.fetch_add(1, Ordering::Relaxed);
                                     if let Some(resp) = s.resolve_packet(&query_data, peer_addr.ip()).await {
                                         let _ = socket_clone.send_to(&resp, peer_addr).await;
                                     }
@@ -528,26 +624,41 @@ impl DnsServer {
     }
 
     /// executes query resolution via oblivious doh relay (rfc 9230) if configured,
-    /// with transparent automatic fallback to direct doh pool upon error
+    /// with transparent automatic fallback to direct doh pool upon error and adaptive timeout under load
     async fn resolve_upstream(
         &self,
         outgoing_query: &[u8],
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(ref odoh) = self.odoh_client {
-            match odoh.resolve(outgoing_query).await {
-                Ok(resp) => return Ok((resp, "odoh".to_string())),
-                Err(e) => {
-                    warn!(
-                        "ODoH resolution failed ({}), falling back to direct DoH upstream",
-                        e
-                    );
+        let active = self.stats.active_queries.load(Ordering::Relaxed);
+        let base_timeout = Duration::from_secs(5);
+        let effective_timeout = compute_adaptive_timeout(base_timeout, active, 250, self.timeout_load_reduction);
+
+        let query_fut = async {
+            if let Some(ref odoh) = self.odoh_client {
+                match odoh.resolve(outgoing_query).await {
+                    Ok(resp) => return Ok((resp, "odoh".to_string())),
+                    Err(e) => {
+                        warn!(
+                            "ODoH resolution failed ({}), falling back to direct DoH upstream",
+                            e
+                        );
+                    }
                 }
             }
-        }
-        if self.racing {
-            self.resolver.resolve_racing(outgoing_query).await
-        } else {
-            self.resolver.resolve(outgoing_query).await
+            if self.racing {
+                self.resolver.resolve_racing(outgoing_query).await
+            } else {
+                self.resolver.resolve(outgoing_query).await
+            }
+        };
+
+        match tokio::time::timeout(effective_timeout, query_fut).await {
+            Ok(res) => res,
+            Err(_) => Err(format!(
+                "upstream query timed out under load (timeout: {:?}, active: {})",
+                effective_timeout, active
+            )
+            .into()),
         }
     }
 
@@ -557,6 +668,16 @@ impl DnsServer {
         if query_data.len() < 12 || (query_data[2] & 0x80) != 0 {
             return None;
         }
+
+        struct ActiveQueryGuard<'a>(&'a std::sync::atomic::AtomicU64);
+        impl<'a> Drop for ActiveQueryGuard<'a> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        self.stats.active_queries.fetch_add(1, Ordering::SeqCst);
+        let _active_guard = ActiveQueryGuard(&self.stats.active_queries);
 
         const MAX_IP_QUEUE_ENTRIES: usize = 4096;
         let start_time = std::time::Instant::now();
@@ -637,7 +758,30 @@ impl DnsServer {
 
         // 4. check split-dns forwarding rules
         if let Some(key) = &query_key {
-            if let Some(target_forwarder) = self.cloak.get_forward_target(&key.name) {
+            let target = {
+                let fw = self.forwarding.read().await;
+                fw.find_target(&key.name)
+            };
+            if let Some(target_forwarder) = target {
+                let fw = self.forwarding.read().await;
+                match fw.forward_query(query_data, target_forwarder).await {
+                    Ok(resp) => {
+                        debug!(domain = %key.name, target = %target_forwarder, "Resolved via ForwardingEngine split-DNS");
+                        self.maybe_log_query(
+                            client_ip,
+                            &domain,
+                            qtype,
+                            QueryStatus::Pass,
+                            start_time,
+                            Some("split_dns_forward"),
+                        );
+                        return Some(resp);
+                    }
+                    Err(e) => {
+                        debug!("ForwardingEngine split-dns to {} failed: {}", target_forwarder, e);
+                    }
+                }
+            } else if let Some(target_forwarder) = self.cloak.get_forward_target(&key.name) {
                 match self.cloak.forward_query(query_data, target_forwarder).await {
                     Ok(resp) => {
                         debug!(domain = %key.name, target = %target_forwarder, "Resolved via split-DNS forwarder");
@@ -663,6 +807,7 @@ impl DnsServer {
             if let Some(key) = &query_key {
                 if is_undelegated_zone(&key.name) {
                     debug!(domain = %key.name, "Blocked undelegated/unqualified domain from leaking upstream");
+                    self.stats.blocked_undelegated.fetch_add(1, Ordering::Relaxed);
                     self.maybe_log_query(
                         client_ip,
                         &domain,
@@ -679,15 +824,40 @@ impl DnsServer {
         // 6. domain allowlist check (whitelisted domains bypass blocklist)
         let is_whitelisted = self.allowlist.read().await.is_allowed(&domain);
 
-        // 7. check memory-optimized hagezi ad/tracker/malware blocklist
+        // 7. check active time schedules and memory-optimized hagezi ad/tracker/malware blocklist
         if !is_whitelisted {
             if let Some(key) = &query_key {
+                let scheduled_block = {
+                    let sm = self.schedule_manager.read().await;
+                    sm.check_blocked(&key.name).map(|s| s.to_string())
+                };
+
+                if let Some(sched_name) = scheduled_block {
+                    self.stats.blocked_domains.fetch_add(1, Ordering::Relaxed);
+                    self.stats.blocked_schedule.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        domain = %key.name,
+                        schedule = %sched_name,
+                        "DNS query blocked by active time schedule"
+                    );
+                    self.maybe_log_query(
+                        client_ip,
+                        &domain,
+                        qtype,
+                        QueryStatus::BlockHagezi,
+                        start_time,
+                        Some(&format!("schedule:{}", sched_name)),
+                    );
+                    return Some(build_sinkhole_response(query_data, key.qtype));
+                }
+
                 let is_blocked = {
                     let bl = self.blocklist.read().await;
                     bl.check(&key.name)
                 };
                 if is_blocked {
                     self.stats.blocked_domains.fetch_add(1, Ordering::Relaxed);
+                    self.stats.blocked_blocklist.fetch_add(1, Ordering::Relaxed);
                     info!(
                         domain = %key.name,
                         qtype = key.qtype,
@@ -744,21 +914,38 @@ impl DnsServer {
                     }
                 }
             }
+            let rcode = if cached_resp.len() >= 4 {
+                cached_resp[3] & 0x0F
+            } else {
+                0
+            };
+            let status = if rcode == 3 {
+                QueryStatus::NxDomain
+            } else {
+                QueryStatus::CacheHit
+            };
             self.maybe_log_query(
                 client_ip,
                 &domain,
                 qtype,
-                QueryStatus::CacheHit,
+                status,
                 start_time,
                 Some("cache_0ms"),
             );
             return Some(cached_resp);
         }
 
-        // 10. prepare outgoing query with RFC 8467 EDNS Padding, RFC 7871 ECS zero-scope, and DNSSEC DO-bit
+        // 10. prepare outgoing query with RFC 8467 EDNS Padding, RFC 7871 ECS, and DNSSEC DO-bit
         self.stats.upstream_queries.fetch_add(1, Ordering::Relaxed);
-        let outgoing_query = if self.edns_padding {
-            apply_edns_options(query_data, self.dnssec, true, true)
+        let outgoing_query = if self.edns_padding || self.edns_client_subnet.is_some() {
+            let default_zero = ClientSubnet::zero_scope();
+            let effective_ecs = self.edns_client_subnet.as_ref().unwrap_or(&default_zero);
+            apply_edns_options_with_ecs(
+                query_data,
+                self.dnssec,
+                self.edns_padding,
+                Some(effective_ecs),
+            )
         } else if self.dnssec {
             enable_dnssec_do(query_data)
         } else {
@@ -776,6 +963,7 @@ impl DnsServer {
                             "Anti-DNS-Rebinding triggered: public response resolved to private IP! Blocking response."
                         );
                         self.stats.rebinding_drops.fetch_add(1, Ordering::Relaxed);
+                        self.stats.blocked_rebinding.fetch_add(1, Ordering::Relaxed);
                         self.maybe_log_query(
                             client_ip,
                             &domain,
@@ -799,6 +987,7 @@ impl DnsServer {
                             ip = %blocked_ip,
                             "Resolved IP dropped by Bogon/Malicious IP blacklist"
                         );
+                        self.stats.blocked_bogon.fetch_add(1, Ordering::Relaxed);
                         self.maybe_log_query(
                             client_ip,
                             &domain,
@@ -907,11 +1096,22 @@ impl DnsServer {
                     }
                 }
 
+                let rcode = if resp_bytes.len() >= 4 {
+                    resp_bytes[3] & 0x0F
+                } else {
+                    0
+                };
+                let status = if rcode == 3 {
+                    QueryStatus::NxDomain
+                } else {
+                    QueryStatus::Pass
+                };
+
                 self.maybe_log_query(
                     client_ip,
                     &domain,
                     qtype,
-                    QueryStatus::Pass,
+                    status,
                     start_time,
                     Some(&via),
                 );
@@ -949,6 +1149,10 @@ impl DnsServer {
     // signals graceful shutdown to background udp listener task
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    pub fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
+        self.shutdown_tx.subscribe()
     }
 
     // clears all entries from the in-memory response cache
@@ -1294,6 +1498,23 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
     }
 }
 
+// calculates adaptive query timeout using quartic load reduction under concurrency
+pub fn compute_adaptive_timeout(
+    base_timeout: Duration,
+    active_queries: u64,
+    max_expected_queries: u64,
+    load_reduction: f64,
+) -> Duration {
+    if load_reduction <= 0.0 {
+        return base_timeout;
+    }
+    let ratio = (active_queries as f64 / max_expected_queries.max(1) as f64).clamp(0.0, 1.0);
+    let reduction = ratio.powi(4) * load_reduction.clamp(0.0, 0.99);
+    let factor = (1.0 - reduction).max(0.1);
+    let effective_millis = (base_timeout.as_millis() as f64 * factor) as u64;
+    Duration::from_millis(effective_millis.max(200))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,5 +1647,28 @@ mod tests {
         assert_eq!(resp[3] & 0x0F, 0x02); // SERVFAIL (rcode=2)
         assert_eq!(resp[6], 0); // ANCOUNT = 0
         assert_eq!(resp[7], 0);
+    }
+
+    #[test]
+    fn test_load_adaptive_timeout() {
+        let base = Duration::from_secs(5);
+
+        // Disabled (load_reduction = 0.0) -> unchanged
+        assert_eq!(compute_adaptive_timeout(base, 100, 200, 0.0), base);
+
+        // Under 0 active queries -> unchanged
+        assert_eq!(compute_adaptive_timeout(base, 0, 250, 0.75), base);
+
+        // Under moderate load (half load: ratio = 0.5, 0.5^4 = 0.0625, reduction = 0.0625 * 0.75 = ~0.0468)
+        let mid_timeout = compute_adaptive_timeout(base, 125, 250, 0.75);
+        assert!(mid_timeout < base && mid_timeout > Duration::from_secs(4));
+
+        // Under max load (250 active, ratio = 1.0, reduction = 0.75) -> 5s * 0.25 = 1.25s
+        let max_timeout = compute_adaptive_timeout(base, 250, 250, 0.75);
+        assert_eq!(max_timeout, Duration::from_millis(1250));
+
+        // Extreme load saturation clamp
+        let extreme_timeout = compute_adaptive_timeout(base, 500, 250, 0.75);
+        assert_eq!(extreme_timeout, Duration::from_millis(1250));
     }
 }

@@ -32,6 +32,7 @@ pub struct CompactBlocklist {
     pub labels: Vec<u8>,
     pub nodes: Vec<CompactNode>,
     pub total_domains: usize,
+    pub patterns: crate::dns::pattern::PatternMatcher,
 }
 
 impl CompactBlocklist {
@@ -49,11 +50,16 @@ impl CompactBlocklist {
                 _padding: 0,
             }],
             total_domains: 0,
+            patterns: crate::dns::pattern::PatternMatcher::new(),
         }
     }
 
     // checks if domain or any of its parent suffixes is blocked with 0 heap allocations
     pub fn check(&self, domain: &str) -> bool {
+        if self.patterns.matches(domain) {
+            return true;
+        }
+
         if self.nodes.is_empty() || self.total_domains == 0 {
             return false;
         }
@@ -138,11 +144,21 @@ impl CompactBlocklist {
         Ok(())
     }
 
-    // deserializes compact blocklist from binary disk blob in < 1ms
+    // deserializes compact blocklist from binary disk blob or text file
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
         let mut file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
-        Self::read_from(&mut file, file_len)
+        match Self::read_from(&mut file, file_len) {
+            Ok(bl) => Ok(bl),
+            Err(e) if e.to_string().contains("magic") || e.to_string().contains("short") => {
+                let content = fs::read_to_string(path)?;
+                let mut builder = BlocklistBuilder::new();
+                builder.add_text_lines(&content);
+                Ok(builder.build())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // deserializes compact blocklist directly from in-memory byte slice
@@ -289,6 +305,7 @@ impl CompactBlocklist {
             labels,
             nodes,
             total_domains,
+            patterns: crate::dns::pattern::PatternMatcher::new(),
         })
     }
 }
@@ -312,6 +329,7 @@ impl IntermediateNode {
 pub struct BlocklistBuilder {
     root: IntermediateNode,
     domain_count: usize,
+    patterns: crate::dns::pattern::PatternMatcher,
 }
 
 impl BlocklistBuilder {
@@ -319,19 +337,25 @@ impl BlocklistBuilder {
         Self {
             root: IntermediateNode::new(),
             domain_count: 0,
+            patterns: crate::dns::pattern::PatternMatcher::new(),
         }
     }
 
-    // parses text content containing one domain per line (comments # ignored)
+    // parses text content containing one domain or pattern per line (comments # ignored)
     pub fn add_text_lines(&mut self, text: &str) {
         for line in text.lines() {
             let clean = line.trim();
             if clean.is_empty() || clean.starts_with('#') || clean.starts_with("//") {
                 continue;
             }
-            // extract domain part (handles '0.0.0.0 domain.com' or raw 'domain.com')
-            let domain = clean.split_whitespace().last().unwrap_or("");
-            let domain = domain.trim_start_matches("*.").trim_end_matches('.');
+            // extract domain or pattern part (handles '0.0.0.0 domain.com' or raw 'domain.com' or '=exact.com' or '*keyword*')
+            let part = clean.split_whitespace().last().unwrap_or("");
+            if part.starts_with('=') || (part.contains('*') && !part.starts_with("*.")) {
+                self.patterns.add_rule(part);
+                self.domain_count += 1;
+                continue;
+            }
+            let domain = part.trim_start_matches("*.").trim_end_matches('.');
             if !domain.is_empty() && domain.contains('.') {
                 self.add_domain(domain);
             }
@@ -439,6 +463,7 @@ impl BlocklistBuilder {
             labels,
             nodes,
             total_domains: self.domain_count,
+            patterns: self.patterns,
         }
     }
 }
@@ -779,9 +804,43 @@ mod tests {
                 _padding: 0,
             }],
             total_domains: 1,
+            patterns: crate::dns::pattern::PatternMatcher::new(),
         };
 
         assert!(!malformed.check("example.com"));
         assert!(!malformed.check("test.org"));
+    }
+
+    #[test]
+    fn test_text_blocklist_with_patterns_and_fallback() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_text_blocklist.txt");
+        let content = r#"
+# Test blocklist file
+doubleclick.net
+=exact-only.com
+*analytics*
+        "#;
+        fs::write(&path, content).unwrap();
+
+        let loaded = CompactBlocklist::load_from_file(&path).unwrap();
+        assert_eq!(loaded.total_domains, 3);
+
+        // Standard suffix rule
+        assert!(loaded.check("doubleclick.net"));
+        assert!(loaded.check("ad.doubleclick.net"));
+
+        // Exact pattern
+        assert!(loaded.check("exact-only.com"));
+        assert!(!loaded.check("sub.exact-only.com"));
+
+        // Substring pattern
+        assert!(loaded.check("my-analytics-tracker.com"));
+        assert!(loaded.check("google-analytics.com"));
+
+        // Non-matching
+        assert!(!loaded.check("clean-site.org"));
+
+        let _ = fs::remove_file(&path);
     }
 }

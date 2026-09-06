@@ -183,7 +183,7 @@ impl Engine {
                 .parse()
                 .unwrap_or_else(|_| "127.0.0.1:8053".parse().unwrap());
 
-            let query_logger = if cfg.query_log {
+            let query_logger = if cfg.query_log || cfg.nx_log {
                 let ip_crypt = if let Some(ref hex) = cfg.ipcrypt_key {
                     match crate::dns::ipcrypt::IpCrypt::from_hex(hex) {
                         Ok(c) => Some(Arc::new(c)),
@@ -198,13 +198,39 @@ impl Engine {
                 } else {
                     None
                 };
-                let path = cfg.query_log_path.as_deref().unwrap_or(if cfg.ram_only {
-                    "/run/albus/query.log"
+                let main_path: Option<String> = if cfg.query_log {
+                    Some(
+                        cfg.query_log_path
+                            .clone()
+                            .unwrap_or_else(|| {
+                                if cfg.ram_only {
+                                    "/run/albus/query.log".to_string()
+                                } else {
+                                    "/var/log/albus/query.log".to_string()
+                                }
+                            }),
+                    )
                 } else {
-                    "/var/log/albus/query.log"
-                });
+                    None
+                };
+                let nx_path: Option<String> = if cfg.nx_log {
+                    Some(
+                        cfg.nx_log_path
+                            .clone()
+                            .unwrap_or_else(|| {
+                                if cfg.ram_only {
+                                    "/run/albus/nx.log".to_string()
+                                } else {
+                                    "/var/log/albus/nx.log".to_string()
+                                }
+                            }),
+                    )
+                } else {
+                    None
+                };
                 Some(crate::dns::logger::QueryLogger::start(
-                    path,
+                    main_path,
+                    nx_path,
                     ip_crypt,
                     10 * 1024 * 1024,
                     5,
@@ -212,6 +238,11 @@ impl Engine {
             } else {
                 None
             };
+
+            let effective_proxy = cfg.effective_proxy();
+            if let Some(ref p) = effective_proxy {
+                info!(proxy = %p, "upstream dns queries routed through socks5 proxy");
+            }
 
             let odoh_client = if cfg.odoh_enabled {
                 let relay = cfg
@@ -222,7 +253,16 @@ impl Engine {
                     .odoh_target
                     .as_deref()
                     .unwrap_or(crate::dns::DEFAULT_ODOH_TARGET);
-                match crate::dns::ODoHClient::new(relay, target, reqwest::Client::new()) {
+
+                let mut client_builder = reqwest::Client::builder();
+                if let Some(ref proxy_url) = effective_proxy {
+                    if let Ok(p) = reqwest::Proxy::all(proxy_url) {
+                        client_builder = client_builder.proxy(p);
+                    }
+                }
+                let http_client = client_builder.build().unwrap_or_else(|_| reqwest::Client::new());
+
+                match crate::dns::ODoHClient::new(relay, target, http_client) {
                     Ok(c) => {
                         info!(relay = %relay, target = %target, "Oblivious DoH (RFC 9230) client initialized");
                         Some(Arc::new(c))
@@ -238,6 +278,77 @@ impl Engine {
             } else {
                 None
             };
+
+            let mut schedule_mgr = crate::dns::ScheduleManager::from_config(&cfg.schedules);
+            if let Some(ref path) = cfg.blocklist_path {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    schedule_mgr.load_rules_from_text(&content);
+                }
+            }
+            let schedule_manager_arc = Arc::new(RwLock::new(schedule_mgr));
+
+            let edns_client_subnet = cfg.edns_client_subnet.as_deref().and_then(|s| {
+                match crate::dns::ClientSubnet::parse_cidr(s) {
+                    Ok(subnet) => Some(subnet),
+                    Err(e) => {
+                        warn!("invalid edns-client-subnet '{}': {}", s, e);
+                        None
+                    }
+                }
+            });
+
+            let metrics_addr: SocketAddr = cfg
+                .metrics_addr
+                .parse()
+                .unwrap_or_else(|_| "127.0.0.1:9153".parse().unwrap());
+
+            let tls_auth = match (&cfg.tls_client_cert, &cfg.tls_client_key) {
+                (Some(cert_path), Some(key_path)) => {
+                    match crate::dns::TlsClientAuth::from_files(cert_path, key_path) {
+                        Ok(auth) => {
+                            info!("loaded X.509 client certificate for DoH mTLS from {}", cert_path);
+                            Some(Arc::new(auth))
+                        }
+                        Err(e) => {
+                            warn!("failed to load mTLS client certificate/key: {}; proceeding without mTLS", e);
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            let mut fw_engine = crate::dns::ForwardingEngine::new();
+            if let Some(ref path) = cfg.forwarding_rules_path {
+                if std::path::Path::new(path).exists() {
+                    match crate::dns::ForwardingEngine::from_file(path) {
+                        Ok(loaded) => {
+                            info!("loaded split-dns forwarding rules from {}", path);
+                            fw_engine = loaded;
+                        }
+                        Err(e) => {
+                            warn!("failed to load split-dns forwarding rules from {}: {}", path, e);
+                        }
+                    }
+                } else {
+                    debug!("split-dns forwarding rules file not found (skipped): {}", path);
+                }
+            }
+            for (domain, target) in &cfg.forwarding_rules {
+                let mut servers = Vec::new();
+                for s in target.split(',') {
+                    let s_trim = s.trim();
+                    if let Ok(sa) = s_trim.parse::<SocketAddr>() {
+                        servers.push(sa);
+                    } else if let Ok(ip) = s_trim.parse::<std::net::IpAddr>() {
+                        servers.push(SocketAddr::new(ip, 53));
+                    }
+                }
+                if !servers.is_empty() {
+                    fw_engine.add_rule(domain, servers);
+                }
+            }
+            let forwarding_arc = Arc::new(RwLock::new(fw_engine));
 
             Some(Arc::new(DnsServer::new(
                 &cfg.doh_upstream,
@@ -264,6 +375,18 @@ impl Engine {
                 cfg.allowlist_path.clone(),
                 cfg.blocklist_path.clone(),
                 odoh_client,
+                effective_proxy.as_deref(),
+                schedule_manager_arc,
+                edns_client_subnet,
+                cfg.metrics,
+                metrics_addr,
+                tls_auth,
+                forwarding_arc,
+                cfg.forwarding_rules_path.clone(),
+                cfg.tls_key_log_file.clone(),
+                cfg.timeout_load_reduction,
+                cfg.cache_neg_min_ttl,
+                cfg.cache_neg_max_ttl,
             )?))
         } else {
             None
@@ -315,6 +438,24 @@ impl Engine {
                 return Err(format!("failed to configure /etc/resolv.conf: {}", e).into());
             }
             info!("encrypted DNS active");
+
+            if self.cfg.web_ui {
+                let web_addr: SocketAddr = self
+                    .cfg
+                    .web_ui_addr
+                    .parse()
+                    .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
+                let auth = match (&self.cfg.web_ui_user, &self.cfg.web_ui_pass) {
+                    (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+                    _ => None,
+                };
+                crate::dns::WebUiServer::start(
+                    web_addr,
+                    dns.stats.clone(),
+                    auth,
+                    dns.subscribe_shutdown(),
+                );
+            }
         }
 
         // 3. attach ebpf sock_ops bytecode to cgroup v2 hierarchy and spawn raw socket injector
