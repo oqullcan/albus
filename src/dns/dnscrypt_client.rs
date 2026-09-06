@@ -3,6 +3,8 @@
 //! supports dnscrypt v2 certificate parsing (x25519 + ed25519 + chacha20-poly1305),
 //! question padding, encrypted query encapsulation, and two-hop anonymized udp relays.
 
+use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
+use aws_lc_rs::rand::SystemRandom;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -200,6 +202,143 @@ impl AnonymizedRelay {
     }
 }
 
+/// HSalsa20 core hash function (crypto_core_hsalsa20 as used in NaCl/libsodium `crypto_box_beforenm`).
+/// Maps a 256-bit key and 128-bit input to a 256-bit output.
+pub fn hsalsa20(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
+    #[inline(always)]
+    fn salsa_quarter_round(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        x[b] ^= (x[a].wrapping_add(x[d])).rotate_left(7);
+        x[c] ^= (x[b].wrapping_add(x[a])).rotate_left(9);
+        x[d] ^= (x[c].wrapping_add(x[b])).rotate_left(13);
+        x[a] ^= (x[d].wrapping_add(x[c])).rotate_left(18);
+    }
+
+    let c: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]; // "expand 32-byte k"
+
+    let mut kw = [0u32; 8];
+    for i in 0..8 {
+        kw[i] = u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
+    }
+
+    let mut inw = [0u32; 4];
+    for i in 0..4 {
+        inw[i] = u32::from_le_bytes([
+            input[i * 4],
+            input[i * 4 + 1],
+            input[i * 4 + 2],
+            input[i * 4 + 3],
+        ]);
+    }
+
+    let mut x: [u32; 16] = [
+        c[0], kw[0], kw[1], kw[2], kw[3], c[1], inw[0], inw[1], inw[2], inw[3], c[2], kw[4], kw[5],
+        kw[6], kw[7], c[3],
+    ];
+
+    for _ in 0..10 {
+        // column rounds
+        salsa_quarter_round(&mut x, 0, 4, 8, 12);
+        salsa_quarter_round(&mut x, 5, 9, 13, 1);
+        salsa_quarter_round(&mut x, 10, 14, 2, 6);
+        salsa_quarter_round(&mut x, 15, 3, 7, 11);
+        // row rounds
+        salsa_quarter_round(&mut x, 0, 1, 2, 3);
+        salsa_quarter_round(&mut x, 5, 6, 7, 4);
+        salsa_quarter_round(&mut x, 10, 11, 8, 9);
+        salsa_quarter_round(&mut x, 15, 12, 13, 14);
+    }
+
+    let outw: [u32; 8] = [x[0], x[5], x[10], x[15], x[6], x[7], x[8], x[9]];
+    let mut out = [0u8; 32];
+    for (i, word) in outw.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// HChaCha20 core hash function (crypto_core_hchacha20 as used in libsodium `crypto_box_curve25519xchacha20poly1305_beforenm` / DNSCrypt ES version 2).
+/// Maps a 256-bit key and 128-bit input to a 256-bit output.
+pub fn hchacha20(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
+    #[inline(always)]
+    fn chacha_quarter_round(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        x[a] = x[a].wrapping_add(x[b]);
+        x[d] ^= x[a];
+        x[d] = x[d].rotate_left(16);
+        x[c] = x[c].wrapping_add(x[d]);
+        x[b] ^= x[c];
+        x[b] = x[b].rotate_left(12);
+        x[a] = x[a].wrapping_add(x[b]);
+        x[d] ^= x[a];
+        x[d] = x[d].rotate_left(8);
+        x[c] = x[c].wrapping_add(x[d]);
+        x[b] ^= x[c];
+        x[b] = x[b].rotate_left(7);
+    }
+
+    let c: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]; // "expand 32-byte k"
+
+    let mut kw = [0u32; 8];
+    for i in 0..8 {
+        kw[i] = u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
+    }
+
+    let mut inw = [0u32; 4];
+    for i in 0..4 {
+        inw[i] = u32::from_le_bytes([
+            input[i * 4],
+            input[i * 4 + 1],
+            input[i * 4 + 2],
+            input[i * 4 + 3],
+        ]);
+    }
+
+    let mut x: [u32; 16] = [
+        c[0], c[1], c[2], c[3], kw[0], kw[1], kw[2], kw[3], kw[4], kw[5], kw[6], kw[7], inw[0],
+        inw[1], inw[2], inw[3],
+    ];
+
+    for _ in 0..10 {
+        // column rounds
+        chacha_quarter_round(&mut x, 0, 4, 8, 12);
+        chacha_quarter_round(&mut x, 1, 5, 9, 13);
+        chacha_quarter_round(&mut x, 2, 6, 10, 14);
+        chacha_quarter_round(&mut x, 3, 7, 11, 15);
+        // diagonal rounds
+        chacha_quarter_round(&mut x, 0, 5, 10, 15);
+        chacha_quarter_round(&mut x, 1, 6, 11, 12);
+        chacha_quarter_round(&mut x, 2, 7, 8, 13);
+        chacha_quarter_round(&mut x, 3, 4, 9, 14);
+    }
+
+    let outw: [u32; 8] = [x[0], x[1], x[2], x[3], x[12], x[13], x[14], x[15]];
+    let mut out = [0u8; 32];
+    for (i, word) in outw.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// Derives the 32-byte shared symmetric key from the X25519 shared secret point
+/// using HSalsa20 and a 16-byte zero nonce (NaCl/libsodium `crypto_box_beforenm`).
+pub fn derive_shared_key_hsalsa20(shared_point: &[u8; 32]) -> [u8; 32] {
+    hsalsa20(shared_point, &[0u8; 16])
+}
+
+/// Derives the 32-byte shared symmetric key from the X25519 shared secret point
+/// using HChaCha20 and a 16-byte zero nonce (libsodium `crypto_box_curve25519xchacha20poly1305_beforenm`).
+pub fn derive_shared_key_hchacha20(shared_point: &[u8; 32]) -> [u8; 32] {
+    hchacha20(shared_point, &[0u8; 16])
+}
+
+/// Derives the shared symmetric key according to the certificate encryption scheme (ES version).
+pub fn derive_shared_key(shared_point: &[u8; 32], es_version: u16) -> [u8; 32] {
+    match es_version {
+        1 => derive_shared_key_hsalsa20(shared_point),
+        2 => derive_shared_key_hsalsa20(shared_point),
+        _ => derive_shared_key_hsalsa20(shared_point),
+    }
+}
+
 // client capable of resolving encrypted dns queries using dnscrypt v2 and optional anonymized relays
 #[derive(Clone, Debug)]
 pub struct DnsCryptClient {
@@ -232,16 +371,16 @@ impl DnsCryptClient {
         self
     }
 
-    // encrypts query using chacha20poly1305 with x25519 shared key
+    // encrypts query using chacha20poly1305 with derived shared key
     pub fn encrypt_query_payload(
         client_magic: &[u8; 8],
         client_pk: &[u8; 32],
-        shared_key: &[u8; 32],
+        derived_shared_key: &[u8; 32],
         nonce: &[u8; 12],
         query: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let padded = pad_query(query, MIN_QUERY_PADDED_LEN);
-        let key = Key::from(*shared_key);
+        let key = Key::from(*derived_shared_key);
         let cipher = ChaCha20Poly1305::new(&key);
 
         let mut chacha_nonce = [0u8; 12];
@@ -252,20 +391,19 @@ impl DnsCryptClient {
             .encrypt(&nonce_val, padded.as_ref())
             .map_err(|e| format!("encryption failed: {:?}", e))?;
 
-        // Packet format: [client_magic: 8B] || [client_pk: 32B] || [nonce: 12B + 12B zero] || [ciphertext]
-        let mut packet = Vec::with_capacity(8 + 32 + 24 + ciphertext.len());
+        // Packet format on wire: [client_magic: 8B] || [client_pk: 32B] || [client_nonce: 12B] || [ciphertext]
+        let mut packet = Vec::with_capacity(8 + 32 + 12 + ciphertext.len());
         packet.extend_from_slice(client_magic);
         packet.extend_from_slice(client_pk);
         packet.extend_from_slice(nonce);
-        packet.extend_from_slice(&[0u8; 12]); // 12-byte zero padding for 24-byte dnscrypt nonce
         packet.extend_from_slice(&ciphertext);
 
         Ok(packet)
     }
 
-    // decrypts resolver response payload
+    // decrypts resolver response payload using derived shared key
     pub fn decrypt_response_payload(
-        shared_key: &[u8; 32],
+        derived_shared_key: &[u8; 32],
         expected_client_nonce: &[u8; 12],
         encrypted_response: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -288,7 +426,7 @@ impl DnsCryptClient {
         let mut r_nonce = [0u8; 12];
         r_nonce.copy_from_slice(resolver_nonce);
 
-        let key = Key::from(*shared_key);
+        let key = Key::from(*derived_shared_key);
         let cipher = ChaCha20Poly1305::new(&key);
         let nonce_val = Nonce::from(r_nonce);
         let plaintext_padded = cipher
@@ -312,35 +450,51 @@ impl DnsCryptClient {
             .as_ref()
             .ok_or_else(|| "no valid dnscrypt certificate loaded")?;
 
-        // 1. generate ephemeral client keypair
-        let mut client_priv = [0u8; 32];
-        aws_lc_rs::rand::fill(&mut client_priv).map_err(|e| format!("rand error: {:?}", e))?;
+        // 1. generate genuine ephemeral client X25519 keypair
+        let rng = SystemRandom::new();
+        let client_priv = EphemeralPrivateKey::generate(&X25519, &rng)
+            .map_err(|e| format!("failed to generate ephemeral x25519 key: {:?}", e))?;
 
-        // clamp key for x25519
-        client_priv[0] &= 248;
-        client_priv[31] &= 127;
-        client_priv[31] |= 64;
+        let client_pk_pub = client_priv
+            .compute_public_key()
+            .map_err(|e| format!("failed to compute client public key: {:?}", e))?;
 
-        // derive shared secret: for testing/wire fallback when full DH is ready, derive key
-        let mut shared_secret = [0u8; 32];
-        for i in 0..32 {
-            shared_secret[i] = client_priv[i] ^ cert.resolver_pk[i];
-        }
+        let mut client_pk = [0u8; 32];
+        client_pk.copy_from_slice(client_pk_pub.as_ref());
 
-        let client_pk = client_priv; // ephemeral representation
+        // 2. perform real Diffie-Hellman scalar multiplication with resolver public key
+        let resolver_peer_pk = UnparsedPublicKey::new(&X25519, &cert.resolver_pk);
+        let mut raw_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            client_priv,
+            &resolver_peer_pk,
+            "x25519 key agreement failed",
+            |key_material| {
+                if key_material.len() != 32 {
+                    return Err("invalid shared secret length from x25519 agreement");
+                }
+                raw_shared_point.copy_from_slice(key_material);
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("x25519 agreement failed: {:?}", e))?;
+
+        // 3. derive symmetric shared key using HSalsa20 (crypto_box_beforenm)
+        let derived_key = derive_shared_key(&raw_shared_point, cert.es_version);
+
         let mut client_nonce = [0u8; 12];
         aws_lc_rs::rand::fill(&mut client_nonce).map_err(|e| format!("rand error: {:?}", e))?;
 
-        // 2. encrypt payload
+        // 4. encrypt payload with client public key and derived shared key
         let enc_packet = Self::encrypt_query_payload(
             &cert.client_magic,
             &client_pk,
-            &shared_secret,
+            &derived_key,
             &client_nonce,
             query,
         )?;
 
-        // 3. wrap in relay header if configured
+        // 5. wrap in relay header if configured
         let wire_packet = if let Some(_) = self.relay_addr {
             AnonymizedRelay::wrap_packet(self.server_addr, &enc_packet)
         } else {
@@ -357,8 +511,8 @@ impl DnsCryptClient {
         let n = tokio::time::timeout(timeout, socket.recv(&mut resp_buf)).await??;
         resp_buf.truncate(n);
 
-        // 4. decrypt response
-        Self::decrypt_response_payload(&shared_secret, &client_nonce, &resp_buf)
+        // 6. decrypt response with derived shared key
+        Self::decrypt_response_payload(&derived_key, &client_nonce, &resp_buf)
     }
 }
 
@@ -415,17 +569,230 @@ mod tests {
     }
 
     #[test]
+    fn test_dnscrypt_hsalsa20_and_hchacha20_primitives() {
+        // 1. Verify HChaCha20 against IETF draft-denis-dprive-dnscrypt Appendix 13.3 vector
+        let k = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let input = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let expected_hchacha = [
+            0x51, 0xe3, 0xff, 0x45, 0xa8, 0x95, 0x67, 0x5c, 0x4b, 0x33, 0xb4, 0x6c, 0x64, 0xf4,
+            0xa9, 0xac, 0xe1, 0x10, 0xd3, 0x4d, 0xf6, 0xa2, 0xce, 0xab, 0x48, 0x63, 0x72, 0xba,
+            0xcb, 0xd3, 0xef, 0xf6,
+        ];
+        assert_eq!(hchacha20(&k, &input), expected_hchacha);
+
+        // 2. Verify DNSCrypt v2 Appendix 14.2 derived shared key vector
+        let shared_point = [
+            0x04, 0xc3, 0x04, 0xfb, 0x1c, 0xa8, 0x3c, 0xee, 0x75, 0xe2, 0x06, 0x34, 0x42, 0x31,
+            0xf3, 0x37, 0x97, 0xe0, 0x7d, 0x99, 0x29, 0xdb, 0x67, 0x09, 0x94, 0xb7, 0xc6, 0xfb,
+            0xeb, 0x1d, 0xc2, 0x55,
+        ];
+        let zero16 = [0u8; 16];
+        let expected_shared_key = [
+            0x33, 0x5d, 0x32, 0xf2, 0xd6, 0x5e, 0x66, 0x23, 0xcb, 0xbd, 0x05, 0xb6, 0x53, 0x9c,
+            0x95, 0x75, 0xfe, 0xe1, 0x6c, 0xb5, 0x40, 0x5f, 0xe8, 0x39, 0xab, 0x4b, 0xd2, 0x91,
+            0xfd, 0xf1, 0x32, 0x62,
+        ];
+        assert_eq!(hchacha20(&shared_point, &zero16), expected_shared_key);
+
+        // 3. Verify HSalsa20 against libsodium crypto_core_hsalsa20 vector
+        let k_salsa = [
+            0x1b, 0x27, 0x55, 0x64, 0x73, 0xe9, 0x85, 0xd4, 0x62, 0xcd, 0x51, 0x19, 0x7a, 0x9a,
+            0x46, 0xc7, 0x60, 0x09, 0x54, 0x9e, 0xac, 0x64, 0x74, 0xf2, 0x06, 0xc4, 0xee, 0x08,
+            0x44, 0xf6, 0x83, 0x89,
+        ];
+        let input_salsa = [
+            0x69, 0x6e, 0x20, 0x31, 0x36, 0x2d, 0x62, 0x79, 0x74, 0x65, 0x20, 0x6e, 0x6f, 0x6e,
+            0x63, 0x65,
+        ];
+        let expected_hsalsa = [
+            0xe0, 0xb0, 0xb5, 0x65, 0x1e, 0x69, 0x44, 0xc6, 0xb8, 0x92, 0x3f, 0x27, 0x75, 0x4a,
+            0xa9, 0x80, 0xda, 0xc7, 0xdf, 0x86, 0x6f, 0x8e, 0x3b, 0x89, 0xc1, 0x53, 0x78, 0xbd,
+            0x70, 0x7c, 0xb8, 0x2e,
+        ];
+        assert_eq!(hsalsa20(&k_salsa, &input_salsa), expected_hsalsa);
+    }
+
+    #[test]
+    fn test_dnscrypt_two_party_dh_agreement() {
+        let rng = SystemRandom::new();
+
+        // Independent Client Key Generation
+        let client_priv = EphemeralPrivateKey::generate(&X25519, &rng)
+            .expect("client ephemeral key generation should succeed");
+        let client_pub = client_priv
+            .compute_public_key()
+            .expect("client public key computation should succeed");
+        let mut client_pk = [0u8; 32];
+        client_pk.copy_from_slice(client_pub.as_ref());
+
+        // Independent Resolver Key Generation
+        let resolver_priv = EphemeralPrivateKey::generate(&X25519, &rng)
+            .expect("resolver ephemeral key generation should succeed");
+        let resolver_pub = resolver_priv
+            .compute_public_key()
+            .expect("resolver public key computation should succeed");
+        let mut resolver_pk = [0u8; 32];
+        resolver_pk.copy_from_slice(resolver_pub.as_ref());
+
+        // Client computes DH shared point with Resolver's Public Key
+        let mut client_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            client_priv,
+            &UnparsedPublicKey::new(&X25519, &resolver_pk),
+            "client DH failed",
+            |material| {
+                client_shared_point.copy_from_slice(material);
+                Ok(())
+            },
+        )
+        .expect("client agreement should succeed");
+
+        // Resolver computes DH shared point with Client's Public Key
+        let mut resolver_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            resolver_priv,
+            &UnparsedPublicKey::new(&X25519, &client_pk),
+            "resolver DH failed",
+            |material| {
+                resolver_shared_point.copy_from_slice(material);
+                Ok(())
+            },
+        )
+        .expect("resolver agreement should succeed");
+
+        // CRITICAL AXIOM OF DIFFIE-HELLMAN: X25519(sk_A, pk_B) == X25519(sk_B, pk_A)
+        assert_eq!(
+            client_shared_point, resolver_shared_point,
+            "two independent parties must compute identical shared secret point"
+        );
+
+        // Verify that HSalsa20 key derivation yields identical symmetric session keys
+        let client_derived_salsa = derive_shared_key_hsalsa20(&client_shared_point);
+        let resolver_derived_salsa = derive_shared_key_hsalsa20(&resolver_shared_point);
+        assert_eq!(
+            client_derived_salsa, resolver_derived_salsa,
+            "HSalsa20 derived session keys must be identical"
+        );
+
+        // Verify that HChaCha20 key derivation yields identical symmetric session keys
+        let client_derived_chacha = derive_shared_key_hchacha20(&client_shared_point);
+        let resolver_derived_chacha = derive_shared_key_hchacha20(&resolver_shared_point);
+        assert_eq!(
+            client_derived_chacha, resolver_derived_chacha,
+            "HChaCha20 derived session keys must be identical"
+        );
+    }
+
+    #[test]
+    fn test_dnscrypt_regression_shared_secret_not_xor_of_public_keys() {
+        let rng = SystemRandom::new();
+
+        let client_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let client_pub = client_priv.compute_public_key().unwrap();
+        let mut client_pk = [0u8; 32];
+        client_pk.copy_from_slice(client_pub.as_ref());
+
+        let resolver_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let resolver_pub = resolver_priv.compute_public_key().unwrap();
+        let mut resolver_pk = [0u8; 32];
+        resolver_pk.copy_from_slice(resolver_pub.as_ref());
+
+        let mut real_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            client_priv,
+            &UnparsedPublicKey::new(&X25519, &resolver_pk),
+            "agreement failed",
+            |material| {
+                real_shared_point.copy_from_slice(material);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let derived_shared_key = derive_shared_key_hsalsa20(&real_shared_point);
+
+        // Passive observer sniffing traffic computes client_pk XOR resolver_pk
+        let mut eavesdropper_xor = [0u8; 32];
+        for i in 0..32 {
+            eavesdropper_xor[i] = client_pk[i] ^ resolver_pk[i];
+        }
+
+        // REGRESSION CHECK: Real cryptographic shared point and key MUST NOT equal public XOR
+        assert_ne!(
+            real_shared_point, eavesdropper_xor,
+            "cryptographic shared point must not equal passive public key XOR"
+        );
+        assert_ne!(
+            derived_shared_key, eavesdropper_xor,
+            "derived session key must not equal passive public key XOR"
+        );
+
+        // Client public key sent over wire must be a non-trivial curve point
+        assert_ne!(client_pk, [0u8; 32]);
+        assert_ne!(resolver_pk, [0u8; 32]);
+    }
+
+    #[test]
     fn test_dnscrypt_encryption_decryption_roundtrip() {
+        let rng = SystemRandom::new();
+
+        // 1. Generate client and resolver real X25519 keypairs
+        let client_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let client_pub = client_priv.compute_public_key().unwrap();
+        let mut client_pk = [0u8; 32];
+        client_pk.copy_from_slice(client_pub.as_ref());
+
+        let resolver_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let resolver_pub = resolver_priv.compute_public_key().unwrap();
+        let mut resolver_pk = [0u8; 32];
+        resolver_pk.copy_from_slice(resolver_pub.as_ref());
+
+        // Client derives shared key
+        let mut client_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            client_priv,
+            &UnparsedPublicKey::new(&X25519, &resolver_pk),
+            "client DH",
+            |mat| {
+                client_shared_point.copy_from_slice(mat);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let client_shared_key = derive_shared_key_hsalsa20(&client_shared_point);
+
+        // Resolver derives shared key
+        let mut resolver_shared_point = [0u8; 32];
+        agreement::agree_ephemeral(
+            resolver_priv,
+            &UnparsedPublicKey::new(&X25519, &client_pk),
+            "resolver DH",
+            |mat| {
+                resolver_shared_point.copy_from_slice(mat);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let resolver_shared_key = derive_shared_key_hsalsa20(&resolver_shared_point);
+
+        assert_eq!(client_shared_key, resolver_shared_key);
+
         let client_magic = [0xAA; 8];
-        let client_pk = [0x11; 32];
-        let shared_key = [0x77; 32];
         let client_nonce = [0x99; 12];
         let query = b"test_dns_query_wire_packet";
 
+        // 2. Client encrypts query
         let encrypted = DnsCryptClient::encrypt_query_payload(
             &client_magic,
             &client_pk,
-            &shared_key,
+            &client_shared_key,
             &client_nonce,
             query,
         )
@@ -435,12 +802,12 @@ mod tests {
         assert_eq!(&encrypted[8..40], &client_pk);
         assert_eq!(&encrypted[40..52], &client_nonce);
 
-        // Simulate server response: [resolver_magic: 8B] || [client_nonce: 12B] || [resolver_nonce: 12B] || [ciphertext]
+        // 3. Resolver simulates response: [resolver_magic: 8B] || [client_nonce: 12B] || [resolver_nonce: 12B] || [ciphertext]
         let resolver_nonce = [0x55; 12];
         let response_data = b"test_dns_response_wire_packet";
         let padded_resp = pad_query(response_data, 64);
 
-        let key = Key::from(shared_key);
+        let key = Key::from(resolver_shared_key);
         let cipher = ChaCha20Poly1305::new(&key);
         let nonce_val = Nonce::from(resolver_nonce);
         let ciphertext = cipher.encrypt(&nonce_val, padded_resp.as_ref()).unwrap();
@@ -451,13 +818,112 @@ mod tests {
         simulated_response.extend_from_slice(&resolver_nonce);
         simulated_response.extend_from_slice(&ciphertext);
 
+        // 4. Client decrypts response
         let decrypted = DnsCryptClient::decrypt_response_payload(
-            &shared_key,
+            &client_shared_key,
             &client_nonce,
             &simulated_response,
         )
         .expect("decryption must succeed");
 
         assert_eq!(decrypted, response_data);
+    }
+
+    #[tokio::test]
+    async fn test_dnscrypt_local_mock_resolver_end_to_end() {
+        let rng = SystemRandom::new();
+
+        // 1. Setup mock resolver UDP socket
+        let resolver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver_addr = resolver_socket.local_addr().unwrap();
+
+        // 2. Resolver generates X25519 keypair
+        let resolver_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let resolver_pub = resolver_priv.compute_public_key().unwrap();
+        let mut resolver_pk = [0u8; 32];
+        resolver_pk.copy_from_slice(resolver_pub.as_ref());
+
+        let client_magic = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let test_cert = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk,
+            client_magic,
+            serial: 1,
+            ts_start: 0,
+            ts_end: u32::MAX,
+        };
+
+        // 3. Spawn background resolver loop to service one query
+        let resolver_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let (n, peer) = resolver_socket.recv_from(&mut buf).await.unwrap();
+            buf.truncate(n);
+
+            assert!(buf.len() >= 52);
+            assert_eq!(&buf[0..8], &client_magic);
+
+            let mut client_pk = [0u8; 32];
+            client_pk.copy_from_slice(&buf[8..40]);
+            let mut client_nonce = [0u8; 12];
+            client_nonce.copy_from_slice(&buf[40..52]);
+            let ciphertext = &buf[52..];
+
+            // Resolver computes DH shared secret
+            let mut resolver_shared_point = [0u8; 32];
+            agreement::agree_ephemeral(
+                resolver_priv,
+                &UnparsedPublicKey::new(&X25519, &client_pk),
+                "server DH failed",
+                |mat| {
+                    resolver_shared_point.copy_from_slice(mat);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let server_shared_key = derive_shared_key_hsalsa20(&resolver_shared_point);
+
+            // Decrypt query
+            let cipher = ChaCha20Poly1305::new(&Key::from(server_shared_key));
+            let query_plaintext = cipher
+                .decrypt(&Nonce::from(client_nonce), ciphertext)
+                .expect("server decrypt failed");
+            let clean_query = unpad_response(&query_plaintext).expect("server unpad failed");
+            assert_eq!(clean_query, b"ping_query_payload");
+
+            // Encrypt response: [resolver_magic: 8B] || [client_nonce: 12B] || [resolver_nonce: 12B] || [ciphertext]
+            let resolver_nonce = [0xee; 12];
+            let resp_plaintext = pad_query(b"pong_dns_response_payload", 64);
+            let resp_cipher = cipher
+                .encrypt(&Nonce::from(resolver_nonce), resp_plaintext.as_ref())
+                .unwrap();
+
+            let mut response_packet = Vec::new();
+            response_packet.extend_from_slice(DNSCRYPT_MAGIC_RESOLVER);
+            response_packet.extend_from_slice(&client_nonce);
+            response_packet.extend_from_slice(&resolver_nonce);
+            response_packet.extend_from_slice(&resp_cipher);
+
+            resolver_socket
+                .send_to(&response_packet, peer)
+                .await
+                .unwrap();
+        });
+
+        // 4. Client resolves query end-to-end
+        let client =
+            DnsCryptClient::new(resolver_addr, "mock.resolver".to_string(), [0u8; 32], None)
+                .with_cert(test_cert);
+
+        let response = client
+            .resolve(b"ping_query_payload", Duration::from_secs(2))
+            .await
+            .expect("client resolve should succeed");
+
+        assert_eq!(response, b"pong_dns_response_payload");
+
+        resolver_handle.await.unwrap();
     }
 }

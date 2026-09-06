@@ -1797,7 +1797,7 @@ Panel {
 
                         RowLayout {
                           width: parent.width - Style.space(24)
-                          spacing: Style.space(4)
+                          spacing: Style.space(6)
 
                           Text {
                             text: "Anonymized DNSCrypt Relays"
@@ -1807,14 +1807,37 @@ Panel {
                             color: root.foreground
                           }
 
-                          Text {
-                            text: "Relay stamps or names"
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption - 2
-                            color: root.subtle
-                            elide: Text.ElideRight
+                          Rectangle {
+                            height: 16
+                            radius: 3
+                            color: Qt.rgba(0.95, 0.65, 0.15, 0.15)
+                            border.color: Qt.rgba(0.95, 0.65, 0.15, 0.4)
+                            border.width: 1
+                            implicitWidth: experimentalRelayText.implicitWidth + 8
+
+                            Text {
+                              id: experimentalRelayText
+                              anchors.centerIn: parent
+                              text: "Experimental - Coming Soon"
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption - 3
+                              font.bold: true
+                              color: Qt.rgba(0.95, 0.65, 0.15, 0.95)
+                            }
+                          }
+
+                          Item {
                             Layout.fillWidth: true
                           }
+                        }
+
+                        Text {
+                          width: parent.width - Style.space(24)
+                          text: "Relay stamps or names (backend under development, not active in live traffic)"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption - 2
+                          color: root.subtle
+                          wrapMode: Text.WordWrap
                         }
 
                         StyledTextField {
