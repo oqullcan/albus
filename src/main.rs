@@ -79,53 +79,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.local_doh_addr = args.local_doh_addr;
                     cfg.query_log = args.query_log;
                     if let Some(ref path) = args.query_log_path {
-                        cfg.query_log_path = if path.trim().is_empty() { None } else { Some(path.clone()) };
+                        cfg.query_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
                     }
                     if let Some(ref key) = args.ipcrypt_key {
-                        cfg.ipcrypt_key = if key.trim().is_empty() { None } else { Some(key.clone()) };
+                        cfg.ipcrypt_key = if key.trim().is_empty() {
+                            None
+                        } else {
+                            Some(key.clone())
+                        };
                     }
                     cfg.odoh_enabled = args.odoh;
                     if let Some(ref relay) = args.odoh_relay {
-                        cfg.odoh_relay = if relay.trim().is_empty() { None } else { Some(relay.clone()) };
+                        cfg.odoh_relay = if relay.trim().is_empty() {
+                            None
+                        } else {
+                            Some(relay.clone())
+                        };
                     }
                     if let Some(ref target) = args.odoh_target {
-                        cfg.odoh_target = if target.trim().is_empty() { None } else { Some(target.clone()) };
+                        cfg.odoh_target = if target.trim().is_empty() {
+                            None
+                        } else {
+                            Some(target.clone())
+                        };
                     }
                     if let Some(ref proxy) = args.socks5_proxy {
-                        cfg.socks5_proxy = if proxy.trim().is_empty() { None } else { Some(proxy.clone()) };
+                        cfg.socks5_proxy = if proxy.trim().is_empty() {
+                            None
+                        } else {
+                            Some(proxy.clone())
+                        };
                     }
                     cfg.tor = args.tor;
                     cfg.nx_log = args.nx_log;
                     if let Some(ref path) = args.nx_log_path {
-                        cfg.nx_log_path = if path.trim().is_empty() { None } else { Some(path.clone()) };
+                        cfg.nx_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
                     }
                     if let Some(ref ecs) = args.edns_client_subnet {
-                        cfg.edns_client_subnet = if ecs.trim().is_empty() { None } else { Some(ecs.clone()) };
+                        cfg.edns_client_subnet = if ecs.trim().is_empty() {
+                            None
+                        } else {
+                            Some(ecs.clone())
+                        };
                     }
                     cfg.metrics = args.metrics;
                     cfg.metrics_addr = args.metrics_addr;
                     if let Some(ref cert) = args.tls_client_cert {
-                        cfg.tls_client_cert = if cert.trim().is_empty() { None } else { Some(cert.clone()) };
+                        cfg.tls_client_cert = if cert.trim().is_empty() {
+                            None
+                        } else {
+                            Some(cert.clone())
+                        };
                     }
                     if let Some(ref key) = args.tls_client_key {
-                        cfg.tls_client_key = if key.trim().is_empty() { None } else { Some(key.clone()) };
+                        cfg.tls_client_key = if key.trim().is_empty() {
+                            None
+                        } else {
+                            Some(key.clone())
+                        };
                     }
                     if let Some(ref path) = args.forwarding_rules_path {
-                        cfg.forwarding_rules_path = if path.trim().is_empty() { None } else { Some(path.clone()) };
+                        cfg.forwarding_rules_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
                     }
                     cfg.cache_neg_min_ttl = args.cache_neg_min_ttl;
                     cfg.cache_neg_max_ttl = args.cache_neg_max_ttl;
                     if let Some(ref path) = args.tls_key_log_file {
-                        cfg.tls_key_log_file = if path.trim().is_empty() { None } else { Some(path.clone()) };
+                        cfg.tls_key_log_file = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
                     }
                     cfg.timeout_load_reduction = args.timeout_load_reduction;
                     cfg.web_ui = args.web_ui;
                     cfg.web_ui_addr = args.web_ui_addr;
                     if let Some(ref user) = args.web_ui_user {
-                        cfg.web_ui_user = if user.trim().is_empty() { None } else { Some(user.clone()) };
+                        cfg.web_ui_user = if user.trim().is_empty() {
+                            None
+                        } else {
+                            Some(user.clone())
+                        };
                     }
                     if let Some(ref pass) = args.web_ui_pass {
-                        cfg.web_ui_pass = if pass.trim().is_empty() { None } else { Some(pass.clone()) };
+                        cfg.web_ui_pass = if pass.trim().is_empty() {
+                            None
+                        } else {
+                            Some(pass.clone())
+                        };
                     }
                     if let Some(ref s) = args.dnscrypt_servers {
                         cfg.dnscrypt_servers = s.clone();
@@ -352,10 +404,7 @@ async fn handle_resolvers_command(
 
     let mut sources = cfg.sources.clone();
     if sources.is_empty() {
-        sources.insert(
-            "public-resolvers".to_string(),
-            dns::SourceConfig::default(),
-        );
+        sources.insert("public-resolvers".to_string(), dns::SourceConfig::default());
     }
 
     match command.unwrap_or(albus::app::cli::ResolversCommands::List) {
@@ -390,7 +439,11 @@ async fn handle_resolvers_command(
                             } else {
                                 ("Unknown", "-".to_string())
                             };
-                            let clean_desc: String = entry.description.chars().filter(|c| !c.is_control()).collect();
+                            let clean_desc: String = entry
+                                .description
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .collect();
                             let desc = if clean_desc.chars().count() > 30 {
                                 let truncated: String = clean_desc.chars().take(27).collect();
                                 format!("{}...", truncated)
@@ -465,4 +518,3 @@ async fn handle_resolvers_command(
     }
     Ok(())
 }
-

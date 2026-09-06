@@ -4,8 +4,8 @@
 //! decodes base64url-encoded stamp strings into upstream provider urls, ports, bootstrap ips,
 //! and protocol attributes (dnssec, nolog, nofilter).
 
-use std::net::{Ipv4Addr, SocketAddr};
 use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StampProtocol {

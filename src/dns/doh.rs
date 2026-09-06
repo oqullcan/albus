@@ -166,10 +166,9 @@ impl SingleDoHClient {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let builder =
-            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(root_store);
+        let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_store);
 
         let mut client_config = if let Some(auth) = tls_auth {
             builder.with_client_auth_cert(auth.certs.clone(), auth.key.clone_key())?
@@ -311,7 +310,15 @@ impl DoHResolver {
             }
 
             if let Some((url, _)) = DOH_PRESETS.get(u) {
-                match SingleDoHClient::new(url, u, custom_bootstrap_ips, pqc, proxy, tls_auth, tls_key_log_file) {
+                match SingleDoHClient::new(
+                    url,
+                    u,
+                    custom_bootstrap_ips,
+                    pqc,
+                    proxy,
+                    tls_auth,
+                    tls_key_log_file,
+                ) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize doh preset {}: {}", u, e),
                 }
@@ -320,7 +327,15 @@ impl DoHResolver {
                     .ok()
                     .and_then(|p| p.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "custom".to_string());
-                match SingleDoHClient::new(u, &name, custom_bootstrap_ips, pqc, proxy, tls_auth, tls_key_log_file) {
+                match SingleDoHClient::new(
+                    u,
+                    &name,
+                    custom_bootstrap_ips,
+                    pqc,
+                    proxy,
+                    tls_auth,
+                    tls_key_log_file,
+                ) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize custom doh {}: {}", u, e),
                 }
@@ -343,8 +358,15 @@ impl DoHResolver {
                         if stamp.doh_url.is_empty() {
                             warn!("dns stamp {} does not specify a doh endpoint", u);
                         } else {
-                            match SingleDoHClient::new(&stamp.doh_url, &name, &all_bootstraps, pqc, proxy, tls_auth, tls_key_log_file)
-                            {
+                            match SingleDoHClient::new(
+                                &stamp.doh_url,
+                                &name,
+                                &all_bootstraps,
+                                pqc,
+                                proxy,
+                                tls_auth,
+                                tls_key_log_file,
+                            ) {
                                 Ok(client) => clients.push(client),
                                 Err(e) => warn!("failed to initialize stamp doh {}: {}", name, e),
                             }
@@ -572,8 +594,15 @@ mod tests {
     #[test]
     fn test_pqc_toggle_true_vs_false_kx_groups() {
         // 1. verify pqc: true contains quantum-resistant KEM hybrid group
-        let client_pqc =
-            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true, None, None, None);
+        let client_pqc = SingleDoHClient::new(
+            "https://dns.quad9.net/dns-query",
+            "quad9",
+            &[],
+            true,
+            None,
+            None,
+            None,
+        );
         assert!(
             client_pqc.is_ok(),
             "PQC client initialization should succeed"
@@ -581,8 +610,15 @@ mod tests {
         assert!(client_pqc.unwrap().pqc);
 
         // 2. verify pqc: false contains exclusively classical elliptic curves
-        let client_classical =
-            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false, None, None, None);
+        let client_classical = SingleDoHClient::new(
+            "https://dns.quad9.net/dns-query",
+            "quad9",
+            &[],
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(
             client_classical.is_ok(),
             "Classical client initialization should succeed"
@@ -639,7 +675,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_quad9_live_query() {
-        let resolver = DoHResolver::new("quad9", &[], true, None, None, None).expect("resolver init should succeed");
+        let resolver = DoHResolver::new("quad9", &[], true, None, None, None)
+            .expect("resolver init should succeed");
         let query_wire = [
             0x12, 0x34, // id
             0x01, 0x00, // standard query
@@ -686,7 +723,14 @@ mod tests {
             "SOCKS5 proxy client initialization should succeed"
         );
 
-        let resolver = DoHResolver::new("quad9", &[], true, Some("socks5://127.0.0.1:9050"), None, None);
+        let resolver = DoHResolver::new(
+            "quad9",
+            &[],
+            true,
+            Some("socks5://127.0.0.1:9050"),
+            None,
+            None,
+        );
         assert!(
             resolver.is_ok(),
             "SOCKS5 resolver initialization should succeed"

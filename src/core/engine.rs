@@ -199,32 +199,24 @@ impl Engine {
                     None
                 };
                 let main_path: Option<String> = if cfg.query_log {
-                    Some(
-                        cfg.query_log_path
-                            .clone()
-                            .unwrap_or_else(|| {
-                                if cfg.ram_only {
-                                    "/run/albus/query.log".to_string()
-                                } else {
-                                    "/var/log/albus/query.log".to_string()
-                                }
-                            }),
-                    )
+                    Some(cfg.query_log_path.clone().unwrap_or_else(|| {
+                        if cfg.ram_only {
+                            "/run/albus/query.log".to_string()
+                        } else {
+                            "/var/log/albus/query.log".to_string()
+                        }
+                    }))
                 } else {
                     None
                 };
                 let nx_path: Option<String> = if cfg.nx_log {
-                    Some(
-                        cfg.nx_log_path
-                            .clone()
-                            .unwrap_or_else(|| {
-                                if cfg.ram_only {
-                                    "/run/albus/nx.log".to_string()
-                                } else {
-                                    "/var/log/albus/nx.log".to_string()
-                                }
-                            }),
-                    )
+                    Some(cfg.nx_log_path.clone().unwrap_or_else(|| {
+                        if cfg.ram_only {
+                            "/run/albus/nx.log".to_string()
+                        } else {
+                            "/var/log/albus/nx.log".to_string()
+                        }
+                    }))
                 } else {
                     None
                 };
@@ -260,7 +252,9 @@ impl Engine {
                         client_builder = client_builder.proxy(p);
                     }
                 }
-                let http_client = client_builder.build().unwrap_or_else(|_| reqwest::Client::new());
+                let http_client = client_builder
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
 
                 match crate::dns::ODoHClient::new(relay, target, http_client) {
                     Ok(c) => {
@@ -306,7 +300,10 @@ impl Engine {
                 (Some(cert_path), Some(key_path)) => {
                     match crate::dns::TlsClientAuth::from_files(cert_path, key_path) {
                         Ok(auth) => {
-                            info!("loaded X.509 client certificate for DoH mTLS from {}", cert_path);
+                            info!(
+                                "loaded X.509 client certificate for DoH mTLS from {}",
+                                cert_path
+                            );
                             Some(Arc::new(auth))
                         }
                         Err(e) => {
@@ -327,11 +324,17 @@ impl Engine {
                             fw_engine = loaded;
                         }
                         Err(e) => {
-                            warn!("failed to load split-dns forwarding rules from {}: {}", path, e);
+                            warn!(
+                                "failed to load split-dns forwarding rules from {}: {}",
+                                path, e
+                            );
                         }
                     }
                 } else {
-                    debug!("split-dns forwarding rules file not found (skipped): {}", path);
+                    debug!(
+                        "split-dns forwarding rules file not found (skipped): {}",
+                        path
+                    );
                 }
             }
             for (domain, target) in &cfg.forwarding_rules {

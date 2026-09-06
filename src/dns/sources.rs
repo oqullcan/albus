@@ -3,10 +3,10 @@
 //! downloads public-resolvers.md, validates cryptographic signatures using minisign ed25519,
 //! caches verified lists locally, and parses dns stamps for upstream resolution.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use super::stamp::DnsStamp;
@@ -214,7 +214,10 @@ impl SourceManager {
         }
         if let Ok(home) = std::env::var("HOME") {
             if !home.trim().is_empty() {
-                return PathBuf::from(home).join(".cache").join("albus").join("resolvers");
+                return PathBuf::from(home)
+                    .join(".cache")
+                    .join("albus")
+                    .join("resolvers");
             }
         }
         PathBuf::from("/var/cache/albus/resolvers")
@@ -378,12 +381,12 @@ fn decode_b64(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send +
 mod tests {
     use super::*;
 
-    const DNSCRYPT_PUBLIC_KEY: &str =
-        "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    const DNSCRYPT_PUBLIC_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
 
     #[test]
     fn test_minisign_public_key_parsing() {
-        let pk = MinisignPublicKey::from_base64(DNSCRYPT_PUBLIC_KEY).expect("should parse valid key");
+        let pk =
+            MinisignPublicKey::from_base64(DNSCRYPT_PUBLIC_KEY).expect("should parse valid key");
         assert_eq!(pk.key_id, [0x1f, 0xe8, 0xb4, 0x42, 0x18, 0x0f, 0x62, 0xe7]);
         assert_eq!(pk.public_key.len(), 32);
     }
@@ -424,13 +427,15 @@ sdns://AgcAAAAAAAAABzEuMS4xLjEAEmNsb3VkZmxhcmUtZG5zLmNvbQovZG5zLXF1ZXJ5
     fn test_minisign_signature_verification_and_tamper() {
         // Generate ephemeral ed25519 keypair using aws_lc_rs
         let pk_bytes: [u8; 32] = [
-            0x79, 0xa5, 0x61, 0xe7, 0x0e, 0xe0, 0x8c, 0xd3,
-            0xe7, 0x54, 0xc6, 0x3e, 0x9b, 0xd6, 0xb9, 0xc3,
-            0x52, 0x0a, 0x1d, 0x42, 0x04, 0xcd, 0x10, 0x4d,
-            0xa2, 0xe7, 0xef, 0x76, 0x3b, 0x18, 0x53, 0xb7,
+            0x79, 0xa5, 0x61, 0xe7, 0x0e, 0xe0, 0x8c, 0xd3, 0xe7, 0x54, 0xc6, 0x3e, 0x9b, 0xd6,
+            0xb9, 0xc3, 0x52, 0x0a, 0x1d, 0x42, 0x04, 0xcd, 0x10, 0x4d, 0xa2, 0xe7, 0xef, 0x76,
+            0x3b, 0x18, 0x53, 0xb7,
         ];
         let key_id: [u8; 8] = [0x1f, 0xe8, 0xb4, 0x42, 0x18, 0x0f, 0x62, 0xe7];
-        let pubkey = MinisignPublicKey { key_id, public_key: pk_bytes };
+        let pubkey = MinisignPublicKey {
+            key_id,
+            public_key: pk_bytes,
+        };
 
         // Test signature string with mismatched key_id should error
         let bad_sig = "\

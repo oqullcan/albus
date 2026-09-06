@@ -181,6 +181,9 @@ mod tests {
         assert_eq!(ecs_code, 8);
         let ecs_len = u16::from_be_bytes([formatted[opt_start + 13], formatted[opt_start + 14]]);
         assert_eq!(ecs_len, 7);
-        assert_eq!(&formatted[opt_start + 15..opt_start + 15 + 7], &[0x00, 0x01, 24, 0, 1, 2, 3]);
+        assert_eq!(
+            &formatted[opt_start + 15..opt_start + 15 + 7],
+            &[0x00, 0x01, 24, 0, 1, 2, 3]
+        );
     }
 }

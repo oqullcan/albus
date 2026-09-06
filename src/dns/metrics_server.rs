@@ -31,7 +31,10 @@ impl MetricsServer {
                     l
                 }
                 Err(e) => {
-                    warn!("failed to bind Prometheus metrics server to {}: {}", bind_addr, e);
+                    warn!(
+                        "failed to bind Prometheus metrics server to {}: {}",
+                        bind_addr, e
+                    );
                     return;
                 }
             };
@@ -175,7 +178,10 @@ mod tests {
         // test /health
         {
             let mut client = tokio::net::TcpStream::connect(actual_addr).await.unwrap();
-            client.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+            client
+                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
             let mut buf = Vec::new();
             client.read_to_end(&mut buf).await.unwrap();
             let resp = String::from_utf8_lossy(&buf);
@@ -186,7 +192,10 @@ mod tests {
         // test /nonexistent
         {
             let mut client = tokio::net::TcpStream::connect(actual_addr).await.unwrap();
-            client.write_all(b"GET /random HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+            client
+                .write_all(b"GET /random HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
             let mut buf = Vec::new();
             client.read_to_end(&mut buf).await.unwrap();
             let resp = String::from_utf8_lossy(&buf);

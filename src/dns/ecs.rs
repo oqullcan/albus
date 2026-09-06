@@ -33,7 +33,10 @@ impl ClientSubnet {
         let clean = s.trim();
         let parts: Vec<&str> = clean.split('/').collect();
         if parts.len() != 2 {
-            return Err(format!("invalid CIDR notation, expected IP/prefix: '{}'", s));
+            return Err(format!(
+                "invalid CIDR notation, expected IP/prefix: '{}'",
+                s
+            ));
         }
         let ip: IpAddr = parts[0]
             .trim()

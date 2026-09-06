@@ -151,8 +151,7 @@ impl QueryLogger {
         tokio::spawn(async move {
             let mut main_state =
                 main_path_buf.map(|p| LogFileState::new(p, max_bytes, max_backups));
-            let mut nx_state =
-                nx_path_buf.map(|p| LogFileState::new(p, max_bytes, max_backups));
+            let mut nx_state = nx_path_buf.map(|p| LogFileState::new(p, max_bytes, max_backups));
 
             while let Some(entry) = rx.recv().await {
                 let client_display = match entry.client_ip {

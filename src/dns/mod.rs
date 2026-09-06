@@ -7,6 +7,7 @@ pub mod cache;
 pub mod captive;
 pub mod cloak;
 pub mod dns64;
+pub mod dnscrypt_client;
 pub mod doh;
 pub mod ech;
 pub mod ecs;
@@ -21,7 +22,6 @@ pub mod netmon;
 pub mod odoh;
 pub mod padding;
 pub mod pattern;
-pub mod dnscrypt_client;
 pub mod schedule;
 pub mod server;
 pub mod sources;
@@ -51,7 +51,9 @@ pub use odoh::{ODoHClient, DEFAULT_ODOH_RELAY, DEFAULT_ODOH_TARGET};
 pub use pattern::{PatternMatcher, PatternRule};
 pub use schedule::{ScheduleConfig, ScheduleManager};
 pub use server::DnsServer;
-pub use sources::{parse_resolver_markdown, MinisignPublicKey, RemoteResolverEntry, SourceConfig, SourceManager};
+pub use sources::{
+    parse_resolver_markdown, MinisignPublicKey, RemoteResolverEntry, SourceConfig, SourceManager,
+};
 pub use stamp::{DnsStamp, StampProtocol};
 pub use stats::{DnsStats, DnsStatsSnapshot};
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};

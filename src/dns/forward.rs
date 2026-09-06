@@ -145,7 +145,9 @@ impl ForwardingEngine {
         let mut buf = vec![0u8; 4096];
         let (n, _) = timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "udp forward query timeout"))??;
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "udp forward query timeout")
+            })??;
 
         buf.truncate(n);
 
@@ -169,7 +171,9 @@ impl ForwardingEngine {
 
         let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(target))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp forward connect timeout"))??;
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp forward connect timeout")
+            })??;
 
         let len_prefix = (query.len() as u16).to_be_bytes();
         stream.write_all(&len_prefix).await?;
@@ -179,13 +183,20 @@ impl ForwardingEngine {
         let mut resp_len_buf = [0u8; 2];
         timeout(Duration::from_secs(2), stream.read_exact(&mut resp_len_buf))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp forward read len timeout"))??;
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp forward read len timeout")
+            })??;
 
         let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
         let mut resp = vec![0u8; resp_len];
         timeout(Duration::from_secs(2), stream.read_exact(&mut resp))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp forward read body timeout"))??;
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "tcp forward read body timeout",
+                )
+            })??;
 
         Ok(resp)
     }
@@ -209,12 +220,21 @@ mod tests {
         assert_eq!(engine.len(), 3);
 
         // Exact match
-        let t1 = engine.find_target("example.corp").expect("should match exact");
-        assert_eq!(t1, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53));
+        let t1 = engine
+            .find_target("example.corp")
+            .expect("should match exact");
+        assert_eq!(
+            t1,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53)
+        );
 
         // Wildcard match
-        let t2a = engine.find_target("auth.internal").expect("should match wildcard");
-        let t2b = engine.find_target("db.internal").expect("should match wildcard");
+        let t2a = engine
+            .find_target("auth.internal")
+            .expect("should match wildcard");
+        let t2b = engine
+            .find_target("db.internal")
+            .expect("should match wildcard");
         let valid_targets = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 53),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 53),
@@ -223,8 +243,13 @@ mod tests {
         assert!(valid_targets.contains(&t2b));
 
         // IP without port (defaults to 53)
-        let t3 = engine.find_target("local.lan").expect("should match local.lan");
-        assert_eq!(t3, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53));
+        let t3 = engine
+            .find_target("local.lan")
+            .expect("should match local.lan");
+        assert_eq!(
+            t3,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53)
+        );
 
         // Unmatched domain
         assert!(engine.find_target("google.com").is_none());

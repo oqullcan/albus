@@ -61,7 +61,8 @@ fn decode_b64(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send +
 
 pub fn parse_pem_certificates(
     pem_str: &str,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>>
+{
     let mut certs = Vec::new();
     let mut in_cert = false;
     let mut b64_buf = String::new();

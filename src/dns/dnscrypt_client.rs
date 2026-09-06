@@ -3,12 +3,12 @@
 //! supports dnscrypt v2 certificate parsing (x25519 + ed25519 + chacha20-poly1305),
 //! question padding, encrypted query encapsulation, and two-hop anonymized udp relays.
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 pub const DNSCRYPT_MAGIC_CERT: &[u8; 4] = b"DNSC";
 pub const DNSCRYPT_MAGIC_RESOLVER: &[u8; 8] = b"r6fnvWJ8";
@@ -307,7 +307,10 @@ impl DnsCryptClient {
         query: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let cert = self.cert.as_ref().ok_or_else(|| "no valid dnscrypt certificate loaded")?;
+        let cert = self
+            .cert
+            .as_ref()
+            .ok_or_else(|| "no valid dnscrypt certificate loaded")?;
 
         // 1. generate ephemeral client keypair
         let mut client_priv = [0u8; 32];
@@ -440,9 +443,7 @@ mod tests {
         let key = Key::from(shared_key);
         let cipher = ChaCha20Poly1305::new(&key);
         let nonce_val = Nonce::from(resolver_nonce);
-        let ciphertext = cipher
-            .encrypt(&nonce_val, padded_resp.as_ref())
-            .unwrap();
+        let ciphertext = cipher.encrypt(&nonce_val, padded_resp.as_ref()).unwrap();
 
         let mut simulated_response = Vec::new();
         simulated_response.extend_from_slice(DNSCRYPT_MAGIC_RESOLVER);

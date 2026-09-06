@@ -492,7 +492,10 @@ impl DnsServer {
                                     info!("split-dns forwarding rules hot-reloaded successfully from {}", path);
                                 }
                                 Err(e) => {
-                                    warn!("failed to hot-reload forwarding rules from {}: {}", path, e);
+                                    warn!(
+                                        "failed to hot-reload forwarding rules from {}: {}",
+                                        path, e
+                                    );
                                 }
                             }
                         }
@@ -631,7 +634,8 @@ impl DnsServer {
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
         let active = self.stats.active_queries.load(Ordering::Relaxed);
         let base_timeout = Duration::from_secs(5);
-        let effective_timeout = compute_adaptive_timeout(base_timeout, active, 250, self.timeout_load_reduction);
+        let effective_timeout =
+            compute_adaptive_timeout(base_timeout, active, 250, self.timeout_load_reduction);
 
         let query_fut = async {
             if let Some(ref odoh) = self.odoh_client {
@@ -778,7 +782,10 @@ impl DnsServer {
                         return Some(resp);
                     }
                     Err(e) => {
-                        debug!("ForwardingEngine split-dns to {} failed: {}", target_forwarder, e);
+                        debug!(
+                            "ForwardingEngine split-dns to {} failed: {}",
+                            target_forwarder, e
+                        );
                     }
                 }
             } else if let Some(target_forwarder) = self.cloak.get_forward_target(&key.name) {
@@ -807,7 +814,9 @@ impl DnsServer {
             if let Some(key) = &query_key {
                 if is_undelegated_zone(&key.name) {
                     debug!(domain = %key.name, "Blocked undelegated/unqualified domain from leaking upstream");
-                    self.stats.blocked_undelegated.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .blocked_undelegated
+                        .fetch_add(1, Ordering::Relaxed);
                     self.maybe_log_query(
                         client_ip,
                         &domain,
@@ -1107,14 +1116,7 @@ impl DnsServer {
                     QueryStatus::Pass
                 };
 
-                self.maybe_log_query(
-                    client_ip,
-                    &domain,
-                    qtype,
-                    status,
-                    start_time,
-                    Some(&via),
-                );
+                self.maybe_log_query(client_ip, &domain, qtype, status, start_time, Some(&via));
                 Some(resp_bytes)
             }
             Err(e) => {

@@ -221,7 +221,10 @@ impl ScheduledRule {
         }
 
         // Suffix / exact check (e.g. "youtube.com" matches "youtube.com" and "www.youtube.com")
-        let target = self.pattern.trim_start_matches("*.").trim_start_matches('*');
+        let target = self
+            .pattern
+            .trim_start_matches("*.")
+            .trim_start_matches('*');
         if clean_domain == target || clean_domain.ends_with(&format!(".{}", target)) {
             return true;
         }

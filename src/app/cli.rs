@@ -57,9 +57,7 @@ pub enum ResolversCommands {
     Update,
 
     // show details and stamp for a specific resolver
-    Show {
-        name: String,
-    },
+    Show { name: String },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -479,13 +477,9 @@ mod tests {
             _ => panic!("expected Commands::Run"),
         }
 
-        let cli_socks = Cli::try_parse_from([
-            "albus",
-            "run",
-            "--socks5-proxy",
-            "socks5://127.0.0.1:1080",
-        ])
-        .expect("socks5 flag should parse");
+        let cli_socks =
+            Cli::try_parse_from(["albus", "run", "--socks5-proxy", "socks5://127.0.0.1:1080"])
+                .expect("socks5 flag should parse");
         match cli_socks.command {
             Some(Commands::Run(args)) => {
                 assert!(!args.tor);
@@ -519,13 +513,8 @@ mod tests {
 
     #[test]
     fn test_cli_ecs_flag() {
-        let cli_ecs = Cli::try_parse_from([
-            "albus",
-            "run",
-            "--edns-client-subnet",
-            "1.2.3.0/24",
-        ])
-        .expect("ecs flag should parse");
+        let cli_ecs = Cli::try_parse_from(["albus", "run", "--edns-client-subnet", "1.2.3.0/24"])
+            .expect("ecs flag should parse");
         match cli_ecs.command {
             Some(Commands::Run(args)) => {
                 assert_eq!(args.edns_client_subnet.as_deref(), Some("1.2.3.0/24"));

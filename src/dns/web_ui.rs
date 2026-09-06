@@ -32,7 +32,10 @@ impl WebUiServer {
                     l
                 }
                 Err(e) => {
-                    warn!("failed to bind Web Monitoring Dashboard to {}: {}", bind_addr, e);
+                    warn!(
+                        "failed to bind Web Monitoring Dashboard to {}: {}",
+                        bind_addr, e
+                    );
                     return;
                 }
             };

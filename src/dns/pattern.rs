@@ -6,10 +6,10 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternRule {
-    Exact(String),      // =example.com (matches only example.com, not sub.example.com)
-    Substring(String),  // *ads* (matches if domain contains substring 'ads')
-    Prefix(String),     // ads.* (matches if domain starts with 'ads.')
-    Suffix(String),     // *.example.com or example.com (matches example.com and all subdomains)
+    Exact(String),     // =example.com (matches only example.com, not sub.example.com)
+    Substring(String), // *ads* (matches if domain contains substring 'ads')
+    Prefix(String),    // ads.* (matches if domain starts with 'ads.')
+    Suffix(String),    // *.example.com or example.com (matches example.com and all subdomains)
 }
 
 #[derive(Debug, Clone, Default)]
