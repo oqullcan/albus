@@ -16,6 +16,22 @@ pub struct Cli {
 
     #[command(flatten)]
     pub run_args: RunArgs,
+
+    // print the list of available resolvers for enabled filters
+    #[arg(long, default_value_t = false)]
+    pub list: bool,
+
+    // print the complete list of available resolvers, ignoring filters
+    #[arg(long, default_value_t = false)]
+    pub list_all: bool,
+
+    // include relays in the resolver list output
+    #[arg(long, default_value_t = false)]
+    pub include_relays: bool,
+
+    // output resolver list as JSON
+    #[arg(long = "json", default_value_t = false)]
+    pub json_output: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -40,6 +56,67 @@ pub enum Commands {
 
     // list, fetch, and verify remote resolver lists with cryptographic minisign signatures
     Resolvers(ResolversArgs),
+
+    // probe and rank upstream resolvers by round-trip latency
+    #[command(name = "benchmark", visible_alias = "check")]
+    Benchmark(BenchmarkArgs),
+
+    // download, parse, and compile domain blocklists from public feeds
+    Blocklist(BlocklistArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BlocklistArgs {
+    // output file path for compiled blocklist
+    #[arg(short = 'o', long, default_value = "blocked-names.txt")]
+    pub output: String,
+
+    // optional configuration file listing feed URLs
+    #[arg(short = 'c', long)]
+    pub config: Option<String>,
+
+    // optional path to allowlist file
+    #[arg(long)]
+    pub allowlist: Option<String>,
+
+    // optional path to time-restricted rules file
+    #[arg(long)]
+    pub time_restricted: Option<String>,
+
+    // optional path to local additions file
+    #[arg(long)]
+    pub local_additions: Option<String>,
+
+    // additional blocklist feed URLs
+    #[arg(long)]
+    pub sources: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BenchmarkArgs {
+    // domain to query for latency benchmarking
+    #[arg(long, default_value = "example.com")]
+    pub domain: String,
+
+    // number of probe queries per resolver
+    #[arg(long, default_value_t = 3)]
+    pub count: usize,
+
+    // per-query probe timeout in seconds
+    #[arg(long, default_value_t = 2)]
+    pub timeout: u64,
+
+    // maximum number of concurrent probe tasks
+    #[arg(long, default_value_t = 16)]
+    pub concurrency: usize,
+
+    // number of top fastest resolvers to display
+    #[arg(long, default_value_t = 10)]
+    pub top: usize,
+
+    // filter resolvers by protocol (doh, dot, dnscrypt, all)
+    #[arg(long)]
+    pub protocol: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -381,6 +458,126 @@ pub struct RunArgs {
     #[arg(long, value_delimiter = ',')]
     pub dnscrypt_relays: Option<Vec<String>>,
 
+    // minimum ttl clamp in seconds for cached entries
+    #[arg(long, default_value_t = 60)]
+    pub cache_min_ttl: u32,
+
+    // maximum ttl clamp in seconds for cached entries
+    #[arg(long, default_value_t = 86400)]
+    pub cache_max_ttl: u32,
+
+    // path to file containing blocked ips or cidr ranges
+    #[arg(long)]
+    pub blocked_ips_file: Option<String>,
+
+    // path to file containing allowed ips or cidr ranges
+    #[arg(long)]
+    pub allowed_ips_file: Option<String>,
+
+    // comma-separated list of allowed ips or cidr ranges
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_ips: Option<Vec<String>>,
+
+    // path to file logging blocked names
+    #[arg(long)]
+    pub blocked_names_log: Option<String>,
+
+    // path to file logging blocked ips
+    #[arg(long)]
+    pub blocked_ips_log: Option<String>,
+
+    // path to file logging allowed names
+    #[arg(long)]
+    pub allowed_names_log: Option<String>,
+
+    // path to file logging allowed ips
+    #[arg(long)]
+    pub allowed_ips_log: Option<String>,
+
+    // force tcp for encrypted upstream connections
+    #[arg(long, default_value_t = false)]
+    pub force_tcp: bool,
+
+    // path to external captive portal map file
+    #[arg(long, visible_alias = "map-file")]
+    pub captive_map_file: Option<String>,
+
+    // one-shot dns resolution for a domain, printing results and exiting
+    #[arg(long)]
+    pub resolve: Option<String>,
+
+    // display certificates and details for configured upstream resolvers and exit
+    #[arg(long, default_value_t = false)]
+    pub show_certs: bool,
+
+    // run resolver latency benchmark and exit
+    #[arg(long, default_value_t = false, visible_alias = "benchmark")]
+    pub check: bool,
+
+    // dns-over-tls (dot) upstream resolver preset or address (port 853)
+    #[arg(long)]
+    pub dot_upstream: Option<String>,
+
+    // path to per-client ip filtering rules file
+    #[arg(long)]
+    pub client_rules_file: Option<String>,
+
+    // comma-separated list of anonymizing proxy relays for doh
+    #[arg(long, value_delimiter = ',')]
+    pub anonymized_doh_relays: Option<Vec<String>>,
+
+    // enforce safesearch redirection for search engines (google, bing, duckduckgo, yandex)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub safe_search: Option<bool>,
+
+    // enforce youtube restricted mode ("strict" or "moderate")
+    #[arg(long)]
+    pub youtube_restricted_mode: Option<String>,
+
+    // enable local dns-over-tls (dot) listener on port 853
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub local_dot: Option<bool>,
+
+    // local dns-over-tls listener bind address
+    #[arg(long)]
+    pub local_dot_addr: Option<String>,
+
+    // enable dynamic randomized edns client subnet (ecs) spoofing for enhanced privacy
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub randomize_ecs: Option<bool>,
+
+    // automatically load and cloak entries from /etc/hosts with reverse ptr support
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub load_system_hosts: Option<bool>,
+
+    // dns-over-quic (doq) upstream resolver preset or address (port 853)
+    #[arg(long)]
+    pub doq_upstream: Option<String>,
+
+    // store the process pid into a file
+    #[arg(long, visible_alias = "pid-file")]
+    pub pidfile: Option<String>,
+
+    // ttl in seconds for synthetic cloaking responses
+    #[arg(long, default_value_t = 300)]
+    pub cloak_ttl: u32,
+
+    // ttl in seconds for synthetic blocked/rejected query responses
+    #[arg(long, default_value_t = 10)]
+    pub reject_ttl: u32,
+
+    // servers with known bugs where fragmented queries over udp are blocked
+    #[arg(long, value_delimiter = ',')]
+    pub fragments_blocked: Option<Vec<String>>,
+
+    // path to external cloaking rules file
+    #[arg(long, visible_alias = "cloak-file")]
+    pub cloaking_rules_path: Option<String>,
+
+    // privacy level for monitoring web ui (0: full details, 1: anonymize client ips, 2: aggregate only)
+    #[arg(long)]
+    pub web_ui_privacy_level: Option<u8>,
+
     // enable verbose debug logging in tracing subscriber
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
@@ -424,6 +621,43 @@ mod tests {
         assert_eq!(cli.run_args.metrics_addr, "127.0.0.1:9153");
         assert_eq!(cli.run_args.tls_client_cert, None);
         assert_eq!(cli.run_args.tls_client_key, None);
+        assert_eq!(cli.run_args.cloak_ttl, 300);
+        assert_eq!(cli.run_args.reject_ttl, 10);
+        assert_eq!(cli.run_args.pidfile, None);
+        assert!(!cli.list);
+        assert!(!cli.list_all);
+        assert!(!cli.include_relays);
+        assert!(!cli.json_output);
+    }
+
+    #[test]
+    fn test_cli_list_flags_and_system_args() {
+        let cli = Cli::try_parse_from(["albus", "--list", "--include-relays", "--json"])
+            .expect("list flags should parse");
+        assert!(cli.list);
+        assert!(!cli.list_all);
+        assert!(cli.include_relays);
+        assert!(cli.json_output);
+
+        let cli2 = Cli::try_parse_from([
+            "albus",
+            "--pidfile",
+            "/run/albus.pid",
+            "--cloak-ttl",
+            "600",
+            "--reject-ttl",
+            "15",
+            "--fragments-blocked",
+            "cisco,cleanbrowsing",
+        ])
+        .expect("system args should parse");
+        assert_eq!(cli2.run_args.pidfile.as_deref(), Some("/run/albus.pid"));
+        assert_eq!(cli2.run_args.cloak_ttl, 600);
+        assert_eq!(cli2.run_args.reject_ttl, 15);
+        assert_eq!(
+            cli2.run_args.fragments_blocked,
+            Some(vec!["cisco".to_string(), "cleanbrowsing".to_string()])
+        );
     }
 
     #[test]

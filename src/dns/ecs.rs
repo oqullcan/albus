@@ -28,6 +28,25 @@ impl ClientSubnet {
         Self::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
     }
 
+    /// Generates a randomized public IPv4 /24 subnet for ECS privacy spoofing.
+    /// Avoids RFC 1918 private, loopback, link-local, multicast, and bogon ranges.
+    pub fn random_prefix() -> Self {
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let b1 = match (nanos & 0x7F) as u8 {
+            0..=9 => 198,
+            10..=126 => (nanos & 0x7F) as u8,
+            _ => 185,
+        };
+        let b1 = if b1 == 0 || b1 == 10 || b1 == 127 { 185 } else { b1 };
+        let b2 = ((nanos >> 8) & 0xFF) as u8;
+        let b3 = ((nanos >> 16) & 0xFF) as u8;
+        Self::new(IpAddr::V4(Ipv4Addr::new(b1, b2, b3, 0)), 24)
+    }
+
     // parses cidr notation string like "1.2.3.0/24" or "2001:db8::/32"
     pub fn parse_cidr(s: &str) -> Result<Self, String> {
         let clean = s.trim();
@@ -191,5 +210,21 @@ mod tests {
         assert!(ClientSubnet::parse_cidr("invalid").is_err());
         assert!(ClientSubnet::parse_cidr("1.2.3.4/33").is_err());
         assert!(ClientSubnet::parse_cidr("2001:db8::/129").is_err());
+    }
+
+    #[test]
+    fn test_random_prefix_generates_valid_v4_subnet() {
+        let ecs = ClientSubnet::random_prefix();
+        assert_eq!(ecs.prefix_len, 24);
+        match ecs.ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                assert_ne!(octets[0], 0);
+                assert_ne!(octets[0], 10);
+                assert_ne!(octets[0], 127);
+                assert_eq!(octets[3], 0);
+            }
+            _ => panic!("expected IPv4 for random prefix"),
+        }
     }
 }

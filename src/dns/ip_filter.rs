@@ -3,28 +3,180 @@
 //! detects and drops dns responses resolving to bogon subnets (rfc 5735 / rfc 6890) or
 //! user-configured malicious ip addresses, thwarting domain generation algorithms (dga) and bulletproof hosters.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IpRule {
+    Exact(IpAddr),
+    CidrV4(Ipv4Addr, u8),
+    CidrV6(Ipv6Addr, u8),
+    Wildcard(String),
+}
+
+impl IpRule {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let clean = raw.trim();
+        if clean.is_empty() || clean.starts_with('#') || clean.starts_with(';') {
+            return None;
+        }
+
+        // 1. Wildcard pattern (e.g. 127.*, 10.0.*, fe80:abcd:*)
+        if clean.contains('*') {
+            return Some(IpRule::Wildcard(clean.to_ascii_lowercase()));
+        }
+
+        // 2. CIDR subnet (e.g. 192.168.1.0/24, 2001:db8::/32)
+        if let Some((ip_part, mask_part)) = clean.split_once('/') {
+            let ip_clean = ip_part.trim();
+            let mask_val = mask_part.trim().parse::<u8>().ok()?;
+            if let Ok(v4) = ip_clean.parse::<Ipv4Addr>() {
+                if mask_val <= 32 {
+                    return Some(IpRule::CidrV4(v4, mask_val));
+                }
+            } else if let Ok(v6) = ip_clean.parse::<Ipv6Addr>() {
+                if mask_val <= 128 {
+                    return Some(IpRule::CidrV6(v6, mask_val));
+                }
+            }
+            return None;
+        }
+
+        // 3. Exact IP address
+        if let Ok(ip) = clean.parse::<IpAddr>() {
+            return Some(IpRule::Exact(ip));
+        }
+
+        None
+    }
+
+    pub fn matches(&self, ip: IpAddr) -> bool {
+        match self {
+            IpRule::Exact(exact) => ip == *exact,
+            IpRule::CidrV4(net, mask_len) => {
+                if let IpAddr::V4(v4) = ip {
+                    ipv4_in_cidr(v4, *net, *mask_len)
+                } else {
+                    false
+                }
+            }
+            IpRule::CidrV6(net, mask_len) => {
+                if let IpAddr::V6(v6) = ip {
+                    ipv6_in_cidr(v6, *net, *mask_len)
+                } else {
+                    false
+                }
+            }
+            IpRule::Wildcard(pat) => {
+                let ip_str = ip.to_string().to_ascii_lowercase();
+                if let Some(prefix) = pat.strip_suffix('*') {
+                    ip_str.starts_with(prefix)
+                } else {
+                    ip_str == *pat
+                }
+            }
+        }
+    }
+}
+
+pub fn ipv4_in_cidr(ip: Ipv4Addr, net: Ipv4Addr, mask_len: u8) -> bool {
+    if mask_len > 32 {
+        return false;
+    }
+    if mask_len == 0 {
+        return true;
+    }
+    let mask = !0u32 << (32 - mask_len);
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
+}
+
+pub fn ipv6_in_cidr(ip: Ipv6Addr, net: Ipv6Addr, mask_len: u8) -> bool {
+    if mask_len > 128 {
+        return false;
+    }
+    if mask_len == 0 {
+        return true;
+    }
+    let mask = !0u128 << (128 - mask_len);
+    (u128::from(ip) & mask) == (u128::from(net) & mask)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct IpFilter {
-    block_bogons: bool,
-    blocked_exact: Vec<IpAddr>,
+    pub block_bogons: bool,
+    pub blocked_rules: Vec<IpRule>,
+    pub allowed_rules: Vec<IpRule>,
 }
 
 impl IpFilter {
     pub fn new(block_bogons: bool, blocked_exact: Vec<IpAddr>) -> Self {
+        let blocked = blocked_exact.into_iter().map(IpRule::Exact).collect();
         Self {
             block_bogons,
-            blocked_exact,
+            blocked_rules: blocked,
+            allowed_rules: Vec::new(),
         }
     }
 
-    // checks if an ip matches bogon ranges or custom blacklisted subnets
+    pub fn new_with_rules(
+        block_bogons: bool,
+        blocked_rules: Vec<IpRule>,
+        allowed_rules: Vec<IpRule>,
+    ) -> Self {
+        Self {
+            block_bogons,
+            blocked_rules,
+            allowed_rules,
+        }
+    }
+
+    pub fn with_allowed_rules(mut self, allowed: Vec<IpRule>) -> Self {
+        self.allowed_rules = allowed;
+        self
+    }
+
+    pub fn add_blocked_rule(&mut self, rule: IpRule) {
+        self.blocked_rules.push(rule);
+    }
+
+    pub fn add_allowed_rule(&mut self, rule: IpRule) {
+        self.allowed_rules.push(rule);
+    }
+
+    pub fn parse_rules_from_text(text: &str) -> Vec<IpRule> {
+        text.lines().filter_map(IpRule::parse).collect()
+    }
+
+    pub fn load_blocked_file<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        let content = fs::read_to_string(path)?;
+        let rules = Self::parse_rules_from_text(&content);
+        let count = rules.len();
+        self.blocked_rules.extend(rules);
+        Ok(count)
+    }
+
+    pub fn load_allowed_file<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        let content = fs::read_to_string(path)?;
+        let rules = Self::parse_rules_from_text(&content);
+        let count = rules.len();
+        self.allowed_rules.extend(rules);
+        Ok(count)
+    }
+
+    // checks if an ip is blocked (allowed_rules bypass takes precedence)
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        if self.blocked_exact.contains(&ip) {
+        // 1. Allowlist bypass: if IP matches allowed rules, it is never blocked
+        if self.allowed_rules.iter().any(|r| r.matches(ip)) {
+            return false;
+        }
+
+        // 2. Custom blocked rules
+        if self.blocked_rules.iter().any(|r| r.matches(ip)) {
             return true;
         }
 
+        // 3. Bogon ranges
         if self.block_bogons && is_bogon_ip(ip) {
             return true;
         }
@@ -175,5 +327,31 @@ mod tests {
         assert!(filter.is_blocked("1.2.3.4".parse().unwrap()));
         assert!(filter.is_blocked("192.0.2.100".parse().unwrap())); // bogon
         assert!(!filter.is_blocked("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_and_wildcard_and_allowlist() {
+        let text_blocked = "10.0.0.0/8\n192.168.1.*\n2606:4700:1::/48\n4.4.4.4\n";
+        let text_allowed = "10.0.0.1\n192.168.1.50\n";
+
+        let filter = IpFilter::new_with_rules(
+            true,
+            IpFilter::parse_rules_from_text(text_blocked),
+            IpFilter::parse_rules_from_text(text_allowed),
+        );
+
+        // 10.0.0.2 is blocked by 10.0.0.0/8
+        assert!(filter.is_blocked("10.0.0.2".parse().unwrap()));
+        // 10.0.0.1 is whitelisted by allowed rule!
+        assert!(!filter.is_blocked("10.0.0.1".parse().unwrap()));
+
+        // 192.168.1.100 is blocked by wildcard 192.168.1.*
+        assert!(filter.is_blocked("192.168.1.100".parse().unwrap()));
+        // 192.168.1.50 is allowed by allowed rule!
+        assert!(!filter.is_blocked("192.168.1.50".parse().unwrap()));
+
+        // IPv6 CIDR match
+        assert!(filter.is_blocked("2606:4700:1:ffff::1".parse().unwrap()));
+        assert!(!filter.is_blocked("2606:4700:2::1".parse().unwrap()));
     }
 }

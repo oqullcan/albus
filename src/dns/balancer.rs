@@ -93,6 +93,7 @@ impl UpstreamStats {
 
 pub struct LoadBalancer {
     stats: RwLock<Vec<UpstreamStats>>,
+    pub timeout_load_reduction: AtomicU64,
 }
 
 impl LoadBalancer {
@@ -100,6 +101,43 @@ impl LoadBalancer {
         let list = names.iter().map(|n| UpstreamStats::new(n)).collect();
         Self {
             stats: RwLock::new(list),
+            timeout_load_reduction: AtomicU64::new(0.75f64.to_bits()),
+        }
+    }
+
+    pub fn with_timeout_load_reduction(self, factor: f64) -> Self {
+        let clamped = factor.clamp(0.1, 1.0);
+        self.timeout_load_reduction.store(clamped.to_bits(), Ordering::Relaxed);
+        self
+    }
+
+    pub fn set_timeout_load_reduction(&self, factor: f64) {
+        let clamped = factor.clamp(0.1, 1.0);
+        self.timeout_load_reduction.store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Computes effective query timeout based on dynamic load conditions.
+    /// If upstream servers exhibit high average latency (>150ms) or consecutive failures,
+    /// scales base timeout by timeout_load_reduction (e.g. 0.75) for faster failover.
+    pub fn effective_timeout(&self, base_timeout: Duration) -> Duration {
+        let factor = f64::from_bits(self.timeout_load_reduction.load(Ordering::Relaxed));
+        if factor >= 1.0 || factor <= 0.0 {
+            return base_timeout;
+        }
+
+        let stats_guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
+        if stats_guard.is_empty() {
+            return base_timeout;
+        }
+
+        let total_failed: u64 = stats_guard.iter().map(|s| s.failed_queries.load(Ordering::Relaxed)).sum();
+        let avg_rtt: f64 = stats_guard.iter().map(|s| s.rtt_ms()).sum::<f64>() / stats_guard.len() as f64;
+
+        if total_failed > 0 || avg_rtt > 150.0 {
+            let reduced_ms = (base_timeout.as_millis() as f64 * factor).max(100.0);
+            Duration::from_millis(reduced_ms as u64)
+        } else {
+            base_timeout
         }
     }
 
@@ -280,5 +318,21 @@ mod tests {
 
         let candidates = lb.select_candidates();
         assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn test_effective_timeout_reduction() {
+        let names = vec!["resolver-a".to_string(), "resolver-b".to_string()];
+        let lb = LoadBalancer::new(&names).with_timeout_load_reduction(0.5);
+
+        let base_timeout = Duration::from_millis(1000);
+        // Under normal low-latency conditions without errors, base timeout is untouched
+        assert_eq!(lb.effective_timeout(base_timeout), base_timeout);
+
+        // Record high latency or failure
+        lb.record_result(0, Duration::from_millis(600), false);
+        let reduced = lb.effective_timeout(base_timeout);
+        // 1000ms * 0.5 = 500ms
+        assert_eq!(reduced, Duration::from_millis(500));
     }
 }

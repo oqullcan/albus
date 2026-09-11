@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, warn};
 
 pub const DNSCRYPT_MAGIC_CERT: &[u8; 4] = b"DNSC";
@@ -750,6 +751,9 @@ pub struct DnsCryptClient {
     pub relay_addr: Option<SocketAddr>,
     pub cert: Option<DnsCryptCert>,
     pub ephemeral_keys: bool,
+    pub cert_ignore_timestamp: bool,
+    pub force_tcp: bool,
+    pub udp_pool: Option<Arc<crate::dns::udp_pool::UdpConnPool>>,
     session_key_cache: Option<(Arc<[u8; 32]>, [u8; 32])>,
     pub pq_session: PqSessionState,
 }
@@ -768,9 +772,27 @@ impl DnsCryptClient {
             relay_addr,
             cert: None,
             ephemeral_keys: true, // default to maximum privacy
+            cert_ignore_timestamp: false,
+            force_tcp: false,
+            udp_pool: None,
             session_key_cache: None,
-            pq_session: PqSessionState::default(),
+            pq_session: PqSessionState::new(),
         }
+    }
+
+    pub fn with_force_tcp(mut self, force: bool) -> Self {
+        self.force_tcp = force;
+        self
+    }
+
+    pub fn with_udp_pool(mut self, pool: Option<Arc<crate::dns::udp_pool::UdpConnPool>>) -> Self {
+        self.udp_pool = pool;
+        self
+    }
+
+    pub fn with_cert_ignore_timestamp(mut self, ignore: bool) -> Self {
+        self.cert_ignore_timestamp = ignore;
+        self
     }
 
     /// Sets whether to generate a fresh X25519 keypair for every query (maximum forward secrecy) or reuse a cached session key.
@@ -823,6 +845,165 @@ impl DnsCryptClient {
         }
         self.cert = Some(cert);
         self
+    }
+
+    // queries server for txt records matching provider_name to discover and validate dnscrypt certificates
+    pub async fn fetch_cert(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<DnsCryptCert, Box<dyn std::error::Error + Send + Sync>> {
+        let mut query = Vec::with_capacity(512);
+        // Transaction ID
+        query.extend_from_slice(&[0x12, 0x34]);
+        // Flags: standard query, recursion desired (0x0100)
+        query.extend_from_slice(&[0x01, 0x00]);
+        // QDCOUNT: 1
+        query.extend_from_slice(&[0x00, 0x01]);
+        // ANCOUNT: 0
+        query.extend_from_slice(&[0x00, 0x00]);
+        // NSCOUNT: 0
+        query.extend_from_slice(&[0x00, 0x00]);
+        // ARCOUNT: 1 (EDNS0 OPT RR)
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        // QNAME: provider_name
+        for part in self.provider_name.split('.') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                query.push(trimmed.len() as u8);
+                query.extend_from_slice(trimmed.as_bytes());
+            }
+        }
+        query.push(0x00); // end of name
+
+        // QTYPE: TXT (16)
+        query.extend_from_slice(&[0x00, 0x10]);
+        // QCLASS: IN (1)
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        // OPT pseudo-RR (RFC 6891) for EDNS0 buffer size 4096
+        query.push(0x00); // root
+        query.extend_from_slice(&[0x00, 0x29]); // type 41 (OPT)
+        query.extend_from_slice(&[0x10, 0x00]); // UDP payload size: 4096 bytes
+        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // extended RCODE and flags
+        query.extend_from_slice(&[0x00, 0x00]); // RDLEN: 0
+
+        // Send query packet to server
+        let resp = self.send_packet(self.server_addr, &query, timeout).await?;
+        if resp.len() < 12 {
+            return Err("response packet too short".into());
+        }
+
+        let qdcount = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+        let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+
+        if ancount == 0 {
+            return Err("no answer records in cert response".into());
+        }
+
+        let mut pos = 12;
+        // Skip Question section
+        for _ in 0..qdcount {
+            while pos < resp.len() {
+                let len = resp[pos] as usize;
+                if len == 0 {
+                    pos += 1;
+                    break;
+                }
+                if (len & 0xC0) == 0xC0 {
+                    pos += 2;
+                    break;
+                }
+                pos += 1 + len;
+            }
+            pos += 4; // skip QTYPE and QCLASS
+            if pos > resp.len() {
+                return Err("malformed question section in response".into());
+            }
+        }
+
+        let mut candidate_certs = Vec::new();
+        // Parse Answer section
+        for _ in 0..ancount {
+            if pos >= resp.len() {
+                break;
+            }
+            // Skip NAME
+            while pos < resp.len() {
+                let len = resp[pos] as usize;
+                if len == 0 {
+                    pos += 1;
+                    break;
+                }
+                if (len & 0xC0) == 0xC0 {
+                    pos += 2;
+                    break;
+                }
+                pos += 1 + len;
+            }
+            if pos + 10 > resp.len() {
+                break;
+            }
+            let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+            let _rclass = u16::from_be_bytes([resp[pos + 2], resp[pos + 3]]);
+            let _ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+            let rdlength = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+            pos += 10;
+
+            if pos + rdlength > resp.len() {
+                break;
+            }
+
+            if rtype == 16 {
+                // TXT record: assemble character-strings
+                let mut txt_data = Vec::new();
+                let mut chunk_pos = pos;
+                let end = pos + rdlength;
+                while chunk_pos < end {
+                    let chunk_len = resp[chunk_pos] as usize;
+                    chunk_pos += 1;
+                    if chunk_pos + chunk_len > end {
+                        break;
+                    }
+                    txt_data.extend_from_slice(&resp[chunk_pos..chunk_pos + chunk_len]);
+                    chunk_pos += chunk_len;
+                }
+
+                if txt_data.len() >= 124 && &txt_data[0..4] == DNSCRYPT_MAGIC_CERT {
+                    if let Ok(cert) = DnsCryptCert::parse(&txt_data) {
+                        let is_zero_pk = self.provider_pk == [0u8; 32];
+                        if is_zero_pk || cert.verify_signature(&self.provider_pk) {
+                            candidate_certs.push(cert);
+                        }
+                    }
+                }
+            }
+            pos += rdlength;
+        }
+
+        if candidate_certs.is_empty() {
+            return Err("no valid dnscrypt certificates found in response".into());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+
+        let best = if self.cert_ignore_timestamp {
+            candidate_certs.into_iter().max_by_key(|c| c.serial)
+        } else {
+            DnsCryptCert::select_best_cert(&candidate_certs, now)
+                .or_else(|| candidate_certs.into_iter().max_by_key(|c| c.serial))
+        }
+        .ok_or_else(|| "no acceptable dnscrypt certificate selected")?;
+
+        self.cert = Some(best.clone());
+        if !self.ephemeral_keys {
+            self.init_session_cache(&best);
+        }
+
+        Ok(best)
     }
 
     // encrypts query using chacha20poly1305 with derived shared key
@@ -975,6 +1156,51 @@ impl DnsCryptClient {
         Ok(clean_wire.to_vec())
     }
 
+    async fn send_packet(
+        &self,
+        target: SocketAddr,
+        wire_packet: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.force_tcp {
+            let mut stream = tokio::time::timeout(timeout, TcpStream::connect(target)).await??;
+            let len_bytes = (wire_packet.len() as u16).to_be_bytes();
+            tokio::time::timeout(timeout, async {
+                stream.write_all(&len_bytes).await?;
+                stream.write_all(wire_packet).await?;
+                stream.flush().await?;
+                let mut rlen = [0u8; 2];
+                stream.read_exact(&mut rlen).await?;
+                let resp_len = u16::from_be_bytes(rlen) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                stream.read_exact(&mut resp_buf).await?;
+                Ok::<Vec<u8>, std::io::Error>(resp_buf)
+            })
+            .await?
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        } else {
+            let (socket, pooled) = if let Some(ref pool) = self.udp_pool {
+                (pool.get_or_create(target).await?, true)
+            } else {
+                let s = UdpSocket::bind("0.0.0.0:0").await?;
+                s.connect(target).await?;
+                (Arc::new(s), false)
+            };
+            socket.send(wire_packet).await?;
+
+            let mut resp_buf = vec![0u8; 4096];
+            let recv_res = tokio::time::timeout(timeout, socket.recv(&mut resp_buf)).await;
+            if pooled {
+                if let Some(ref pool) = self.udp_pool {
+                    pool.return_conn(target, socket).await;
+                }
+            }
+            let n = recv_res??;
+            resp_buf.truncate(n);
+            Ok(resp_buf)
+        }
+    }
+
     // resolves a dns query using pqdnscrypt (x-wing hybrid kem / es_version 3) with ticket resumption support
     pub async fn resolve_pq_with_epoch(
         &self,
@@ -987,7 +1213,7 @@ impl DnsCryptClient {
             .as_ref()
             .ok_or_else(|| "no valid dnscrypt certificate loaded")?;
 
-        if !cert.is_valid_at(epoch_secs) {
+        if !self.cert_ignore_timestamp && !cert.is_valid_at(epoch_secs) {
             return Err(format!(
                 "dnscrypt certificate expired or not yet valid (ts_start={}, ts_end={}, current_epoch={})",
                 cert.ts_start, cert.ts_end, epoch_secs
@@ -1053,13 +1279,7 @@ impl DnsCryptClient {
         };
 
         let target = self.relay_addr.unwrap_or(self.server_addr);
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(target).await?;
-        socket.send(&wire_query).await?;
-
-        let mut resp_buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(timeout, socket.recv(&mut resp_buf)).await??;
-        resp_buf.truncate(n);
+        let resp_buf = self.send_packet(target, &wire_query, timeout).await?;
 
         if resp_buf.len() < 8 + 12 + 12 + 16 {
             return Err("pq dnscrypt response packet too short".into());
@@ -1128,7 +1348,7 @@ impl DnsCryptClient {
             .as_ref()
             .ok_or_else(|| "no valid dnscrypt certificate loaded")?;
 
-        if !cert.is_valid_at(epoch_secs) {
+        if !self.cert_ignore_timestamp && !cert.is_valid_at(epoch_secs) {
             return Err(format!(
                 "dnscrypt certificate expired or not yet valid (ts_start={}, ts_end={}, current_epoch={})",
                 cert.ts_start, cert.ts_end, epoch_secs
@@ -1219,14 +1439,7 @@ impl DnsCryptClient {
         };
 
         let target = self.relay_addr.unwrap_or(self.server_addr);
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(target).await?;
-
-        socket.send(&wire_packet).await?;
-
-        let mut resp_buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(timeout, socket.recv(&mut resp_buf)).await??;
-        resp_buf.truncate(n);
+        let resp_buf = self.send_packet(target, &wire_packet, timeout).await?;
 
         // 6. decrypt response with derived shared key
         Self::decrypt_response_payload(&derived_key, &client_nonce, &resp_buf)
@@ -1656,6 +1869,98 @@ mod tests {
         assert_eq!(response, b"pong_dns_response_payload");
 
         resolver_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dnscrypt_tcp_mock_resolver_end_to_end() {
+        let rng = SystemRandom::new();
+
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resolver_addr = tcp_listener.local_addr().unwrap();
+
+        let resolver_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let resolver_pub = resolver_priv.compute_public_key().unwrap();
+        let mut resolver_pk = [0u8; 32];
+        resolver_pk.copy_from_slice(resolver_pub.as_ref());
+
+        let client_magic = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22];
+        let test_cert = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: resolver_pk.to_vec(),
+            client_magic,
+            serial: 1,
+            ts_start: 0,
+            ts_end: u32::MAX,
+            raw_cert: Vec::new(),
+        };
+
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let query_len = u16::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; query_len];
+            stream.read_exact(&mut buf).await.unwrap();
+
+            assert_eq!(&buf[0..8], &client_magic);
+            let mut client_pk = [0u8; 32];
+            client_pk.copy_from_slice(&buf[8..40]);
+            let mut client_nonce = [0u8; 12];
+            client_nonce.copy_from_slice(&buf[40..52]);
+            let ciphertext = &buf[52..];
+
+            let client_unparsed = UnparsedPublicKey::new(&X25519, &client_pk);
+            let mut shared_secret = [0u8; 32];
+            agreement::agree_ephemeral(
+                resolver_priv,
+                &client_unparsed,
+                "server dh",
+                |mat| {
+                    shared_secret.copy_from_slice(mat);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            let derived = derive_shared_key(&shared_secret, 2);
+            let cipher = ChaCha20Poly1305::new(&Key::from(derived));
+            let plaintext = cipher.decrypt(&Nonce::from(client_nonce), ciphertext).unwrap();
+            let unpadded = unpad_response(&plaintext).unwrap();
+            assert_eq!(unpadded, b"tcp_ping_query_payload");
+
+            let resolver_nonce = [0x77; 12];
+            let resp_plaintext = pad_query(b"tcp_pong_response_payload", 64);
+            let resp_cipher = cipher
+                .encrypt(&Nonce::from(resolver_nonce), resp_plaintext.as_ref())
+                .unwrap();
+
+            let mut response_packet = Vec::new();
+            response_packet.extend_from_slice(DNSCRYPT_MAGIC_RESOLVER);
+            response_packet.extend_from_slice(&client_nonce);
+            response_packet.extend_from_slice(&resolver_nonce);
+            response_packet.extend_from_slice(&resp_cipher);
+
+            let resp_len_bytes = (response_packet.len() as u16).to_be_bytes();
+            stream.write_all(&resp_len_bytes).await.unwrap();
+            stream.write_all(&response_packet).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let client =
+            DnsCryptClient::new(resolver_addr, "mock.resolver".to_string(), [0u8; 32], None)
+                .with_force_tcp(true)
+                .with_cert(test_cert);
+
+        let response = client
+            .resolve(b"tcp_ping_query_payload", Duration::from_secs(2))
+            .await
+            .expect("tcp client resolve should succeed");
+
+        assert_eq!(response, b"tcp_pong_response_payload");
+        server_handle.await.unwrap();
     }
 
     #[test]
@@ -2214,5 +2519,93 @@ mod tests {
             AnonymizedRelay::select_relay_for_server("unknown", &no_wildcard, &available),
             None
         );
+    }
+
+    #[test]
+    fn test_cert_ignore_timestamp() {
+        let mut client = DnsCryptClient::new(
+            "127.0.0.1:443".parse().unwrap(),
+            "2.dnscrypt-cert.example.com".to_string(),
+            [0u8; 32],
+            None,
+        );
+        assert!(!client.cert_ignore_timestamp);
+        client = client.with_cert_ignore_timestamp(true);
+        assert!(client.cert_ignore_timestamp);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cert_from_mock_resolver() {
+        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        let test_cert = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x42; 32],
+            client_magic: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            serial: 9999,
+            ts_start: 0,
+            ts_end: u32::MAX,
+            raw_cert: Vec::new(),
+        };
+        let cert_bytes = test_cert.to_bytes();
+
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let (n, peer) = mock_socket.recv_from(&mut buf).await.unwrap();
+            buf.truncate(n);
+
+            // build DNS response with TXT answer
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&buf[0..2]); // tx id
+            resp.extend_from_slice(&[0x81, 0x80]); // standard response, no error
+            resp.extend_from_slice(&[0x00, 0x01]); // qdcount: 1
+            resp.extend_from_slice(&[0x00, 0x01]); // ancount: 1
+            resp.extend_from_slice(&[0x00, 0x00]); // nscount: 0
+            resp.extend_from_slice(&[0x00, 0x00]); // arcount: 0
+
+            // Copy question from query
+            let mut pos = 12;
+            while pos < buf.len() && buf[pos] != 0 {
+                pos += 1 + buf[pos] as usize;
+            }
+            pos += 1; // 0x00
+            pos += 4; // qtype + qclass
+            resp.extend_from_slice(&buf[12..pos]);
+
+            // Answer section: TXT record
+            resp.extend_from_slice(&[0xc0, 0x0c]); // pointer to QNAME
+            resp.extend_from_slice(&[0x00, 0x10]); // type TXT
+            resp.extend_from_slice(&[0x00, 0x01]); // class IN
+            resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // ttl 60
+
+            // TXT RDATA: character-string chunks of <= 255 bytes
+            let mut txt_rdata = Vec::new();
+            for chunk in cert_bytes.chunks(255) {
+                txt_rdata.push(chunk.len() as u8);
+                txt_rdata.extend_from_slice(chunk);
+            }
+            resp.extend_from_slice(&(txt_rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&txt_rdata);
+
+            mock_socket.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut client = DnsCryptClient::new(
+            mock_addr,
+            "2.dnscrypt-cert.example.com".to_string(),
+            [0u8; 32],
+            None,
+        );
+
+        let cert = client.fetch_cert(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(cert.serial, 9999);
+        assert_eq!(cert.client_magic, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert!(client.cert.is_some());
+
+        handle.await.unwrap();
     }
 }

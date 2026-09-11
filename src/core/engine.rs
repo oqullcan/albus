@@ -85,12 +85,26 @@ impl Engine {
 
         // instantiate local doh proxy server on 127.0.0.1:53
         let dns_server = if cfg.doh_enabled {
-            let mut cloak = CloakEngine::new();
-            for (domain, ip_str) in &cfg.cloaking_rules {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            let mut cloak = CloakEngine::new().with_cloak_ttl(cfg.cloak_ttl);
+            if cfg.load_system_hosts {
+                match cloak.load_hosts_file("/etc/hosts") {
+                    Ok(n) => info!(count = n, "Loaded system /etc/hosts into DNS cloaking & reverse PTR engine"),
+                    Err(e) => debug!("Could not read /etc/hosts: {}", e),
+                }
+            }
+            if let Some(ref path) = cfg.cloaking_rules_path {
+                if std::path::Path::new(path).exists() {
+                    match cloak.load_cloaking_rules_file(path) {
+                        Ok(n) => info!(count = n, path = %path, "Loaded cloaking rules from file"),
+                        Err(e) => warn!("Failed to load cloaking rules from {}: {}", path, e),
+                    }
+                }
+            }
+            for (domain, target_str) in &cfg.cloaking_rules {
+                if let Ok(ip) = target_str.parse::<IpAddr>() {
                     cloak.add_cloak_rule(domain, ip);
                 } else {
-                    warn!(domain = %domain, ip = %ip_str, "Invalid IP address in cloaking_rules");
+                    cloak.add_cname_rule(domain, target_str);
                 }
             }
             for (domain, addr_str) in &cfg.forwarding_rules {
@@ -169,13 +183,38 @@ impl Engine {
             }
             let allowlist_arc = Arc::new(RwLock::new(allowlist));
 
-            // initialize IP filter
-            let blocked_ips: Vec<std::net::IpAddr> = cfg
-                .blocked_ips
-                .iter()
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-            let ip_filter_arc = Arc::new(IpFilter::new(cfg.block_bogons, blocked_ips));
+            // initialize IP filter with CIDR, wildcard, allowlist, and file loading
+            let mut ip_filter = IpFilter::new(cfg.block_bogons, vec![]);
+            for raw in &cfg.blocked_ips {
+                if let Some(rule) = crate::dns::ip_filter::IpRule::parse(raw) {
+                    ip_filter.add_blocked_rule(rule);
+                }
+            }
+            for raw in &cfg.allowed_ips {
+                if let Some(rule) = crate::dns::ip_filter::IpRule::parse(raw) {
+                    ip_filter.add_allowed_rule(rule);
+                }
+            }
+            if let Some(ref path) = cfg.blocked_ips_file {
+                if let Ok(count) = ip_filter.load_blocked_file(path) {
+                    info!(count, path = %path, "Loaded blocked IP rules from file");
+                }
+            }
+            if let Some(ref path) = cfg.allowed_ips_file {
+                if let Ok(count) = ip_filter.load_allowed_file(path) {
+                    info!(count, path = %path, "Loaded allowed IP rules from file");
+                }
+            }
+            let ip_filter_arc = Arc::new(ip_filter);
+
+            // initialize captive portal map
+            let mut captive_map = crate::dns::captive::CaptiveMap::new();
+            if let Some(ref path) = cfg.captive_portals_map_file {
+                if let Ok(count) = captive_map.load_from_file(path) {
+                    info!(count, path = %path, "Loaded captive portal map entries from file");
+                }
+            }
+            let captive_map_arc = Arc::new(captive_map);
 
             // initialize atomic DNS statistics
             let dns_stats = DnsStats::new();
@@ -186,7 +225,13 @@ impl Engine {
                 .parse()
                 .unwrap_or_else(|_| "127.0.0.1:8053".parse().unwrap());
 
-            let query_logger = if cfg.query_log || cfg.nx_log {
+            let query_logger = if cfg.query_log
+                || cfg.nx_log
+                || cfg.blocked_names_log_path.is_some()
+                || cfg.blocked_ips_log_path.is_some()
+                || cfg.allowed_names_log_path.is_some()
+                || cfg.allowed_ips_log_path.is_some()
+            {
                 let ip_crypt = if let Some(ref hex) = cfg.ipcrypt_key {
                     match crate::dns::ipcrypt::IpCrypt::from_hex(hex) {
                         Ok(c) => Some(Arc::new(c)),
@@ -201,39 +246,47 @@ impl Engine {
                 } else {
                     None
                 };
-                let main_path: Option<String> = if cfg.query_log {
-                    Some(cfg.query_log_path.clone().unwrap_or_else(|| {
+                let main_path = if cfg.query_log {
+                    Some(std::path::PathBuf::from(cfg.query_log_path.clone().unwrap_or_else(|| {
                         if cfg.ram_only {
                             "/run/albus/query.log".to_string()
                         } else {
                             "/var/log/albus/query.log".to_string()
                         }
-                    }))
+                    })))
                 } else {
                     None
                 };
-                let nx_path: Option<String> = if cfg.nx_log {
-                    Some(cfg.nx_log_path.clone().unwrap_or_else(|| {
+                let nx_path = if cfg.nx_log {
+                    Some(std::path::PathBuf::from(cfg.nx_log_path.clone().unwrap_or_else(|| {
                         if cfg.ram_only {
                             "/run/albus/nx.log".to_string()
                         } else {
                             "/var/log/albus/nx.log".to_string()
                         }
-                    }))
+                    })))
                 } else {
                     None
                 };
-                let q_fmt = crate::dns::logger::LogFormat::parse_lenient(&cfg.query_log_format);
-                let n_fmt = crate::dns::logger::LogFormat::parse_lenient(&cfg.nx_log_format);
-                Some(crate::dns::logger::QueryLogger::start_with_formats(
+                let opts = crate::dns::logger::LoggerOptions {
                     main_path,
                     nx_path,
+                    blocked_names_path: cfg.blocked_names_log_path.as_ref().map(std::path::PathBuf::from),
+                    blocked_ips_path: cfg.blocked_ips_log_path.as_ref().map(std::path::PathBuf::from),
+                    allowed_names_path: cfg.allowed_names_log_path.as_ref().map(std::path::PathBuf::from),
+                    allowed_ips_path: cfg.allowed_ips_log_path.as_ref().map(std::path::PathBuf::from),
+                    main_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.query_log_format),
+                    nx_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.nx_log_format),
+                    blocked_names_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.blocked_names_log_format),
+                    blocked_ips_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.blocked_ips_log_format),
+                    allowed_names_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.allowed_names_log_format),
+                    allowed_ips_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.allowed_ips_log_format),
                     ip_crypt,
-                    10 * 1024 * 1024,
-                    5,
-                    q_fmt,
-                    n_fmt,
-                ))
+                    max_bytes: 10 * 1024 * 1024,
+                    max_backups: 5,
+                    ignored_qtypes: cfg.ignored_qtypes.clone(),
+                };
+                Some(crate::dns::logger::QueryLogger::start_full(opts))
             } else {
                 None
             };
@@ -358,6 +411,14 @@ impl Engine {
                     fw_engine.add_rule(domain, servers);
                 }
             }
+            let bootstrap_addrs: Vec<SocketAddr> = cfg
+                .bootstrap_resolvers
+                .iter()
+                .filter_map(|s| s.parse::<SocketAddr>().ok())
+                .collect();
+            fw_engine = fw_engine
+                .with_bootstrap_resolvers(bootstrap_addrs)
+                .with_socks5_proxy(cfg.socks5_proxy.clone());
             let forwarding_arc = Arc::new(RwLock::new(fw_engine));
 
             let parsed_listen_addrs: Vec<SocketAddr> = cfg
@@ -370,6 +431,63 @@ impl Engine {
             } else {
                 parsed_listen_addrs
             };
+
+            let mut client_rules_engine = crate::dns::ClientRuleEngine::from_configs(&cfg.client_rules);
+            if let Some(ref path) = cfg.client_rules_file {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(cfgs) = serde_json::from_str::<Vec<crate::dns::ClientProfileConfig>>(&content) {
+                        for p in cfgs {
+                            client_rules_engine.add_profile(crate::dns::ClientProfile::from_config(&p));
+                        }
+                    }
+                }
+            }
+            let client_rules_arc = Arc::new(client_rules_engine);
+
+            let youtube_mode = cfg
+                .youtube_restricted_mode
+                .as_deref()
+                .map(crate::dns::YouTubeMode::parse)
+                .unwrap_or(crate::dns::YouTubeMode::None);
+            let safesearch_engine = Arc::new(crate::dns::SafeSearchEngine::new(
+                cfg.safe_search,
+                youtube_mode,
+            ));
+
+            let dot_client = if let Some(ref dot_target) = cfg.dot_upstream {
+                match crate::dns::DotClient::from_preset_or_addr(dot_target, cfg.pqc) {
+                    Ok(client) => {
+                        info!(upstream = %dot_target, pqc = cfg.pqc, "Configured DNS-over-TLS (DoT) upstream client");
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize DoT upstream ({}): {}", dot_target, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let doq_client = if let Some(ref doq_target) = cfg.doq_upstream {
+                match crate::dns::DoQClient::from_preset_or_addr(doq_target) {
+                    Ok(client) => {
+                        info!(upstream = %doq_target, "Configured DNS-over-QUIC (DoQ) upstream client");
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize DoQ upstream ({}): {}", doq_target, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let local_dot_addr: SocketAddr = cfg
+                .local_dot_addr
+                .parse()
+                .unwrap_or_else(|_| "127.0.0.1:853".parse().unwrap());
 
             Some(Arc::new(
                 DnsServer::new(
@@ -410,7 +528,12 @@ impl Engine {
                     cfg.timeout_load_reduction,
                     cfg.cache_neg_min_ttl,
                     cfg.cache_neg_max_ttl,
+                    cfg.cache_min_ttl,
+                    cfg.cache_max_ttl,
+                    cfg.force_tcp,
+                    captive_map_arc,
                 )?
+                .with_client_rules(client_rules_arc)
                 .with_query_meta(cfg.query_meta.clone())
                 .with_listen_addresses(listen_addrs)
                 .with_max_clients(cfg.max_clients)
@@ -425,6 +548,25 @@ impl Engine {
                     cfg.local_doh_tls,
                     cfg.local_doh_cert_file.clone(),
                     cfg.local_doh_key_file.clone(),
+                )
+                .with_blocked_query_response(&cfg.blocked_query_response)
+                .with_offline_mode(cfg.offline_mode)
+                .with_ignore_system_dns(cfg.ignore_system_dns)
+                .with_cloaked_ptr(cfg.cloaked_ptr)
+                .with_tls_disable_session_tickets(cfg.tls_disable_session_tickets)
+                .with_cert_refresh_delay(cfg.cert_refresh_delay)
+                .with_cert_ignore_timestamp(cfg.cert_ignore_timestamp)
+                .with_udp_pool(cfg.udp_pool)
+                .with_safesearch(safesearch_engine)
+                .with_dot_client(dot_client)
+                .with_doq_client(doq_client)
+                .with_randomize_ecs(cfg.randomize_ecs)
+                .with_reject_ttl(cfg.reject_ttl)
+                .with_local_dot(
+                    cfg.local_dot,
+                    local_dot_addr,
+                    cfg.local_dot_cert_file.clone(),
+                    cfg.local_dot_key_file.clone(),
                 ),
             ))
         } else {
@@ -560,7 +702,20 @@ impl Engine {
             }
         }
 
-        // 3.1 drop root privileges if user_name is specified in configuration
+        // 3.1 create PID file if configured
+        let _pid_guard = self
+            .cfg
+            .pid_file
+            .as_ref()
+            .and_then(|p| match crate::dns::system::PidFileGuard::create(p) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    warn!("failed to create PID file at '{}': {}", p, e);
+                    None
+                }
+            });
+
+        // 3.2 drop root privileges if user_name is specified in configuration
         if let Some(ref user) = self.cfg.user_name {
             if let Err(e) = crate::dns::system::drop_privileges(user) {
                 warn!("failed to drop privileges to user '{}': {}", user, e);

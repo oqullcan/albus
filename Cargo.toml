@@ -26,6 +26,7 @@ chacha20 = "0.9"
 poly1305 = "0.8"
 aws-lc-rs = "1.18"
 tokio-rustls = "0.26"
+quinn = { version = "0.11", default-features = false, features = ["rustls"] }
 
 [build-dependencies]
 cc = "1.1"

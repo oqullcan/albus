@@ -63,6 +63,12 @@ impl DnsCache {
         self
     }
 
+    pub fn with_ttl(mut self, min: u32, max: u32) -> Self {
+        self.min_ttl = min;
+        self.max_ttl = max.max(min);
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.entries.lock().map(|m| m.len()).unwrap_or(0)
     }

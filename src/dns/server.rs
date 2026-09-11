@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -15,14 +15,15 @@ use tracing::{debug, error, info, warn};
 use super::allowlist::DomainAllowlist;
 use super::blocklist::{build_seed_blocklist, CompactBlocklist};
 use super::cache::{extract_query_key, DnsCache};
-use super::captive::{build_captive_response, check_captive_portal};
+use super::captive::{build_captive_response, check_captive_portal, CaptiveMap};
 use super::cloak::CloakEngine;
 use super::dns64::build_dns64_response;
 use super::doh::DoHResolver;
 use super::ecs::ClientSubnet;
 use super::filter::{
-    build_nxdomain_response, build_refused_response, build_sinkhole_response, detect_dns_rebinding,
-    extract_question_end, is_firefox_canary, is_undelegated_zone,
+    build_blocked_response, build_nxdomain_response, build_refused_response,
+    build_sinkhole_response, detect_dns_rebinding, extract_question_end, is_firefox_canary,
+    is_undelegated_zone,
 };
 use super::forward::ForwardingEngine;
 use super::ip_filter::{extract_resolved_ips, IpFilter};
@@ -69,6 +70,10 @@ pub struct DnsServer {
     pub local_doh_tls: bool,
     pub local_doh_cert_file: Option<String>,
     pub local_doh_key_file: Option<String>,
+    pub local_dot: bool,
+    pub local_dot_addr: SocketAddr,
+    pub local_dot_cert_file: Option<String>,
+    pub local_dot_key_file: Option<String>,
     pub query_logger: Option<Arc<QueryLogger>>,
     pub allowlist_path: Option<String>,
     pub blocklist_path: Option<String>,
@@ -87,8 +92,25 @@ pub struct DnsServer {
     pub load_balancer: Arc<crate::dns::balancer::LoadBalancer>,
     pub fragments_blocked: Arc<StdRwLock<Vec<String>>>,
     pub anonymized_dns_routes: Arc<StdRwLock<Vec<crate::app::config::AnonymizedDnsRoute>>>,
+    pub captive_map: Arc<CaptiveMap>,
+    pub force_tcp: Arc<AtomicBool>,
     pub skip_incompatible: Arc<AtomicBool>,
     pub direct_cert_fallback: Arc<AtomicBool>,
+    pub blocked_query_response: Arc<StdRwLock<String>>,
+    pub offline_mode: Arc<AtomicBool>,
+    pub ignore_system_dns: Arc<AtomicBool>,
+    pub cloaked_ptr: Arc<AtomicBool>,
+    pub tls_disable_session_tickets: Arc<AtomicBool>,
+    pub cert_refresh_delay: Arc<AtomicU32>,
+    pub cert_ignore_timestamp: Arc<AtomicBool>,
+    pub udp_pool_enabled: Arc<AtomicBool>,
+    pub udp_pool: Arc<crate::dns::udp_pool::UdpConnPool>,
+    pub client_rules: Arc<crate::dns::client_rules::ClientRuleEngine>,
+    pub safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>,
+    pub dot_client: Option<Arc<crate::dns::dot::DotClient>>,
+    pub doq_client: Option<Arc<crate::dns::doq::DoQClient>>,
+    pub randomize_ecs: Arc<AtomicBool>,
+    pub reject_ttl: Arc<AtomicU32>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -132,6 +154,10 @@ impl DnsServer {
         timeout_load_reduction: f64,
         cache_neg_min_ttl: u32,
         cache_neg_max_ttl: u32,
+        cache_min_ttl: u32,
+        cache_max_ttl: u32,
+        force_tcp: bool,
+        captive_map: Arc<CaptiveMap>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let resolver = DoHResolver::new_with_options(
             upstreams_csv,
@@ -164,7 +190,11 @@ impl DnsServer {
             dns64: Arc::new(AtomicBool::new(dns64)),
             netmon: Arc::new(AtomicBool::new(netmon)),
             stats,
-            cache: Arc::new(DnsCache::new(2048).with_neg_ttl(cache_neg_min_ttl, cache_neg_max_ttl)),
+            cache: Arc::new(
+                DnsCache::new(2048)
+                    .with_neg_ttl(cache_neg_min_ttl, cache_neg_max_ttl)
+                    .with_ttl(cache_min_ttl, cache_max_ttl),
+            ),
             ip_queue: Arc::new(Mutex::new(HashMap::new())),
             tcp_listener,
             local_doh,
@@ -172,6 +202,10 @@ impl DnsServer {
             local_doh_tls: false,
             local_doh_cert_file: None,
             local_doh_key_file: None,
+            local_dot: false,
+            local_dot_addr: "127.0.0.1:853".parse().unwrap(),
+            local_dot_cert_file: None,
+            local_dot_key_file: None,
             query_logger,
             allowlist_path,
             blocklist_path,
@@ -193,10 +227,114 @@ impl DnsServer {
                 "cleanbrowsing-adult".to_string(),
             ])),
             anonymized_dns_routes: Arc::new(StdRwLock::new(Vec::new())),
+            captive_map,
+            force_tcp: Arc::new(AtomicBool::new(force_tcp)),
             skip_incompatible: Arc::new(AtomicBool::new(false)),
             direct_cert_fallback: Arc::new(AtomicBool::new(true)),
+            blocked_query_response: Arc::new(StdRwLock::new("hinfo".to_string())),
+            offline_mode: Arc::new(AtomicBool::new(false)),
+            ignore_system_dns: Arc::new(AtomicBool::new(true)),
+            cloaked_ptr: Arc::new(AtomicBool::new(true)),
+            tls_disable_session_tickets: Arc::new(AtomicBool::new(false)),
+            cert_refresh_delay: Arc::new(AtomicU32::new(240)),
+            cert_ignore_timestamp: Arc::new(AtomicBool::new(false)),
+            udp_pool_enabled: Arc::new(AtomicBool::new(true)),
+            udp_pool: Arc::new(crate::dns::udp_pool::UdpConnPool::default()),
+            client_rules: Arc::new(crate::dns::client_rules::ClientRuleEngine::new()),
+            safesearch: Arc::new(crate::dns::safesearch::SafeSearchEngine::new(
+                false,
+                crate::dns::safesearch::YouTubeMode::None,
+            )),
+            dot_client: None,
+            doq_client: None,
+            randomize_ecs: Arc::new(AtomicBool::new(false)),
+            reject_ttl: Arc::new(AtomicU32::new(10)),
             shutdown_tx,
         })
+    }
+
+    /// Sets the TTL returned in synthetic responses for blocked/rejected queries.
+    pub fn with_reject_ttl(self, ttl: u32) -> Self {
+        self.reject_ttl.store(ttl, Ordering::Relaxed);
+        self
+    }
+
+    /// Sets per-client IP filtering rules engine.
+    pub fn with_client_rules(mut self, rules: Arc<crate::dns::client_rules::ClientRuleEngine>) -> Self {
+        self.client_rules = rules;
+        self
+    }
+
+    /// Sets SafeSearch enforcement engine.
+    pub fn with_safesearch(mut self, safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>) -> Self {
+        self.safesearch = safesearch;
+        self
+    }
+
+    /// Sets DNS-over-TLS (DoT) client for upstream failover.
+    pub fn with_dot_client(mut self, client: Option<Arc<crate::dns::dot::DotClient>>) -> Self {
+        self.dot_client = client;
+        self
+    }
+
+    /// Sets DNS-over-QUIC (DoQ) client for upstream failover.
+    pub fn with_doq_client(mut self, client: Option<Arc<crate::dns::doq::DoQClient>>) -> Self {
+        self.doq_client = client;
+        self
+    }
+
+    /// Enables dynamic randomized EDNS Client Subnet (ECS) spoofing.
+    pub fn with_randomize_ecs(self, enable: bool) -> Self {
+        self.randomize_ecs.store(enable, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures response type when a DNS query is blocked (hinfo, refused, a:<ip4>,aaaa:<ip6>).
+    pub fn with_blocked_query_response(self, resp: &str) -> Self {
+        *self.blocked_query_response.write().unwrap() = resp.to_string();
+        self
+    }
+
+    /// Configures offline mode (disables all upstream network queries).
+    pub fn with_offline_mode(self, offline: bool) -> Self {
+        self.offline_mode.store(offline, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures whether to bypass system DNS during bootstrap.
+    pub fn with_ignore_system_dns(self, ignore: bool) -> Self {
+        self.ignore_system_dns.store(ignore, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures whether cloaked domains return synthetic PTR records.
+    pub fn with_cloaked_ptr(self, enabled: bool) -> Self {
+        self.cloaked_ptr.store(enabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures whether TLS session tickets are disabled for DoH.
+    pub fn with_tls_disable_session_tickets(self, disabled: bool) -> Self {
+        self.tls_disable_session_tickets.store(disabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures certificate refresh delay in minutes.
+    pub fn with_cert_refresh_delay(self, delay: u32) -> Self {
+        self.cert_refresh_delay.store(delay, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures whether to ignore certificate timestamps.
+    pub fn with_cert_ignore_timestamp(self, ignore: bool) -> Self {
+        self.cert_ignore_timestamp.store(ignore, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures whether UDP connection pooling is enabled.
+    pub fn with_udp_pool(self, enabled: bool) -> Self {
+        self.udp_pool_enabled.store(enabled, Ordering::Relaxed);
+        self
     }
 
     /// Attaches DNSCrypt-compatible query_meta TXT strings to outgoing queries.
@@ -257,6 +395,20 @@ impl DnsServer {
         self
     }
 
+    pub fn with_local_dot(
+        mut self,
+        enabled: bool,
+        addr: SocketAddr,
+        cert_file: Option<String>,
+        key_file: Option<String>,
+    ) -> Self {
+        self.local_dot = enabled;
+        self.local_dot_addr = addr;
+        self.local_dot_cert_file = cert_file;
+        self.local_dot_key_file = key_file;
+        self
+    }
+
     pub fn is_http3(&self) -> bool {
         self.http3.load(Ordering::Relaxed)
     }
@@ -271,7 +423,7 @@ impl DnsServer {
         &self,
         cfg: &crate::app::config::Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let new_resolver = DoHResolver::new_with_options(
+        let new_resolver = DoHResolver::new_full(
             &cfg.doh_upstream,
             &cfg.doh_bootstrap_ips,
             cfg.pqc,
@@ -279,6 +431,8 @@ impl DnsServer {
             cfg.effective_proxy().as_deref(),
             self.tls_auth.as_deref(),
             cfg.tls_key_log_file.as_deref(),
+            cfg.tls_disable_session_tickets,
+            cfg.ignore_system_dns,
         )?;
 
         *self.resolver.write().await = new_resolver;
@@ -300,6 +454,15 @@ impl DnsServer {
         *self.anonymized_dns_routes.write().unwrap() = cfg.anonymized_dns_routes.clone();
         self.skip_incompatible.store(cfg.skip_incompatible, Ordering::Relaxed);
         self.direct_cert_fallback.store(cfg.direct_cert_fallback, Ordering::Relaxed);
+        *self.blocked_query_response.write().unwrap() = cfg.blocked_query_response.clone();
+        self.offline_mode.store(cfg.offline_mode, Ordering::Relaxed);
+        self.ignore_system_dns.store(cfg.ignore_system_dns, Ordering::Relaxed);
+        self.cloaked_ptr.store(cfg.cloaked_ptr, Ordering::Relaxed);
+        self.tls_disable_session_tickets.store(cfg.tls_disable_session_tickets, Ordering::Relaxed);
+        self.cert_refresh_delay.store(cfg.cert_refresh_delay, Ordering::Relaxed);
+        self.cert_ignore_timestamp.store(cfg.cert_ignore_timestamp, Ordering::Relaxed);
+        self.udp_pool_enabled.store(cfg.udp_pool, Ordering::Relaxed);
+        self.reject_ttl.store(cfg.reject_ttl, Ordering::Relaxed);
         self.cache.clear();
 
         info!(
@@ -308,6 +471,8 @@ impl DnsServer {
             http3 = cfg.http3,
             dnssec = cfg.dnssec,
             lb_strategy = %cfg.lb_strategy,
+            offline_mode = cfg.offline_mode,
+            blocked_response = %cfg.blocked_query_response,
             "DNS server configuration dynamically reloaded in real time"
         );
         Ok(())
@@ -358,6 +523,10 @@ impl DnsServer {
             0.0,
             60,
             600,
+            60,
+            86400,
+            false,
+            Arc::new(CaptiveMap::new()),
         )
     }
 
@@ -481,16 +650,29 @@ impl DnsServer {
         };
 
         let mut udp_sockets = Vec::new();
-        for addr in &addrs {
-            let socket = match create_tuned_udp_socket(*addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(
-                        format!("failed to bind tuned UDP socket to {}: {}", addr, e).into(),
-                    );
+        if let Some(systemd) = crate::dns::system::get_systemd_sockets() {
+            for std_sock in systemd.udp {
+                if let Ok(addr) = std_sock.local_addr() {
+                    if let Ok(tokio_sock) = tokio::net::UdpSocket::from_std(std_sock) {
+                        info!(addr = %addr, "Using systemd activated UDP socket");
+                        udp_sockets.push((addr, Arc::new(tokio_sock)));
+                    }
                 }
-            };
-            udp_sockets.push((*addr, Arc::new(socket)));
+            }
+        }
+
+        if udp_sockets.is_empty() {
+            for addr in &addrs {
+                let socket = match create_tuned_udp_socket(*addr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(
+                            format!("failed to bind tuned UDP socket to {}: {}", addr, e).into(),
+                        );
+                    }
+                };
+                udp_sockets.push((*addr, Arc::new(socket)));
+            }
         }
 
         info!(
@@ -587,6 +769,27 @@ impl DnsServer {
                 }
             }
         });
+
+        // 2b. spawn periodic certificate and upstream health refresh (cert_refresh_delay in minutes)
+        let cert_delay = self.cert_refresh_delay.load(Ordering::Relaxed);
+        if cert_delay > 0 {
+            let mut cert_shutdown_rx = self.shutdown_tx.subscribe();
+            let resolver_ref = self.resolver.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(cert_delay as u64 * 60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            debug!("Periodic certificate and upstream health refresh tick triggered");
+                            let r = resolver_ref.read().await;
+                            r.reset_balancer();
+                        }
+                        _ = cert_shutdown_rx.recv() => break,
+                    }
+                }
+            });
+        }
 
         let server_arc = Arc::new(self.clone());
 
@@ -729,6 +932,39 @@ impl DnsServer {
             );
         }
 
+        // 6.0. spawn local DNS-over-TLS (DoT port 853) listener if enabled
+        if self.local_dot {
+            let s_dot = server_arc.clone();
+            let rx = self.shutdown_tx.subscribe();
+            let cert_file = self.local_dot_cert_file.as_deref().or(self.local_doh_cert_file.as_deref());
+            let key_file = self.local_dot_key_file.as_deref().or(self.local_doh_key_file.as_deref());
+
+            if let (Some(c), Some(k)) = (cert_file, key_file) {
+                match crate::dns::local_dot::create_dot_tls_acceptor_from_files(c, k) {
+                    Ok(tls_acceptor) => {
+                        crate::dns::LocalDoTServer::start(
+                            self.local_dot_addr,
+                            tls_acceptor,
+                            move |query, peer| {
+                                let s = s_dot.clone();
+                                async move {
+                                    s.stats.queries_dot.fetch_add(1, Ordering::Relaxed);
+                                    s.resolve_packet(&query, peer.ip()).await
+                                }
+                            },
+                            rx,
+                        );
+                        info!(addr = %self.local_dot_addr, "Local DoT server started (TLS on port 853)");
+                    }
+                    Err(e) => {
+                        warn!("failed to create TLS acceptor for local DoT: {}", e);
+                    }
+                }
+            } else {
+                warn!("local DoT listener requires TLS certificate and private key files");
+            }
+        }
+
         // 6.1. spawn Prometheus metrics endpoint (/metrics) on metrics_addr (e.g. 127.0.0.1:9153)
         if self.metrics {
             let rx = self.shutdown_tx.subscribe();
@@ -825,6 +1061,10 @@ impl DnsServer {
         &self,
         outgoing_query: &[u8],
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        if self.offline_mode.load(Ordering::Relaxed) {
+            return Err("offline mode enabled: upstream network queries disabled".into());
+        }
+
         let active = self.stats.active_queries.load(Ordering::Relaxed);
         let max_c = self.max_clients.load(Ordering::Relaxed).max(1) as u64;
         let base_timeout = Duration::from_secs(5);
@@ -865,17 +1105,66 @@ impl DnsServer {
             }
         };
 
-        match tokio::time::timeout(effective_timeout, query_fut).await {
+        let doh_result = tokio::time::timeout(effective_timeout, query_fut).await;
+        match doh_result {
             Ok(Ok((res, via))) => {
                 self.load_balancer.record_result(0, start_time.elapsed(), true);
                 Ok((res, via))
             }
             Ok(Err(e)) => {
                 self.load_balancer.record_result(0, start_time.elapsed(), false);
+                if let Some(ref doq) = self.doq_client {
+                    debug!("DoH resolution failed ({}), attempting failover to DNS-over-QUIC (DoQ)", e);
+                    match doq.query(effective_query).await {
+                        Ok(doq_resp) => {
+                            debug!("DNS query successfully resolved via DoQ failover");
+                            return Ok((doq_resp, "doq_failover".to_string()));
+                        }
+                        Err(doq_err) => {
+                            warn!("DoQ failover also failed: {}", doq_err);
+                        }
+                    }
+                }
+                if let Some(ref dot) = self.dot_client {
+                    debug!("DoH resolution failed ({}), attempting failover to DNS-over-TLS (DoT)", e);
+                    match dot.query(effective_query).await {
+                        Ok(dot_resp) => {
+                            debug!("DNS query successfully resolved via DoT failover");
+                            return Ok((dot_resp, "dot_failover".to_string()));
+                        }
+                        Err(dot_err) => {
+                            warn!("DoT failover also failed: {}", dot_err);
+                        }
+                    }
+                }
                 Err(e)
             }
             Err(_) => {
                 self.load_balancer.record_result(0, effective_timeout, false);
+                if let Some(ref doq) = self.doq_client {
+                    debug!("DoH query timed out, attempting failover to DNS-over-QUIC (DoQ)");
+                    match doq.query(effective_query).await {
+                        Ok(doq_resp) => {
+                            debug!("DNS query successfully resolved via DoQ failover");
+                            return Ok((doq_resp, "doq_failover".to_string()));
+                        }
+                        Err(doq_err) => {
+                            warn!("DoQ failover also failed: {}", doq_err);
+                        }
+                    }
+                }
+                if let Some(ref dot) = self.dot_client {
+                    debug!("DoH query timed out, attempting failover to DNS-over-TLS (DoT)");
+                    match dot.query(effective_query).await {
+                        Ok(dot_resp) => {
+                            debug!("DNS query successfully resolved via DoT failover");
+                            return Ok((dot_resp, "dot_failover".to_string()));
+                        }
+                        Err(dot_err) => {
+                            warn!("DoT failover also failed: {}", dot_err);
+                        }
+                    }
+                }
                 Err(format!(
                     "upstream query timed out under load (timeout: {:?}, active: {})",
                     effective_timeout, active
@@ -927,6 +1216,30 @@ impl DnsServer {
             .unwrap_or_default();
         let qtype = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
 
+        let client_decision = self.client_rules.evaluate(client_ip, &domain, qtype);
+        match client_decision {
+            crate::dns::client_rules::ClientDecision::Blocked(reason) => {
+                debug!(domain = %domain, client = %client_ip, reason = %reason, "Blocked by per-client filtering rule");
+                self.stats.blocked_domains.fetch_add(1, Ordering::Relaxed);
+                self.maybe_log_query(
+                    client_ip,
+                    &domain,
+                    qtype,
+                    QueryStatus::BlockedName,
+                    start_time,
+                    Some(reason),
+                );
+                return Some(build_sinkhole_response(query_data, qtype));
+            }
+            crate::dns::client_rules::ClientDecision::DropIPv6 => {
+                debug!(domain = %domain, client = %client_ip, "Dropped AAAA query per client profile IPv6 policy");
+                self.stats.blocked_domains.fetch_add(1, Ordering::Relaxed);
+                return Some(build_nodata_response(query_data));
+            }
+            _ => {}
+        }
+        let client_bypassed = matches!(client_decision, crate::dns::client_rules::ClientDecision::Allowed(_));
+
         // 1. intercept mozilla firefox doh canary (use-application-dns.net) to force local proxy
         if let Some(key) = &query_key {
             if is_firefox_canary(&key.name) {
@@ -946,7 +1259,7 @@ impl DnsServer {
 
         // 2. handle wi-fi captive portal detection probes (apple, android, windows, gnome)
         if let Some(key) = &query_key {
-            if let Some(captive_ip) = check_captive_portal(&key.name, key.qtype) {
+            if let Some(captive_ip) = self.captive_map.check(&key.name, key.qtype) {
                 debug!(domain = %key.name, ip = %captive_ip, "Synthesized captive portal detection response");
                 self.stats.captive_probes.fetch_add(1, Ordering::Relaxed);
                 self.maybe_log_query(
@@ -961,11 +1274,10 @@ impl DnsServer {
             }
         }
 
-        // 3. check local cloaking table (0ms local hosts / synthetic overrides)
+        // 2.5 enforce SafeSearch & YouTube restricted mode redirects
         if let Some(key) = &query_key {
-            if let Some(cloaked_resp) = self.cloak.resolve_cloaked(&key.name, key.qtype, query_data)
-            {
-                debug!(domain = %key.name, "Resolved via local cloaking table (0ms)");
+            if let Some(ovr) = self.safesearch.check(&key.name, key.qtype) {
+                debug!(domain = %key.name, "Applying SafeSearch / YouTube restricted mode override");
                 self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
                 self.maybe_log_query(
                     client_ip,
@@ -973,23 +1285,45 @@ impl DnsServer {
                     qtype,
                     QueryStatus::Cloak0ms,
                     start_time,
-                    Some("cloak_override"),
+                    Some("safesearch"),
                 );
-                return Some(cloaked_resp);
+                return Some(crate::dns::safesearch::build_safesearch_response(
+                    query_data,
+                    &key.name,
+                    key.qtype,
+                    &ovr,
+                ));
+            }
+        }
+
+        // 3. check local cloaking table (0ms local hosts / synthetic overrides)
+        if let Some(key) = &query_key {
+            if key.qtype != 12 || self.cloaked_ptr.load(Ordering::Relaxed) {
+                if let Some(cloaked_resp) =
+                    self.cloak.resolve_cloaked(&key.name, key.qtype, query_data)
+                {
+                    debug!(domain = %key.name, "Resolved via local cloaking table (0ms)");
+                    self.stats.cloaked_responses.fetch_add(1, Ordering::Relaxed);
+                    self.maybe_log_query(
+                        client_ip,
+                        &domain,
+                        qtype,
+                        QueryStatus::Cloak0ms,
+                        start_time,
+                        Some("cloak_override"),
+                    );
+                    return Some(cloaked_resp);
+                }
             }
         }
 
         // 4. check split-dns forwarding rules
         if let Some(key) = &query_key {
-            let target = {
-                let fw = self.forwarding.read().await;
-                fw.find_target(&key.name)
-            };
-            if let Some(target_forwarder) = target {
-                let fw = self.forwarding.read().await;
-                match fw.forward_query(query_data, target_forwarder).await {
+            let fw = self.forwarding.read().await;
+            if let Some(forward_res) = fw.forward_query_for_domain(query_data, &key.name).await {
+                match forward_res {
                     Ok(resp) => {
-                        debug!(domain = %key.name, target = %target_forwarder, "Resolved via ForwardingEngine split-DNS");
+                        debug!(domain = %key.name, "Resolved via ForwardingEngine split-DNS");
                         self.maybe_log_query(
                             client_ip,
                             &domain,
@@ -1002,8 +1336,8 @@ impl DnsServer {
                     }
                     Err(e) => {
                         debug!(
-                            "ForwardingEngine split-dns to {} failed: {}",
-                            target_forwarder, e
+                            "ForwardingEngine split-dns failed for {}: {}",
+                            key.name, e
                         );
                     }
                 }
@@ -1076,10 +1410,13 @@ impl DnsServer {
                         start_time,
                         Some(&format!("schedule:{}", sched_name)),
                     );
-                    return Some(build_sinkhole_response(query_data, key.qtype));
+                    let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    return Some(build_blocked_response(query_data, key.qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
                 }
 
-                let is_blocked = {
+                let is_blocked = if client_bypassed {
+                    false
+                } else {
                     let bl = self.blocklist.read().await;
                     bl.check(&key.name)
                 };
@@ -1099,7 +1436,8 @@ impl DnsServer {
                         start_time,
                         Some("hagezi_block"),
                     );
-                    return Some(build_sinkhole_response(query_data, key.qtype));
+                    let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    return Some(build_blocked_response(query_data, key.qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
                 }
             }
         }
@@ -1167,9 +1505,16 @@ impl DnsServer {
         self.stats.upstream_queries.fetch_add(1, Ordering::Relaxed);
         let is_padding = self.edns_padding.load(Ordering::Relaxed);
         let is_dnssec = self.dnssec.load(Ordering::Relaxed);
-        let outgoing_query = if is_padding || self.edns_client_subnet.is_some() {
+        let is_random_ecs = self.randomize_ecs.load(Ordering::Relaxed);
+        let outgoing_query = if is_padding || self.edns_client_subnet.is_some() || is_random_ecs {
+            let random_subnet;
             let default_zero = ClientSubnet::zero_scope();
-            let effective_ecs = self.edns_client_subnet.as_ref().unwrap_or(&default_zero);
+            let effective_ecs = if is_random_ecs {
+                random_subnet = ClientSubnet::random_prefix();
+                &random_subnet
+            } else {
+                self.edns_client_subnet.as_ref().unwrap_or(&default_zero)
+            };
             apply_edns_options_with_ecs(
                 query_data,
                 is_dnssec,
@@ -1188,6 +1533,19 @@ impl DnsServer {
         } else {
             outgoing_query
         };
+
+        if self.offline_mode.load(Ordering::Relaxed) {
+            debug!(domain = %domain, "Offline mode enabled: refusing query without upstream network access");
+            self.maybe_log_query(
+                client_ip,
+                &domain,
+                qtype,
+                QueryStatus::Refused,
+                start_time,
+                Some("offline_mode"),
+            );
+            return Some(build_refused_response(query_data));
+        }
 
         match self.resolve_upstream(&outgoing_query).await {
             Ok((resp_bytes, via)) => {
@@ -1262,8 +1620,8 @@ impl DnsServer {
                                     start_time,
                                     Some(&target),
                                 );
-                                let qtype_val = query_key.as_ref().map(|k| k.qtype).unwrap_or(1);
-                                return Some(build_sinkhole_response(query_data, qtype_val));
+                                 let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
+                                return Some(build_blocked_response(query_data, qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
                             }
                         }
                     }
@@ -2154,11 +2512,94 @@ mod tests {
             0.0,
             60,
             600,
+            60,
+            86400,
+            false,
+            Arc::new(CaptiveMap::new()),
         )
         .unwrap();
 
         assert!(server.is_http3());
         assert!(server.resolver.read().await.clients()[0].http3);
+    }
+
+    #[tokio::test]
+    async fn test_safesearch_and_youtube_resolution_interception() {
+        let safesearch = Arc::new(crate::dns::SafeSearchEngine::new(
+            true,
+            crate::dns::YouTubeMode::Strict,
+        ));
+
+        let server = DnsServer::new(
+            "https://cloudflare-dns.com/dns-query",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Arc::new(CloakEngine::new()),
+            Arc::new(RwLock::new(CompactBlocklist::empty())),
+            Arc::new(RwLock::new(DomainAllowlist::new())),
+            Arc::new(IpFilter::default()),
+            false,
+            false,
+            false,
+            DnsStats::new(),
+            false,
+            false,
+            "127.0.0.1:8053".parse().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(RwLock::new(ScheduleManager::new())),
+            None,
+            false,
+            "127.0.0.1:9153".parse().unwrap(),
+            None,
+            Arc::new(RwLock::new(ForwardingEngine::new())),
+            None,
+            None,
+            0.0,
+            60,
+            600,
+            60,
+            86400,
+            false,
+            Arc::new(CaptiveMap::new()),
+        )
+        .unwrap()
+        .with_safesearch(safesearch);
+
+        // Test Google SafeSearch A query interception
+        let google_query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x06, b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        let resp = server
+            .resolve_packet(&google_query, "127.0.0.1".parse().unwrap())
+            .await
+            .expect("should return safesearch response");
+        // Check Google SafeSearch VIP 216.239.38.120
+        assert!(resp.windows(4).any(|w| w == [216, 239, 38, 120]));
+
+        // Test YouTube Strict Mode A query interception (VIP 216.239.38.119)
+        let yt_query = vec![
+            0x56, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'y', b'o', b'u', b't', b'u', b'b', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        let yt_resp = server
+            .resolve_packet(&yt_query, "127.0.0.1".parse().unwrap())
+            .await
+            .expect("should return youtube strict response");
+        assert!(yt_resp.windows(4).any(|w| w == [216, 239, 38, 119]));
     }
 }
 

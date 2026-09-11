@@ -5,7 +5,8 @@
 
 const PADDING_OPTION_CODE: u16 = 12; // rfc 7830 / rfc 8467 edns0 padding option code
 const ECS_OPTION_CODE: u16 = 8; // rfc 7871 edns0 client subnet
-const DEFAULT_EDNS_PAYLOAD_SIZE: u16 = 4096;
+pub const DEFAULT_EDNS_PAYLOAD_SIZE: u16 = 4096;
+pub const SAFE_EDNS_PAYLOAD_SIZE: u16 = 1252; // RFC-safe non-fragmenting UDP payload size (broken_implementations)
 
 // discrete padding boundaries (bytes) compliant with rfc 8467 recommendations
 const DISCRETE_BOUNDARIES: &[usize] = &[
@@ -52,6 +53,17 @@ pub fn apply_edns_options_with_ecs(
     padding: bool,
     ecs: Option<&ClientSubnet>,
 ) -> Vec<u8> {
+    apply_edns_options_with_payload_size(query, dnssec, padding, ecs, DEFAULT_EDNS_PAYLOAD_SIZE)
+}
+
+// applies edns0 options with a customized advertised udp payload size
+pub fn apply_edns_options_with_payload_size(
+    query: &[u8],
+    dnssec: bool,
+    padding: bool,
+    ecs: Option<&ClientSubnet>,
+    payload_size: u16,
+) -> Vec<u8> {
     if query.len() < 12 || query.len() > 65500 {
         return query.to_vec();
     }
@@ -93,7 +105,7 @@ pub fn apply_edns_options_with_ecs(
         // opt rr header
         out.push(0x00); // root label
         out.extend_from_slice(&41u16.to_be_bytes()); // type: opt (41)
-        out.extend_from_slice(&DEFAULT_EDNS_PAYLOAD_SIZE.to_be_bytes()); // udp payload size (4096)
+        out.extend_from_slice(&payload_size.to_be_bytes()); // udp payload size
 
         // extended rcode & edns flags: set do bit (0x8000) if dnssec enabled
         if dnssec {
@@ -185,5 +197,19 @@ mod tests {
             &formatted[opt_start + 15..opt_start + 15 + 7],
             &[0x00, 0x01, 24, 0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn test_apply_edns_custom_payload_size() {
+        let mut query = vec![
+            0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        query.extend_from_slice(b"\x06google\x03com\x00\x00\x01\x00\x01");
+
+        let formatted = apply_edns_options_with_payload_size(&query, true, false, None, SAFE_EDNS_PAYLOAD_SIZE);
+        let opt_start = query.len();
+        // Payload size is bytes 3 and 4 after root label (offset opt_start + 3..opt_start + 5)
+        let size = u16::from_be_bytes([formatted[opt_start + 3], formatted[opt_start + 4]]);
+        assert_eq!(size, 1252);
     }
 }

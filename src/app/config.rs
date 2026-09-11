@@ -72,6 +72,8 @@ pub struct Config {
     pub blocklist_path: Option<String>,
     #[serde(default)]
     pub cloaking_rules: HashMap<String, String>,
+    #[serde(default, alias = "cloak_file", alias = "cloaking_rules_file")]
+    pub cloaking_rules_path: Option<String>,
     #[serde(default)]
     pub forwarding_rules: HashMap<String, String>,
     #[serde(default)]
@@ -146,6 +148,10 @@ pub struct Config {
     pub web_ui_user: Option<String>,
     #[serde(default)]
     pub web_ui_pass: Option<String>,
+    #[serde(default = "default_privacy_level", alias = "privacy_level")]
+    pub web_ui_privacy_level: u8,
+    #[serde(default = "default_max_query_log_entries", alias = "max_query_log_entries")]
+    pub web_ui_max_query_log_entries: usize,
     #[serde(default)]
     pub dnscrypt_servers: Vec<String>,
     #[serde(default)]
@@ -190,12 +196,138 @@ pub struct Config {
     pub local_doh_cert_file: Option<String>,
     #[serde(default)]
     pub local_doh_key_file: Option<String>,
+    #[serde(default = "default_blocked_query_response")]
+    pub blocked_query_response: String,
+    #[serde(default)]
+    pub offline_mode: bool,
+    #[serde(default = "default_true")]
+    pub ignore_system_dns: bool,
+    #[serde(default = "default_true")]
+    pub cloaked_ptr: bool,
+    #[serde(default)]
+    pub tls_disable_session_tickets: bool,
+    #[serde(default = "default_cert_refresh_delay")]
+    pub cert_refresh_delay: u32,
+    #[serde(default)]
+    pub cert_ignore_timestamp: bool,
+    #[serde(default)]
+    pub ignored_qtypes: Vec<String>,
+    #[serde(default = "default_true")]
+    pub udp_pool: bool,
+    #[serde(default = "default_cache_min_ttl")]
+    pub cache_min_ttl: u32,
+    #[serde(default = "default_cache_max_ttl")]
+    pub cache_max_ttl: u32,
+    #[serde(default)]
+    pub blocked_ips_file: Option<String>,
+    #[serde(default)]
+    pub allowed_ips_file: Option<String>,
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub blocked_names_log_path: Option<String>,
+    #[serde(default = "default_log_format")]
+    pub blocked_names_log_format: String,
+    #[serde(default)]
+    pub blocked_ips_log_path: Option<String>,
+    #[serde(default = "default_log_format")]
+    pub blocked_ips_log_format: String,
+    #[serde(default)]
+    pub allowed_names_log_path: Option<String>,
+    #[serde(default = "default_log_format")]
+    pub allowed_names_log_format: String,
+    #[serde(default)]
+    pub allowed_ips_log_path: Option<String>,
+    #[serde(default = "default_log_format")]
+    pub allowed_ips_log_format: String,
+    #[serde(default)]
+    pub force_tcp: bool,
+    #[serde(default)]
+    pub captive_portals_map_file: Option<String>,
+    #[serde(default)]
+    pub server_names: Vec<String>,
+    #[serde(default)]
+    pub disabled_server_names: Vec<String>,
+    #[serde(default = "default_true")]
+    pub ipv4_servers: bool,
+    #[serde(default)]
+    pub ipv6_servers: bool,
+    #[serde(default = "default_true")]
+    pub doh_servers: bool,
+    #[serde(default)]
+    pub odoh_servers: bool,
+    #[serde(default)]
+    pub require_dnssec: bool,
+    #[serde(default = "default_true")]
+    pub require_nolog: bool,
+    #[serde(default = "default_true")]
+    pub require_nofilter: bool,
+    #[serde(default)]
+    pub dot_upstream: Option<String>,
+    #[serde(default)]
+    pub client_rules: Vec<crate::dns::client_rules::ClientProfileConfig>,
+    #[serde(default)]
+    pub client_rules_file: Option<String>,
+    #[serde(default)]
+    pub anonymized_doh_relays: Vec<String>,
+    #[serde(default = "default_true")]
+    pub load_system_hosts: bool,
+    #[serde(default)]
+    pub safe_search: bool,
+    #[serde(default)]
+    pub youtube_restricted_mode: Option<String>,
+    #[serde(default)]
+    pub local_dot: bool,
+    #[serde(default = "default_local_dot_addr")]
+    pub local_dot_addr: String,
+    #[serde(default)]
+    pub local_dot_cert_file: Option<String>,
+    #[serde(default)]
+    pub local_dot_key_file: Option<String>,
+    #[serde(default)]
+    pub randomize_ecs: bool,
+    #[serde(default)]
+    pub doq_upstream: Option<String>,
+    #[serde(default)]
+    pub pid_file: Option<String>,
+    #[serde(default = "default_cloak_ttl")]
+    pub cloak_ttl: u32,
+    #[serde(default = "default_reject_ttl")]
+    pub reject_ttl: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnonymizedDnsRoute {
     pub server_name: String,
     pub via: Vec<String>,
+}
+
+fn default_local_dot_addr() -> String {
+    "127.0.0.1:853".to_string()
+}
+
+fn default_cloak_ttl() -> u32 {
+    300
+}
+
+fn default_reject_ttl() -> u32 {
+    10
+}
+
+fn default_blocked_query_response() -> String {
+    "hinfo".to_string()
+}
+
+fn default_cache_min_ttl() -> u32 {
+    60
+}
+
+fn default_cache_max_ttl() -> u32 {
+    86400
+}
+
+fn default_cert_refresh_delay() -> u32 {
+    240
 }
 
 fn default_netprobe_timeout() -> i32 {
@@ -256,6 +388,14 @@ fn default_cache_neg_max_ttl() -> u32 {
 
 fn default_web_ui_addr() -> String {
     "127.0.0.1:0205".to_string()
+}
+
+fn default_privacy_level() -> u8 {
+    1
+}
+
+fn default_max_query_log_entries() -> usize {
+    100
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -336,6 +476,7 @@ impl Default for Config {
             blocklist: true,
             blocklist_path: None,
             cloaking_rules: HashMap::new(),
+            cloaking_rules_path: None,
             forwarding_rules: HashMap::new(),
             allow_domains: Vec::new(),
             allowlist_path: None,
@@ -373,6 +514,8 @@ impl Default for Config {
             web_ui_addr: "127.0.0.1:0205".to_string(),
             web_ui_user: None,
             web_ui_pass: None,
+            web_ui_privacy_level: 1,
+            web_ui_max_query_log_entries: 100,
             dnscrypt_servers: Vec::new(),
             dnscrypt_relays: Vec::new(),
             query_log_format: "tsv".to_string(),
@@ -395,6 +538,55 @@ impl Default for Config {
             local_doh_tls: false,
             local_doh_cert_file: None,
             local_doh_key_file: None,
+            blocked_query_response: "hinfo".to_string(),
+            offline_mode: false,
+            ignore_system_dns: true,
+            cloaked_ptr: true,
+            tls_disable_session_tickets: false,
+            cert_refresh_delay: 240,
+            cert_ignore_timestamp: false,
+            ignored_qtypes: Vec::new(),
+            udp_pool: true,
+            cache_min_ttl: 60,
+            cache_max_ttl: 86400,
+            blocked_ips_file: None,
+            allowed_ips_file: None,
+            allowed_ips: Vec::new(),
+            blocked_names_log_path: None,
+            blocked_names_log_format: "tsv".to_string(),
+            blocked_ips_log_path: None,
+            blocked_ips_log_format: "tsv".to_string(),
+            allowed_names_log_path: None,
+            allowed_names_log_format: "tsv".to_string(),
+            allowed_ips_log_path: None,
+            allowed_ips_log_format: "tsv".to_string(),
+            force_tcp: false,
+            captive_portals_map_file: None,
+            server_names: Vec::new(),
+            disabled_server_names: Vec::new(),
+            ipv4_servers: true,
+            ipv6_servers: false,
+            doh_servers: true,
+            odoh_servers: false,
+            require_dnssec: false,
+            require_nolog: true,
+            require_nofilter: true,
+            dot_upstream: None,
+            client_rules: Vec::new(),
+            client_rules_file: None,
+            anonymized_doh_relays: Vec::new(),
+            load_system_hosts: true,
+            safe_search: false,
+            youtube_restricted_mode: None,
+            local_dot: false,
+            local_dot_addr: "127.0.0.1:853".to_string(),
+            local_dot_cert_file: None,
+            local_dot_key_file: None,
+            randomize_ecs: false,
+            doq_upstream: None,
+            pid_file: None,
+            cloak_ttl: 300,
+            reject_ttl: 10,
         }
     }
 }
@@ -951,9 +1143,21 @@ mod tests {
         assert_eq!(cfg.web_ui_pass, None);
         assert_eq!(cfg.web_ui_addr, "127.0.0.1:0205");
 
+        assert_eq!(cfg.cache_min_ttl, 60);
+        assert_eq!(cfg.cache_max_ttl, 86400);
+        assert_eq!(cfg.force_tcp, false);
+        assert_eq!(cfg.require_nolog, true);
+        assert_eq!(cfg.require_nofilter, true);
+        assert_eq!(cfg.ipv4_servers, true);
+        assert_eq!(cfg.ipv6_servers, false);
+
         // Verify serde deserialization of empty json "{}" yields identical defaults
         let from_empty: Config =
             serde_json::from_str("{}").expect("empty json must parse with all defaults");
+        assert_eq!(from_empty.cache_min_ttl, 60);
+        assert_eq!(from_empty.cache_max_ttl, 86400);
+        assert_eq!(from_empty.force_tcp, false);
+        assert_eq!(from_empty.require_nolog, true);
         assert_eq!(from_empty.mss, 88);
         assert_eq!(from_empty.min_mss, 64);
         assert_eq!(from_empty.doh_upstream, "quad9");

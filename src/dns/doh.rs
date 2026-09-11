@@ -177,6 +177,32 @@ impl SingleDoHClient {
         tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
         tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_full(
+            upstream,
+            name,
+            custom_bootstrap_ips,
+            pqc,
+            http3,
+            proxy,
+            tls_auth,
+            tls_key_log_file,
+            false,
+            false,
+        )
+    }
+
+    pub fn new_full(
+        upstream: &str,
+        name: &str,
+        custom_bootstrap_ips: &[Ipv4Addr],
+        pqc: bool,
+        http3: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
+        tls_disable_session_tickets: bool,
+        ignore_system_dns: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
         if !pqc {
             // enforce classical key exchange ONLY: eliminate all post-quantum KEMs
@@ -202,6 +228,10 @@ impl SingleDoHClient {
             client_config.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
         } else {
             client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        }
+
+        if tls_disable_session_tickets {
+            client_config.resumption = rustls::client::Resumption::disabled();
         }
 
         if let Some(keylog_path) = tls_key_log_file {
@@ -264,11 +294,13 @@ impl SingleDoHClient {
                     if let Ok(ip) = host_str.parse::<Ipv4Addr>() {
                         bootstrap_addrs.push(SocketAddr::from((ip, port)));
                     } else if proxy.is_none() {
-                        // 4. resolve fqdn via system resolver prior to resolv.conf modification (skip when using proxy to avoid leaks)
-                        let host_with_port = format!("{}:{}", host_str, port);
-                        if let Ok(resolved) = host_with_port.to_socket_addrs() {
-                            for addr in resolved {
-                                bootstrap_addrs.push(addr);
+                        // 4. resolve fqdn via system resolver prior to resolv.conf modification (skip when using proxy or ignore_system_dns to avoid leaks)
+                        if !ignore_system_dns {
+                            let host_with_port = format!("{}:{}", host_str, port);
+                            if let Ok(resolved) = host_with_port.to_socket_addrs() {
+                                for addr in resolved {
+                                    bootstrap_addrs.push(addr);
+                                }
                             }
                         }
                         if bootstrap_addrs.is_empty() {
@@ -376,6 +408,30 @@ impl DoHResolver {
         tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
         tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_full(
+            upstreams_csv,
+            custom_bootstrap_ips,
+            pqc,
+            http3,
+            proxy,
+            tls_auth,
+            tls_key_log_file,
+            false,
+            false,
+        )
+    }
+
+    pub fn new_full(
+        upstreams_csv: &str,
+        custom_bootstrap_ips: &[Ipv4Addr],
+        pqc: bool,
+        http3: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
+        tls_disable_session_tickets: bool,
+        ignore_system_dns: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut clients = Vec::new();
 
         for raw in upstreams_csv.split(',') {
@@ -385,7 +441,7 @@ impl DoHResolver {
             }
 
             if let Some((url, _)) = DOH_PRESETS.get(u) {
-                match SingleDoHClient::new_with_options(
+                match SingleDoHClient::new_full(
                     url,
                     u,
                     custom_bootstrap_ips,
@@ -394,6 +450,8 @@ impl DoHResolver {
                     proxy,
                     tls_auth,
                     tls_key_log_file,
+                    tls_disable_session_tickets,
+                    ignore_system_dns,
                 ) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize doh preset {}: {}", u, e),
@@ -403,7 +461,7 @@ impl DoHResolver {
                     .ok()
                     .and_then(|p| p.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "custom".to_string());
-                match SingleDoHClient::new_with_options(
+                match SingleDoHClient::new_full(
                     u,
                     &name,
                     custom_bootstrap_ips,
@@ -412,6 +470,8 @@ impl DoHResolver {
                     proxy,
                     tls_auth,
                     tls_key_log_file,
+                    tls_disable_session_tickets,
+                    ignore_system_dns,
                 ) {
                     Ok(client) => clients.push(client),
                     Err(e) => warn!("failed to initialize custom doh {}: {}", u, e),
@@ -435,7 +495,7 @@ impl DoHResolver {
                         if stamp.doh_url.is_empty() {
                             warn!("dns stamp {} does not specify a doh endpoint", u);
                         } else {
-                            match SingleDoHClient::new_with_options(
+                            match SingleDoHClient::new_full(
                                 &stamp.doh_url,
                                 &name,
                                 &all_bootstraps,
@@ -444,6 +504,8 @@ impl DoHResolver {
                                 proxy,
                                 tls_auth,
                                 tls_key_log_file,
+                                tls_disable_session_tickets,
+                                ignore_system_dns,
                             ) {
                                 Ok(client) => clients.push(client),
                                 Err(e) => warn!("failed to initialize stamp doh {}: {}", name, e),
@@ -458,7 +520,7 @@ impl DoHResolver {
         }
 
         if clients.is_empty() {
-            let cf = SingleDoHClient::new_with_options(
+            let cf = SingleDoHClient::new_full(
                 "https://cloudflare-dns.com/dns-query",
                 "cloudflare",
                 custom_bootstrap_ips,
@@ -467,6 +529,8 @@ impl DoHResolver {
                 proxy,
                 tls_auth,
                 tls_key_log_file,
+                tls_disable_session_tickets,
+                ignore_system_dns,
             )?;
             clients.push(cf);
         }

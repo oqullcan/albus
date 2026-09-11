@@ -8,6 +8,7 @@ use albus::core::engine::Engine;
 use albus::core::firewall;
 use albus::dns;
 use clap::Parser;
+use std::io::Write;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -15,6 +16,13 @@ use tracing_subscriber::FmtSubscriber;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // parse command line arguments via clap derive parser
     let cli = Cli::parse();
+
+    // top-level resolver listing (dnscrypt-proxy CLI compatibility: --list, --list-all, --include-relays, --json)
+    if cli.list || cli.list_all {
+        let cfg = Config::load_or_default();
+        let filter = cli.list && !cli.list_all;
+        return handle_resolvers_list_custom(&cfg, filter, cli.include_relays, cli.json_output).await;
+    }
 
     match cli.command {
         // query kernel capabilities and service state
@@ -189,6 +197,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if let Some(ref r) = args.dnscrypt_relays {
                         cfg.dnscrypt_relays = r.clone();
                     }
+                    if args.cache_min_ttl != 60 {
+                        cfg.cache_min_ttl = args.cache_min_ttl;
+                    }
+                    if args.cache_max_ttl != 86400 {
+                        cfg.cache_max_ttl = args.cache_max_ttl;
+                    }
+                    if let Some(ref path) = args.blocked_ips_file {
+                        cfg.blocked_ips_file = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref path) = args.allowed_ips_file {
+                        cfg.allowed_ips_file = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref ips) = args.allowed_ips {
+                        cfg.allowed_ips = ips.clone();
+                    }
+                    if let Some(ref path) = args.blocked_names_log {
+                        cfg.blocked_names_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref path) = args.blocked_ips_log {
+                        cfg.blocked_ips_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref path) = args.allowed_names_log {
+                        cfg.allowed_names_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref path) = args.allowed_ips_log {
+                        cfg.allowed_ips_log_path = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    cfg.force_tcp = args.force_tcp;
+                    if let Some(ref path) = args.captive_map_file {
+                        cfg.captive_portals_map_file = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref dot) = args.dot_upstream {
+                        cfg.dot_upstream = if dot.trim().is_empty() {
+                            None
+                        } else {
+                            Some(dot.clone())
+                        };
+                    }
+                    if let Some(ref path) = args.client_rules_file {
+                        cfg.client_rules_file = if path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                    }
+                    if let Some(ref relays) = args.anonymized_doh_relays {
+                        cfg.anonymized_doh_relays = relays.clone();
+                    }
+                    if let Some(v) = args.safe_search {
+                        cfg.safe_search = v;
+                    }
+                    if let Some(ref mode) = args.youtube_restricted_mode {
+                        cfg.youtube_restricted_mode = if mode.trim().is_empty() {
+                            None
+                        } else {
+                            Some(mode.clone())
+                        };
+                    }
+                    if let Some(v) = args.local_dot {
+                        cfg.local_dot = v;
+                    }
+                    if let Some(ref addr) = args.local_dot_addr {
+                        cfg.local_dot_addr = addr.clone();
+                    }
+                    if let Some(v) = args.randomize_ecs {
+                        cfg.randomize_ecs = v;
+                    }
+                    if let Some(v) = args.load_system_hosts {
+                        cfg.load_system_hosts = v;
+                    }
+                    if let Some(ref doq) = args.doq_upstream {
+                        cfg.doq_upstream = if doq.trim().is_empty() {
+                            None
+                        } else {
+                            Some(doq.clone())
+                        };
+                    }
                     cfg.verbose = args.verbose;
 
                     let path = Config::default_config_path();
@@ -259,6 +372,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(Commands::Resolvers(resolvers_args)) => {
             handle_resolvers_command(resolvers_args.command).await
         }
+        // probe and rank upstream resolvers by latency
+        Some(Commands::Benchmark(b_args)) => {
+            let cfg = Config::load_or_default();
+            let opts = dns::BenchmarkOptions {
+                domain: b_args.domain,
+                count: b_args.count,
+                timeout_secs: b_args.timeout,
+                concurrency: b_args.concurrency,
+                top: b_args.top,
+                protocol_filter: b_args.protocol,
+            };
+            let _ = dns::run_benchmark(&cfg, &opts).await?;
+            Ok(())
+        }
+        // download, parse, and compile domain blocklists from public feeds
+        Some(Commands::Blocklist(b_args)) => handle_blocklist_command(b_args).await,
         // start packet fragmentation and desync engine
         Some(Commands::Run(args)) => run_engine(args).await,
         None => run_engine(cli.run_args).await,
@@ -393,6 +522,108 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     }
     cfg.fake_seq_offset = args.fake_seq_offset;
     cfg.dns_racing = args.dns_racing;
+    if args.cache_min_ttl != 60 {
+        cfg.cache_min_ttl = args.cache_min_ttl;
+    }
+    if args.cache_max_ttl != 86400 {
+        cfg.cache_max_ttl = args.cache_max_ttl;
+    }
+    if let Some(ref path) = args.blocked_ips_file {
+        cfg.blocked_ips_file = Some(path.clone());
+    }
+    if let Some(ref path) = args.allowed_ips_file {
+        cfg.allowed_ips_file = Some(path.clone());
+    }
+    if let Some(ref ips) = args.allowed_ips {
+        cfg.allowed_ips = ips.clone();
+    }
+    if let Some(ref path) = args.blocked_names_log {
+        cfg.blocked_names_log_path = Some(path.clone());
+    }
+    if let Some(ref path) = args.blocked_ips_log {
+        cfg.blocked_ips_log_path = Some(path.clone());
+    }
+    if let Some(ref path) = args.allowed_names_log {
+        cfg.allowed_names_log_path = Some(path.clone());
+    }
+    if let Some(ref path) = args.allowed_ips_log {
+        cfg.allowed_ips_log_path = Some(path.clone());
+    }
+    if args.force_tcp {
+        cfg.force_tcp = true;
+    }
+    if let Some(ref path) = args.captive_map_file {
+        cfg.captive_portals_map_file = Some(path.clone());
+    }
+    if let Some(ref dot) = args.dot_upstream {
+        cfg.dot_upstream = Some(dot.clone());
+    }
+    if let Some(ref path) = args.client_rules_file {
+        cfg.client_rules_file = Some(path.clone());
+    }
+    if let Some(ref relays) = args.anonymized_doh_relays {
+        cfg.anonymized_doh_relays = relays.clone();
+    }
+    if let Some(v) = args.safe_search {
+        cfg.safe_search = v;
+    }
+    if let Some(ref mode) = args.youtube_restricted_mode {
+        cfg.youtube_restricted_mode = Some(mode.clone());
+    }
+    if let Some(v) = args.local_dot {
+        cfg.local_dot = v;
+    }
+    if let Some(ref addr) = args.local_dot_addr {
+        cfg.local_dot_addr = addr.clone();
+    }
+    if let Some(v) = args.randomize_ecs {
+        cfg.randomize_ecs = v;
+    }
+    if let Some(v) = args.load_system_hosts {
+        cfg.load_system_hosts = v;
+    }
+    if let Some(ref doq) = args.doq_upstream {
+        cfg.doq_upstream = Some(doq.clone());
+    }
+    if let Some(ref p) = args.pidfile {
+        cfg.pid_file = Some(p.clone());
+    }
+    cfg.cloak_ttl = args.cloak_ttl;
+    cfg.reject_ttl = args.reject_ttl;
+    if let Some(ref fb) = args.fragments_blocked {
+        cfg.fragments_blocked = fb.clone();
+    }
+    if let Some(ref path) = args.cloaking_rules_path {
+        cfg.cloaking_rules_path = Some(path.clone());
+    }
+    if let Some(lvl) = args.web_ui_privacy_level {
+        cfg.web_ui_privacy_level = lvl;
+    }
+
+    // one-shot latency benchmark check
+    if args.check {
+        let opts = dns::BenchmarkOptions::default();
+        let _ = dns::run_benchmark(&cfg, &opts).await?;
+        return Ok(());
+    }
+
+    // one-shot dns resolution command
+    if let Some(ref domain) = args.resolve {
+        return albus::dns::diagnostics::handle_resolve_command(domain, &cfg).await;
+    }
+
+    // upstream security and cryptographic certificate inspection command
+    if args.show_certs {
+        return albus::dns::diagnostics::handle_show_certs_command(&cfg).await;
+    }
+
+    // audit binary and config permissions for security (dnscrypt-proxy permcheck parity)
+    if let Ok(exe_path) = std::env::current_exe() {
+        albus::dns::system::warn_if_maybe_writable_by_other_users(&exe_path);
+    }
+    if let Some(ref cfg_path) = args.config {
+        albus::dns::system::warn_if_maybe_writable_by_other_users(cfg_path);
+    }
 
     if is_root() {
         let _ = cfg.save_to_file("/etc/albus/config.json");
@@ -406,6 +637,115 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;
     engine.run().await
+}
+
+async fn handle_resolvers_list_custom(
+    cfg: &Config,
+    filter: bool,
+    include_relays: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cache_dir = dns::SourceManager::default_cache_dir();
+    let mgr = dns::SourceManager::new();
+
+    let mut sources = cfg.sources.clone();
+    if sources.is_empty() {
+        sources.insert("public-resolvers".to_string(), dns::SourceConfig::default());
+    }
+
+    let filter_opts = albus::dns::sources::ServerFilterOptions {
+        ipv4: cfg.ipv4_servers,
+        ipv6: cfg.ipv6_servers,
+        dnscrypt: !cfg.dnscrypt_servers.is_empty(),
+        doh: cfg.doh_servers,
+        odoh: cfg.odoh_servers,
+        require_dnssec: cfg.require_dnssec,
+        require_nolog: cfg.require_nolog,
+        require_nofilter: cfg.require_nofilter,
+        disabled_server_names: cfg.disabled_server_names.clone(),
+    };
+
+    let mut all_entries = Vec::new();
+
+    for (src_name, src_cfg) in &sources {
+        match mgr.fetch_or_load_cached(src_cfg, &cache_dir).await {
+            Ok(entries) => {
+                for entry in entries {
+                    if filter && !filter_opts.matches(&entry) {
+                        continue;
+                    }
+                    if !include_relays {
+                        if let Some(ref stamp) = entry.primary_stamp {
+                            if matches!(
+                                stamp.protocol,
+                                dns::StampProtocol::ODoHRelay | dns::StampProtocol::DNSCryptRelay
+                            ) {
+                                continue;
+                            }
+                        }
+                    }
+                    all_entries.push(entry);
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to load resolver source {}: {}", src_name, e);
+            }
+        }
+    }
+
+    let mut stdout = std::io::stdout();
+    if json_output {
+        let json = serde_json::to_string_pretty(&all_entries)?;
+        let _ = writeln!(stdout, "{}", json);
+        return Ok(());
+    }
+
+    if writeln!(
+        stdout,
+        "{:<32} {:<12} {:<24} DESCRIPTION\n{}",
+        "NAME", "PROTO", "ADDRESS", "-".repeat(95)
+    ).is_err() {
+        return Ok(());
+    }
+
+    for entry in &all_entries {
+        let (proto, addr) = if let Some(ref stamp) = entry.primary_stamp {
+            let p = match stamp.protocol {
+                dns::StampProtocol::PlainDns => "DNS",
+                dns::StampProtocol::CryptDns => "DNSCrypt",
+                dns::StampProtocol::DoH => "DoH",
+                dns::StampProtocol::DoT => "DoT",
+                dns::StampProtocol::DoQ => "DoQ",
+                dns::StampProtocol::ODoHRelay => "ODoH-Relay",
+                dns::StampProtocol::ODoHTarget => "ODoH-Target",
+                dns::StampProtocol::DNSCryptRelay => "DNSCrypt-Relay",
+                dns::StampProtocol::Unknown(_) => "Unknown",
+            };
+            let a = stamp
+                .server_addr
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| stamp.provider_name.clone());
+            (p, a)
+        } else {
+            ("Unknown", "-".to_string())
+        };
+        let clean_desc: String = entry
+            .description
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let desc = if clean_desc.chars().count() > 30 {
+            let truncated: String = clean_desc.chars().take(27).collect();
+            format!("{}...", truncated)
+        } else {
+            clean_desc
+        };
+        if writeln!(stdout, "{:<32} {:<12} {:<24} {}", entry.name, proto, addr, desc).is_err() {
+            return Ok(());
+        }
+    }
+    let _ = writeln!(stdout, "{}\nTotal verified resolvers: {}", "-".repeat(95), all_entries.len());
+    Ok(())
 }
 
 async fn handle_resolvers_command(
@@ -422,58 +762,7 @@ async fn handle_resolvers_command(
 
     match command.unwrap_or(albus::app::cli::ResolversCommands::List) {
         albus::app::cli::ResolversCommands::List => {
-            println!(
-                "{:<32} {:<12} {:<24} DESCRIPTION",
-                "NAME", "PROTO", "ADDRESS"
-            );
-            println!("{}", "-".repeat(95));
-            let mut total = 0;
-            for (src_name, src_cfg) in &sources {
-                match mgr.fetch_or_load_cached(src_cfg, &cache_dir).await {
-                    Ok(entries) => {
-                        total += entries.len();
-                        for entry in entries {
-                            let (proto, addr) = if let Some(ref stamp) = entry.primary_stamp {
-                                let p = match stamp.protocol {
-                                    dns::StampProtocol::PlainDns => "DNS",
-                                    dns::StampProtocol::CryptDns => "DNSCrypt",
-                                    dns::StampProtocol::DoH => "DoH",
-                                    dns::StampProtocol::DoT => "DoT",
-                                    dns::StampProtocol::DoQ => "DoQ",
-                                    dns::StampProtocol::ODoHRelay => "ODoH-Relay",
-                                    dns::StampProtocol::ODoHTarget => "ODoH-Target",
-                                    dns::StampProtocol::DNSCryptRelay => "DNSCrypt-Relay",
-                                    dns::StampProtocol::Unknown(_) => "Unknown",
-                                };
-                                let a = stamp
-                                    .server_addr
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| stamp.provider_name.clone());
-                                (p, a)
-                            } else {
-                                ("Unknown", "-".to_string())
-                            };
-                            let clean_desc: String = entry
-                                .description
-                                .chars()
-                                .filter(|c| !c.is_control())
-                                .collect();
-                            let desc = if clean_desc.chars().count() > 30 {
-                                let truncated: String = clean_desc.chars().take(27).collect();
-                                format!("{}...", truncated)
-                            } else {
-                                clean_desc
-                            };
-                            println!("{:<32} {:<12} {:<24} {}", entry.name, proto, addr, desc);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("failed to load resolver source {}: {}", src_name, e);
-                    }
-                }
-            }
-            println!("{}", "-".repeat(95));
-            println!("Total verified resolvers: {}", total);
+            handle_resolvers_list_custom(&cfg, false, true, false).await?
         }
         albus::app::cli::ResolversCommands::Update => {
             println!("updating remote resolver lists with cryptographic minisign verification...");
@@ -530,5 +819,44 @@ async fn handle_resolvers_command(
             }
         }
     }
+    Ok(())
+}
+
+async fn handle_blocklist_command(
+    args: albus::app::cli::BlocklistArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut sources = args.sources;
+    if let Some(ref cfg_path) = args.config {
+        if let Ok(content) = std::fs::read_to_string(cfg_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    sources.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if sources.is_empty() {
+        sources.extend(
+            albus::dns::blocklist_generator::DEFAULT_FEED_URLS
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+
+    println!("Compiling domain blocklist from {} sources...", sources.len());
+    let count = albus::dns::compile_blocklist(
+        &sources,
+        args.allowlist.as_deref(),
+        args.time_restricted.as_deref(),
+        args.local_additions.as_deref(),
+        &args.output,
+    )
+    .await?;
+
+    println!(
+        "Successfully compiled {} blocked domains into {}",
+        count, args.output
+    );
     Ok(())
 }

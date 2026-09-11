@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -208,9 +208,158 @@ pub fn lookup_user_ids(_user_name: &str) -> std::result::Result<(u32, u32), Stri
     Err("user lookup is not supported on non-unix platforms".to_string())
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct SystemdSockets {
+    pub udp: Vec<std::net::UdpSocket>,
+    pub tcp: Vec<std::net::TcpListener>,
+}
+
 #[cfg(not(unix))]
-pub fn drop_privileges(_user_name: &str) -> std::result::Result<(), String> {
-    Err("dropping privileges is not supported on non-unix platforms".to_string())
+#[derive(Debug)]
+pub struct SystemdSockets {
+    pub udp: Vec<()>,
+    pub tcp: Vec<()>,
+}
+
+/// Detects systemd socket activation via LISTEN_PID and LISTEN_FDS environment variables.
+#[cfg(unix)]
+pub fn get_systemd_sockets() -> Option<SystemdSockets> {
+    use std::os::unix::io::FromRawFd;
+
+    let pid_str = std::env::var("LISTEN_PID").ok()?;
+    let pid: u32 = pid_str.parse().ok()?;
+    if pid != std::process::id() {
+        return None;
+    }
+
+    let fds_str = std::env::var("LISTEN_FDS").ok()?;
+    let count: usize = fds_str.parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+
+    let mut udp = Vec::new();
+    let mut tcp = Vec::new();
+
+    const SD_LISTEN_FDS_START: i32 = 3;
+    for i in 0..count {
+        let fd = SD_LISTEN_FDS_START + i as i32;
+        let mut sock_type: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut sock_type as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+
+        if ret == 0 {
+            if sock_type == libc::SOCK_DGRAM {
+                let sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+                let _ = sock.set_nonblocking(true);
+                udp.push(sock);
+            } else if sock_type == libc::SOCK_STREAM {
+                let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+                let _ = listener.set_nonblocking(true);
+                tcp.push(listener);
+            }
+        }
+    }
+
+    if udp.is_empty() && tcp.is_empty() {
+        None
+    } else {
+        tracing::info!(
+            udp_count = udp.len(),
+            tcp_count = tcp.len(),
+            "Inherited systemd activated sockets"
+        );
+        Some(SystemdSockets { udp, tcp })
+    }
+}
+
+#[cfg(not(unix))]
+pub fn get_systemd_sockets() -> Option<SystemdSockets> {
+    None
+}
+
+/// RAII Guard that creates a PID file storing the current process ID on creation,
+/// and automatically removes the PID file when dropped or upon process termination.
+#[derive(Debug)]
+pub struct PidFileGuard {
+    path: PathBuf,
+}
+
+impl PidFileGuard {
+    /// Creates a PID file at the specified path with the current process ID.
+    /// Creates intermediate directories if they do not exist.
+    pub fn create<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let pid = std::process::id();
+        fs::write(&path, format!("{}\n", pid))?;
+        tracing::info!(path = %path.display(), pid = pid, "created PID file");
+        Ok(Self { path })
+    }
+
+    /// Returns the path to the managed PID file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            if let Err(e) = fs::remove_file(&self.path) {
+                tracing::warn!(path = %self.path.display(), error = %e, "failed to remove PID file");
+            } else {
+                tracing::info!(path = %self.path.display(), "removed PID file");
+            }
+        }
+    }
+}
+
+/// Audits file and directory permissions along the path.
+/// Emits a warning if any non-sticky directory or file is writable by other unprivileged users.
+pub fn warn_if_maybe_writable_by_other_users<P: AsRef<Path>>(path: P) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut curr = path.as_ref();
+        while let Some(parent) = curr.parent() {
+            if curr.as_os_str().is_empty() || curr == Path::new("/") {
+                break;
+            }
+            if let Ok(meta) = fs::metadata(curr) {
+                let mode = meta.permissions().mode();
+                // Check if group or other has write permission (0o022 or 0o002)
+                if (mode & 0o002) != 0 {
+                    let is_sticky_dir = meta.is_dir() && (mode & 0o1000) != 0;
+                    if !is_sticky_dir {
+                        tracing::warn!(
+                            path = %curr.display(),
+                            "path is writable by other system users; it is recommended to restrict file permissions"
+                        );
+                        break;
+                    }
+                }
+            }
+            curr = parent;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +459,40 @@ mod tests {
             let invalid_lookup = lookup_user_ids("__albus_non_existent_user_999__");
             assert!(invalid_lookup.is_err());
         }
+    }
+
+    #[test]
+    fn test_systemd_socket_activation_none_by_default() {
+        // Without LISTEN_PID and LISTEN_FDS set, should safely return None
+        let sockets = get_systemd_sockets();
+        assert!(sockets.is_none());
+    }
+
+    #[test]
+    fn test_pid_file_guard_lifecycle() {
+        let temp_dir = std::env::temp_dir();
+        let pid_path = temp_dir.join(format!("albus_test_pid_{}.pid", std::process::id()));
+
+        {
+            let guard = PidFileGuard::create(&pid_path).expect("PID file creation should succeed");
+            assert!(pid_path.exists(), "PID file must exist while guard is active");
+            let content = fs::read_to_string(&pid_path).expect("PID file must be readable");
+            let parsed_pid: u32 = content.trim().parse().expect("PID content must be numeric");
+            assert_eq!(parsed_pid, std::process::id());
+            assert_eq!(guard.path(), pid_path.as_path());
+        }
+
+        // After guard is dropped, PID file must be automatically removed
+        assert!(!pid_path.exists(), "PID file must be cleaned up on guard drop");
+    }
+
+    #[test]
+    fn test_warn_if_maybe_writable_by_other_users() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!("albus_perm_test_{}.tmp", std::process::id()));
+        let _ = fs::write(&test_file, b"test");
+        // Running function should not panic or error
+        warn_if_maybe_writable_by_other_users(&test_file);
+        let _ = fs::remove_file(&test_file);
     }
 }

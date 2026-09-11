@@ -52,6 +52,118 @@ pub fn parse_web_ui_addr(input: &str) -> SocketAddr {
     "127.0.0.1:205".parse().unwrap()
 }
 
+/// Anonymizes client IP addresses and domain names in log lines according to privacy level.
+/// Privacy levels (inspired by dnscrypt-proxy):
+/// - 0: No anonymization. Log lines returned verbatim.
+/// - 1: Client IP addresses are anonymized (e.g., IPv4 /24 masked: `192.168.1.42` -> `192.168.1.0`, IPv6 /48 masked).
+/// - 2: Both client IP addresses and domain names are masked (e.g. `example.com` -> `***.com`, `sub.example.com` -> `***.example.com`).
+/// - 3+: Full privacy (all client IPs, domains, and sensitive query tokens masked).
+pub fn anonymize_log_line(line: &str, privacy_level: u8) -> String {
+    if privacy_level == 0 {
+        return line.to_string();
+    }
+
+    let anonymize_token = |token: &str| -> String {
+        if let Ok(ip) = token.parse::<std::net::Ipv4Addr>() {
+            let oct = ip.octets();
+            return format!("{}.{}.{}.0", oct[0], oct[1], oct[2]);
+        }
+        if let Ok(sock) = token.parse::<std::net::SocketAddrV4>() {
+            let oct = sock.ip().octets();
+            return format!("{}.{}.{}.0:{}", oct[0], oct[1], oct[2], sock.port());
+        }
+        if let Ok(ip6) = token.parse::<std::net::Ipv6Addr>() {
+            let seg = ip6.segments();
+            return format!("{:x}:{:x}:{:x}::0", seg[0], seg[1], seg[2]);
+        }
+        if let Ok(sock6) = token.parse::<std::net::SocketAddrV6>() {
+            let seg = sock6.ip().segments();
+            return format!("[{:x}:{:x}:{:x}::0]:{}", seg[0], seg[1], seg[2], sock6.port());
+        }
+
+        if privacy_level >= 2 {
+            let clean = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
+            if clean.contains('.')
+                && !clean.starts_with('.')
+                && !clean.ends_with('.')
+                && !clean.chars().next().map_or(false, |c| c.is_ascii_digit())
+                && clean.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+            {
+                let parts: Vec<&str> = clean.split('.').collect();
+                if parts.len() >= 2 {
+                    if privacy_level >= 3 {
+                        return token.replace(clean, "[REDACTED_DOMAIN]");
+                    }
+                    let tld = parts[parts.len() - 1];
+                    let sld = parts[parts.len() - 2];
+                    let masked_domain = if parts.len() == 2 {
+                        format!("***.{}", tld)
+                    } else {
+                        format!("***.{}.{}", sld, tld)
+                    };
+                    return token.replace(clean, &masked_domain);
+                }
+            }
+        }
+
+        token.to_string()
+    };
+
+    if line.contains('\t') {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let mut new_cols = Vec::with_capacity(cols.len());
+        for (idx, col) in cols.iter().enumerate() {
+            if idx == 1 {
+                new_cols.push(anonymize_token(col));
+            } else if idx == 2 && privacy_level >= 2 {
+                new_cols.push(anonymize_token(col));
+            } else {
+                new_cols.push(col.to_string());
+            }
+        }
+        return new_cols.join("\t");
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut current_word = String::new();
+
+    let flush_word = |word: &str, target: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        if let Some((k, v)) = word.split_once('=') {
+            if k == "client" || k == "client_ip" || k == "ip" || k == "addr" {
+                target.push_str(k);
+                target.push('=');
+                target.push_str(&anonymize_token(v));
+            } else if (k == "domain" || k == "qname" || k == "host") && privacy_level >= 2 {
+                target.push_str(k);
+                target.push('=');
+                target.push_str(&anonymize_token(v));
+            } else {
+                target.push_str(k);
+                target.push('=');
+                target.push_str(&anonymize_token(v));
+            }
+        } else {
+            target.push_str(&anonymize_token(word));
+        }
+    };
+
+    for c in line.chars() {
+        if c.is_whitespace() || c == ',' || c == ';' || c == '"' || c == '\'' {
+            flush_word(&current_word, &mut out);
+            current_word.clear();
+            out.push(c);
+        } else {
+            current_word.push(c);
+        }
+    }
+    flush_word(&current_word, &mut out);
+
+    out
+}
+
 pub struct WebUiServer;
 
 const MAX_CONCURRENT_WEB_CONNS: usize = 32;
@@ -404,17 +516,23 @@ impl WebUiServer {
                                         }
                                     }
                                     ("GET", "/api/logs") => {
+                                        let cfg = Config::load_or_default();
+                                        let limit = cfg.web_ui_max_query_log_entries.clamp(10, 1000);
+                                        let limit_str = limit.to_string();
                                         let log_cmd = tokio::time::timeout(
                                             Duration::from_millis(1500),
                                             tokio::process::Command::new("journalctl")
-                                                .args(["-u", "albus.service", "-n", "100", "--no-pager"])
+                                                .args(["-u", "albus.service", "-n", &limit_str, "--no-pager"])
                                                 .output(),
                                         )
                                         .await;
                                         let logs: Vec<String> = match log_cmd {
                                             Ok(Ok(output)) if output.status.success() => {
                                                 let s = String::from_utf8_lossy(&output.stdout);
-                                                s.lines().filter(|l| !l.trim().is_empty()).map(|l| l.to_string()).collect()
+                                                s.lines()
+                                                    .filter(|l| !l.trim().is_empty())
+                                                    .map(|l| anonymize_log_line(l, cfg.web_ui_privacy_level))
+                                                    .collect()
                                             }
                                             _ => Vec::new(),
                                         };
@@ -1754,9 +1872,60 @@ body {
             <label class="form-label" for="cfg_socks5_proxy">SOCKS5 Proxy Endpoint</label>
             <input type="text" class="form-input" id="cfg_socks5_proxy" placeholder="127.0.0.1:9050" onchange="debounceSave()">
           </div>
+
+          <div class="form-field">
+            <label class="form-label" for="cfg_cert_refresh_delay">Cert Refresh Delay (Minutes)</label>
+            <input type="number" class="form-input" id="cfg_cert_refresh_delay" min="1" max="1440" value="240" onchange="debounceSave()">
+          </div>
         </div>
 
         <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--t-border-subtle);">
+          <div class="settings-grid" style="margin-bottom: 16px;">
+            <div class="setting-tile">
+              <div class="tile-text">
+                <span class="tile-title">Offline Mode</span>
+                <span class="tile-desc">Disables all upstream network queries; resolves solely via local cloak rules and cache</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg_offline_mode" onchange="debounceSave()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-tile">
+              <div class="tile-text">
+                <span class="tile-title">Ignore System DNS</span>
+                <span class="tile-desc">Bypass system resolver (/etc/resolv.conf) during DoH bootstrap to eliminate leaks</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg_ignore_system_dns" onchange="debounceSave()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-tile">
+              <div class="tile-text">
+                <span class="tile-title">UDP Connection Pooling</span>
+                <span class="tile-desc">Maintain persistent connected UDP socket pool to upstream relays and resolvers</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg_udp_pool" onchange="debounceSave()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-tile">
+              <div class="tile-text">
+                <span class="tile-title">Ignore Cert Timestamp</span>
+                <span class="tile-desc">Ignore DNSCrypt certificate expiration dates if system real-time clock is uncalibrated</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg_cert_ignore_timestamp" onchange="debounceSave()">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
           <div class="setting-tile" style="margin-bottom: 12px;">
             <div class="tile-text">
               <span class="tile-title">Local DoH HTTPS / TLS Termination</span>
@@ -1935,6 +2104,28 @@ body {
               <span class="slider"></span>
             </label>
           </div>
+
+          <div class="setting-tile">
+            <div class="tile-text">
+              <span class="tile-title">Disable TLS Session Tickets</span>
+              <span class="tile-desc">Mitigate cross-session TLS session resumption tracking and fingerprinting</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="cfg_tls_disable_session_tickets" onchange="debounceSave()">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-tile">
+            <div class="tile-text">
+              <span class="tile-title">Synthesize Cloaked Reverse PTR</span>
+              <span class="tile-desc">Automatically return synthetic in-addr.arpa and ip6.arpa PTR responses for cloaked hosts</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="cfg_cloaked_ptr" onchange="debounceSave()">
+              <span class="slider"></span>
+            </label>
+          </div>
         </div>
       </div>
     </div>
@@ -2046,6 +2237,26 @@ body {
           </div>
 
           <div class="form-field">
+            <label class="form-label" for="cfg_cloaking_rules_path">Cloaking &amp; CNAME Rules File Path</label>
+            <input type="text" class="form-input" id="cfg_cloaking_rules_path" value="/etc/albus/cloaking-rules.txt" onchange="debounceSave()">
+          </div>
+
+          <div class="form-field">
+            <label class="form-label" for="cfg_web_ui_privacy_level">Web UI Privacy Level</label>
+            <select class="form-select" id="cfg_web_ui_privacy_level" onchange="debounceSave()">
+              <option value="0">Level 0: No Anonymization (Full Logs)</option>
+              <option value="1">Level 1: Anonymize Client IPs (Default)</option>
+              <option value="2">Level 2: Mask Domain Names &amp; Client IPs</option>
+              <option value="3">Level 3: Full Privacy (Mask Query Details)</option>
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label class="form-label" for="cfg_web_ui_max_query_log_entries">Max Web UI Log Entries</label>
+            <input type="number" class="form-input" id="cfg_web_ui_max_query_log_entries" min="10" max="1000" value="100" onchange="debounceSave()">
+          </div>
+
+          <div class="form-field">
             <label class="form-label" for="cfg_edns_client_subnet">EDNS Client Subnet (ECS) Override</label>
             <input type="text" class="form-input" id="cfg_edns_client_subnet" placeholder="e.g. 198.51.100.0/24" onchange="debounceSave()">
           </div>
@@ -2063,6 +2274,20 @@ body {
           <div class="form-field">
             <label class="form-label" for="cfg_fragments_blocked">Fragment Blocked Resolvers (Clamp EDNS 1252B)</label>
             <input type="text" class="form-input" id="cfg_fragments_blocked" placeholder="cisco, cleanbrowsing-adult" onchange="debounceSave()">
+          </div>
+
+          <div class="form-field">
+            <label class="form-label" for="cfg_blocked_query_response">Blocked Query Response Format</label>
+            <select class="form-select" id="cfg_blocked_query_response" onchange="debounceSave()">
+              <option value="hinfo">HINFO (RFC 8482 synthetic, Android 8+ compatible)</option>
+              <option value="refused">REFUSED (RCODE 5)</option>
+              <option value="a:0.0.0.0,aaaa:::">Sinkhole (0.0.0.0 / ::)</option>
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label class="form-label" for="cfg_ignored_qtypes">Ignored Query Types for Logging</label>
+            <input type="text" class="form-input" id="cfg_ignored_qtypes" placeholder="DNSKEY, NS, HTTPS" onchange="debounceSave()">
           </div>
         </div>
       </div>
@@ -2276,6 +2501,9 @@ async function loadConfig() {
     document.getElementById('cfg_socks5_proxy').value = currentConfig.socks5_proxy || '';
     document.getElementById('cfg_local_doh_addr').value = currentConfig.local_doh_addr || '127.0.0.1:8053';
     document.getElementById('cfg_forwarding_rules_path').value = currentConfig.forwarding_rules_path || '/etc/albus/forwarding-rules.txt';
+    document.getElementById('cfg_cloaking_rules_path').value = currentConfig.cloaking_rules_path || '/etc/albus/cloaking-rules.txt';
+    document.getElementById('cfg_web_ui_privacy_level').value = currentConfig.web_ui_privacy_level !== undefined ? currentConfig.web_ui_privacy_level : 1;
+    document.getElementById('cfg_web_ui_max_query_log_entries').value = currentConfig.web_ui_max_query_log_entries || 100;
     document.getElementById('cfg_edns_client_subnet').value = currentConfig.edns_client_subnet || '';
     document.getElementById('cfg_tls_key_log_file').value = currentConfig.tls_key_log_file || '';
     document.getElementById('cfg_ipcrypt_key').value = currentConfig.ipcrypt_key || '';
@@ -2288,6 +2516,9 @@ async function loadConfig() {
     document.getElementById('cfg_local_doh_cert_file').value = currentConfig.local_doh_cert_file || '';
     document.getElementById('cfg_local_doh_key_file').value = currentConfig.local_doh_key_file || '';
     document.getElementById('cfg_fragments_blocked').value = (currentConfig.fragments_blocked || []).join(', ');
+    document.getElementById('cfg_cert_refresh_delay').value = currentConfig.cert_refresh_delay !== undefined ? currentConfig.cert_refresh_delay : 240;
+    document.getElementById('cfg_blocked_query_response').value = currentConfig.blocked_query_response || 'hinfo';
+    document.getElementById('cfg_ignored_qtypes').value = (currentConfig.ignored_qtypes || []).join(', ');
 
     const boolKeys = [
       'dns_racing', 'auto_ttl', 'fake_bad_checksum', 'tor',
@@ -2296,7 +2527,9 @@ async function loadConfig() {
       'blocklist', 'uncloak_cnames', 'edns_padding', 'dns64',
       'http3', 'block_ipv6', 'netmon', 'block_undelegated',
       'query_log', 'dnscrypt_ephemeral_keys',
-      'local_doh_tls', 'direct_cert_fallback', 'skip_incompatible', 'lb_estimator'
+      'local_doh_tls', 'direct_cert_fallback', 'skip_incompatible', 'lb_estimator',
+      'offline_mode', 'ignore_system_dns', 'cloaked_ptr', 'tls_disable_session_tickets',
+      'cert_ignore_timestamp', 'udp_pool'
     ];
     boolKeys.forEach(k => {
       const el = document.getElementById('cfg_' + k);
@@ -2346,6 +2579,9 @@ async function saveConfig() {
   currentConfig.socks5_proxy = document.getElementById('cfg_socks5_proxy').value.trim() || null;
   currentConfig.local_doh_addr = document.getElementById('cfg_local_doh_addr').value.trim() || '127.0.0.1:8053';
   currentConfig.forwarding_rules_path = document.getElementById('cfg_forwarding_rules_path').value.trim() || null;
+  currentConfig.cloaking_rules_path = document.getElementById('cfg_cloaking_rules_path').value.trim() || null;
+  currentConfig.web_ui_privacy_level = parseInt(document.getElementById('cfg_web_ui_privacy_level').value) || 0;
+  currentConfig.web_ui_max_query_log_entries = parseInt(document.getElementById('cfg_web_ui_max_query_log_entries').value) || 100;
   currentConfig.edns_client_subnet = document.getElementById('cfg_edns_client_subnet').value.trim() || null;
   currentConfig.tls_key_log_file = document.getElementById('cfg_tls_key_log_file').value.trim() || null;
   currentConfig.ipcrypt_key = document.getElementById('cfg_ipcrypt_key').value.trim() || null;
@@ -2365,6 +2601,11 @@ async function saveConfig() {
   const fragStr = document.getElementById('cfg_fragments_blocked').value.trim();
   currentConfig.fragments_blocked = fragStr ? fragStr.split(',').map(s => s.trim()).filter(Boolean) : [];
 
+  currentConfig.cert_refresh_delay = parseInt(document.getElementById('cfg_cert_refresh_delay').value) || 240;
+  currentConfig.blocked_query_response = document.getElementById('cfg_blocked_query_response').value || 'hinfo';
+  const ignQtypesStr = document.getElementById('cfg_ignored_qtypes').value.trim();
+  currentConfig.ignored_qtypes = ignQtypesStr ? ignQtypesStr.split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : [];
+
   const boolKeys = [
     'dns_racing', 'auto_ttl', 'fake_bad_checksum', 'tor',
     'pqc', 'dnssec', 'anti_dns_rebinding', 'block_bogons',
@@ -2372,7 +2613,9 @@ async function saveConfig() {
     'blocklist', 'uncloak_cnames', 'edns_padding', 'dns64',
     'http3', 'block_ipv6', 'netmon', 'block_undelegated',
     'query_log', 'dnscrypt_ephemeral_keys',
-    'local_doh_tls', 'direct_cert_fallback', 'skip_incompatible', 'lb_estimator'
+    'local_doh_tls', 'direct_cert_fallback', 'skip_incompatible', 'lb_estimator',
+    'offline_mode', 'ignore_system_dns', 'cloaked_ptr', 'tls_disable_session_tickets',
+    'cert_ignore_timestamp', 'udp_pool'
   ];
   boolKeys.forEach(k => {
     const el = document.getElementById('cfg_' + k);
@@ -2689,6 +2932,40 @@ mod tests {
         assert!(html.contains("cfg_netprobe_timeout"));
         assert!(html.contains("cfg_local_doh_tls"));
         assert!(html.contains("cfg_fragments_blocked"));
+        assert!(html.contains("cfg_cloaking_rules_path"));
+        assert!(html.contains("cfg_web_ui_privacy_level"));
+    }
+
+    #[test]
+    fn test_anonymize_log_line() {
+        let sample_tsv = "1700000000\t192.168.1.55\tads.tracker.com\t1\tPASS\t2ms\t-";
+        // Level 0: verbatim
+        assert_eq!(anonymize_log_line(sample_tsv, 0), sample_tsv);
+
+        // Level 1: client IP anonymized to /24
+        let l1 = anonymize_log_line(sample_tsv, 1);
+        assert!(l1.contains("192.168.1.0"));
+        assert!(l1.contains("ads.tracker.com"));
+
+        // Level 2: IP anonymized + domain masked
+        let l2 = anonymize_log_line(sample_tsv, 2);
+        assert!(l2.contains("192.168.1.0"));
+        assert!(l2.contains("***.tracker.com"));
+
+        // Level 3: domain redacted
+        let l3 = anonymize_log_line(sample_tsv, 3);
+        assert!(l3.contains("192.168.1.0"));
+        assert!(l3.contains("[REDACTED_DOMAIN]"));
+
+        // Systemd log style
+        let sys_line = "DNS query client=10.20.30.40 domain=evil.sub.badsite.org status=PASS";
+        let sys_l1 = anonymize_log_line(sys_line, 1);
+        assert!(sys_l1.contains("10.20.30.0"));
+        assert!(sys_l1.contains("evil.sub.badsite.org"));
+
+        let sys_l2 = anonymize_log_line(sys_line, 2);
+        assert!(sys_l2.contains("10.20.30.0"));
+        assert!(sys_l2.contains("***.badsite.org"));
     }
 
     #[test]

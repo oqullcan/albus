@@ -17,6 +17,9 @@ use super::ipcrypt::IpCrypt;
 pub enum QueryStatus {
     Pass,
     BlockHagezi,
+    BlockedName,
+    AllowedName,
+    AllowedIp,
     UncloakedCname,
     RebindRefused,
     BogonDrop,
@@ -27,6 +30,7 @@ pub enum QueryStatus {
     Undelegated,
     NxDomain,
     PqcDowngradeDrop,
+    Refused,
 }
 
 impl QueryStatus {
@@ -34,6 +38,9 @@ impl QueryStatus {
         match self {
             Self::Pass => "PASS",
             Self::BlockHagezi => "BLOCK_HAGEZI",
+            Self::BlockedName => "BLOCKED_NAME",
+            Self::AllowedName => "ALLOWED_NAME",
+            Self::AllowedIp => "ALLOWED_IP",
             Self::UncloakedCname => "UNCLOAKED_CNAME",
             Self::RebindRefused => "REBIND_REFUSED",
             Self::BogonDrop => "BOGON_DROP",
@@ -44,6 +51,7 @@ impl QueryStatus {
             Self::Undelegated => "UNDELEGATED",
             Self::NxDomain => "NXDOMAIN",
             Self::PqcDowngradeDrop => "PQC_DOWNGRADE_DROP",
+            Self::Refused => "REFUSED",
         }
     }
 }
@@ -240,6 +248,26 @@ impl LogFileState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LoggerOptions {
+    pub main_path: Option<PathBuf>,
+    pub nx_path: Option<PathBuf>,
+    pub blocked_names_path: Option<PathBuf>,
+    pub blocked_ips_path: Option<PathBuf>,
+    pub allowed_names_path: Option<PathBuf>,
+    pub allowed_ips_path: Option<PathBuf>,
+    pub main_format: LogFormat,
+    pub nx_format: LogFormat,
+    pub blocked_names_format: LogFormat,
+    pub blocked_ips_format: LogFormat,
+    pub allowed_names_format: LogFormat,
+    pub allowed_ips_format: LogFormat,
+    pub ip_crypt: Option<Arc<IpCrypt>>,
+    pub max_bytes: u64,
+    pub max_backups: usize,
+    pub ignored_qtypes: Vec<String>,
+}
+
 pub struct QueryLogger {
     tx: mpsc::Sender<QueryLogEntry>,
 }
@@ -264,6 +292,25 @@ impl QueryLogger {
         )
     }
 
+pub fn qtype_from_str(s: &str) -> Option<u16> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "A" => Some(1),
+        "NS" => Some(2),
+        "CNAME" => Some(5),
+        "SOA" => Some(6),
+        "PTR" => Some(12),
+        "HINFO" => Some(13),
+        "MX" => Some(15),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        "SRV" => Some(33),
+        "OPT" => Some(41),
+        "DNSKEY" => Some(48),
+        "HTTPS" => Some(65),
+        _ => s.trim().parse::<u16>().ok(),
+    }
+}
+
     pub fn start_with_formats<P1: AsRef<Path>, P2: AsRef<Path>>(
         main_path: Option<P1>,
         nx_path: Option<P2>,
@@ -273,27 +320,91 @@ impl QueryLogger {
         main_format: LogFormat,
         nx_format: LogFormat,
     ) -> Arc<Self> {
+        Self::start_with_options(
+            main_path,
+            nx_path,
+            ip_crypt,
+            max_bytes,
+            max_backups,
+            main_format,
+            nx_format,
+            vec![],
+        )
+    }
+
+    pub fn start_with_options<P1: AsRef<Path>, P2: AsRef<Path>>(
+        main_path: Option<P1>,
+        nx_path: Option<P2>,
+        ip_crypt: Option<Arc<IpCrypt>>,
+        max_bytes: u64,
+        max_backups: usize,
+        main_format: LogFormat,
+        nx_format: LogFormat,
+        ignored_qtypes: Vec<String>,
+    ) -> Arc<Self> {
+        let opts = LoggerOptions {
+            main_path: main_path.map(|p| p.as_ref().to_path_buf()),
+            nx_path: nx_path.map(|p| p.as_ref().to_path_buf()),
+            blocked_names_path: None,
+            blocked_ips_path: None,
+            allowed_names_path: None,
+            allowed_ips_path: None,
+            main_format,
+            nx_format,
+            blocked_names_format: LogFormat::Tsv,
+            blocked_ips_format: LogFormat::Tsv,
+            allowed_names_format: LogFormat::Tsv,
+            allowed_ips_format: LogFormat::Tsv,
+            ip_crypt,
+            max_bytes,
+            max_backups,
+            ignored_qtypes,
+        };
+        Self::start_full(opts)
+    }
+
+    pub fn start_full(opts: LoggerOptions) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<QueryLogEntry>(2048);
-        let main_path_buf = main_path.map(|p| p.as_ref().to_path_buf());
-        let nx_path_buf = nx_path.map(|p| p.as_ref().to_path_buf());
+        let ignored_set: std::collections::HashSet<u16> = opts
+            .ignored_qtypes
+            .iter()
+            .filter_map(|s| Self::qtype_from_str(s))
+            .collect();
 
         tokio::spawn(async move {
-            let mut main_state =
-                main_path_buf.map(|p| LogFileState::new(p, max_bytes, max_backups));
-            let mut nx_state = nx_path_buf.map(|p| LogFileState::new(p, max_bytes, max_backups));
+            let mut main_state = opts
+                .main_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
+            let mut nx_state = opts
+                .nx_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
+            let mut blocked_names_state = opts
+                .blocked_names_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
+            let mut blocked_ips_state = opts
+                .blocked_ips_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
+            let mut allowed_names_state = opts
+                .allowed_names_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
+            let mut allowed_ips_state = opts
+                .allowed_ips_path
+                .map(|p| LogFileState::new(p, opts.max_bytes, opts.max_backups));
 
             while let Some(entry) = rx.recv().await {
+                if ignored_set.contains(&entry.qtype) {
+                    continue;
+                }
                 let client_display = match entry.client_ip {
                     IpAddr::V4(v4) => {
-                        if let Some(ref crypt) = ip_crypt {
+                        if let Some(ref crypt) = opts.ip_crypt {
                             format!("ip:{}", crypt.encrypt(v4))
                         } else {
                             v4.to_string()
                         }
                     }
                     IpAddr::V6(v6) => {
-                        if ip_crypt.is_some() {
-                            // mask host bits of ipv6 for privacy
+                        if opts.ip_crypt.is_some() {
                             let segs = v6.segments();
                             format!(
                                 "{:x}:{:x}:{:x}:{:x}::[masked]",
@@ -315,7 +426,7 @@ impl QueryLogger {
                         &client_display,
                         &safe_domain,
                         &safe_details,
-                        main_format,
+                        opts.main_format,
                     );
                     main.write_line(&line);
                 }
@@ -327,9 +438,64 @@ impl QueryLogger {
                             &client_display,
                             &safe_domain,
                             &safe_details,
-                            nx_format,
+                            opts.nx_format,
                         );
                         nx.write_line(&line);
+                    }
+                }
+
+                if entry.status == QueryStatus::BlockHagezi
+                    || entry.status == QueryStatus::BlockedName
+                    || entry.status == QueryStatus::UncloakedCname
+                {
+                    if let Some(ref mut bn) = blocked_names_state {
+                        let line = format_query_log(
+                            &entry,
+                            &client_display,
+                            &safe_domain,
+                            &safe_details,
+                            opts.blocked_names_format,
+                        );
+                        bn.write_line(&line);
+                    }
+                }
+
+                if entry.status == QueryStatus::BogonDrop {
+                    if let Some(ref mut bi) = blocked_ips_state {
+                        let line = format_query_log(
+                            &entry,
+                            &client_display,
+                            &safe_domain,
+                            &safe_details,
+                            opts.blocked_ips_format,
+                        );
+                        bi.write_line(&line);
+                    }
+                }
+
+                if entry.status == QueryStatus::AllowedName {
+                    if let Some(ref mut an) = allowed_names_state {
+                        let line = format_query_log(
+                            &entry,
+                            &client_display,
+                            &safe_domain,
+                            &safe_details,
+                            opts.allowed_names_format,
+                        );
+                        an.write_line(&line);
+                    }
+                }
+
+                if entry.status == QueryStatus::AllowedIp {
+                    if let Some(ref mut ai) = allowed_ips_state {
+                        let line = format_query_log(
+                            &entry,
+                            &client_display,
+                            &safe_domain,
+                            &safe_details,
+                            opts.allowed_ips_format,
+                        );
+                        ai.write_line(&line);
                     }
                 }
             }
@@ -525,5 +691,81 @@ mod tests {
             nx_ltsv,
             "time:1700000005\thost:10.0.0.5\tmessage:invalid.domain\ttype:28\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dedicated_filter_logs() {
+        let temp_dir = std::env::temp_dir().join(format!("albus_filter_log_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let blocked_names_file = temp_dir.join("blocked_names.log");
+        let blocked_ips_file = temp_dir.join("blocked_ips.log");
+        let allowed_names_file = temp_dir.join("allowed_names.log");
+
+        let opts = LoggerOptions {
+            main_path: None,
+            nx_path: None,
+            blocked_names_path: Some(blocked_names_file.clone()),
+            blocked_ips_path: Some(blocked_ips_file.clone()),
+            allowed_names_path: Some(allowed_names_file.clone()),
+            allowed_ips_path: None,
+            main_format: LogFormat::Tsv,
+            nx_format: LogFormat::Tsv,
+            blocked_names_format: LogFormat::Tsv,
+            blocked_ips_format: LogFormat::Tsv,
+            allowed_names_format: LogFormat::Tsv,
+            allowed_ips_format: LogFormat::Tsv,
+            ip_crypt: None,
+            max_bytes: 1024 * 1024,
+            max_backups: 1,
+            ignored_qtypes: vec![],
+        };
+
+        let logger = QueryLogger::start_full(opts);
+
+        logger.log(QueryLogEntry {
+            timestamp_epoch_secs: 100,
+            client_ip: "127.0.0.1".parse().unwrap(),
+            domain: "ads.tracker.com".to_string(),
+            qtype: 1,
+            status: QueryStatus::BlockedName,
+            duration_ms: 0,
+            details: Some("blocklist".to_string()),
+        });
+
+        logger.log(QueryLogEntry {
+            timestamp_epoch_secs: 101,
+            client_ip: "127.0.0.1".parse().unwrap(),
+            domain: "malware.host".to_string(),
+            qtype: 1,
+            status: QueryStatus::BogonDrop,
+            duration_ms: 10,
+            details: Some("bogon_filter".to_string()),
+        });
+
+        logger.log(QueryLogEntry {
+            timestamp_epoch_secs: 102,
+            client_ip: "127.0.0.1".parse().unwrap(),
+            domain: "trusted.internal".to_string(),
+            qtype: 1,
+            status: QueryStatus::AllowedName,
+            duration_ms: 0,
+            details: Some("allowlist".to_string()),
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        let bn_content = fs::read_to_string(&blocked_names_file).expect("blocked names log must exist");
+        assert!(bn_content.contains("ads.tracker.com"));
+        assert!(!bn_content.contains("malware.host"));
+
+        let bi_content = fs::read_to_string(&blocked_ips_file).expect("blocked ips log must exist");
+        assert!(bi_content.contains("malware.host"));
+        assert!(!bi_content.contains("ads.tracker.com"));
+
+        let an_content = fs::read_to_string(&allowed_names_file).expect("allowed names log must exist");
+        assert!(an_content.contains("trusted.internal"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

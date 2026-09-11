@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, warn};
 
-use super::stamp::DnsStamp;
+use super::stamp::{DnsStamp, StampProtocol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceConfig {
@@ -47,6 +47,89 @@ pub struct RemoteResolverEntry {
     pub description: String,
     pub stamps: Vec<String>,
     pub primary_stamp: Option<DnsStamp>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerFilterOptions {
+    pub ipv4: bool,
+    pub ipv6: bool,
+    pub dnscrypt: bool,
+    pub doh: bool,
+    pub odoh: bool,
+    pub require_dnssec: bool,
+    pub require_nolog: bool,
+    pub require_nofilter: bool,
+    pub disabled_server_names: Vec<String>,
+}
+
+impl Default for ServerFilterOptions {
+    fn default() -> Self {
+        Self {
+            ipv4: true,
+            ipv6: false,
+            dnscrypt: true,
+            doh: true,
+            odoh: false,
+            require_dnssec: false,
+            require_nolog: true,
+            require_nofilter: true,
+            disabled_server_names: Vec::new(),
+        }
+    }
+}
+
+impl ServerFilterOptions {
+    pub fn matches(&self, entry: &RemoteResolverEntry) -> bool {
+        let entry_lower = entry.name.to_ascii_lowercase();
+        for disabled in &self.disabled_server_names {
+            let dis_clean = disabled.trim().to_ascii_lowercase();
+            if !dis_clean.is_empty() && (entry_lower == dis_clean || entry_lower.starts_with(&format!("{}-", dis_clean))) {
+                return false;
+            }
+        }
+
+        if let Some(ref stamp) = entry.primary_stamp {
+            if self.require_dnssec && !stamp.dnssec {
+                return false;
+            }
+            if self.require_nolog && !stamp.no_log {
+                return false;
+            }
+            if self.require_nofilter && !stamp.no_filter {
+                return false;
+            }
+
+            match stamp.protocol {
+                StampProtocol::CryptDns => {
+                    if !self.dnscrypt {
+                        return false;
+                    }
+                }
+                StampProtocol::DoH => {
+                    if !self.doh {
+                        return false;
+                    }
+                }
+                StampProtocol::ODoHTarget | StampProtocol::ODoHRelay => {
+                    if !self.odoh {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(addr) = stamp.server_addr {
+                if addr.is_ipv4() && !self.ipv4 {
+                    return false;
+                }
+                if addr.is_ipv6() && !self.ipv6 {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
 }
 
 pub struct MinisignPublicKey {
@@ -328,6 +411,33 @@ impl SourceManager {
 
         self.update(config, cache_dir).await
     }
+
+    pub async fn fetch_multi_sources(
+        &self,
+        sources: &std::collections::HashMap<String, SourceConfig>,
+        cache_dir: &Path,
+        filter_opts: Option<&ServerFilterOptions>,
+    ) -> Vec<RemoteResolverEntry> {
+        let mut all_entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_name, cfg) in sources {
+            if let Ok(entries) = self.fetch_or_load_cached(cfg, cache_dir).await {
+                for entry in entries {
+                    if let Some(opts) = filter_opts {
+                        if !opts.matches(&entry) {
+                            continue;
+                        }
+                    }
+                    if seen.insert(entry.name.clone()) {
+                        all_entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        all_entries
+    }
 }
 
 fn decode_b64(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -545,5 +655,59 @@ trusted comment: timestamp:1788418738	file:public-resolvers.md
             corrupt_res.is_err(),
             "corrupted global signature must be rejected"
         );
+    }
+
+    #[test]
+    fn test_server_filter_options() {
+        let stamp_google = DnsStamp {
+            protocol: StampProtocol::DoH,
+            dnssec: true,
+            no_log: false, // logs!
+            no_filter: true,
+            server_addr: Some("8.8.8.8:443".parse().unwrap()),
+            provider_name: "dns.google".to_string(),
+            path: "/dns-query".to_string(),
+            doh_url: "https://dns.google/dns-query".to_string(),
+            bootstrap_ips: vec![],
+        };
+
+        let stamp_quad9 = DnsStamp {
+            protocol: StampProtocol::DoH,
+            dnssec: true,
+            no_log: true,
+            no_filter: false, // filters!
+            server_addr: Some("9.9.9.9:443".parse().unwrap()),
+            provider_name: "dns.quad9.net".to_string(),
+            path: "/dns-query".to_string(),
+            doh_url: "https://dns.quad9.net/dns-query".to_string(),
+            bootstrap_ips: vec![],
+        };
+
+        let entry_google = RemoteResolverEntry {
+            name: "google".to_string(),
+            description: "Google Public DNS".to_string(),
+            stamps: vec![],
+            primary_stamp: Some(stamp_google),
+        };
+
+        let entry_quad9 = RemoteResolverEntry {
+            name: "quad9-doh-filter-pri".to_string(),
+            description: "Quad9".to_string(),
+            stamps: vec![],
+            primary_stamp: Some(stamp_quad9),
+        };
+
+        let mut opts = ServerFilterOptions::default();
+        opts.require_nolog = true;
+        opts.require_nofilter = false;
+
+        // google fails require_nolog
+        assert!(!opts.matches(&entry_google));
+        // quad9 passes require_nolog when require_nofilter is false
+        assert!(opts.matches(&entry_quad9));
+
+        // now disable quad9 via disabled_server_names
+        opts.disabled_server_names = vec!["quad9".to_string()];
+        assert!(!opts.matches(&entry_quad9));
     }
 }

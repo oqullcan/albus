@@ -6,7 +6,57 @@
 //! instant ip responses so the os http probe proceeds and hits the gateway redirect.
 
 use super::filter::extract_question_end;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+
+#[derive(Clone, Debug, Default)]
+pub struct CaptiveMap {
+    custom_entries: Vec<(String, IpAddr)>,
+}
+
+impl CaptiveMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load_from_text(&mut self, text: &str) {
+        for line in text.lines() {
+            let clean = line.trim();
+            if clean.is_empty() || clean.starts_with('#') || clean.starts_with(';') {
+                continue;
+            }
+            let mut parts = clean.split_whitespace();
+            if let (Some(domain), Some(ip_str)) = (parts.next(), parts.next()) {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    let d = domain.trim_end_matches('.').to_ascii_lowercase();
+                    self.custom_entries.push((d, ip));
+                }
+            }
+        }
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        let content = fs::read_to_string(path)?;
+        let prev = self.custom_entries.len();
+        self.load_from_text(&content);
+        Ok(self.custom_entries.len() - prev)
+    }
+
+    pub fn check(&self, domain: &str, qtype: u16) -> Option<IpAddr> {
+        let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+        for (d, ip) in &self.custom_entries {
+            if &lower == d || lower.ends_with(&format!(".{}", d)) {
+                match (qtype, ip) {
+                    (1, IpAddr::V4(_)) => return Some(*ip),
+                    (28, IpAddr::V6(_)) => return Some(*ip),
+                    _ => {}
+                }
+            }
+        }
+        check_captive_portal(domain, qtype)
+    }
+}
 
 struct CaptiveEntry {
     domain: &'static str,
@@ -159,5 +209,21 @@ mod tests {
         assert_eq!(resp[2] & 0x80, 0x80); // QR=1
         assert_eq!(resp[7], 1); // ancount=1
         assert!(resp.windows(4).any(|w| w == [17, 253, 109, 201]));
+    }
+
+    #[test]
+    fn test_captive_map() {
+        let mut map = CaptiveMap::new();
+        map.load_from_text("my-hotel-wifi.com 192.168.10.1\nlogin.airport.net 10.1.1.1\n");
+        assert_eq!(
+            map.check("my-hotel-wifi.com", 1),
+            Some("192.168.10.1".parse().unwrap())
+        );
+        assert_eq!(
+            map.check("portal.my-hotel-wifi.com", 1),
+            Some("192.168.10.1".parse().unwrap())
+        );
+        // Built-in fallback still works
+        assert!(map.check("captive.apple.com", 1).is_some());
     }
 }

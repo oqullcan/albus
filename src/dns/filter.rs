@@ -258,16 +258,83 @@ pub fn is_firefox_canary(domain: &str) -> bool {
     lower == "use-application-dns.net" || lower.ends_with(".use-application-dns.net")
 }
 
-// builds synthetic sinkhole response (0.0.0.0 for A, :: for AAAA) with 60s TTL for blocked domains
-pub fn build_sinkhole_response(query: &[u8], qtype: u16) -> Vec<u8> {
-    if query.len() < 12 {
-        return query.to_vec();
+// appends an EDNS0 OPT record with RFC 8914 Extended DNS Error (EDE)
+pub fn append_edns_ede(resp: &mut Vec<u8>, info_code: u16, extra_text: &str) {
+    if resp.len() < 12 {
+        return;
     }
+    let arcount = ((resp[10] as u16) << 8) | (resp[11] as u16);
+    let new_arcount = arcount.saturating_add(1);
+    resp[10] = (new_arcount >> 8) as u8;
+    resp[11] = (new_arcount & 0xff) as u8;
 
-    if qtype != 1 && qtype != 28 {
-        return build_nxdomain_response(query);
-    }
+    // OPT RR
+    resp.push(0x00); // root name
+    resp.extend_from_slice(&[0x00, 0x29]); // type: OPT (41)
+    resp.extend_from_slice(&[0x04, 0xd0]); // UDP payload size: 1232
+    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags
 
+    let opt_len = (2 + extra_text.len()) as u16;
+    let rdlength = 4 + opt_len;
+    resp.extend_from_slice(&rdlength.to_be_bytes());
+
+    // Option code 15: Extended DNS Error (RFC 8914)
+    resp.extend_from_slice(&[0x00, 0x0f]);
+    resp.extend_from_slice(&opt_len.to_be_bytes());
+    resp.extend_from_slice(&info_code.to_be_bytes());
+    resp.extend_from_slice(extra_text.as_bytes());
+}
+
+// builds synthetic HINFO response for blocked queries (Android 8+ compatibility)
+pub fn build_hinfo_response(query: &[u8], ttl: u32) -> Vec<u8> {
+    let q_end = match extract_question_end(query) {
+        Some(end) => end,
+        None => return build_nxdomain_response(query),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 64);
+    resp.extend_from_slice(&query[..q_end]);
+
+    // standard response, qr=1, aa=1, ra=1, rcode=0 (NoError)
+    resp[2] = 0x85;
+    resp[3] = 0x80;
+
+    // ancount = 1
+    resp[6] = 0x00;
+    resp[7] = 0x01;
+
+    // nscount = 0, arcount = 0
+    resp[8] = 0x00;
+    resp[9] = 0x00;
+    resp[10] = 0x00;
+    resp[11] = 0x00;
+
+    // pointer to question name at offset 12
+    resp.push(0xc0);
+    resp.push(0x0c);
+
+    // HINFO RR (type 13, class IN 1)
+    resp.extend_from_slice(&[0x00, 0x0d]); // type: HINFO (13)
+    resp.extend_from_slice(&[0x00, 0x01]); // class: IN (1)
+    resp.extend_from_slice(&ttl.to_be_bytes()); // ttl
+
+    let cpu = b"This query has been locally blocked";
+    let os = b"by albus";
+    let rdlen = 1 + cpu.len() + 1 + os.len();
+    resp.extend_from_slice(&(rdlen as u16).to_be_bytes());
+
+    resp.push(cpu.len() as u8);
+    resp.extend_from_slice(cpu);
+    resp.push(os.len() as u8);
+    resp.extend_from_slice(os);
+
+    append_edns_ede(&mut resp, 15, "This query has been locally blocked by albus");
+
+    resp
+}
+
+// builds synthetic sinkhole response with custom IP
+pub fn build_sinkhole_response_custom(query: &[u8], ip: IpAddr, ttl: u32) -> Vec<u8> {
     let q_end = match extract_question_end(query) {
         Some(end) => end,
         None => return build_nxdomain_response(query),
@@ -294,23 +361,69 @@ pub fn build_sinkhole_response(query: &[u8], qtype: u16) -> Vec<u8> {
     resp.push(0xc0);
     resp.push(0x0c);
 
-    if qtype == 1 {
-        // A record -> 0.0.0.0
-        resp.extend_from_slice(&[0x00, 0x01]); // type: a (1)
-        resp.extend_from_slice(&[0x00, 0x01]); // class: in (1)
-        resp.extend_from_slice(&60u32.to_be_bytes()); // ttl: 60s
-        resp.extend_from_slice(&4u16.to_be_bytes()); // rdlen: 4
-        resp.extend_from_slice(&[0, 0, 0, 0]);
-    } else {
-        // AAAA record -> ::
-        resp.extend_from_slice(&[0x00, 0x1c]); // type: aaaa (28)
-        resp.extend_from_slice(&[0x00, 0x01]); // class: in (1)
-        resp.extend_from_slice(&60u32.to_be_bytes()); // ttl: 60s
-        resp.extend_from_slice(&16u16.to_be_bytes()); // rdlen: 16
-        resp.extend_from_slice(&[0u8; 16]);
+    match ip {
+        IpAddr::V4(v4) => {
+            resp.extend_from_slice(&[0x00, 0x01]); // type: a (1)
+            resp.extend_from_slice(&[0x00, 0x01]); // class: in (1)
+            resp.extend_from_slice(&ttl.to_be_bytes()); // ttl
+            resp.extend_from_slice(&4u16.to_be_bytes()); // rdlen: 4
+            resp.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            resp.extend_from_slice(&[0x00, 0x1c]); // type: aaaa (28)
+            resp.extend_from_slice(&[0x00, 0x01]); // class: in (1)
+            resp.extend_from_slice(&ttl.to_be_bytes()); // ttl
+            resp.extend_from_slice(&16u16.to_be_bytes()); // rdlen: 16
+            resp.extend_from_slice(&v6.octets());
+        }
     }
 
     resp
+}
+
+// flexible dispatcher for blocked query responses matching dnscrypt-proxy
+pub fn build_blocked_response(query: &[u8], qtype: u16, response_format: &str, ttl: u32) -> Vec<u8> {
+    let fmt = response_format.trim().to_ascii_lowercase();
+    if fmt == "refused" {
+        let mut r = build_refused_response(query);
+        append_edns_ede(&mut r, 15, "This query has been locally blocked by albus");
+        r
+    } else if fmt == "hinfo" {
+        build_hinfo_response(query, ttl)
+    } else if fmt.starts_with("a:") || fmt.contains('.') {
+        let (v4_str, v6_str) = if let Some((part1, part2)) = fmt.split_once(',') {
+            (part1.trim_start_matches("a:"), part2.trim_start_matches("aaaa:"))
+        } else {
+            (fmt.trim_start_matches("a:"), "::")
+        };
+        let v4_ip = v4_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+        let v6_ip = v6_str.parse::<Ipv6Addr>().unwrap_or(Ipv6Addr::UNSPECIFIED);
+
+        if qtype == 1 {
+            let mut r = build_sinkhole_response_custom(query, IpAddr::V4(v4_ip), ttl);
+            append_edns_ede(&mut r, 4, "Forged answer - filtered by albus");
+            r
+        } else if qtype == 28 {
+            let mut r = build_sinkhole_response_custom(query, IpAddr::V6(v6_ip), ttl);
+            append_edns_ede(&mut r, 4, "Forged answer - filtered by albus");
+            r
+        } else {
+            build_hinfo_response(query, ttl)
+        }
+    } else {
+        build_hinfo_response(query, ttl)
+    }
+}
+
+// builds synthetic sinkhole response (0.0.0.0 for A, :: for AAAA) with 60s TTL for blocked domains
+pub fn build_sinkhole_response(query: &[u8], qtype: u16) -> Vec<u8> {
+    if qtype == 1 {
+        build_sinkhole_response_custom(query, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 60)
+    } else if qtype == 28 {
+        build_sinkhole_response_custom(query, IpAddr::V6(Ipv6Addr::UNSPECIFIED), 60)
+    } else {
+        build_nxdomain_response(query)
+    }
 }
 
 #[cfg(test)]
@@ -402,5 +515,34 @@ mod tests {
         assert_eq!(resp[7], 1);
         // Total length should be q_end + 16 (pointer(2) + type(2) + class(2) + ttl(4) + rdlen(2) + rdata(4))
         assert_eq!(resp.len(), q_end + 16);
+    }
+
+    #[test]
+    fn test_build_hinfo_and_blocked_response() {
+        let query = vec![
+            0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'b', b'l', b'o', b'c', b'k', b'e', b'd', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+
+        // 1. HINFO mode
+        let hinfo_resp = build_blocked_response(&query, 1, "hinfo", 60);
+        // rcode should be 0 (NoError)
+        assert_eq!(hinfo_resp[3] & 0x0f, 0);
+        // ancount = 1
+        assert_eq!(hinfo_resp[7], 1);
+        // arcount = 1 (EDNS0 EDE option)
+        assert_eq!(hinfo_resp[11], 1);
+
+        // 2. Refused mode
+        let refused_resp = build_blocked_response(&query, 1, "refused", 60);
+        // rcode should be 5 (Refused)
+        assert_eq!(refused_resp[3] & 0x0f, 5);
+
+        // 3. Custom IP mode
+        let ip_resp = build_blocked_response(&query, 1, "a:127.0.0.2,aaaa:::1", 10);
+        assert_eq!(ip_resp[3] & 0x0f, 0);
+        assert_eq!(ip_resp[7], 1);
+        assert!(ip_resp.windows(4).any(|w| w == [127, 0, 0, 2]));
     }
 }

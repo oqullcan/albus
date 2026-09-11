@@ -29,6 +29,8 @@ pub struct DnsStatsSnapshot {
     #[serde(default)]
     pub queries_doh: u64,
     #[serde(default)]
+    pub queries_dot: u64,
+    #[serde(default)]
     pub blocked_blocklist: u64,
     #[serde(default)]
     pub blocked_schedule: u64,
@@ -63,6 +65,7 @@ pub struct DnsStats {
     pub queries_udp: AtomicU64,
     pub queries_tcp: AtomicU64,
     pub queries_doh: AtomicU64,
+    pub queries_dot: AtomicU64,
     pub blocked_blocklist: AtomicU64,
     pub blocked_schedule: AtomicU64,
     pub blocked_rebinding: AtomicU64,
@@ -103,6 +106,7 @@ impl DnsStats {
             queries_udp: self.queries_udp.load(Ordering::Relaxed),
             queries_tcp: self.queries_tcp.load(Ordering::Relaxed),
             queries_doh: self.queries_doh.load(Ordering::Relaxed),
+            queries_dot: self.queries_dot.load(Ordering::Relaxed),
             blocked_blocklist: self.blocked_blocklist.load(Ordering::Relaxed),
             blocked_schedule: self.blocked_schedule.load(Ordering::Relaxed),
             blocked_rebinding: self.blocked_rebinding.load(Ordering::Relaxed),

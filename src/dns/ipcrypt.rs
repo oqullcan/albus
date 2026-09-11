@@ -6,6 +6,7 @@
 use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 
+#[derive(Debug, Clone)]
 pub struct IpCrypt {
     key: [u8; 16],
 }
