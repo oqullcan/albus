@@ -150,6 +150,69 @@ pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
     Ok(false)
 }
 
+/// Looks up the UID and GID for a given username or numeric UID string.
+#[cfg(unix)]
+pub fn lookup_user_ids(user_name: &str) -> std::result::Result<(libc::uid_t, libc::gid_t), String> {
+    use std::ffi::CString;
+    let c_user = CString::new(user_name).map_err(|e| format!("invalid user name: {}", e))?;
+    unsafe {
+        let pwd = libc::getpwnam(c_user.as_ptr());
+        if !pwd.is_null() {
+            Ok(((*pwd).pw_uid, (*pwd).pw_gid))
+        } else if let Ok(parsed_uid) = user_name.parse::<u32>() {
+            Ok((parsed_uid as libc::uid_t, parsed_uid as libc::gid_t))
+        } else {
+            Err(format!("user '{}' not found in system user database", user_name))
+        }
+    }
+}
+
+/// Drops process privileges to the target user after binding low ports (e.g. port 53).
+#[cfg(unix)]
+pub fn drop_privileges(user_name: &str) -> std::result::Result<(), String> {
+    let (uid, gid) = lookup_user_ids(user_name)?;
+
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            // Retain permitted capabilities across UID change if running as root
+            libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0);
+        }
+
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!("failed to clear supplementary groups: {}", err);
+        }
+        if libc::setgid(gid) != 0 {
+            return Err(format!(
+                "failed to switch GID to {}: {}",
+                gid,
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::setuid(uid) != 0 {
+            return Err(format!(
+                "failed to switch UID to {}: {}",
+                uid,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    tracing::info!(user = user_name, uid = uid, gid = gid, "process privileges successfully dropped");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn lookup_user_ids(_user_name: &str) -> std::result::Result<(u32, u32), String> {
+    Err("user lookup is not supported on non-unix platforms".to_string())
+}
+
+#[cfg(not(unix))]
+pub fn drop_privileges(_user_name: &str) -> std::result::Result<(), String> {
+    Err("dropping privileges is not supported on non-unix platforms".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +288,27 @@ mod tests {
         assert!(!restored.contains("127.0.0.53"));
 
         let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_lookup_user_ids() {
+        #[cfg(unix)]
+        {
+            // Root user always exists on unix systems
+            let root_lookup = lookup_user_ids("root");
+            assert!(root_lookup.is_ok());
+            let (uid, gid) = root_lookup.unwrap();
+            assert_eq!(uid, 0);
+            assert_eq!(gid, 0);
+
+            // Numeric UID string
+            let num_lookup = lookup_user_ids("65534");
+            assert!(num_lookup.is_ok());
+            assert_eq!(num_lookup.unwrap().0, 65534);
+
+            // Non-existent user
+            let invalid_lookup = lookup_user_ids("__albus_non_existent_user_999__");
+            assert!(invalid_lookup.is_err());
+        }
     }
 }

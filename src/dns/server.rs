@@ -5,8 +5,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -42,29 +42,33 @@ use super::watcher::FileWatcher;
 // local dns server instance wrapping doh client pool and response cache
 #[derive(Clone)]
 pub struct DnsServer {
-    resolver: DoHResolver,
+    pub resolver: Arc<tokio::sync::RwLock<DoHResolver>>,
     pub odoh_client: Option<Arc<ODoHClient>>,
-    upstream_desc: String,
-    block_ipv6: bool,
-    dnssec: bool,
-    pqc: bool,
-    pub racing: bool,
-    anti_dns_rebinding: bool,
-    block_undelegated: bool,
-    edns_padding: bool,
+    upstream_desc: Arc<StdRwLock<String>>,
+    block_ipv6: Arc<AtomicBool>,
+    dnssec: Arc<AtomicBool>,
+    pqc: Arc<AtomicBool>,
+    pub http3: Arc<AtomicBool>,
+    pub racing: Arc<AtomicBool>,
+    anti_dns_rebinding: Arc<AtomicBool>,
+    block_undelegated: Arc<AtomicBool>,
+    edns_padding: Arc<AtomicBool>,
     cloak: Arc<CloakEngine>,
     pub blocklist: Arc<RwLock<CompactBlocklist>>,
     pub allowlist: Arc<RwLock<DomainAllowlist>>,
     pub ip_filter: Arc<IpFilter>,
-    pub uncloak_cnames: bool,
-    pub dns64: bool,
-    pub netmon: bool,
+    pub uncloak_cnames: Arc<AtomicBool>,
+    pub dns64: Arc<AtomicBool>,
+    pub netmon: Arc<AtomicBool>,
     pub stats: Arc<DnsStats>,
     cache: Arc<DnsCache>,
     ip_queue: Arc<Mutex<HashMap<Ipv4Addr, VecDeque<String>>>>,
     pub tcp_listener: bool,
     pub local_doh: bool,
     pub local_doh_addr: SocketAddr,
+    pub local_doh_tls: bool,
+    pub local_doh_cert_file: Option<String>,
+    pub local_doh_key_file: Option<String>,
     pub query_logger: Option<Arc<QueryLogger>>,
     pub allowlist_path: Option<String>,
     pub blocklist_path: Option<String>,
@@ -76,6 +80,15 @@ pub struct DnsServer {
     pub forwarding: Arc<RwLock<ForwardingEngine>>,
     pub forwarding_rules_path: Option<String>,
     pub timeout_load_reduction: f64,
+    pub query_meta: Arc<StdRwLock<Vec<String>>>,
+    pub listen_addresses: Vec<SocketAddr>,
+    pub max_clients: Arc<AtomicUsize>,
+    pub lb_strategy: Arc<StdRwLock<String>>,
+    pub load_balancer: Arc<crate::dns::balancer::LoadBalancer>,
+    pub fragments_blocked: Arc<StdRwLock<Vec<String>>>,
+    pub anonymized_dns_routes: Arc<StdRwLock<Vec<crate::app::config::AnonymizedDnsRoute>>>,
+    pub skip_incompatible: Arc<AtomicBool>,
+    pub direct_cert_fallback: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -87,6 +100,7 @@ impl DnsServer {
         block_ipv6: bool,
         dnssec: bool,
         pqc: bool,
+        http3: bool,
         racing: bool,
         anti_dns_rebinding: bool,
         block_undelegated: bool,
@@ -119,10 +133,11 @@ impl DnsServer {
         cache_neg_min_ttl: u32,
         cache_neg_max_ttl: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let resolver = DoHResolver::new(
+        let resolver = DoHResolver::new_with_options(
             upstreams_csv,
             custom_bootstrap_ips,
             pqc,
+            http3,
             proxy,
             tls_auth.as_deref(),
             tls_key_log_file.as_deref(),
@@ -130,29 +145,33 @@ impl DnsServer {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
-            resolver,
+            resolver: Arc::new(tokio::sync::RwLock::new(resolver)),
             odoh_client,
-            upstream_desc: upstreams_csv.to_string(),
-            block_ipv6,
-            dnssec,
-            pqc,
-            racing,
-            anti_dns_rebinding,
-            block_undelegated,
-            edns_padding,
+            upstream_desc: Arc::new(StdRwLock::new(upstreams_csv.to_string())),
+            block_ipv6: Arc::new(AtomicBool::new(block_ipv6)),
+            dnssec: Arc::new(AtomicBool::new(dnssec)),
+            pqc: Arc::new(AtomicBool::new(pqc)),
+            http3: Arc::new(AtomicBool::new(http3)),
+            racing: Arc::new(AtomicBool::new(racing)),
+            anti_dns_rebinding: Arc::new(AtomicBool::new(anti_dns_rebinding)),
+            block_undelegated: Arc::new(AtomicBool::new(block_undelegated)),
+            edns_padding: Arc::new(AtomicBool::new(edns_padding)),
             cloak,
             blocklist,
             allowlist,
             ip_filter,
-            uncloak_cnames,
-            dns64,
-            netmon,
+            uncloak_cnames: Arc::new(AtomicBool::new(uncloak_cnames)),
+            dns64: Arc::new(AtomicBool::new(dns64)),
+            netmon: Arc::new(AtomicBool::new(netmon)),
             stats,
             cache: Arc::new(DnsCache::new(2048).with_neg_ttl(cache_neg_min_ttl, cache_neg_max_ttl)),
             ip_queue: Arc::new(Mutex::new(HashMap::new())),
             tcp_listener,
             local_doh,
             local_doh_addr,
+            local_doh_tls: false,
+            local_doh_cert_file: None,
+            local_doh_key_file: None,
             query_logger,
             allowlist_path,
             blocklist_path,
@@ -164,8 +183,134 @@ impl DnsServer {
             forwarding,
             forwarding_rules_path,
             timeout_load_reduction,
+            query_meta: Arc::new(StdRwLock::new(Vec::new())),
+            listen_addresses: vec!["127.0.0.1:53".parse().unwrap()],
+            max_clients: Arc::new(AtomicUsize::new(250)),
+            lb_strategy: Arc::new(StdRwLock::new("wp2".to_string())),
+            load_balancer: Arc::new(crate::dns::balancer::LoadBalancer::new(&[upstreams_csv.to_string()])),
+            fragments_blocked: Arc::new(StdRwLock::new(vec![
+                "cisco".to_string(),
+                "cleanbrowsing-adult".to_string(),
+            ])),
+            anonymized_dns_routes: Arc::new(StdRwLock::new(Vec::new())),
+            skip_incompatible: Arc::new(AtomicBool::new(false)),
+            direct_cert_fallback: Arc::new(AtomicBool::new(true)),
             shutdown_tx,
         })
+    }
+
+    /// Attaches DNSCrypt-compatible query_meta TXT strings to outgoing queries.
+    pub fn with_query_meta(self, meta: Vec<String>) -> Self {
+        *self.query_meta.write().unwrap() = meta;
+        self
+    }
+
+    /// Sets custom local listening addresses (UDP and TCP).
+    pub fn with_listen_addresses(mut self, addrs: Vec<SocketAddr>) -> Self {
+        if !addrs.is_empty() {
+            self.listen_addresses = addrs;
+        }
+        self
+    }
+
+    /// Configures maximum concurrent clients for quartic timeout load reduction.
+    pub fn with_max_clients(self, max_c: usize) -> Self {
+        self.max_clients.store(max_c, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures upstream load balancing strategy (wp2, p2, ph, first, random).
+    pub fn with_lb_strategy(self, strategy: &str) -> Self {
+        *self.lb_strategy.write().unwrap() = strategy.to_string();
+        self
+    }
+
+    /// Configures broken fragments blocked workaround servers list.
+    pub fn with_fragments_blocked(self, blocked: Vec<String>) -> Self {
+        *self.fragments_blocked.write().unwrap() = blocked;
+        self
+    }
+
+    /// Configures multi-relay routing matrix for Anonymized DNS.
+    pub fn with_anonymized_dns_routes(
+        self,
+        routes: Vec<crate::app::config::AnonymizedDnsRoute>,
+        skip_incomp: bool,
+        direct_fallback: bool,
+    ) -> Self {
+        *self.anonymized_dns_routes.write().unwrap() = routes;
+        self.skip_incompatible.store(skip_incomp, Ordering::Relaxed);
+        self.direct_cert_fallback.store(direct_fallback, Ordering::Relaxed);
+        self
+    }
+
+    /// Configures TLS termination options for Local DoH (RFC 8484 HTTPS).
+    pub fn with_local_doh_tls(
+        mut self,
+        tls: bool,
+        cert_file: Option<String>,
+        key_file: Option<String>,
+    ) -> Self {
+        self.local_doh_tls = tls;
+        self.local_doh_cert_file = cert_file;
+        self.local_doh_key_file = key_file;
+        self
+    }
+
+    pub fn is_http3(&self) -> bool {
+        self.http3.load(Ordering::Relaxed)
+    }
+
+    pub fn resolver(&self) -> Arc<tokio::sync::RwLock<DoHResolver>> {
+        self.resolver.clone()
+    }
+
+    /// Dynamically reloads upstream resolver, post-quantum settings, security policies, and filters
+    /// in-place without dropping existing socket listeners or restarting the process.
+    pub async fn reload_from_config(
+        &self,
+        cfg: &crate::app::config::Config,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let new_resolver = DoHResolver::new_with_options(
+            &cfg.doh_upstream,
+            &cfg.doh_bootstrap_ips,
+            cfg.pqc,
+            cfg.http3,
+            cfg.effective_proxy().as_deref(),
+            self.tls_auth.as_deref(),
+            cfg.tls_key_log_file.as_deref(),
+        )?;
+
+        *self.resolver.write().await = new_resolver;
+        *self.upstream_desc.write().unwrap() = cfg.doh_upstream.clone();
+        self.block_ipv6.store(cfg.block_ipv6, Ordering::Relaxed);
+        self.dnssec.store(cfg.dnssec, Ordering::Relaxed);
+        self.pqc.store(cfg.pqc, Ordering::Relaxed);
+        self.http3.store(cfg.http3, Ordering::Relaxed);
+        self.racing.store(cfg.dns_racing, Ordering::Relaxed);
+        self.anti_dns_rebinding.store(cfg.anti_dns_rebinding, Ordering::Relaxed);
+        self.block_undelegated.store(cfg.block_undelegated, Ordering::Relaxed);
+        self.edns_padding.store(cfg.edns_padding, Ordering::Relaxed);
+        self.uncloak_cnames.store(cfg.uncloak_cnames, Ordering::Relaxed);
+        self.dns64.store(cfg.dns64, Ordering::Relaxed);
+        *self.query_meta.write().unwrap() = cfg.query_meta.clone();
+        self.max_clients.store(cfg.max_clients, Ordering::Relaxed);
+        *self.lb_strategy.write().unwrap() = cfg.lb_strategy.clone();
+        *self.fragments_blocked.write().unwrap() = cfg.fragments_blocked.clone();
+        *self.anonymized_dns_routes.write().unwrap() = cfg.anonymized_dns_routes.clone();
+        self.skip_incompatible.store(cfg.skip_incompatible, Ordering::Relaxed);
+        self.direct_cert_fallback.store(cfg.direct_cert_fallback, Ordering::Relaxed);
+        self.cache.clear();
+
+        info!(
+            upstream = %cfg.doh_upstream,
+            pqc = cfg.pqc,
+            http3 = cfg.http3,
+            dnssec = cfg.dnssec,
+            lb_strategy = %cfg.lb_strategy,
+            "DNS server configuration dynamically reloaded in real time"
+        );
+        Ok(())
     }
 
     pub fn with_defaults(
@@ -181,6 +326,7 @@ impl DnsServer {
             block_ipv6,
             dnssec,
             pqc,
+            false,
             true,
             true,
             true,
@@ -232,7 +378,7 @@ impl DnsServer {
 
 // creates a Linux kernel socket tuned with IP_FREEBIND, IP_TOS (DSCP 0x70), and enlarged socket buffers
 fn create_tuned_udp_socket(
-    addr: &str,
+    addr: SocketAddr,
 ) -> Result<tokio::net::UdpSocket, Box<dyn std::error::Error + Send + Sync>> {
     let std_sock = std::net::UdpSocket::bind(addr)
         .map_err(|e| format!("failed to bind UDP socket to {}: {}", addr, e))?;
@@ -252,23 +398,36 @@ fn create_tuned_udp_socket(
 
             #[cfg(target_os = "linux")]
             {
+                let level = if addr.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
+                let opt = if addr.is_ipv6() { libc::IPV6_FREEBIND } else { libc::IP_FREEBIND };
                 let _ = libc::setsockopt(
                     fd,
-                    libc::IPPROTO_IP,
-                    libc::IP_FREEBIND,
+                    level,
+                    opt,
                     &one as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&one) as libc::socklen_t,
                 );
             }
 
-            let tos: libc::c_int = 0x70; // DSCP Interactive / Low Latency
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_TOS,
-                &tos as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&tos) as libc::socklen_t,
-            );
+            if addr.is_ipv4() {
+                let tos: libc::c_int = 0x70; // DSCP Interactive / Low Latency
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_TOS,
+                    &tos as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&tos) as libc::socklen_t,
+                );
+            } else {
+                let tclass: libc::c_int = 0x70;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_TCLASS,
+                    &tclass as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&tclass) as libc::socklen_t,
+                );
+            }
 
             let buf_size: libc::c_int = 256 * 1024;
             let _ = libc::setsockopt(
@@ -313,26 +472,36 @@ pub fn build_a_query(domain: &str) -> Vec<u8> {
 }
 
 impl DnsServer {
-    // spawns background asynchronous udp receive loop on loopback interface 127.0.0.1:53
+    // spawns background asynchronous udp receive loop on configured listen addresses
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let socket = match create_tuned_udp_socket("127.0.0.1:53") {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(
-                    format!("failed to bind tuned UDP socket to 127.0.0.1:53: {}", e).into(),
-                );
-            }
+        let addrs = if self.listen_addresses.is_empty() {
+            vec!["127.0.0.1:53".parse().unwrap()]
+        } else {
+            self.listen_addresses.clone()
         };
 
+        let mut udp_sockets = Vec::new();
+        for addr in &addrs {
+            let socket = match create_tuned_udp_socket(*addr) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(
+                        format!("failed to bind tuned UDP socket to {}: {}", addr, e).into(),
+                    );
+                }
+            };
+            udp_sockets.push((*addr, Arc::new(socket)));
+        }
+
         info!(
-            addr = "127.0.0.1:53",
-            upstream = %self.upstream_desc,
-            block_ipv6 = self.block_ipv6,
-            dnssec = self.dnssec,
-            pqc = self.pqc,
-            uncloak_cnames = self.uncloak_cnames,
-            dns64 = self.dns64,
-            netmon = self.netmon,
+            listen_addresses = ?addrs,
+            upstream = %self.upstream_desc.read().unwrap_or_else(|p| p.into_inner()),
+            block_ipv6 = self.block_ipv6.load(Ordering::Relaxed),
+            dnssec = self.dnssec.load(Ordering::Relaxed),
+            pqc = self.pqc.load(Ordering::Relaxed),
+            uncloak_cnames = self.uncloak_cnames.load(Ordering::Relaxed),
+            dns64 = self.dns64.load(Ordering::Relaxed),
+            netmon = self.netmon.load(Ordering::Relaxed),
             tcp_listener = self.tcp_listener,
             local_doh = self.local_doh,
             local_doh_addr = %self.local_doh_addr,
@@ -341,10 +510,8 @@ impl DnsServer {
             "DNS server started"
         );
 
-        let socket = Arc::new(socket);
-
         // 1. spawn network sentinel (netmon) for interface and routing transitions
-        if self.netmon {
+        if self.netmon.load(Ordering::Relaxed) {
             let net_mon = NetworkMonitor::new();
             let cache_ref = self.cache.clone();
             let resolver_ref = self.resolver.clone();
@@ -353,7 +520,10 @@ impl DnsServer {
                 std::time::Duration::from_secs(5),
                 move |_epoch| {
                     cache_ref.clear();
-                    resolver_ref.reset_balancer();
+                    let r = resolver_ref.clone();
+                    tokio::spawn(async move {
+                        r.read().await.reset_balancer();
+                    });
                     stats_ref.network_changes.fetch_add(1, Ordering::Relaxed);
                 },
                 self.shutdown_tx.subscribe(),
@@ -376,6 +546,7 @@ impl DnsServer {
             }
         });
 
+        let canary_probe_target = addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]);
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -405,9 +576,9 @@ impl DnsServer {
                             }
                         }
 
-                        // Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
+                        // Active watchdog check: actively probe local resolver on configured target every 60s
                         if tick_count % 4 == 0 {
-                            run_active_canary_probe().await;
+                            run_active_canary_probe(canary_probe_target).await;
                         }
                     }
                     _ = canary_shutdown_rx.recv() => {
@@ -505,30 +676,48 @@ impl DnsServer {
             }
         }
 
-        // 5. spawn RFC 7766 TCP listener on 127.0.0.1:53
+        // 5. spawn RFC 7766 TCP listener on all configured listen_addresses
         if self.tcp_listener {
-            let s_tcp = server_arc.clone();
-            let rx = self.shutdown_tx.subscribe();
-            let tcp_bind: SocketAddr = "127.0.0.1:53".parse().unwrap();
-            DnsTcpServer::start(
-                tcp_bind,
-                move |query, peer| {
-                    let s = s_tcp.clone();
-                    async move {
-                        s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
-                        s.resolve_packet(&query, peer.ip()).await
-                    }
-                },
-                rx,
-            );
+            for addr in &addrs {
+                let s_tcp = server_arc.clone();
+                let rx = self.shutdown_tx.subscribe();
+                let tcp_bind = *addr;
+                DnsTcpServer::start(
+                    tcp_bind,
+                    move |query, peer| {
+                        let s = s_tcp.clone();
+                        async move {
+                            s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
+                            s.resolve_packet(&query, peer.ip()).await
+                        }
+                    },
+                    rx,
+                );
+            }
         }
 
         // 6. spawn RFC 8484 Local DoH listener on local_doh_addr (e.g. 127.0.0.1:8053)
         if self.local_doh {
             let s_doh = server_arc.clone();
             let rx = self.shutdown_tx.subscribe();
-            LocalDoHServer::start(
+            let tls_acceptor = if self.local_doh_tls {
+                if let (Some(ref cert), Some(ref key)) = (&self.local_doh_cert_file, &self.local_doh_key_file) {
+                    match crate::dns::local_doh::create_tls_acceptor_from_files(cert, key) {
+                        Ok(acc) => Some(acc),
+                        Err(e) => {
+                            warn!("failed to create TLS acceptor for local DoH: {}; falling back to HTTP", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            LocalDoHServer::start_with_tls(
                 self.local_doh_addr,
+                tls_acceptor,
                 move |query, peer| {
                     let s = s_doh.clone();
                     async move {
@@ -546,56 +735,60 @@ impl DnsServer {
             MetricsServer::start(self.metrics_addr, self.stats.clone(), rx);
         }
 
-        // 7. spawn UDP receive loop
+        // 7. spawn UDP receive loops
         const MAX_CONCURRENT_DNS_TASKS: usize = 512;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_TASKS));
-        let server_udp = server_arc.clone();
-        let mut udp_shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
+        for (bind_addr, socket) in udp_sockets {
+            let server_udp = server_arc.clone();
+            let mut udp_shutdown_rx = self.shutdown_tx.subscribe();
+            let sem_clone = semaphore.clone();
 
-            loop {
-                tokio::select! {
-                    recv_res = socket.recv_from(&mut buf) => {
-                        match recv_res {
-                            Ok((len, peer_addr)) => {
-                                let query_data = buf[..len].to_vec();
-                                let socket_clone = socket.clone();
-                                let s = server_udp.clone();
-                                let sem_clone = semaphore.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
 
-                                tokio::spawn(async move {
-                                    let _permit = match sem_clone.try_acquire() {
-                                        Ok(permit) => permit,
-                                        Err(_) => {
-                                            if query_data.len() >= 12 {
-                                                let fail_resp = build_servfail_response(&query_data);
-                                                let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
+                loop {
+                    tokio::select! {
+                        recv_res = socket.recv_from(&mut buf) => {
+                            match recv_res {
+                                Ok((len, peer_addr)) => {
+                                    let query_data = buf[..len].to_vec();
+                                    let socket_clone = socket.clone();
+                                    let s = server_udp.clone();
+                                    let sem = sem_clone.clone();
+
+                                    tokio::spawn(async move {
+                                        let _permit = match sem.try_acquire() {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                if query_data.len() >= 12 {
+                                                    let fail_resp = build_servfail_response(&query_data);
+                                                    let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
+                                                }
+                                                return;
                                             }
-                                            return;
-                                        }
-                                    };
+                                        };
 
-                                    s.stats.queries_udp.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(resp) = s.resolve_packet(&query_data, peer_addr.ip()).await {
-                                        let _ = socket_clone.send_to(&resp, peer_addr).await;
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                warn!("UDP recv_from error: {}; continuing", e);
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                        s.stats.queries_udp.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(resp) = s.resolve_packet(&query_data, peer_addr.ip()).await {
+                                            let _ = socket_clone.send_to(&resp, peer_addr).await;
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("UDP recv_from error on {}: {}; continuing", bind_addr, e);
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
                             }
                         }
-                    }
-                    _ = udp_shutdown_rx.recv() => {
-                        debug!("DNS UDP server shutting down");
-                        break;
+                        _ = udp_shutdown_rx.recv() => {
+                            debug!("DNS UDP server shutting down on {}", bind_addr);
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Ok(())
     }
@@ -633,13 +826,27 @@ impl DnsServer {
         outgoing_query: &[u8],
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
         let active = self.stats.active_queries.load(Ordering::Relaxed);
+        let max_c = self.max_clients.load(Ordering::Relaxed).max(1) as u64;
         let base_timeout = Duration::from_secs(5);
         let effective_timeout =
-            compute_adaptive_timeout(base_timeout, active, 250, self.timeout_load_reduction);
+            compute_adaptive_timeout(base_timeout, active, max_c, self.timeout_load_reduction);
 
+        // Broken implementations workaround: clamp EDNS buffer size if upstream matches fragments_blocked
+        let effective_query = {
+            let upstream = self.upstream_desc.read().unwrap_or_else(|p| p.into_inner());
+            let blocked = self.fragments_blocked.read().unwrap_or_else(|p| p.into_inner());
+            let is_blocked = blocked.iter().any(|b| upstream.to_ascii_lowercase().contains(&b.to_ascii_lowercase()));
+            if is_blocked && outgoing_query.len() > 1252 {
+                &outgoing_query[..1252]
+            } else {
+                outgoing_query
+            }
+        };
+
+        let start_time = std::time::Instant::now();
         let query_fut = async {
             if let Some(ref odoh) = self.odoh_client {
-                match odoh.resolve(outgoing_query).await {
+                match odoh.resolve(effective_query).await {
                     Ok(resp) => return Ok((resp, "odoh".to_string())),
                     Err(e) => {
                         warn!(
@@ -649,20 +856,32 @@ impl DnsServer {
                     }
                 }
             }
-            if self.racing {
-                self.resolver.resolve_racing(outgoing_query).await
+            if self.racing.load(Ordering::Relaxed) {
+                let r = self.resolver.read().await;
+                r.resolve_racing(effective_query).await
             } else {
-                self.resolver.resolve(outgoing_query).await
+                let r = self.resolver.read().await;
+                r.resolve(effective_query).await
             }
         };
 
         match tokio::time::timeout(effective_timeout, query_fut).await {
-            Ok(res) => res,
-            Err(_) => Err(format!(
-                "upstream query timed out under load (timeout: {:?}, active: {})",
-                effective_timeout, active
-            )
-            .into()),
+            Ok(Ok((res, via))) => {
+                self.load_balancer.record_result(0, start_time.elapsed(), true);
+                Ok((res, via))
+            }
+            Ok(Err(e)) => {
+                self.load_balancer.record_result(0, start_time.elapsed(), false);
+                Err(e)
+            }
+            Err(_) => {
+                self.load_balancer.record_result(0, effective_timeout, false);
+                Err(format!(
+                    "upstream query timed out under load (timeout: {:?}, active: {})",
+                    effective_timeout, active
+                )
+                .into())
+            }
         }
     }
 
@@ -810,7 +1029,7 @@ impl DnsServer {
         }
 
         // 5. block unqualified dotless hostnames and undelegated private zones (prevent leaks upstream)
-        if self.block_undelegated {
+        if self.block_undelegated.load(Ordering::Relaxed) {
             if let Some(key) = &query_key {
                 if is_undelegated_zone(&key.name) {
                     debug!(domain = %key.name, "Blocked undelegated/unqualified domain from leaking upstream");
@@ -886,7 +1105,7 @@ impl DnsServer {
         }
 
         // 8. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
-        if self.block_ipv6 && !self.dns64 && is_aaaa_query(query_data) {
+        if self.block_ipv6.load(Ordering::Relaxed) && !self.dns64.load(Ordering::Relaxed) && is_aaaa_query(query_data) {
             self.maybe_log_query(
                 client_ip,
                 &domain,
@@ -946,25 +1165,34 @@ impl DnsServer {
 
         // 10. prepare outgoing query with RFC 8467 EDNS Padding, RFC 7871 ECS, and DNSSEC DO-bit
         self.stats.upstream_queries.fetch_add(1, Ordering::Relaxed);
-        let outgoing_query = if self.edns_padding || self.edns_client_subnet.is_some() {
+        let is_padding = self.edns_padding.load(Ordering::Relaxed);
+        let is_dnssec = self.dnssec.load(Ordering::Relaxed);
+        let outgoing_query = if is_padding || self.edns_client_subnet.is_some() {
             let default_zero = ClientSubnet::zero_scope();
             let effective_ecs = self.edns_client_subnet.as_ref().unwrap_or(&default_zero);
             apply_edns_options_with_ecs(
                 query_data,
-                self.dnssec,
-                self.edns_padding,
+                is_dnssec,
+                is_padding,
                 Some(effective_ecs),
             )
-        } else if self.dnssec {
+        } else if is_dnssec {
             enable_dnssec_do(query_data)
         } else {
             query_data.to_vec()
         };
 
+        let qm = self.query_meta.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let outgoing_query = if !qm.is_empty() {
+            inject_query_meta(&outgoing_query, &qm)
+        } else {
+            outgoing_query
+        };
+
         match self.resolve_upstream(&outgoing_query).await {
             Ok((resp_bytes, via)) => {
                 // Anti-DNS-Rebinding validation
-                if self.anti_dns_rebinding {
+                if self.anti_dns_rebinding.load(Ordering::Relaxed) {
                     if let Some(private_ip) = detect_dns_rebinding(&resp_bytes) {
                         warn!(
                             domain = ?query_key.as_ref().map(|k| &k.name),
@@ -1010,7 +1238,7 @@ impl DnsServer {
                 }
 
                 // CNAME & HTTPS/SVCB AliasMode Uncloaking Defense
-                if self.uncloak_cnames && !is_whitelisted {
+                if self.uncloak_cnames.load(Ordering::Relaxed) && !is_whitelisted {
                     let targets = extract_alias_targets(&resp_bytes);
                     for target in targets {
                         let is_target_whitelisted = self.allowlist.read().await.is_allowed(&target);
@@ -1042,7 +1270,7 @@ impl DnsServer {
                 }
 
                 // DNS64 IPv6 synthesis for IPv4-only domains (RFC 6052 / RFC 6147)
-                if self.dns64 {
+                if self.dns64.load(Ordering::Relaxed) {
                     if let Some(key) = &query_key {
                         if key.qtype == 28 {
                             let ancount = if resp_bytes.len() >= 8 {
@@ -1077,10 +1305,38 @@ impl DnsServer {
                     }
                 }
 
+                let is_ad = is_dnssec_authenticated(&resp_bytes);
+                if self.dnssec.load(Ordering::Relaxed) {
+                    let dnssec_report = crate::dns::dnssec::inspect_response_dnssec(&resp_bytes);
+                    if dnssec_report.authenticated {
+                        self.stats.dnssec_validated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if dnssec_report.has_pqc_rrsig && dnssec_report.authenticated {
+                        self.stats.pqc_dnssec_validated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if self.pqc.load(Ordering::Relaxed) {
+                        if let Err(downgrade_err) = crate::dns::dnssec::check_anti_downgrade(&dnssec_report) {
+                            warn!(
+                                domain = %domain,
+                                violation = %downgrade_err,
+                                "Anti-downgrade policy triggered: returning SERVFAIL"
+                            );
+                            self.stats.pqc_downgrade_prevented.fetch_add(1, Ordering::Relaxed);
+                            self.maybe_log_query(
+                                client_ip,
+                                &domain,
+                                qtype,
+                                QueryStatus::PqcDowngradeDrop,
+                                start_time,
+                                Some("anti_downgrade_pqc"),
+                            );
+                            return Some(build_servfail_response(query_data));
+                        }
+                    }
+                }
+
                 // insert response into cache (supports negative caching and serve-stale)
                 self.cache.insert(query_data, &resp_bytes);
-
-                let is_ad = is_dnssec_authenticated(&resp_bytes);
                 if let Some((domain_parsed, ips)) = parse_dns_response(&resp_bytes) {
                     if !ips.is_empty() {
                         debug!(
@@ -1220,6 +1476,42 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Injects DNSCrypt-compatible query_meta TXT resource record to the Additional records section.
+pub fn inject_query_meta(query: &[u8], query_meta: &[String]) -> Vec<u8> {
+    if query.len() < 12 || query_meta.is_empty() {
+        return query.to_vec();
+    }
+
+    let mut out = query.to_vec();
+    let arcount = ((out[10] as u16) << 8) | (out[11] as u16);
+    let new_arcount = arcount.saturating_add(1);
+    out[10] = (new_arcount >> 8) as u8;
+    out[11] = (new_arcount & 0xff) as u8;
+
+    // Root domain (".")
+    out.push(0x00);
+    // Type: TXT (16 = 0x0010)
+    out.extend_from_slice(&16u16.to_be_bytes());
+    // Class: IN (1 = 0x0001)
+    out.extend_from_slice(&1u16.to_be_bytes());
+    // TTL: 86400 (0x00015180)
+    out.extend_from_slice(&86400u32.to_be_bytes());
+
+    // Build RDATA: sequence of length-prefixed strings
+    let mut rdata = Vec::new();
+    for meta in query_meta {
+        let bytes = meta.as_bytes();
+        let chunk_len = bytes.len().min(255) as u8;
+        rdata.push(chunk_len);
+        rdata.extend_from_slice(&bytes[..chunk_len as usize]);
+    }
+
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
+
+    out
+}
+
 // inspects header flags to verify presence of authenticated data (ad) bit
 #[inline]
 pub fn is_dnssec_authenticated(response: &[u8]) -> bool {
@@ -1299,11 +1591,12 @@ pub fn build_canary_query() -> Vec<u8> {
 }
 
 // actively probes local loopback resolver to verify canary responsiveness and detect dns leaks
-async fn run_active_canary_probe() {
+async fn run_active_canary_probe(target: SocketAddr) {
     let probe_res = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let bind_local = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = tokio::net::UdpSocket::bind(bind_local).await?;
         let query = build_canary_query();
-        sock.send_to(&query, "127.0.0.1:53").await?;
+        sock.send_to(&query, target).await?;
 
         let mut resp_buf = [0u8; 512];
         let (len, _) = sock.recv_from(&mut resp_buf).await?;
@@ -1673,4 +1966,199 @@ mod tests {
         let extreme_timeout = compute_adaptive_timeout(base, 500, 250, 0.75);
         assert_eq!(extreme_timeout, Duration::from_millis(1250));
     }
+
+    #[test]
+    fn test_dns_server_post_quantum_dnssec_and_anti_downgrade() {
+        use crate::dns::dnssec::{check_anti_downgrade, inspect_response_dnssec, DowngradeViolation};
+        use std::sync::atomic::Ordering;
+
+        let stats = Arc::new(DnsStats::default());
+
+        // 1. Valid Post-Quantum DNSSEC response (ML-DSA-44 / Algorithm 18)
+        let mut valid_pqc_resp = vec![
+            0x12, 0x34, // ID
+            0x81, 0xA0, // QR=1, RD=1, RA=1, AD=1 (authenticated)
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x02, // ANCOUNT = 2 (A record + RRSIG)
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            // Question: example.com IN A
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // Answer 1: A record
+            0xC0, 0x0C, // Name pointer
+            0x00, 0x01, 0x00, 0x01, // Type A, Class IN
+            0x00, 0x00, 0x01, 0x2C, // TTL = 300
+            0x00, 0x04, 93, 184, 216, 34, // RDATA IP
+            // Answer 2: RRSIG record with ML-DSA-44 (18)
+            0xC0, 0x0C, // Name pointer
+            0x00, 0x2E, 0x00, 0x01, // Type RRSIG (46), Class IN
+            0x00, 0x00, 0x01, 0x2C, // TTL = 300
+        ];
+        // RRSIG RDATA:
+        let mut rrsig_rdata = Vec::new();
+        rrsig_rdata.extend_from_slice(&1u16.to_be_bytes()); // Type Covered = A
+        rrsig_rdata.push(18); // Algorithm = ML-DSA-44
+        rrsig_rdata.push(2); // Labels = 2
+        rrsig_rdata.extend_from_slice(&300u32.to_be_bytes()); // Original TTL
+        rrsig_rdata.extend_from_slice(&1789166009u32.to_be_bytes()); // Expiration
+        rrsig_rdata.extend_from_slice(&1789076009u32.to_be_bytes()); // Inception
+        rrsig_rdata.extend_from_slice(&1234u16.to_be_bytes()); // Key Tag
+        rrsig_rdata.extend_from_slice(b"\x07example\x03com\x00"); // Signer name uncompressed
+        rrsig_rdata.extend_from_slice(&vec![0xAA; 2420]); // 2,420 byte signature
+
+        valid_pqc_resp.extend_from_slice(&(rrsig_rdata.len() as u16).to_be_bytes());
+        valid_pqc_resp.extend_from_slice(&rrsig_rdata);
+
+        // Verify report and stats increment
+        let report = inspect_response_dnssec(&valid_pqc_resp);
+        assert!(report.authenticated);
+        assert!(report.has_pqc_rrsig);
+        assert!(check_anti_downgrade(&report).is_ok());
+
+        if report.authenticated {
+            stats.dnssec_validated.fetch_add(1, Ordering::Relaxed);
+        }
+        if report.has_pqc_rrsig && report.authenticated {
+            stats.pqc_dnssec_validated.fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert_eq!(stats.dnssec_validated.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.pqc_dnssec_validated.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.pqc_downgrade_prevented.load(Ordering::Relaxed), 0);
+
+        // 2. Downgraded response: Parent DS signals ML-DSA-44 (18), but adversary stripped PQC signature
+        let mut downgraded_resp = vec![
+            0x12, 0x34, // ID
+            0x81, 0xA0, // QR=1, RD=1, RA=1, AD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x01, // ANCOUNT = 1 (A only, no PQC RRSIG)
+            0x00, 0x01, // NSCOUNT = 1 (DS record in authority)
+            0x00, 0x00, // ARCOUNT = 0
+            // Question: example.com IN A
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+            // Answer 1: A record
+            0xC0, 0x0C,
+            0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x01, 0x2C,
+            0x00, 0x04, 93, 184, 216, 34,
+            // Authority 1: DS record signaling Algorithm 18
+            0xC0, 0x0C,
+            0x00, 0x2B, 0x00, 0x01, // Type DS (43), Class IN
+            0x00, 0x00, 0x01, 0x2C,
+            0x00, 0x24, // RDLENGTH = 36
+            0x04, 0xD2, // Key Tag = 1234
+            18, // Algorithm = ML-DSA-44
+            2,  // Digest Type = SHA-256
+        ];
+        downgraded_resp.extend_from_slice(&[0xBB; 32]); // SHA-256 digest
+
+        let downgraded_report = inspect_response_dnssec(&downgraded_resp);
+        assert!(downgraded_report.has_pqc_ds_signal);
+        assert!(!downgraded_report.has_pqc_rrsig);
+
+        let check_res = check_anti_downgrade(&downgraded_report);
+        assert_eq!(check_res, Err(DowngradeViolation::PqcSignatureStripped));
+
+        // When downgrade is detected:
+        stats.pqc_downgrade_prevented.fetch_add(1, Ordering::Relaxed);
+        let servfail = build_servfail_response(&downgraded_resp);
+        assert_eq!(servfail[3] & 0x0F, 0x02); // RCODE = 2 (SERVFAIL)
+        assert_eq!(stats.pqc_downgrade_prevented.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_inject_query_meta() {
+        let base_query = vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // Standard query
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            // example.com A IN
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+
+        let meta = vec!["token:SecretValue123".to_string(), "user:alice".to_string()];
+        let with_meta = inject_query_meta(&base_query, &meta);
+
+        assert!(with_meta.len() > base_query.len());
+        // ARCOUNT must be 1
+        assert_eq!(with_meta[10], 0x00);
+        assert_eq!(with_meta[11], 0x01);
+
+        // Verify TXT record content: contains root "." (0x00) and type TXT (0x0010)
+        let tail = &with_meta[base_query.len()..];
+        assert_eq!(tail[0], 0x00); // Root name "."
+        assert_eq!(&tail[1..3], &16u16.to_be_bytes()); // Type TXT
+        assert_eq!(&tail[3..5], &1u16.to_be_bytes()); // Class IN
+        assert_eq!(&tail[5..9], &86400u32.to_be_bytes()); // TTL 86400
+        assert!(tail.windows("token:SecretValue123".len()).any(|w| w == b"token:SecretValue123"));
+        assert!(tail.windows("user:alice".len()).any(|w| w == b"user:alice"));
+    }
+
+    #[test]
+    fn test_with_listen_addresses() {
+        let server = DnsServer::with_defaults("https://cloudflare-dns.com/dns-query", &[], false, false, false)
+            .unwrap();
+        assert_eq!(server.listen_addresses, vec!["127.0.0.1:53".parse::<SocketAddr>().unwrap()]);
+
+        let custom_addrs = vec![
+            "127.0.0.1:5353".parse::<SocketAddr>().unwrap(),
+            "127.0.0.2:53".parse::<SocketAddr>().unwrap(),
+        ];
+        let server_custom = server.with_listen_addresses(custom_addrs.clone());
+        assert_eq!(server_custom.listen_addresses, custom_addrs);
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_http3_configuration() {
+        let server = DnsServer::new(
+            "https://cloudflare-dns.com/dns-query",
+            &[],
+            false,
+            false,
+            false,
+            true, // http3 = true
+            false,
+            false,
+            false,
+            false,
+            Arc::new(CloakEngine::new()),
+            Arc::new(RwLock::new(build_seed_blocklist())),
+            Arc::new(RwLock::new(DomainAllowlist::new())),
+            Arc::new(IpFilter::default()),
+            false,
+            false,
+            false,
+            DnsStats::new(),
+            false,
+            false,
+            "127.0.0.1:8053".parse().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(RwLock::new(ScheduleManager::new())),
+            None,
+            false,
+            "127.0.0.1:9153".parse().unwrap(),
+            None,
+            Arc::new(RwLock::new(ForwardingEngine::new())),
+            None,
+            None,
+            0.0,
+            60,
+            600,
+        )
+        .unwrap();
+
+        assert!(server.is_http3());
+        assert!(server.resolver.read().await.clients()[0].http3);
+    }
 }
+

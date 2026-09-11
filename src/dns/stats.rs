@@ -40,6 +40,12 @@ pub struct DnsStatsSnapshot {
     pub blocked_undelegated: u64,
     #[serde(default)]
     pub active_queries: u64,
+    #[serde(default)]
+    pub dnssec_validated: u64,
+    #[serde(default)]
+    pub pqc_dnssec_validated: u64,
+    #[serde(default)]
+    pub pqc_downgrade_prevented: u64,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +69,9 @@ pub struct DnsStats {
     pub blocked_bogon: AtomicU64,
     pub blocked_undelegated: AtomicU64,
     pub active_queries: AtomicU64,
+    pub dnssec_validated: AtomicU64,
+    pub pqc_dnssec_validated: AtomicU64,
+    pub pqc_downgrade_prevented: AtomicU64,
 }
 
 impl DnsStats {
@@ -100,6 +109,9 @@ impl DnsStats {
             blocked_bogon: self.blocked_bogon.load(Ordering::Relaxed),
             blocked_undelegated: self.blocked_undelegated.load(Ordering::Relaxed),
             active_queries: self.active_queries.load(Ordering::Relaxed),
+            dnssec_validated: self.dnssec_validated.load(Ordering::Relaxed),
+            pqc_dnssec_validated: self.pqc_dnssec_validated.load(Ordering::Relaxed),
+            pqc_downgrade_prevented: self.pqc_downgrade_prevented.load(Ordering::Relaxed),
         }
     }
 
@@ -223,6 +235,27 @@ impl DnsStats {
         out.push_str(&format!(
             "albus_dns_active_queries {}\n",
             self.active_queries.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP albus_dns_dnssec_validated_total Total DNSSEC authenticated responses.\n");
+        out.push_str("# TYPE albus_dns_dnssec_validated_total counter\n");
+        out.push_str(&format!(
+            "albus_dns_dnssec_validated_total {}\n",
+            self.dnssec_validated.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP albus_dns_pqc_dnssec_validated_total Total Post-Quantum DNSSEC (ML-DSA-44) responses validated.\n");
+        out.push_str("# TYPE albus_dns_pqc_dnssec_validated_total counter\n");
+        out.push_str(&format!(
+            "albus_dns_pqc_dnssec_validated_total {}\n",
+            self.pqc_dnssec_validated.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP albus_dns_pqc_downgrade_prevented_total Total DNSSEC downgrade attacks blocked by local policy.\n");
+        out.push_str("# TYPE albus_dns_pqc_downgrade_prevented_total counter\n");
+        out.push_str(&format!(
+            "albus_dns_pqc_downgrade_prevented_total {}\n",
+            self.pqc_downgrade_prevented.load(Ordering::Relaxed)
         ));
 
         out

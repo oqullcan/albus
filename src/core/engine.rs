@@ -223,12 +223,16 @@ impl Engine {
                 } else {
                     None
                 };
-                Some(crate::dns::logger::QueryLogger::start(
+                let q_fmt = crate::dns::logger::LogFormat::parse_lenient(&cfg.query_log_format);
+                let n_fmt = crate::dns::logger::LogFormat::parse_lenient(&cfg.nx_log_format);
+                Some(crate::dns::logger::QueryLogger::start_with_formats(
                     main_path,
                     nx_path,
                     ip_crypt,
                     10 * 1024 * 1024,
                     5,
+                    q_fmt,
+                    n_fmt,
                 ))
             } else {
                 None
@@ -356,44 +360,73 @@ impl Engine {
             }
             let forwarding_arc = Arc::new(RwLock::new(fw_engine));
 
-            Some(Arc::new(DnsServer::new(
-                &cfg.doh_upstream,
-                &cfg.doh_bootstrap_ips,
-                cfg.block_ipv6,
-                cfg.dnssec,
-                cfg.pqc,
-                cfg.dns_racing,
-                cfg.anti_dns_rebinding,
-                cfg.block_undelegated,
-                cfg.edns_padding,
-                Arc::new(cloak),
-                blocklist_arc,
-                allowlist_arc,
-                ip_filter_arc,
-                cfg.uncloak_cnames,
-                cfg.dns64,
-                cfg.netmon,
-                dns_stats,
-                cfg.tcp_listener,
-                cfg.local_doh,
-                local_doh_addr,
-                query_logger,
-                cfg.allowlist_path.clone(),
-                cfg.blocklist_path.clone(),
-                odoh_client,
-                effective_proxy.as_deref(),
-                schedule_manager_arc,
-                edns_client_subnet,
-                cfg.metrics,
-                metrics_addr,
-                tls_auth,
-                forwarding_arc,
-                cfg.forwarding_rules_path.clone(),
-                cfg.tls_key_log_file.clone(),
-                cfg.timeout_load_reduction,
-                cfg.cache_neg_min_ttl,
-                cfg.cache_neg_max_ttl,
-            )?))
+            let parsed_listen_addrs: Vec<SocketAddr> = cfg
+                .listen_addresses
+                .iter()
+                .filter_map(|s| s.parse::<SocketAddr>().ok())
+                .collect();
+            let listen_addrs = if parsed_listen_addrs.is_empty() {
+                vec!["127.0.0.1:53".parse().unwrap()]
+            } else {
+                parsed_listen_addrs
+            };
+
+            Some(Arc::new(
+                DnsServer::new(
+                    &cfg.doh_upstream,
+                    &cfg.doh_bootstrap_ips,
+                    cfg.block_ipv6,
+                    cfg.dnssec,
+                    cfg.pqc,
+                    cfg.http3,
+                    cfg.dns_racing,
+                    cfg.anti_dns_rebinding,
+                    cfg.block_undelegated,
+                    cfg.edns_padding,
+                    Arc::new(cloak),
+                    blocklist_arc,
+                    allowlist_arc,
+                    ip_filter_arc,
+                    cfg.uncloak_cnames,
+                    cfg.dns64,
+                    cfg.netmon,
+                    dns_stats,
+                    cfg.tcp_listener,
+                    cfg.local_doh,
+                    local_doh_addr,
+                    query_logger,
+                    cfg.allowlist_path.clone(),
+                    cfg.blocklist_path.clone(),
+                    odoh_client,
+                    effective_proxy.as_deref(),
+                    schedule_manager_arc,
+                    edns_client_subnet,
+                    cfg.metrics,
+                    metrics_addr,
+                    tls_auth,
+                    forwarding_arc,
+                    cfg.forwarding_rules_path.clone(),
+                    cfg.tls_key_log_file.clone(),
+                    cfg.timeout_load_reduction,
+                    cfg.cache_neg_min_ttl,
+                    cfg.cache_neg_max_ttl,
+                )?
+                .with_query_meta(cfg.query_meta.clone())
+                .with_listen_addresses(listen_addrs)
+                .with_max_clients(cfg.max_clients)
+                .with_lb_strategy(&cfg.lb_strategy)
+                .with_fragments_blocked(cfg.fragments_blocked.clone())
+                .with_anonymized_dns_routes(
+                    cfg.anonymized_dns_routes.clone(),
+                    cfg.skip_incompatible,
+                    cfg.direct_cert_fallback,
+                )
+                .with_local_doh_tls(
+                    cfg.local_doh_tls,
+                    cfg.local_doh_cert_file.clone(),
+                    cfg.local_doh_key_file.clone(),
+                ),
+            ))
         } else {
             None
         };
@@ -474,7 +507,27 @@ impl Engine {
                         if let Some(parent) = token_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let _ = std::fs::write(token_path, format!("{}:{}\n", user, token));
+                        let token_content = format!("{}:{}\n", user, token);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            let _ = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                                .open(token_path)
+                                .and_then(|mut f| {
+                                    use std::io::Write;
+                                    f.write_all(token_content.as_bytes())?;
+                                    f.sync_all()
+                                });
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = std::fs::write(token_path, token_content);
+                        }
                         Some((user, token))
                     }
                 };
@@ -483,6 +536,7 @@ impl Engine {
                     dns.stats.clone(),
                     auth,
                     dns.subscribe_shutdown(),
+                    Some(dns.clone()),
                 );
             }
         }
@@ -503,6 +557,13 @@ impl Engine {
                         &self.upstream_ips_v6,
                     );
                 }
+            }
+        }
+
+        // 3.1 drop root privileges if user_name is specified in configuration
+        if let Some(ref user) = self.cfg.user_name {
+            if let Err(e) = crate::dns::system::drop_privileges(user) {
+                warn!("failed to drop privileges to user '{}': {}", user, e);
             }
         }
 
@@ -530,7 +591,7 @@ impl Engine {
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration and updating eBPF maps live...");
-                    self.reload_config();
+                    self.reload_config().await;
                 }
             }
         }
@@ -540,12 +601,18 @@ impl Engine {
     }
 
     // reloads persistent configuration and updates ebpf kernel maps live without process restart
-    pub fn reload_config(&mut self) {
+    pub async fn reload_config(&mut self) {
         let new_cfg = Config::load_or_default();
         info!(
             "Reloading configuration from {}",
             Config::default_config_path().display()
         );
+
+        if let Some(ref dns) = self.dns_server {
+            if let Err(e) = dns.reload_from_config(&new_cfg).await {
+                warn!("failed to reload DNS server from config: {}", e);
+            }
+        }
 
         let mut exclude_ips = if new_cfg.doh_enabled {
             extract_upstream_ips(&new_cfg.doh_upstream, &new_cfg.doh_bootstrap_ips)

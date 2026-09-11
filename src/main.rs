@@ -398,6 +398,11 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
         let _ = cfg.save_to_file("/etc/albus/config.json");
     }
 
+    // 0. verify outbound network connectivity (coldstart netprobe) before initializing resolvers
+    if cfg.netprobe_timeout != 0 {
+        dns::wait_for_network(&cfg.netprobe_address, cfg.netprobe_timeout).await;
+    }
+
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;
     engine.run().await
@@ -437,6 +442,7 @@ async fn handle_resolvers_command(
                                     dns::StampProtocol::DoQ => "DoQ",
                                     dns::StampProtocol::ODoHRelay => "ODoH-Relay",
                                     dns::StampProtocol::ODoHTarget => "ODoH-Target",
+                                    dns::StampProtocol::DNSCryptRelay => "DNSCrypt-Relay",
                                     dns::StampProtocol::Unknown(_) => "Unknown",
                                 };
                                 let a = stamp

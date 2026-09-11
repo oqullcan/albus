@@ -150,6 +150,84 @@ pub struct Config {
     pub dnscrypt_servers: Vec<String>,
     #[serde(default)]
     pub dnscrypt_relays: Vec<String>,
+    #[serde(default = "default_log_format")]
+    pub query_log_format: String,
+    #[serde(default = "default_log_format")]
+    pub nx_log_format: String,
+    #[serde(default)]
+    pub query_meta: Vec<String>,
+    #[serde(default = "default_true")]
+    pub dnscrypt_ephemeral_keys: bool,
+    #[serde(default = "default_listen_addresses")]
+    pub listen_addresses: Vec<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
+    #[serde(default)]
+    pub http3: bool,
+    #[serde(default = "default_netprobe_timeout")]
+    pub netprobe_timeout: i32,
+    #[serde(default = "default_netprobe_address")]
+    pub netprobe_address: String,
+    #[serde(default = "default_bootstrap_resolvers")]
+    pub bootstrap_resolvers: Vec<String>,
+    #[serde(default = "default_max_clients")]
+    pub max_clients: usize,
+    #[serde(default = "default_lb_strategy")]
+    pub lb_strategy: String,
+    #[serde(default = "default_true")]
+    pub lb_estimator: bool,
+    #[serde(default)]
+    pub anonymized_dns_routes: Vec<AnonymizedDnsRoute>,
+    #[serde(default)]
+    pub skip_incompatible: bool,
+    #[serde(default = "default_true")]
+    pub direct_cert_fallback: bool,
+    #[serde(default = "default_fragments_blocked")]
+    pub fragments_blocked: Vec<String>,
+    #[serde(default)]
+    pub local_doh_tls: bool,
+    #[serde(default)]
+    pub local_doh_cert_file: Option<String>,
+    #[serde(default)]
+    pub local_doh_key_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymizedDnsRoute {
+    pub server_name: String,
+    pub via: Vec<String>,
+}
+
+fn default_netprobe_timeout() -> i32 {
+    60
+}
+
+fn default_netprobe_address() -> String {
+    "9.9.9.9:53".to_string()
+}
+
+fn default_bootstrap_resolvers() -> Vec<String> {
+    vec!["9.9.9.11:53".to_string(), "8.8.8.8:53".to_string()]
+}
+
+fn default_max_clients() -> usize {
+    250
+}
+
+fn default_lb_strategy() -> String {
+    "wp2".to_string()
+}
+
+fn default_fragments_blocked() -> Vec<String> {
+    vec!["cisco".to_string(), "cleanbrowsing-adult".to_string()]
+}
+
+fn default_log_format() -> String {
+    "tsv".to_string()
+}
+
+fn default_listen_addresses() -> Vec<String> {
+    vec!["127.0.0.1:53".to_string()]
 }
 
 fn default_forwarding_rules_path() -> Option<String> {
@@ -297,6 +375,26 @@ impl Default for Config {
             web_ui_pass: None,
             dnscrypt_servers: Vec::new(),
             dnscrypt_relays: Vec::new(),
+            query_log_format: "tsv".to_string(),
+            nx_log_format: "tsv".to_string(),
+            query_meta: Vec::new(),
+            dnscrypt_ephemeral_keys: true,
+            listen_addresses: vec!["127.0.0.1:53".to_string()],
+            user_name: None,
+            http3: false,
+            netprobe_timeout: 60,
+            netprobe_address: "9.9.9.9:53".to_string(),
+            bootstrap_resolvers: vec!["9.9.9.11:53".to_string(), "8.8.8.8:53".to_string()],
+            max_clients: 250,
+            lb_strategy: "wp2".to_string(),
+            lb_estimator: true,
+            anonymized_dns_routes: Vec::new(),
+            skip_incompatible: false,
+            direct_cert_fallback: true,
+            fragments_blocked: vec!["cisco".to_string(), "cleanbrowsing-adult".to_string()],
+            local_doh_tls: false,
+            local_doh_cert_file: None,
+            local_doh_key_file: None,
         }
     }
 }
@@ -718,12 +816,21 @@ impl Config {
 
         // 2. persist master configuration to disk so user preferences survive reboots
         let target_path = path.as_ref();
-        safe_write(target_path, &json)?;
+        let target_res = safe_write(target_path, &json);
 
         // 3. also sync to /etc/albus/config.json if running as root or directory exists
         let etc = Path::new("/etc/albus/config.json");
+        let mut etc_written = false;
         if crate::core::ebpf::is_root() || etc.exists() {
-            let _ = safe_write(etc, &json);
+            if safe_write(etc, &json).is_ok() {
+                etc_written = true;
+            }
+        }
+
+        if let Err(e) = target_res {
+            if !etc_written {
+                return Err(Box::new(e));
+            }
         }
 
         Ok(())
@@ -839,6 +946,10 @@ mod tests {
         assert_eq!(cfg.tls_client_cert, None);
         assert_eq!(cfg.tls_client_key, None);
         assert!(cfg.sources.is_empty());
+        assert_eq!(cfg.web_ui, false);
+        assert_eq!(cfg.web_ui_user, None);
+        assert_eq!(cfg.web_ui_pass, None);
+        assert_eq!(cfg.web_ui_addr, "127.0.0.1:0205");
 
         // Verify serde deserialization of empty json "{}" yields identical defaults
         let from_empty: Config =
@@ -865,6 +976,10 @@ mod tests {
         assert_eq!(from_empty.tls_client_cert, None);
         assert_eq!(from_empty.tls_client_key, None);
         assert!(from_empty.sources.is_empty());
+        assert_eq!(from_empty.web_ui, false);
+        assert_eq!(from_empty.web_ui_user, None);
+        assert_eq!(from_empty.web_ui_pass, None);
+        assert_eq!(from_empty.web_ui_addr, "127.0.0.1:0205");
     }
 
     #[test]
@@ -999,6 +1114,50 @@ mod tests {
         }
         if let Some(v) = prev_cfg_user {
             std::env::set_var("ALBUS_CONFIG_USER", v);
+        }
+    }
+
+    #[test]
+    fn test_config_security_defaults_and_doc_parity() {
+        let cfg = Config::default();
+        assert_eq!(cfg.web_ui, false, "web_ui must default to false for defense-in-depth");
+        assert_eq!(cfg.web_ui_user, None, "web_ui_user must default to None");
+        assert_eq!(cfg.web_ui_pass, None, "web_ui_pass must default to None");
+
+        let cli_doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("wiki/CLI-Reference-and-Configuration.md");
+        if cli_doc_path.exists() {
+            let doc_content = std::fs::read_to_string(&cli_doc_path)
+                .expect("CLI-Reference-and-Configuration.md should be readable");
+            // Parity check 1: No legacy hardcoded credentials "ogy" or "12345"
+            assert!(
+                !doc_content.contains("\"web_ui_user\": \"ogy\""),
+                "documentation must not claim 'ogy' is default web_ui_user"
+            );
+            assert!(
+                !doc_content.contains("\"web_ui_pass\": \"12345\""),
+                "documentation must not claim '12345' is default web_ui_pass"
+            );
+            assert!(
+                !doc_content.contains("| `ogy` |"),
+                "CLI table must not claim 'ogy' is default username"
+            );
+            assert!(
+                !doc_content.contains("| `12345` |"),
+                "CLI table must not claim '12345' is default password"
+            );
+
+            // Parity check 2: web_ui default documented as false
+            assert!(
+                doc_content.contains("\"web_ui\": false"),
+                "documentation example must have web_ui: false"
+            );
+
+            // Parity check 3: volatile_config_path documented as priority 1
+            assert!(
+                doc_content.contains("1. `volatile_config_path()`"),
+                "documentation must list volatile_config_path as priority 1"
+            );
         }
     }
 }

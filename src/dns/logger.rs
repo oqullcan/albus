@@ -26,6 +26,7 @@ pub enum QueryStatus {
     Captive,
     Undelegated,
     NxDomain,
+    PqcDowngradeDrop,
 }
 
 impl QueryStatus {
@@ -42,6 +43,26 @@ impl QueryStatus {
             Self::Captive => "CAPTIVE",
             Self::Undelegated => "UNDELEGATED",
             Self::NxDomain => "NXDOMAIN",
+            Self::PqcDowngradeDrop => "PQC_DOWNGRADE_DROP",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Tsv,
+    Ltsv,
+    Json,
+}
+
+impl LogFormat {
+    pub fn parse_lenient(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ltsv" => Self::Ltsv,
+            "json" => Self::Json,
+            _ => Self::Tsv,
         }
     }
 }
@@ -55,6 +76,94 @@ pub struct QueryLogEntry {
     pub status: QueryStatus,
     pub duration_ms: u32,
     pub details: Option<String>,
+}
+
+pub fn format_query_log(
+    entry: &QueryLogEntry,
+    client_display: &str,
+    safe_domain: &str,
+    safe_details: &str,
+    format: LogFormat,
+) -> String {
+    match format {
+        LogFormat::Tsv => format!(
+            "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
+            entry.timestamp_epoch_secs,
+            client_display,
+            safe_domain,
+            entry.qtype,
+            entry.status.as_str(),
+            entry.duration_ms,
+            safe_details
+        ),
+        LogFormat::Ltsv => {
+            let cached = if entry.status == QueryStatus::CacheHit { 1 } else { 0 };
+            format!(
+                "time:{}\thost:{}\tmessage:{}\ttype:{}\treturn:{}\tcached:{}\tduration:{}\tserver:{}\trelay:-\n",
+                entry.timestamp_epoch_secs,
+                client_display,
+                safe_domain,
+                entry.qtype,
+                entry.status.as_str(),
+                cached,
+                entry.duration_ms,
+                safe_details
+            )
+        }
+        LogFormat::Json => {
+            let cached = entry.status == QueryStatus::CacheHit;
+            serde_json::json!({
+                "time": entry.timestamp_epoch_secs,
+                "host": client_display,
+                "message": safe_domain,
+                "type": entry.qtype,
+                "return": entry.status.as_str(),
+                "cached": cached,
+                "duration_ms": entry.duration_ms,
+                "server": safe_details,
+            })
+            .to_string()
+                + "\n"
+        }
+    }
+}
+
+pub fn format_nx_log(
+    entry: &QueryLogEntry,
+    client_display: &str,
+    safe_domain: &str,
+    safe_details: &str,
+    format: LogFormat,
+) -> String {
+    match format {
+        LogFormat::Tsv => format!(
+            "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
+            entry.timestamp_epoch_secs,
+            client_display,
+            safe_domain,
+            entry.qtype,
+            entry.status.as_str(),
+            entry.duration_ms,
+            safe_details
+        ),
+        LogFormat::Ltsv => format!(
+            "time:{}\thost:{}\tmessage:{}\ttype:{}\n",
+            entry.timestamp_epoch_secs, client_display, safe_domain, entry.qtype
+        ),
+        LogFormat::Json => {
+            serde_json::json!({
+                "time": entry.timestamp_epoch_secs,
+                "host": client_display,
+                "message": safe_domain,
+                "type": entry.qtype,
+                "return": entry.status.as_str(),
+                "duration_ms": entry.duration_ms,
+                "server": safe_details,
+            })
+            .to_string()
+                + "\n"
+        }
+    }
 }
 
 struct LogFileState {
@@ -144,6 +253,26 @@ impl QueryLogger {
         max_bytes: u64,
         max_backups: usize,
     ) -> Arc<Self> {
+        Self::start_with_formats(
+            main_path,
+            nx_path,
+            ip_crypt,
+            max_bytes,
+            max_backups,
+            LogFormat::Tsv,
+            LogFormat::Tsv,
+        )
+    }
+
+    pub fn start_with_formats<P1: AsRef<Path>, P2: AsRef<Path>>(
+        main_path: Option<P1>,
+        nx_path: Option<P2>,
+        ip_crypt: Option<Arc<IpCrypt>>,
+        max_bytes: u64,
+        max_backups: usize,
+        main_format: LogFormat,
+        nx_format: LogFormat,
+    ) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<QueryLogEntry>(2048);
         let main_path_buf = main_path.map(|p| p.as_ref().to_path_buf());
         let nx_path_buf = nx_path.map(|p| p.as_ref().to_path_buf());
@@ -178,25 +307,28 @@ impl QueryLogger {
 
                 let safe_domain = sanitize_log_field(&entry.domain);
                 let safe_details =
-                    sanitize_log_field(&entry.details.unwrap_or_else(|| "-".to_string()));
-
-                let line = format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
-                    entry.timestamp_epoch_secs,
-                    client_display,
-                    safe_domain,
-                    entry.qtype,
-                    entry.status.as_str(),
-                    entry.duration_ms,
-                    safe_details
-                );
+                    sanitize_log_field(&entry.details.clone().unwrap_or_else(|| "-".to_string()));
 
                 if let Some(ref mut main) = main_state {
+                    let line = format_query_log(
+                        &entry,
+                        &client_display,
+                        &safe_domain,
+                        &safe_details,
+                        main_format,
+                    );
                     main.write_line(&line);
                 }
 
                 if entry.status == QueryStatus::NxDomain {
                     if let Some(ref mut nx) = nx_state {
+                        let line = format_nx_log(
+                            &entry,
+                            &client_display,
+                            &safe_domain,
+                            &safe_details,
+                            nx_format,
+                        );
                         nx.write_line(&line);
                     }
                 }
@@ -265,6 +397,7 @@ mod tests {
         assert_eq!(QueryStatus::Pass.as_str(), "PASS");
         assert_eq!(QueryStatus::BlockHagezi.as_str(), "BLOCK_HAGEZI");
         assert_eq!(QueryStatus::UncloakedCname.as_str(), "UNCLOAKED_CNAME");
+        assert_eq!(QueryStatus::PqcDowngradeDrop.as_str(), "PQC_DOWNGRADE_DROP");
     }
 
     #[test]
@@ -357,5 +490,40 @@ mod tests {
         assert!(nx_content.contains("NXDOMAIN"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ltsv_query_and_nx_log_formatting() {
+        let entry = QueryLogEntry {
+            timestamp_epoch_secs: 1700000000,
+            client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            domain: "example.com".to_string(),
+            qtype: 1,
+            status: QueryStatus::CacheHit,
+            duration_ms: 1,
+            details: Some("quad9".to_string()),
+        };
+
+        let ltsv_line = format_query_log(&entry, "192.168.1.10", "example.com", "quad9", LogFormat::Ltsv);
+        assert_eq!(
+            ltsv_line,
+            "time:1700000000\thost:192.168.1.10\tmessage:example.com\ttype:1\treturn:CACHE_HIT\tcached:1\tduration:1\tserver:quad9\trelay:-\n"
+        );
+
+        let nx_entry = QueryLogEntry {
+            timestamp_epoch_secs: 1700000005,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            domain: "invalid.domain".to_string(),
+            qtype: 28,
+            status: QueryStatus::NxDomain,
+            duration_ms: 15,
+            details: None,
+        };
+
+        let nx_ltsv = format_nx_log(&nx_entry, "10.0.0.5", "invalid.domain", "-", LogFormat::Ltsv);
+        assert_eq!(
+            nx_ltsv,
+            "time:1700000005\thost:10.0.0.5\tmessage:invalid.domain\ttype:28\n"
+        );
     }
 }

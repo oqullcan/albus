@@ -18,6 +18,7 @@ pub enum StampProtocol {
     DoQ,
     ODoHTarget,
     ODoHRelay,
+    DNSCryptRelay,
     Unknown(u8),
 }
 
@@ -57,9 +58,65 @@ impl DnsStamp {
             0x03 => StampProtocol::DoT,
             0x04 => StampProtocol::DoQ,
             0x05 => StampProtocol::ODoHTarget,
+            0x81 => StampProtocol::DNSCryptRelay,
             0x85 => StampProtocol::ODoHRelay,
             other => StampProtocol::Unknown(other),
         };
+
+        if protocol == StampProtocol::DNSCryptRelay {
+            let (server_addr_str, next_pos) = read_lp_string(&decoded, 1)?;
+            if next_pos != decoded.len() {
+                return Err("invalid dnscrypt relay stamp: unexpected trailing bytes".into());
+            }
+            let (server_addr, bootstrap_ip) = if let Ok(sa) = server_addr_str.parse::<SocketAddr>() {
+                let v4 = if let std::net::IpAddr::V4(ip) = sa.ip() {
+                    Some(ip)
+                } else {
+                    None
+                };
+                (Some(sa), v4)
+            } else if let Ok(ip) = server_addr_str.parse::<Ipv4Addr>() {
+                (Some(SocketAddr::from((ip, 443))), Some(ip))
+            } else if let Ok(ip) = server_addr_str.parse::<std::net::Ipv6Addr>() {
+                (Some(SocketAddr::from((ip, 443))), None)
+            } else {
+                return Err(format!("invalid relay server address: {}", server_addr_str).into());
+            };
+
+            if let Some(ref sa) = server_addr {
+                if is_ssrf_risk_ip(&sa.ip()) {
+                    return Err(format!(
+                        "dns stamp rejected: server address {} is a reserved/private SSRF risk",
+                        sa.ip()
+                    )
+                    .into());
+                }
+            }
+
+            let mut bootstrap_ips = Vec::new();
+            if let Some(v4) = bootstrap_ip {
+                if is_ssrf_risk_ip(&IpAddr::V4(v4)) {
+                    return Err(format!(
+                        "dns stamp rejected: bootstrap IP {} is a reserved/private SSRF risk",
+                        v4
+                    )
+                    .into());
+                }
+                bootstrap_ips.push(v4);
+            }
+
+            return Ok(Self {
+                protocol,
+                dnssec: false,
+                no_log: false,
+                no_filter: false,
+                server_addr,
+                provider_name: String::new(),
+                path: String::new(),
+                doh_url: String::new(),
+                bootstrap_ips,
+            });
+        }
 
         let mut pos = 1;
 
@@ -388,5 +445,20 @@ mod tests {
         assert!(err.is_err(), "stamp pointing to IMDS must be rejected");
         let err_msg = err.err().unwrap().to_string();
         assert!(err_msg.contains("SSRF risk"));
+    }
+
+    #[test]
+    fn test_parse_dnscrypt_relay_stamp() {
+        let stamp_str = "sdns://gRIxMzcuNzQuMjIzLjIzNDo0NDM";
+        let stamp = DnsStamp::parse(stamp_str).expect("relay stamp must parse");
+        assert_eq!(stamp.protocol, StampProtocol::DNSCryptRelay);
+        assert_eq!(
+            stamp.server_addr,
+            Some("137.74.223.234:443".parse().unwrap())
+        );
+        assert_eq!(
+            stamp.bootstrap_ips,
+            vec!["137.74.223.234".parse::<Ipv4Addr>().unwrap()]
+        );
     }
 }

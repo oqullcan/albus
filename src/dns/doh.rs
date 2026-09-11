@@ -100,12 +100,13 @@ pub static DOH_PRESETS_V6: LazyLock<HashMap<&'static str, &'static [Ipv6Addr]>> 
         m
     });
 
-// individual http/2 client targeting an encrypted dns endpoint
+// individual http/2 or http/3 client targeting an encrypted dns endpoint
 #[derive(Clone)]
 pub struct SingleDoHClient {
     pub name: String,
     pub url: String,
     pub pqc: bool,
+    pub http3: bool,
     client: reqwest::Client,
 }
 
@@ -154,6 +155,28 @@ impl SingleDoHClient {
         tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
         tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_options(
+            upstream,
+            name,
+            custom_bootstrap_ips,
+            pqc,
+            false,
+            proxy,
+            tls_auth,
+            tls_key_log_file,
+        )
+    }
+
+    pub fn new_with_options(
+        upstream: &str,
+        name: &str,
+        custom_bootstrap_ips: &[Ipv4Addr],
+        pqc: bool,
+        http3: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
         if !pqc {
             // enforce classical key exchange ONLY: eliminate all post-quantum KEMs
@@ -175,7 +198,11 @@ impl SingleDoHClient {
         } else {
             builder.with_no_client_auth()
         };
-        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        if http3 {
+            client_config.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+        } else {
+            client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        }
 
         if let Some(keylog_path) = tls_key_log_file {
             client_config.key_log = std::sync::Arc::new(FileKeyLog::new(keylog_path));
@@ -188,6 +215,10 @@ impl SingleDoHClient {
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(client_config)
             .timeout(Duration::from_secs(5));
+
+        if http3 {
+            builder = builder.http3_prior_knowledge();
+        }
 
         if let Some(proxy_str) = proxy {
             let clean = proxy_str.trim();
@@ -240,6 +271,10 @@ impl SingleDoHClient {
                                 bootstrap_addrs.push(addr);
                             }
                         }
+                        if bootstrap_addrs.is_empty() {
+                            let fallback = resolve_host_via_bootstrap_resolvers(host_str, port, &[]);
+                            bootstrap_addrs.extend(fallback);
+                        }
                     }
                 }
 
@@ -254,6 +289,7 @@ impl SingleDoHClient {
             name: name.to_string(),
             url: upstream.to_string(),
             pqc,
+            http3,
             client,
         })
     }
@@ -263,14 +299,18 @@ impl SingleDoHClient {
         &self,
         query_wire_bytes: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut resp = self
+        let mut request = self
             .client
             .post(&self.url)
             .header("Content-Type", "application/dns-message")
             .header("Accept", "application/dns-message")
-            .body(query_wire_bytes.to_vec())
-            .send()
-            .await?;
+            .body(query_wire_bytes.to_vec());
+
+        if self.http3 {
+            request = request.version(reqwest::Version::HTTP_3);
+        }
+
+        let mut resp = request.send().await?;
 
         if !resp.status().is_success() {
             return Err(format!("DoH server {} returned HTTP {}", self.name, resp.status()).into());
@@ -316,6 +356,26 @@ impl DoHResolver {
         tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
         tls_key_log_file: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_options(
+            upstreams_csv,
+            custom_bootstrap_ips,
+            pqc,
+            false,
+            proxy,
+            tls_auth,
+            tls_key_log_file,
+        )
+    }
+
+    pub fn new_with_options(
+        upstreams_csv: &str,
+        custom_bootstrap_ips: &[Ipv4Addr],
+        pqc: bool,
+        http3: bool,
+        proxy: Option<&str>,
+        tls_auth: Option<&crate::dns::tls_auth::TlsClientAuth>,
+        tls_key_log_file: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut clients = Vec::new();
 
         for raw in upstreams_csv.split(',') {
@@ -325,11 +385,12 @@ impl DoHResolver {
             }
 
             if let Some((url, _)) = DOH_PRESETS.get(u) {
-                match SingleDoHClient::new(
+                match SingleDoHClient::new_with_options(
                     url,
                     u,
                     custom_bootstrap_ips,
                     pqc,
+                    http3,
                     proxy,
                     tls_auth,
                     tls_key_log_file,
@@ -342,11 +403,12 @@ impl DoHResolver {
                     .ok()
                     .and_then(|p| p.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "custom".to_string());
-                match SingleDoHClient::new(
+                match SingleDoHClient::new_with_options(
                     u,
                     &name,
                     custom_bootstrap_ips,
                     pqc,
+                    http3,
                     proxy,
                     tls_auth,
                     tls_key_log_file,
@@ -373,11 +435,12 @@ impl DoHResolver {
                         if stamp.doh_url.is_empty() {
                             warn!("dns stamp {} does not specify a doh endpoint", u);
                         } else {
-                            match SingleDoHClient::new(
+                            match SingleDoHClient::new_with_options(
                                 &stamp.doh_url,
                                 &name,
                                 &all_bootstraps,
                                 pqc,
+                                http3,
                                 proxy,
                                 tls_auth,
                                 tls_key_log_file,
@@ -395,11 +458,12 @@ impl DoHResolver {
         }
 
         if clients.is_empty() {
-            let cf = SingleDoHClient::new(
+            let cf = SingleDoHClient::new_with_options(
                 "https://cloudflare-dns.com/dns-query",
                 "cloudflare",
                 custom_bootstrap_ips,
                 pqc,
+                http3,
                 proxy,
                 tls_auth,
                 tls_key_log_file,
@@ -411,6 +475,10 @@ impl DoHResolver {
         let balancer = Arc::new(LoadBalancer::new(&names));
 
         Ok(Self { clients, balancer })
+    }
+
+    pub fn clients(&self) -> &[SingleDoHClient] {
+        &self.clients
     }
 
     // resets upstream performance scoring upon network changes
@@ -600,6 +668,55 @@ pub fn extract_upstream_ips_v6(
     ips.sort();
     ips.dedup();
     ips
+}
+
+// resolves upstream domain via external bootstrap resolvers list using udp 53
+pub fn resolve_host_via_bootstrap_resolvers(
+    host: &str,
+    port: u16,
+    bootstrap_resolvers: &[String],
+) -> Vec<SocketAddr> {
+    let mut addrs = Vec::new();
+    let query_wire = crate::dns::server::build_a_query(host);
+    let defaults = ["9.9.9.11:53", "8.8.8.8:53", "1.1.1.1:53"];
+    let resolvers: Vec<&str> = if bootstrap_resolvers.is_empty() {
+        defaults.to_vec()
+    } else {
+        bootstrap_resolvers.iter().map(|s| s.as_str()).collect()
+    };
+
+    for resolver in resolvers {
+        let resolver_addr = match resolver.parse::<SocketAddr>() {
+            Ok(sa) => sa,
+            Err(_) => {
+                if let Ok(ip) = resolver.parse::<std::net::IpAddr>() {
+                    SocketAddr::new(ip, 53)
+                } else {
+                    continue;
+                }
+            }
+        };
+
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(1500)));
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(1500)));
+            if socket.send_to(&query_wire, resolver_addr).is_ok() {
+                let mut resp_buf = [0u8; 512];
+                if let Ok((len, _)) = socket.recv_from(&mut resp_buf) {
+                    let resp = &resp_buf[..len];
+                    if let Some((_, ips)) = crate::dns::server::parse_dns_response(resp) {
+                        for ip in ips {
+                            addrs.push(SocketAddr::from((ip, port)));
+                        }
+                        if !addrs.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    addrs
 }
 
 #[cfg(test)]
@@ -861,4 +978,29 @@ MC4CAQAwBQYDK2VwBCIEII1my9yC6gDHipAN+m87pQ1AECzquF5mj3NU+c6Yg7a7
         );
         assert!(priv_boot_res.is_err());
     }
+
+    #[tokio::test]
+    async fn test_doh_http3_client_initialization() {
+        let client = SingleDoHClient::new_with_options(
+            "https://cloudflare-dns.com/dns-query",
+            "cloudflare",
+            &[],
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(client.is_ok(), "HTTP/3 SingleDoHClient initialization must succeed: {:?}", client.as_ref().err());
+        let c = client.unwrap();
+        assert!(c.http3, "HTTP/3 flag must be true");
+
+        let resolver = DoHResolver::new_with_options("cloudflare,quad9", &[], true, true, None, None, None);
+        assert!(resolver.is_ok(), "HTTP/3 DoHResolver initialization must succeed: {:?}", resolver.as_ref().err());
+        let r = resolver.unwrap();
+        assert_eq!(r.clients().len(), 2);
+        assert!(r.clients()[0].http3);
+        assert!(r.clients()[1].http3);
+    }
 }
+

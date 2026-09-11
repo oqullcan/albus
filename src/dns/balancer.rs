@@ -155,6 +155,85 @@ impl LoadBalancer {
         ordered
     }
 
+    // selects dispatch order of upstream candidate indices based on configured lb_strategy:
+    // "wp2" (default), "p2", "ph", "first", or "random"
+    pub fn select_with_strategy(&self, strategy: &str) -> Vec<usize> {
+        let stats_guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
+        let count = stats_guard.len();
+        if count <= 1 {
+            return (0..count).collect();
+        }
+
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize;
+
+        match strategy.to_ascii_lowercase().as_str() {
+            "first" => {
+                let mut indexed: Vec<(usize, f64)> = stats_guard
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.score()))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.into_iter().map(|(i, _)| i).collect()
+            }
+            "random" => {
+                let mut indices: Vec<usize> = (0..count).collect();
+                for i in (1..count).rev() {
+                    let j = (now_nanos + i * 17) % (i + 1);
+                    indices.swap(i, j);
+                }
+                indices
+            }
+            "p2" => {
+                let mut indexed: Vec<(usize, f64)> = stats_guard
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.score()))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top1 = indexed[0].0;
+                let top2 = indexed[1].0;
+                let (chosen, other) = if (now_nanos % 2) == 0 {
+                    (top1, top2)
+                } else {
+                    (top2, top1)
+                };
+                let mut res = vec![chosen, other];
+                for (idx, _) in indexed.into_iter().skip(2) {
+                    res.push(idx);
+                }
+                res
+            }
+            "ph" => {
+                let mut indexed: Vec<(usize, f64)> = stats_guard
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.score()))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let half = (count / 2).max(1);
+                let chosen_idx = now_nanos % half;
+                let winner = indexed[chosen_idx].0;
+                let mut res = vec![winner];
+                for (idx, _) in indexed {
+                    if idx != winner {
+                        res.push(idx);
+                    }
+                }
+                res
+            }
+            _ => self.select_candidates(),
+        }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        let stats_guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
+        stats_guard.iter().map(|s| s.name.clone()).collect()
+    }
+
     pub fn record_result(&self, index: usize, latency: Duration, success: bool) {
         let guard = self.stats.read().unwrap_or_else(|p| p.into_inner());
         if let Some(target) = guard.get(index) {

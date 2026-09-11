@@ -22,6 +22,19 @@ impl LocalDoHServer {
     pub fn start<F, Fut>(
         bind_addr: SocketAddr,
         handler: F,
+        shutdown_rx: broadcast::Receiver<()>,
+    ) where
+        F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        Self::start_with_tls(bind_addr, None, handler, shutdown_rx);
+    }
+
+    // spawns local doh listener with optional TLS termination (HTTPS RFC 8484)
+    pub fn start_with_tls<F, Fut>(
+        bind_addr: SocketAddr,
+        tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+        handler: F,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) where
         F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
@@ -29,11 +42,19 @@ impl LocalDoHServer {
     {
         let handler_arc = Arc::new(handler);
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DOH_CONNS));
+        let is_tls = tls_acceptor.is_some();
 
         tokio::spawn(async move {
             let listener = match TcpListener::bind(bind_addr).await {
                 Ok(l) => {
-                    info!(addr = %bind_addr, "Local DoH server active on http://{}/dns-query", bind_addr);
+                    let proto = if is_tls { "https" } else { "http" };
+                    info!(
+                        addr = %bind_addr,
+                        tls = is_tls,
+                        "Local DoH server active on {}://{}/dns-query",
+                        proto,
+                        bind_addr
+                    );
                     l
                 }
                 Err(e) => {
@@ -46,7 +67,7 @@ impl LocalDoHServer {
                 tokio::select! {
                     accept_res = listener.accept() => {
                         match accept_res {
-                            Ok((mut stream, peer_addr)) => {
+                            Ok((stream, peer_addr)) => {
                                 let permit = match sem.clone().try_acquire_owned() {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -56,94 +77,25 @@ impl LocalDoHServer {
                                 };
                                 let handler_clone = handler_arc.clone();
 
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let mut buf = vec![0u8; MAX_DOH_REQUEST_SIZE];
-                                    let mut total_read = 0;
-
-                                    // read http request with strict timeout and content-length boundary check
-                                    let read_res = tokio::time::timeout(Duration::from_secs(5), async {
-                                        loop {
-                                            let n = stream.read(&mut buf[total_read..]).await?;
-                                            if n == 0 {
-                                                break;
+                                if let Some(ref acceptor) = tls_acceptor {
+                                    let acceptor_clone = acceptor.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        match acceptor_clone.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                process_doh_connection(tls_stream, peer_addr, handler_clone).await;
                                             }
-                                            total_read += n;
-
-                                            // check if header delimiter \r\n\r\n is received
-                                            if let Some(pos) = buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n") {
-                                                let header_str = String::from_utf8_lossy(&buf[..pos]);
-                                                if header_str.starts_with("POST") {
-                                                    let mut cl_opt = None;
-                                                    for line in header_str.lines() {
-                                                        let lower = line.to_ascii_lowercase();
-                                                        if let Some(val) = lower.strip_prefix("content-length:") {
-                                                            if let Ok(cl) = val.trim().parse::<usize>() {
-                                                                cl_opt = Some(cl);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    if let Some(cl) = cl_opt {
-                                                        if total_read >= pos + 4 + cl {
-                                                            break;
-                                                        }
-                                                    } else {
-                                                        break;
-                                                    }
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                            if total_read >= buf.len() {
-                                                break;
+                                            Err(e) => {
+                                                debug!("local DoH TLS handshake error from {}: {}", peer_addr, e);
                                             }
                                         }
-                                        Ok::<usize, std::io::Error>(total_read)
-                                    }).await;
-
-                                    let n = match read_res {
-                                        Ok(Ok(n)) if n > 0 => n,
-                                        _ => return,
-                                    };
-
-                                    let req = &buf[..n];
-                                    let (query_bytes, _is_post) = match parse_http_dns_request(req) {
-                                        HttpDnsRequest::Query(bytes, is_post) => (bytes, is_post),
-                                        HttpDnsRequest::HealthCheck => {
-                                            let body = "Albus Secure Local DoH Resolver (RFC 8484) Active\nEndpoint: /dns-query\n";
-                                            let resp = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                                body.len(),
-                                                body
-                                            );
-                                            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
-                                            return;
-                                        }
-                                        HttpDnsRequest::BadRequest => {
-                                            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
-                                            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
-                                            return;
-                                        }
-                                    };
-
-                                    if let Some(dns_resp) = handler_clone(query_bytes, peer_addr).await {
-                                        let header = format!(
-                                            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n",
-                                            dns_resp.len()
-                                        );
-                                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                                            stream.write_all(header.as_bytes()).await?;
-                                            stream.write_all(&dns_resp).await?;
-                                            stream.flush().await
-                                        }).await;
-                                    } else {
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_secs(5),
-                                            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"),
-                                        ).await;
-                                    }
-                                });
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        process_doh_connection(stream, peer_addr, handler_clone).await;
+                                    });
+                                }
                             }
                             Err(e) => {
                                 warn!("local DoH accept error: {}; continuing", e);
@@ -158,6 +110,118 @@ impl LocalDoHServer {
                 }
             }
         });
+    }
+}
+
+// creates tokio-rustls TlsAcceptor from X.509 certificate and private key PEM files
+pub fn create_tls_acceptor_from_files(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<tokio_rustls::TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+    let cert_pem = std::fs::read_to_string(cert_path)?;
+    let key_pem = std::fs::read_to_string(key_path)?;
+    let certs = crate::dns::tls_auth::parse_pem_certificates(&cert_pem)?;
+    let key = crate::dns::tls_auth::parse_pem_private_key(&key_pem)?;
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg)))
+}
+
+async fn process_doh_connection<S, F, Fut>(
+    mut stream: S,
+    peer_addr: SocketAddr,
+    handler: Arc<F>,
+) where
+    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+    F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
+    let mut buf = vec![0u8; MAX_DOH_REQUEST_SIZE];
+    let mut total_read = 0;
+
+    let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let n = stream.read(&mut buf[total_read..]).await?;
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+
+            if let Some(pos) = buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_str = String::from_utf8_lossy(&buf[..pos]);
+                if header_str.starts_with("POST") {
+                    let mut cl_opt = None;
+                    for line in header_str.lines() {
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(val) = lower.strip_prefix("content-length:") {
+                            if let Ok(cl) = val.trim().parse::<usize>() {
+                                cl_opt = Some(cl);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(cl) = cl_opt {
+                        if total_read >= pos + 4 + cl {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if total_read >= buf.len() {
+                break;
+            }
+        }
+        Ok::<usize, std::io::Error>(total_read)
+    })
+    .await;
+
+    let n = match read_res {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return,
+    };
+
+    let req = &buf[..n];
+    let (query_bytes, _is_post) = match parse_http_dns_request(req) {
+        HttpDnsRequest::Query(bytes, is_post) => (bytes, is_post),
+        HttpDnsRequest::HealthCheck => {
+            let body = "Albus Secure Local DoH Resolver (RFC 8484) Active\nEndpoint: /dns-query\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
+            return;
+        }
+        HttpDnsRequest::BadRequest => {
+            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
+            return;
+        }
+    };
+
+    if let Some(dns_resp) = handler(query_bytes, peer_addr).await {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n",
+            dns_resp.len()
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(&dns_resp).await?;
+            stream.flush().await
+        })
+        .await;
+    } else {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
     }
 }
 

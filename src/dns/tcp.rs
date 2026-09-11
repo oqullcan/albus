@@ -51,10 +51,12 @@ impl DnsTcpServer {
 
                     #[cfg(target_os = "linux")]
                     {
+                        let level = if bind_addr.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
+                        let opt = if bind_addr.is_ipv6() { libc::IPV6_FREEBIND } else { libc::IP_FREEBIND };
                         let _ = libc::setsockopt(
                             fd,
-                            libc::IPPROTO_IP,
-                            libc::IP_FREEBIND,
+                            level,
+                            opt,
                             &one as *const _ as *const libc::c_void,
                             std::mem::size_of_val(&one) as libc::socklen_t,
                         );
