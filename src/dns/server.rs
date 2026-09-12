@@ -761,6 +761,23 @@ impl DnsServer {
             }
         });
 
+        // 3. spawn periodic anti-injection stale flow state cleanup
+        if let Some(anti_inj) = self.anti_injection.clone() {
+            let mut anti_inj_shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            anti_inj.cleanup_stale(std::time::Duration::from_secs(300));
+                        }
+                        _ = anti_inj_shutdown_rx.recv() => break,
+                    }
+                }
+            });
+        }
+
         let canary_probe_target = addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]);
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {

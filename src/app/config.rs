@@ -1122,6 +1122,12 @@ impl Config {
         if self.tor {
             return Some("socks5://127.0.0.1:9050".to_string());
         }
+        if !self.anonymized_doh_relays.is_empty() {
+            let relay = self.anonymized_doh_relays[0].trim();
+            if !relay.is_empty() {
+                return Some(relay.to_string());
+            }
+        }
         None
     }
 
@@ -1403,7 +1409,7 @@ impl Config {
         if let Some(ref p) = args.pidfile {
             self.pid_file = Some(p.clone());
         }
-        if args.cloak_ttl != 10 && args.cloak_ttl != 300 {
+        if args.cloak_ttl != 300 {
             self.cloak_ttl = args.cloak_ttl;
         }
         if args.reject_ttl != 10 {
@@ -1566,6 +1572,14 @@ mod tests {
         assert_eq!(
             cfg.effective_proxy().as_deref(),
             Some("socks5://10.0.0.1:1080")
+        );
+
+        // anonymized_doh_relays fallback when neither socks5_proxy nor tor is configured
+        let mut relay_cfg = Config::default();
+        relay_cfg.anonymized_doh_relays = vec!["socks5://127.0.0.1:9150".to_string()];
+        assert_eq!(
+            relay_cfg.effective_proxy().as_deref(),
+            Some("socks5://127.0.0.1:9150")
         );
     }
 

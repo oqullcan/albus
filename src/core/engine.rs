@@ -65,6 +65,11 @@ impl Engine {
 
         let ja4_profile = cfg.ja4_mimic.as_deref().and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
         let stack_morph_profile = cfg.stack_morph.as_deref().and_then(crate::core::stack_morph::OsProfile::from_str);
+        let anti_injection_filter = if cfg.anti_injection {
+            Some(Arc::new(crate::core::anti_injection::AntiInjectionFilter::new(cfg.anti_injection_ttl_tolerance)))
+        } else {
+            None
+        };
 
         // assemble bpf manager configuration parameters
         let bpf_cfg = BpfManagerConfig {
@@ -92,6 +97,7 @@ impl Engine {
             stack_morph: cfg.stack_morph.is_some(),
             stack_morph_profile,
             auto_ttl_estimator,
+            anti_injection: anti_injection_filter.clone(),
         };
 
         // instantiate local doh proxy server on 127.0.0.1:53
@@ -499,7 +505,12 @@ impl Engine {
             let dnscrypt_client = if !cfg.dnscrypt_servers.is_empty() {
                 let first_server = &cfg.dnscrypt_servers[0];
                 let relay_addr = if !cfg.dnscrypt_relays.is_empty() {
-                    cfg.dnscrypt_relays[0].parse::<SocketAddr>().ok()
+                    let r = &cfg.dnscrypt_relays[0];
+                    if r.starts_with("sdns://") {
+                        crate::dns::stamp::DnsStamp::parse(r).ok().and_then(|s| s.server_addr)
+                    } else {
+                        r.parse::<SocketAddr>().ok()
+                    }
                 } else {
                     crate::dns::AnonymizedRelay::select_relay_for_server(
                         first_server,
@@ -617,11 +628,7 @@ impl Engine {
                 .with_dnscrypt_client(dnscrypt_client)
                 .with_randomize_ecs(cfg.randomize_ecs)
                 .with_reject_ttl(cfg.reject_ttl)
-                .with_optional_anti_injection(if cfg.anti_injection {
-                    Some(Arc::new(crate::core::anti_injection::AntiInjectionFilter::new(cfg.anti_injection_ttl_tolerance)))
-                } else {
-                    None
-                })
+                .with_optional_anti_injection(anti_injection_filter.clone())
                 .with_local_dot(
                     cfg.local_dot,
                     local_dot_addr,
@@ -907,6 +914,7 @@ impl Engine {
             stack_morph: new_cfg.stack_morph.is_some(),
             stack_morph_profile,
             auto_ttl_estimator,
+            anti_injection: self.dns_server.as_ref().and_then(|s| s.anti_injection.clone()),
         };
 
         if let Err(e) = self.bpf_manager.reload_maps(&bpf_cfg) {

@@ -338,14 +338,28 @@ impl AnonymizedRelay {
         routes: &[crate::app::config::AnonymizedDnsRoute],
         available_relays: &std::collections::HashMap<String, SocketAddr>,
     ) -> Option<SocketAddr> {
+        let resolve_via = |via: &str| -> Option<SocketAddr> {
+            if let Some(addr) = available_relays.get(via) {
+                return Some(*addr);
+            }
+            if let Ok(addr) = via.parse::<SocketAddr>() {
+                return Some(addr);
+            }
+            if via.starts_with("sdns://") {
+                if let Ok(stamp) = crate::dns::stamp::DnsStamp::parse(via) {
+                    if let Some(addr) = stamp.server_addr {
+                        return Some(addr);
+                    }
+                }
+            }
+            None
+        };
+
         // 1. Exact match on server_name
         for route in routes {
             if route.server_name.eq_ignore_ascii_case(server_name) {
                 for via in &route.via {
-                    if let Some(addr) = available_relays.get(via) {
-                        return Some(*addr);
-                    }
-                    if let Ok(addr) = via.parse::<SocketAddr>() {
+                    if let Some(addr) = resolve_via(via) {
                         return Some(addr);
                     }
                 }
@@ -355,10 +369,7 @@ impl AnonymizedRelay {
         for route in routes {
             if route.server_name == "*" {
                 for via in &route.via {
-                    if let Some(addr) = available_relays.get(via) {
-                        return Some(*addr);
-                    }
-                    if let Ok(addr) = via.parse::<SocketAddr>() {
+                    if let Some(addr) = resolve_via(via) {
                         return Some(addr);
                     }
                 }
@@ -2594,6 +2605,14 @@ mod tests {
             AnonymizedRelay::select_relay_for_server("unknown", &no_wildcard, &available),
             None
         );
+
+        // SDNS relay stamp resolution
+        let stamp_routes = vec![crate::app::config::AnonymizedDnsRoute {
+            server_name: "relay-stamp-test".to_string(),
+            via: vec!["sdns://gQ8xODUuMjM2LjEwNC4yNDg".to_string()],
+        }];
+        let stamp_relay = AnonymizedRelay::select_relay_for_server("relay-stamp-test", &stamp_routes, &available);
+        assert_eq!(stamp_relay, Some("185.236.104.248:443".parse().unwrap()));
     }
 
     #[test]

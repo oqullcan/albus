@@ -110,3 +110,23 @@ All notable changes to the Albus project are documented in this file.
 - **Wire Transaction ID Preservation & DNSSEC AD Bit Stripping (`src/dns/server.rs`)**:
   - Guaranteed RFC 1035 wire transaction ID matching on all upstream responses (`resp_bytes[0..2] = query_data[0..2]`).
   - Enforced RFC 6840 Section 5.7 compliance by clearing the AD bit when local DNSSEC validation is disabled.
+
+#### Evasion Entropy, Relay Stamps & Protocol Pipeline Hardening
+- **Entropy Hardening for Decoy Handshakes (`src/core/fake/clienthello.rs`, `src/core/ja4_mimic.rs`)**:
+  - Replaced static byte repetitions in fake ClientHello and JA4 browser mimicry with dual-entropy CSPRNG generation (`fill_dual_entropy`) for client random, legacy session ID, and synthetic key shares, eliminating trivial heuristic signatures for DPI middleboxes.
+- **Dynamic TCP Option Timestamps (`src/core/rawsock/packet.rs`)**:
+  - Replaced static TCP timestamp (`0x12345678`) in morphed TCP options with dynamic millisecond epoch timestamps derived from system time, matching authentic OS TCP stack behaviour under passive OS fingerprinting.
+- **Bounded Memory & State Pruning for Anti-Injection (`src/core/anti_injection.rs`, `src/dns/server.rs`, `src/core/ebpf/manager.rs`, `src/core/engine.rs`)**:
+  - Enforced bounded memory ceiling (`MAX_TRACKED_FLOWS = 10_000`) with stale entry pruning and eviction in `record_legitimate_flow`.
+  - Added periodic background cleanup task in `DnsServer::start` running every 60 seconds.
+  - Connected live eBPF connection events to `AntiInjectionFilter` via `BpfManagerConfig`, providing authentic flow baseline calibration.
+- **RFC Assigned Default Ports in DNS Stamps (`src/dns/stamp.rs`)**:
+  - Bare IPs in DNS stamps without explicit ports now correctly assign port 853 for DoT and DoQ, and port 443 for DNSCrypt/DoH, per RFC 7858, RFC 9250, and DNSCrypt specifications.
+- **Anonymized DNS Relay Stamp Resolution (`src/dns/dnscrypt_client.rs`, `src/core/engine.rs`)**:
+  - Extended `AnonymizedRelay::select_relay_for_server` and `Engine` to automatically resolve `sdns://` relay stamps into their socket endpoints for relay routes.
+- **Anonymized DoH Relay Pipeline Wiring (`src/app/config.rs`)**:
+  - Connected `anonymized_doh_relays` to `effective_proxy()`, allowing configured proxy relays to tunnel DoH queries when explicit socks5_proxy/tor is not set.
+- **Wire Cache Multi-Record TTL Decay (`src/dns/cache.rs`)**:
+  - Decays and updates TTL values across both answer and authority records, preventing stale authority records and clamping min TTL across all returned records.
+- **Split-DNS Forwarding Socket Isolation & RFC 1035 Match (`src/dns/forward.rs`)**:
+  - Connected forwarding UDP socket directly to target to filter out stray middlebox packets and enforced RFC 1035 transaction ID validation on incoming responses.

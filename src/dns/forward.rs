@@ -283,14 +283,34 @@ impl ForwardingEngine {
         };
 
         let sock = UdpSocket::bind(bind_addr).await?;
-        sock.send_to(query, target).await?;
+        let _ = sock.connect(target).await;
+        sock.send(query).await?;
 
         let mut buf = vec![0u8; 4096];
-        let (n, _) = timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "udp forward query timeout")
-            })??;
+        let timeout_dur = Duration::from_secs(2);
+        let start = std::time::Instant::now();
+
+        let n = loop {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout_dur {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "udp forward query timeout",
+                ));
+            }
+            let remaining = timeout_dur - elapsed;
+            let recv_len = timeout(remaining, sock.recv(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "udp forward query timeout")
+                })??;
+
+            if recv_len >= 2 && query.len() >= 2 && (buf[0] != query[0] || buf[1] != query[1]) {
+                // Ignore mismatched transaction ID
+                continue;
+            }
+            break recv_len;
+        };
 
         buf.truncate(n);
 

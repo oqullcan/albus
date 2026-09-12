@@ -149,13 +149,15 @@ impl DnsStamp {
             (Some(sa), v4)
         } else if let Ok(ip) = server_addr_str.parse::<Ipv4Addr>() {
             let default_port = match protocol {
-                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay => 443,
+                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay | StampProtocol::CryptDns => 443,
+                StampProtocol::DoT | StampProtocol::DoQ => 853,
                 _ => 53,
             };
             (Some(SocketAddr::from((ip, default_port))), Some(ip))
         } else if let Ok(ip) = server_addr_str.parse::<std::net::Ipv6Addr>() {
             let default_port = match protocol {
-                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay => 443,
+                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay | StampProtocol::CryptDns => 443,
+                StampProtocol::DoT | StampProtocol::DoQ => 853,
                 _ => 53,
             };
             (Some(SocketAddr::from((ip, default_port))), None)
@@ -481,5 +483,45 @@ mod tests {
             stamp.bootstrap_ips,
             vec!["137.74.223.234".parse::<Ipv4Addr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn test_dot_and_doq_default_port_853() {
+        // Construct DoT stamp with bare IP (9.9.9.9):
+        // Proto: 0x03, Props: 8 bytes zero, Addr: lp_string("9.9.9.9"), PK: 32 bytes zero, Provider: lp_string("dns.quad9.net")
+        let mut raw = Vec::new();
+        raw.push(0x03); // DoT
+        raw.extend_from_slice(&[0u8; 8]); // Props
+        let addr = b"9.9.9.9";
+        raw.push(addr.len() as u8);
+        raw.extend_from_slice(addr);
+        raw.extend_from_slice(&[0u8; 32]); // PK
+        let host = b"dns.quad9.net";
+        raw.push(host.len() as u8);
+        raw.extend_from_slice(host);
+
+        // base64url encode
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut b64 = String::new();
+        let chunks = raw.chunks(3);
+        for chunk in chunks {
+            let b0 = chunk[0];
+            let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+            b64.push(TABLE[(b0 >> 2) as usize] as char);
+            b64.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                b64.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                b64.push(TABLE[(b2 & 0x3f) as usize] as char);
+            }
+        }
+
+        let stamp_str = format!("sdns://{}", b64);
+        let stamp = DnsStamp::parse(&stamp_str).expect("DoT stamp with bare IP must parse");
+        assert_eq!(stamp.protocol, StampProtocol::DoT);
+        assert_eq!(stamp.server_addr, Some(SocketAddr::from(([9, 9, 9, 9], 853))));
     }
 }

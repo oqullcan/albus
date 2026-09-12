@@ -142,8 +142,12 @@ pub fn build_packet_stack_morphed(
     let mut pkt = StackPacket::new();
     let effective_flags = tcp_flags.unwrap_or(0x18);
     let (tcp_options, default_win, default_ttl) = if let Some(profile) = os_profile {
+        let ts_val = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u32)
+            .unwrap_or(0x12345678);
         (
-            profile.build_tcp_options(1460, 7, 0x12345678, 0),
+            profile.build_tcp_options(1460, 7, ts_val, 0),
             profile.default_window_size(),
             profile.default_ttl(),
         )

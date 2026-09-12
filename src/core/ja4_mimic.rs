@@ -177,11 +177,15 @@ pub fn synthesize_client_hello(
     packet.push(0x03);
 
     // Client Random: 32 bytes
-    packet.extend_from_slice(&[0x42; 32]);
+    let mut client_random = [0x42u8; 32];
+    let _ = crate::dns::entropy::fill_dual_entropy(&mut client_random);
+    packet.extend_from_slice(&client_random);
 
     // Legacy Session ID: 32 bytes
     packet.push(32);
-    packet.extend_from_slice(&[0x24; 32]);
+    let mut session_id = [0x24u8; 32];
+    let _ = crate::dns::entropy::fill_dual_entropy(&mut session_id);
+    packet.extend_from_slice(&session_id);
 
     // Cipher Suites
     let ciphers = profile.cipher_suites();

@@ -136,14 +136,18 @@ pub fn anonymize_log_line(line: &str, privacy_level: u8) -> String {
                 target.push_str(k);
                 target.push('=');
                 target.push_str(&anonymize_token(v));
-            } else if (k == "domain" || k == "qname" || k == "host") && privacy_level >= 2 {
+            } else if k == "domain" || k == "qname" || k == "host" {
                 target.push_str(k);
                 target.push('=');
-                target.push_str(&anonymize_token(v));
+                if privacy_level >= 2 {
+                    target.push_str(&anonymize_token(v));
+                } else {
+                    target.push_str(v);
+                }
             } else {
                 target.push_str(k);
                 target.push('=');
-                target.push_str(&anonymize_token(v));
+                target.push_str(v);
             }
         } else {
             target.push_str(&anonymize_token(word));

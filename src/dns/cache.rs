@@ -222,7 +222,7 @@ pub fn update_response_ttls(data: &mut [u8], new_ttl: u32) {
     let ancount = ((data[6] as usize) << 8) | (data[7] as usize);
     let nscount = ((data[8] as usize) << 8) | (data[9] as usize);
 
-    let records_to_update = if ancount > 0 { ancount } else { nscount };
+    let records_to_update = ancount + nscount;
     if records_to_update == 0 {
         return;
     }
@@ -329,7 +329,7 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
     let ancount = ((data[6] as usize) << 8) | (data[7] as usize);
     let nscount = ((data[8] as usize) << 8) | (data[9] as usize);
 
-    let count = if ancount > 0 { ancount } else { nscount };
+    let count = ancount + nscount;
     if count == 0 {
         return 60;
     }

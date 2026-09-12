@@ -1,6 +1,6 @@
 //! high-level ebpf manager coordinating kernel hooks, raw packet injection, and ring buffer polling.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -35,6 +35,7 @@ pub struct BpfManagerConfig {
     pub stack_morph: bool,
     pub stack_morph_profile: Option<crate::core::stack_morph::OsProfile>,
     pub auto_ttl_estimator: AutoTtlEstimator,
+    pub anti_injection: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>,
 }
 
 // manager coordinating the ebpf filter engine and raw-socket injector
@@ -120,6 +121,7 @@ impl BpfManager {
         let fake_tcp_flags = self.cfg.fake_tcp_flags;
         let stack_morph = self.cfg.stack_morph;
         let stack_morph_profile = self.cfg.stack_morph_profile;
+        let anti_injection = self.cfg.anti_injection.clone();
         running.store(true, Ordering::SeqCst);
 
         self.engine = Some(engine);
@@ -256,6 +258,11 @@ impl BpfManager {
                         IpAddr::V6(_) => fake_ttl_fallback,
                     };
 
+                    if let Some(ref anti_inj) = anti_injection {
+                        let server_addr = SocketAddr::new(conn.dst_ip, conn.dst_port);
+                        anti_inj.record_legitimate_flow(server_addr, conn.seq, 65535, optimal_ttl);
+                    }
+
                     let is_http = conn.dst_port == 80 || conn.dst_port == 8080;
                     let payload: &[u8] = if is_http {
                         if fake_http_payloads.is_empty() {
@@ -382,6 +389,7 @@ mod tests {
             stack_morph: false,
             stack_morph_profile: None,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+            anti_injection: None,
         }
     }
 

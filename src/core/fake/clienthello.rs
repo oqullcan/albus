@@ -73,7 +73,9 @@ pub fn build_fake_client_hello_advanced(sni_host: &str, pqc: bool, ja4_mimic: bo
         key_share_entry.push(0x99);
         key_share_entry.push(0x00); // key exchange length (32 bytes)
         key_share_entry.push(0x20);
-        key_share_entry.extend_from_slice(&[0x42; 32]); // synthetic x25519 + kyber public share
+        let mut key_share = [0x42u8; 32];
+        let _ = crate::dns::entropy::fill_dual_entropy(&mut key_share);
+        key_share_entry.extend_from_slice(&key_share); // synthetic x25519 + kyber public share
 
         let ks_list_len = key_share_entry.len();
         let mut key_share_data = Vec::with_capacity(2 + ks_list_len);
@@ -95,7 +97,11 @@ pub fn build_fake_client_hello_advanced(sni_host: &str, pqc: bool, ja4_mimic: bo
     let mut body = Vec::new();
     body.push(0x03); // client_version major (tls 1.2 legacy)
     body.push(0x03); // client_version minor
-    body.extend_from_slice(&[0u8; 32]); // 32-byte client random
+    let mut client_random = [0u8; 32];
+    if crate::dns::entropy::fill_dual_entropy(&mut client_random).is_err() {
+        client_random.fill(0x42);
+    }
+    body.extend_from_slice(&client_random); // 32-byte client random
     body.push(0x00); // legacy_session_id vector length
     body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites (tls_aes_128_gcm_sha256)
     body.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods (null compression)

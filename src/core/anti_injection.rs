@@ -48,6 +48,8 @@ pub struct AntiInjectionFilter {
 }
 
 impl AntiInjectionFilter {
+    pub const MAX_TRACKED_FLOWS: usize = 10_000;
+
     pub fn new(ttl_tolerance: u8) -> Self {
         Self {
             flows: Arc::new(RwLock::new(HashMap::new())),
@@ -55,7 +57,7 @@ impl AntiInjectionFilter {
         }
     }
 
-    /// Records or updates verified state from legitimate server traffic.
+    /// Records or updates verified state from legitimate server traffic with bounded memory capacity.
     pub fn record_legitimate_flow(
         &self,
         server_addr: SocketAddr,
@@ -64,6 +66,15 @@ impl AntiInjectionFilter {
         ttl: u8,
     ) {
         if let Ok(mut lock) = self.flows.write() {
+            if lock.len() >= Self::MAX_TRACKED_FLOWS && !lock.contains_key(&server_addr) {
+                let now = Instant::now();
+                lock.retain(|_, state| now.duration_since(state.last_seen) < Duration::from_secs(300));
+                if lock.len() >= Self::MAX_TRACKED_FLOWS {
+                    if let Some((&oldest_key, _)) = lock.iter().min_by_key(|(_, s)| s.last_seen) {
+                        lock.remove(&oldest_key);
+                    }
+                }
+            }
             lock.insert(
                 server_addr,
                 FlowState {
@@ -214,5 +225,20 @@ mod tests {
             }
             _ => panic!("injected IPv6 DNS response must be dropped"),
         }
+    }
+
+    #[test]
+    fn test_anti_injection_cleanup_stale() {
+        let filter = AntiInjectionFilter::new(3);
+        let s_addr: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        filter.record_legitimate_flow(s_addr, 1000, 4096, 50);
+
+        assert_eq!(filter.inspect_tcp_rst(s_addr, 1005, 50), InjectionVerdict::Legitimate);
+
+        // Immediate cleanup with 0 timeout removes all stale entries
+        filter.cleanup_stale(Duration::from_millis(0));
+
+        // After cleanup, flow is no longer tracked, so uncalibrated packets default to Legitimate
+        assert_eq!(filter.flows.read().unwrap().len(), 0);
     }
 }
