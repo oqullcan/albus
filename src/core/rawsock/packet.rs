@@ -82,6 +82,29 @@ pub fn checksum(data: &[u8]) -> u16 {
     checksum_finalize(sum)
 }
 
+// parses symbolic or numeric tcp control flags representation into 8-bit wire flag byte
+pub fn parse_tcp_flags(flags_str: &str) -> Option<u8> {
+    let s = flags_str.trim().to_lowercase();
+    match s.as_str() {
+        "pshack" | "psh_ack" | "psh+ack" => Some(0x18),
+        "synack" | "syn_ack" | "syn+ack" => Some(0x12),
+        "rst" => Some(0x04),
+        "rstack" | "rst_ack" | "rst+ack" => Some(0x14),
+        "ack" => Some(0x10),
+        "syn" => Some(0x02),
+        "fin" => Some(0x01),
+        "finack" | "fin_ack" | "fin+ack" => Some(0x11),
+        "urg" => Some(0x20),
+        _ => {
+            if let Some(hex) = s.strip_prefix("0x") {
+                u8::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<u8>().ok()
+            }
+        }
+    }
+}
+
 // serializes ipv4 or ipv6 header and tcp segment directly into pre-allocated stack buffer
 pub fn build_packet_stack_opts(
     conn: &ConnInfo,
@@ -89,7 +112,21 @@ pub fn build_packet_stack_opts(
     ttl: u8,
     bad_checksum: bool,
 ) -> StackPacket {
+    build_packet_stack_advanced(conn, payload, ttl, bad_checksum, None, None)
+}
+
+// serializes ipv4 or ipv6 header and tcp segment with customizable window size and tcp flags
+pub fn build_packet_stack_advanced(
+    conn: &ConnInfo,
+    payload: &[u8],
+    ttl: u8,
+    bad_checksum: bool,
+    window_size: Option<u16>,
+    tcp_flags: Option<u8>,
+) -> StackPacket {
     let mut pkt = StackPacket::new();
+    let effective_flags = tcp_flags.unwrap_or(0x18);
+    let effective_win = window_size.unwrap_or(502);
 
     match (conn.src_ip, conn.dst_ip) {
         (std::net::IpAddr::V6(src6), std::net::IpAddr::V6(dst6)) => {
@@ -120,9 +157,8 @@ pub fn build_packet_stack_opts(
             tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
             tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
             tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
-            tcp_hdr[13] = 0x18; // control flags: psh + ack
-            let window_size: u16 = 502;
-            tcp_hdr[14..16].copy_from_slice(&window_size.to_be_bytes());
+            tcp_hdr[13] = effective_flags;
+            tcp_hdr[14..16].copy_from_slice(&effective_win.to_be_bytes());
 
             // 3. compute tcp checksum over ipv6 pseudo-header (rfc 8200 section 8.1)
             let mut pseudo_sum: u32 = 0;
@@ -189,9 +225,8 @@ pub fn build_packet_stack_opts(
             tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
             tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
             tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
-            tcp_hdr[13] = 0x18; // control flags: psh + ack
-            let window_size: u16 = 502;
-            tcp_hdr[14..16].copy_from_slice(&window_size.to_be_bytes());
+            tcp_hdr[13] = effective_flags;
+            tcp_hdr[14..16].copy_from_slice(&effective_win.to_be_bytes());
             tcp_hdr[18] = 0; // urgent pointer
             tcp_hdr[19] = 0;
 
@@ -386,5 +421,50 @@ mod tests {
         let cs1 = checksum(sample);
         let cs2 = checksum(sample);
         assert_eq!(cs1, cs2);
+    }
+
+    #[test]
+    fn test_parse_tcp_flags() {
+        assert_eq!(parse_tcp_flags("pshack"), Some(0x18));
+        assert_eq!(parse_tcp_flags("PSH_ACK"), Some(0x18));
+        assert_eq!(parse_tcp_flags("synack"), Some(0x12));
+        assert_eq!(parse_tcp_flags("rst"), Some(0x04));
+        assert_eq!(parse_tcp_flags("rstack"), Some(0x14));
+        assert_eq!(parse_tcp_flags("ack"), Some(0x10));
+        assert_eq!(parse_tcp_flags("syn"), Some(0x02));
+        assert_eq!(parse_tcp_flags("fin"), Some(0x01));
+        assert_eq!(parse_tcp_flags("finack"), Some(0x11));
+        assert_eq!(parse_tcp_flags("0x18"), Some(0x18));
+        assert_eq!(parse_tcp_flags("24"), Some(24));
+        assert_eq!(parse_tcp_flags("invalid_flags"), None);
+    }
+
+    #[test]
+    fn test_build_packet_stack_advanced_window_and_flags() {
+        let conn = ConnInfo::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            12345,
+            80,
+            100,
+            200,
+        );
+        let payload = b"GET / HTTP/1.1\r\n\r\n";
+        // test zero-window probe with RST flag
+        let pkt = build_packet_stack_advanced(&conn, payload, 10, false, Some(0), Some(0x04));
+        assert!(!pkt.is_empty());
+        let tcp_seg = &pkt[20..40];
+        // flag at byte 13
+        assert_eq!(tcp_seg[13], 0x04);
+        // window size at bytes 14..16
+        let win = u16::from_be_bytes([tcp_seg[14], tcp_seg[15]]);
+        assert_eq!(win, 0);
+
+        // test default fallback (None, None) -> 502 window, 0x18 (PSH+ACK)
+        let pkt_default = build_packet_stack_advanced(&conn, payload, 10, false, None, None);
+        let tcp_default = &pkt_default[20..40];
+        assert_eq!(tcp_default[13], 0x18);
+        let win_default = u16::from_be_bytes([tcp_default[14], tcp_default[15]]);
+        assert_eq!(win_default, 502);
     }
 }

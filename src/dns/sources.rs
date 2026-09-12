@@ -669,6 +669,7 @@ trusted comment: timestamp:1788418738	file:public-resolvers.md
             path: "/dns-query".to_string(),
             doh_url: "https://dns.google/dns-query".to_string(),
             bootstrap_ips: vec![],
+            provider_pk: None,
         };
 
         let stamp_quad9 = DnsStamp {
@@ -681,6 +682,7 @@ trusted comment: timestamp:1788418738	file:public-resolvers.md
             path: "/dns-query".to_string(),
             doh_url: "https://dns.quad9.net/dns-query".to_string(),
             bootstrap_ips: vec![],
+            provider_pk: None,
         };
 
         let entry_google = RemoteResolverEntry {

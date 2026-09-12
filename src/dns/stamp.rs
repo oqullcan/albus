@@ -33,6 +33,8 @@ pub struct DnsStamp {
     pub path: String,
     pub doh_url: String,
     pub bootstrap_ips: Vec<Ipv4Addr>,
+    #[serde(default)]
+    pub provider_pk: Option<[u8; 32]>,
 }
 
 impl DnsStamp {
@@ -115,6 +117,7 @@ impl DnsStamp {
                 path: String::new(),
                 doh_url: String::new(),
                 bootstrap_ips,
+                provider_pk: None,
             });
         }
 
@@ -184,6 +187,7 @@ impl DnsStamp {
 
         let mut provider_name = String::new();
         let mut path = "/dns-query".to_string();
+        let mut provider_pk: Option<[u8; 32]> = None;
 
         if protocol == StampProtocol::DoH || protocol == StampProtocol::ODoHTarget {
             // skip hashes array (length-prefixed items)
@@ -204,6 +208,22 @@ impl DnsStamp {
                 if !p.is_empty() {
                     path = p;
                 }
+            }
+        } else if protocol == StampProtocol::CryptDns {
+            // CryptDns: read provider public key (32 bytes) then provider name
+            if pos < decoded.len() {
+                let pk_len = decoded[pos] as usize;
+                pos += 1;
+                if pk_len == 32 && pos + 32 <= decoded.len() {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&decoded[pos..pos + 32]);
+                    provider_pk = Some(pk);
+                    pos += 32;
+                }
+            }
+            if pos < decoded.len() {
+                let (name, _) = read_lp_string(&decoded, pos)?;
+                provider_name = name;
             }
         } else {
             // for cryptographic / plain dns: read provider public key / name
@@ -244,6 +264,7 @@ impl DnsStamp {
             path,
             doh_url,
             bootstrap_ips,
+            provider_pk,
         })
     }
 }

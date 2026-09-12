@@ -12,9 +12,11 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, warn};
+use zeroize::Zeroize;
 
 pub const DNSCRYPT_MAGIC_CERT: &[u8; 4] = b"DNSC";
 pub const DNSCRYPT_MAGIC_RESOLVER: &[u8; 8] = b"r6fnvWJ8";
@@ -687,6 +689,19 @@ struct PqSessionStateInner {
     encap_epoch: u64,
 }
 
+impl Drop for PqSessionStateInner {
+    fn drop(&mut self) {
+        self.resume_secret.zeroize();
+        self.encap_key.zeroize();
+        if let Some(ref mut t) = self.ticket {
+            t.zeroize();
+        }
+        if let Some(ref mut c) = self.encap_ct {
+            c.zeroize();
+        }
+    }
+}
+
 impl PqSessionState {
     pub fn new() -> Self {
         Self::default()
@@ -711,12 +726,20 @@ impl PqSessionState {
         let mut lock = self.inner.lock().ok()?;
         if let Some(exp) = lock.expiry {
             if std::time::Instant::now() > exp {
+                if let Some(ref mut t) = lock.ticket {
+                    t.zeroize();
+                }
+                lock.resume_secret.zeroize();
                 lock.ticket = None;
                 lock.expiry = None;
                 return None;
             }
         }
         if lock.epoch != current_epoch {
+            if let Some(ref mut t) = lock.ticket {
+                t.zeroize();
+            }
+            lock.resume_secret.zeroize();
             lock.ticket = None;
             lock.expiry = None;
             return None;
@@ -735,6 +758,10 @@ impl PqSessionState {
     pub fn get_cached_encapsulation(&self, current_epoch: u64) -> Option<(Vec<u8>, [u8; 32])> {
         let mut lock = self.inner.lock().ok()?;
         if lock.encap_epoch != current_epoch {
+            if let Some(ref mut ct) = lock.encap_ct {
+                ct.zeroize();
+            }
+            lock.encap_key.zeroize();
             lock.encap_ct = None;
             return None;
         }
@@ -845,6 +872,20 @@ impl DnsCryptClient {
         }
         self.cert = Some(cert);
         self
+    }
+
+    /// Constructs a DnsCryptClient by parsing an "sdns://..." stamp string or resolving endpoint parameters.
+    pub fn from_stamp_str(
+        stamp_str: &str,
+        relay_addr: Option<SocketAddr>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let stamp = crate::dns::stamp::DnsStamp::parse(stamp_str)?;
+        let server_addr = stamp
+            .server_addr
+            .ok_or_else(|| "DNSCrypt stamp missing server address")?;
+        let provider_name = stamp.provider_name;
+        let provider_pk = stamp.provider_pk.unwrap_or([0u8; 32]);
+        Ok(Self::new(server_addr, provider_name, provider_pk, relay_addr))
     }
 
     // queries server for txt records matching provider_name to discover and validate dnscrypt certificates
@@ -1047,7 +1088,7 @@ impl DnsCryptClient {
         let mut first_block = [0u8; 64];
         cipher.apply_keystream(&mut first_block);
 
-        let poly_key = *poly1305::Key::from_slice(&first_block[0..32]);
+        let mut poly_key = *poly1305::Key::from_slice(&first_block[0..32]);
 
         let mut out = Vec::with_capacity(16 + message.len());
         out.resize(16, 0u8);
@@ -1057,16 +1098,20 @@ impl DnsCryptClient {
             out.push(first_block[32 + i] ^ message[i]);
         }
 
+        first_block.zeroize();
+
         if message.len() > 32 {
             let mut rest = message[32..].to_vec();
             cipher.seek(64);
             cipher.apply_keystream(&mut rest);
             out.extend_from_slice(&rest);
+            rest.zeroize();
         }
 
         let mut poly = Poly1305::new(&poly_key);
         poly.update_padded(&out[16..]);
         let tag = poly.finalize();
+        poly_key.zeroize();
         out[0..16].copy_from_slice(&tag);
         out
     }
@@ -1093,12 +1138,16 @@ impl DnsCryptClient {
         let mut first_block = [0u8; 64];
         cipher.apply_keystream(&mut first_block);
 
-        let poly_key = *poly1305::Key::from_slice(&first_block[0..32]);
+        let mut poly_key = *poly1305::Key::from_slice(&first_block[0..32]);
         let mut poly = Poly1305::new(&poly_key);
         poly.update_padded(ciphertext);
         let expected_tag = poly.finalize();
 
-        if aws_lc_rs::constant_time::verify_slices_are_equal(tag, expected_tag.as_slice()).is_err() {
+        let tag_matches = tag.ct_eq(expected_tag.as_slice()).unwrap_u8() == 1;
+        poly_key.zeroize();
+
+        if !tag_matches {
+            first_block.zeroize();
             return Err("incorrect tag in xsecretbox");
         }
 
@@ -1107,12 +1156,14 @@ impl DnsCryptClient {
         for i in 0..first_chunk_len {
             message.push(first_block[32 + i] ^ ciphertext[i]);
         }
+        first_block.zeroize();
 
         if ciphertext.len() > 32 {
             let mut rest = ciphertext[32..].to_vec();
             cipher.seek(64);
             cipher.apply_keystream(&mut rest);
             message.extend_from_slice(&rest);
+            rest.zeroize();
         }
 
         Ok(message)
@@ -1129,11 +1180,11 @@ impl DnsCryptClient {
             return Err("dnscrypt response packet too short".into());
         }
 
-        if &encrypted_response[0..8] != DNSCRYPT_MAGIC_RESOLVER {
+        if encrypted_response[0..8].ct_eq(DNSCRYPT_MAGIC_RESOLVER).unwrap_u8() != 1 {
             return Err("invalid dnscrypt resolver magic".into());
         }
 
-        if &encrypted_response[8..20] != expected_client_nonce {
+        if encrypted_response[8..20].ct_eq(expected_client_nonce).unwrap_u8() != 1 {
             return Err("client nonce mismatch in dnscrypt response".into());
         }
 
@@ -1389,6 +1440,7 @@ impl DnsCryptClient {
                 )
                 .map_err(|e| format!("x25519 agreement failed: {:?}", e))?;
                 let derived = derive_shared_key(&raw_shared_point, cert.es_version);
+                raw_shared_point.zeroize();
                 (derived, client_pk)
             }
         } else {
@@ -1416,6 +1468,7 @@ impl DnsCryptClient {
             )
             .map_err(|e| format!("x25519 agreement failed: {:?}", e))?;
             let derived = derive_shared_key(&raw_shared_point, cert.es_version);
+            raw_shared_point.zeroize();
             (derived, client_pk)
         };
 
@@ -1442,7 +1495,12 @@ impl DnsCryptClient {
         let resp_buf = self.send_packet(target, &wire_packet, timeout).await?;
 
         // 6. decrypt response with derived shared key
-        Self::decrypt_response_payload(&derived_key, &client_nonce, &resp_buf)
+        let dec_res = Self::decrypt_response_payload(&derived_key, &client_nonce, &resp_buf);
+        if self.ephemeral_keys {
+            let mut k = derived_key;
+            k.zeroize();
+        }
+        dec_res
     }
 
     // resolves a dns query over udp using current system clock for certificate validity check

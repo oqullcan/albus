@@ -214,6 +214,14 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 0)]
     pub fake_seq_offset: i32,
 
+    // custom tcp window size for fake packets (e.g. 0 for zero-window probe)
+    #[arg(long)]
+    pub fake_window_size: Option<u16>,
+
+    // custom tcp control flags for fake packets (pshack, synack, rst, ack, finack)
+    #[arg(long)]
+    pub fake_tcp_flags: Option<String>,
+
     // dynamic hop distance estimation and ttl optimization
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub auto_ttl: bool,
@@ -577,6 +585,30 @@ pub struct RunArgs {
     // privacy level for monitoring web ui (0: full details, 1: anonymize client ips, 2: aggregate only)
     #[arg(long)]
     pub web_ui_privacy_level: Option<u8>,
+
+    // integrated defense operational profile (balanced, paranoid, maximum-privacy, censorship-resistant)
+    #[arg(long)]
+    pub defense_profile: Option<String>,
+
+    // target browser tls client hello fingerprint mimicry (chrome, firefox, safari)
+    #[arg(long)]
+    pub ja4_mimic: Option<String>,
+
+    // enable active probe and replay attack defense with rolling bloom filter and honeytokens
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub active_probe_defense: bool,
+
+    // enable in-kernel xdp driver packet filtering and anti-rst drop
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub xdp_filter: bool,
+
+    // enable sphinx multi-hop onion mixnet routing
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub sphinx_routing: bool,
+
+    // enable simd / avx2 hardware cryptographic acceleration
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub simd_accel: bool,
 
     // enable verbose debug logging in tracing subscriber
     #[arg(short, long, default_value_t = false)]

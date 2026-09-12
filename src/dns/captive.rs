@@ -27,10 +27,14 @@ impl CaptiveMap {
                 continue;
             }
             let mut parts = clean.split_whitespace();
-            if let (Some(domain), Some(ip_str)) = (parts.next(), parts.next()) {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    let d = domain.trim_end_matches('.').to_ascii_lowercase();
-                    self.custom_entries.push((d, ip));
+            if let Some(domain) = parts.next() {
+                let d = domain.trim_end_matches('.').to_ascii_lowercase();
+                let rest = clean[domain.len()..].trim();
+                for token in rest.split(',') {
+                    let clean_token = token.trim().trim_matches(|c| c == '[' || c == ']');
+                    if let Ok(ip) = clean_token.parse::<IpAddr>() {
+                        self.custom_entries.push((d.clone(), ip));
+                    }
                 }
             }
         }
@@ -223,6 +227,10 @@ mod tests {
             map.check("portal.my-hotel-wifi.com", 1),
             Some("192.168.10.1".parse().unwrap())
         );
+        // Comma-separated multiple IPs (IPv4 and IPv6)
+        map.load_from_text("custom.captive.com 1.2.3.4, 5.6.7.8, 2001:db8::1\n");
+        assert_eq!(map.check("custom.captive.com", 1), Some("1.2.3.4".parse().unwrap()));
+        assert_eq!(map.check("custom.captive.com", 28), Some("2001:db8::1".parse().unwrap()));
         // Built-in fallback still works
         assert!(map.check("captive.apple.com", 1).is_some());
     }

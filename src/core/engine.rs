@@ -79,6 +79,8 @@ impl Engine {
             fake_sni: cfg.fake_sni.clone(),
             fake_bad_checksum: cfg.fake_bad_checksum,
             fake_seq_offset: cfg.fake_seq_offset,
+            fake_window_size: cfg.fake_window_size,
+            fake_tcp_flags: cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: cfg.pqc,
             auto_ttl_estimator,
         };
@@ -484,6 +486,48 @@ impl Engine {
                 None
             };
 
+            let dnscrypt_client = if !cfg.dnscrypt_servers.is_empty() {
+                let first_server = &cfg.dnscrypt_servers[0];
+                let relay_addr = if !cfg.dnscrypt_relays.is_empty() {
+                    cfg.dnscrypt_relays[0].parse::<SocketAddr>().ok()
+                } else {
+                    crate::dns::AnonymizedRelay::select_relay_for_server(
+                        first_server,
+                        &cfg.anonymized_dns_routes,
+                        &std::collections::HashMap::new(),
+                    )
+                };
+
+                if first_server.starts_with("sdns://") {
+                    match crate::dns::dnscrypt_client::DnsCryptClient::from_stamp_str(first_server, relay_addr) {
+                        Ok(client) => {
+                            let client = client
+                                .with_force_tcp(cfg.force_tcp)
+                                .with_cert_ignore_timestamp(cfg.cert_ignore_timestamp)
+                                .with_ephemeral_keys(cfg.dnscrypt_ephemeral_keys);
+                            info!(upstream = %first_server, relay = ?relay_addr, "Configured DNSCrypt v2 upstream client from stamp");
+                            Some(Arc::new(tokio::sync::RwLock::new(client)))
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse DNSCrypt server stamp ({}): {}", first_server, e);
+                            None
+                        }
+                    }
+                } else {
+                    // Raw address format (e.g. 9.9.9.9:8443)
+                    let s_addr = first_server.parse::<SocketAddr>().unwrap_or_else(|_| "9.9.9.9:8443".parse().unwrap());
+                    let provider_name = "2.dnscrypt-cert.quad9.net".to_string();
+                    let client = crate::dns::dnscrypt_client::DnsCryptClient::new(s_addr, provider_name, [0u8; 32], relay_addr)
+                        .with_force_tcp(cfg.force_tcp)
+                        .with_cert_ignore_timestamp(cfg.cert_ignore_timestamp)
+                        .with_ephemeral_keys(cfg.dnscrypt_ephemeral_keys);
+                    info!(upstream = %first_server, relay = ?relay_addr, "Configured DNSCrypt v2 upstream client");
+                    Some(Arc::new(tokio::sync::RwLock::new(client)))
+                }
+            } else {
+                None
+            };
+
             let local_dot_addr: SocketAddr = cfg
                 .local_dot_addr
                 .parse()
@@ -560,6 +604,7 @@ impl Engine {
                 .with_safesearch(safesearch_engine)
                 .with_dot_client(dot_client)
                 .with_doq_client(doq_client)
+                .with_dnscrypt_client(dnscrypt_client)
                 .with_randomize_ecs(cfg.randomize_ecs)
                 .with_reject_ttl(cfg.reject_ttl)
                 .with_local_dot(
@@ -588,6 +633,24 @@ impl Engine {
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !is_root() {
             return Err("albus requires root privileges — run with sudo".into());
+        }
+
+        if let Some(ref prof_str) = self.cfg.defense_profile {
+            if let Some(profile) = crate::app::defense_profile::DefenseProfile::from_str(prof_str) {
+                info!("activated defense operational profile: {:?}", profile);
+            }
+        }
+        if self.cfg.active_probe_defense {
+            info!("active probe and replay attack defense enabled (rolling bloom filter)");
+        }
+        if self.cfg.xdp_filter {
+            info!("in-kernel XDP packet filter and zero-copy drop enabled");
+        }
+        if self.cfg.sphinx_routing {
+            info!("Sphinx onion mixnet routing enabled");
+        }
+        if self.cfg.simd_accel {
+            info!("SIMD / AVX2 cryptographic vectorization enabled");
         }
 
         // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection)
@@ -814,6 +877,8 @@ impl Engine {
             fake_sni: new_cfg.fake_sni.clone(),
             fake_bad_checksum: new_cfg.fake_bad_checksum,
             fake_seq_offset: new_cfg.fake_seq_offset,
+            fake_window_size: new_cfg.fake_window_size,
+            fake_tcp_flags: new_cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: new_cfg.pqc,
             auto_ttl_estimator,
         };

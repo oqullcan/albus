@@ -4,5 +4,6 @@ pub mod cache;
 pub mod probe;
 
 pub use probe::{
-    detect_interface_mtu, resolve_optimal_restore_mss, AutoTtlConfig, AutoTtlEstimator,
+    detect_interface_mtu, resolve_default_network_interface, resolve_optimal_restore_mss,
+    AutoTtlConfig, AutoTtlEstimator,
 };

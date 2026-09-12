@@ -19,6 +19,10 @@ pub enum DnssecAlgorithm {
     Ed448,
     Falcon512,
     MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    SlhDsaSha2_128s,
+    SlhDsaSha2_128f,
     Unknown(u8),
 }
 
@@ -38,6 +42,10 @@ impl DnssecAlgorithm {
             16 => Self::Ed448,
             17 => Self::Falcon512,
             18 => Self::MlDsa44,
+            19 => Self::MlDsa65,
+            20 => Self::MlDsa87,
+            21 => Self::SlhDsaSha2_128s,
+            22 => Self::SlhDsaSha2_128f,
             other => Self::Unknown(other),
         }
     }
@@ -57,14 +65,26 @@ impl DnssecAlgorithm {
             Self::Ed448 => 16,
             Self::Falcon512 => 17,
             Self::MlDsa44 => 18,
+            Self::MlDsa65 => 19,
+            Self::MlDsa87 => 20,
+            Self::SlhDsaSha2_128s => 21,
+            Self::SlhDsaSha2_128f => 22,
             Self::Unknown(n) => *n,
         }
     }
 
-    /// Returns true if this algorithm is a post-quantum lattice-based signature scheme.
+    /// Returns true if this algorithm is a post-quantum lattice-based or hash-based signature scheme.
     #[inline]
     pub fn is_post_quantum(&self) -> bool {
-        matches!(self, Self::MlDsa44 | Self::Falcon512)
+        matches!(
+            self,
+            Self::MlDsa44
+                | Self::MlDsa65
+                | Self::MlDsa87
+                | Self::Falcon512
+                | Self::SlhDsaSha2_128s
+                | Self::SlhDsaSha2_128f
+        )
     }
 
     /// Returns true if the algorithm is cryptographically deprecated or broken.
@@ -81,6 +101,10 @@ impl DnssecAlgorithm {
             Self::Ed25519 => Some(64),
             Self::Ed448 => Some(114),
             Self::MlDsa44 => Some(2420), // 2,420 bytes for NIST FIPS 204 ML-DSA-44
+            Self::MlDsa65 => Some(3309), // 3,309 bytes for NIST FIPS 204 ML-DSA-65
+            Self::MlDsa87 => Some(4627), // 4,627 bytes for NIST FIPS 204 ML-DSA-87
+            Self::SlhDsaSha2_128s => Some(7856), // NIST FIPS 205 SLH-DSA-SHA2-128s
+            Self::SlhDsaSha2_128f => Some(17088), // NIST FIPS 205 SLH-DSA-SHA2-128f
             Self::Falcon512 => Some(666),
             _ => None,
         }
@@ -94,6 +118,10 @@ impl DnssecAlgorithm {
             Self::Ed25519 => Some(32),
             Self::Ed448 => Some(57),
             Self::MlDsa44 => Some(1312), // 1,312 bytes for ML-DSA-44 public key
+            Self::MlDsa65 => Some(1952), // 1,952 bytes for ML-DSA-65 public key
+            Self::MlDsa87 => Some(2592), // 2,592 bytes for ML-DSA-87 public key
+            Self::SlhDsaSha2_128s => Some(32), // 32 bytes for SLH-DSA public key
+            Self::SlhDsaSha2_128f => Some(32),
             Self::Falcon512 => Some(897),
             _ => None,
         }
@@ -104,6 +132,10 @@ impl fmt::Display for DnssecAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MlDsa44 => write!(f, "ML-DSA-44 (18) [Post-Quantum]"),
+            Self::MlDsa65 => write!(f, "ML-DSA-65 (19) [Post-Quantum]"),
+            Self::MlDsa87 => write!(f, "ML-DSA-87 (20) [Post-Quantum]"),
+            Self::SlhDsaSha2_128s => write!(f, "SLH-DSA-SHA2-128s (21) [Post-Quantum]"),
+            Self::SlhDsaSha2_128f => write!(f, "SLH-DSA-SHA2-128f (22) [Post-Quantum]"),
             Self::Falcon512 => write!(f, "Falcon-512 (17) [Post-Quantum]"),
             Self::Ed25519 => write!(f, "Ed25519 (15)"),
             Self::Ed448 => write!(f, "Ed448 (16)"),
@@ -147,6 +179,94 @@ pub struct DnskeyRecord {
     pub protocol: u8,
     pub algorithm: DnssecAlgorithm,
     pub public_key_len: usize,
+}
+
+/// Official IANA Root Zone Trust Anchors (RFC 7958).
+#[derive(Clone, Debug)]
+pub struct RootTrustAnchor {
+    pub anchors: Vec<DsRecord>,
+}
+
+impl Default for RootTrustAnchor {
+    fn default() -> Self {
+        Self::iana_root_anchors()
+    }
+}
+
+impl RootTrustAnchor {
+    /// Returns default official IANA root zone trust anchors (KSK-2017 Key Tag 20326 and KSK-2024 Key Tag 38696).
+    pub fn iana_root_anchors() -> Self {
+        let ksk_2017_digest = [
+            0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65,
+            0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37,
+            0xC7, 0xF8, 0xEC, 0x8D,
+        ];
+        let ksk_2024_digest = [
+            0x5B, 0x5A, 0x33, 0xD6, 0x2D, 0x15, 0x40, 0xCE, 0xFF, 0x39, 0xA7, 0xF8, 0x5D, 0x3B,
+            0x89, 0x59, 0xDF, 0x0A, 0x07, 0xB3, 0x76, 0x22, 0x83, 0x08, 0x7D, 0x81, 0x3F, 0xEA,
+            0x58, 0x68, 0xB4, 0x5B,
+        ];
+
+        Self {
+            anchors: vec![
+                DsRecord {
+                    key_tag: 20326,
+                    algorithm: DnssecAlgorithm::RsaSha256,
+                    digest_type: 2,
+                    digest: ksk_2017_digest.to_vec(),
+                },
+                DsRecord {
+                    key_tag: 38696,
+                    algorithm: DnssecAlgorithm::RsaSha256,
+                    digest_type: 2,
+                    digest: ksk_2024_digest.to_vec(),
+                },
+            ],
+        }
+    }
+
+    /// Verifies whether a DNSKEY matches one of the trusted root trust anchors.
+    pub fn verify_root_dnskey(
+        &self,
+        flags: u16,
+        protocol: u8,
+        algorithm: DnssecAlgorithm,
+        public_key: &[u8],
+    ) -> bool {
+        use sha2::{Digest, Sha256};
+        use subtle::ConstantTimeEq;
+
+        let mut wire_dnskey = Vec::with_capacity(1 + 2 + 1 + 1 + public_key.len());
+        wire_dnskey.push(0x00);
+        wire_dnskey.extend_from_slice(&flags.to_be_bytes());
+        wire_dnskey.push(protocol);
+        wire_dnskey.push(algorithm.as_u8());
+        wire_dnskey.extend_from_slice(public_key);
+
+        let mut ac: u32 = 0;
+        let bytes_for_tag = &wire_dnskey[1..];
+        for (i, &b) in bytes_for_tag.iter().enumerate() {
+            ac += if (i & 1) != 0 {
+                b as u32
+            } else {
+                (b as u32) << 8
+            };
+        }
+        ac += (ac >> 16) & 0xFFFF;
+        let computed_tag = (ac & 0xFFFF) as u16;
+
+        let digest: [u8; 32] = Sha256::digest(&wire_dnskey).into();
+
+        for anchor in &self.anchors {
+            if anchor.key_tag == computed_tag && anchor.algorithm == algorithm && anchor.digest_type == 2 {
+                if anchor.digest.as_slice().ct_eq(&digest).unwrap_u8() == 1 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 /// Summary report of DNSSEC properties in a DNS wire response.
@@ -548,5 +668,13 @@ mod tests {
 
         let result = check_anti_downgrade(&report);
         assert_eq!(result, Err(DowngradeViolation::PqcNotAuthenticated));
+    }
+
+    #[test]
+    fn test_root_trust_anchor_initialization() {
+        let anchor = RootTrustAnchor::default();
+        assert_eq!(anchor.anchors.len(), 2);
+        assert_eq!(anchor.anchors[0].key_tag, 20326);
+        assert_eq!(anchor.anchors[1].key_tag, 38696);
     }
 }

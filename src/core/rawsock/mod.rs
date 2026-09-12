@@ -3,7 +3,7 @@
 pub mod packet;
 pub mod types;
 
-pub use packet::build_packet_stack_opts;
+pub use packet::{build_packet_stack_advanced, build_packet_stack_opts, parse_tcp_flags};
 pub use types::ConnInfo;
 
 use std::io::{Error, Result};
@@ -68,17 +68,26 @@ impl RawSocket {
         }
     }
 
-    // transmits raw packet payload with custom ip time-to-live and tcp checksum control
-    pub fn send_fake_opts(
+    // transmits raw packet payload with custom ip time-to-live, tcp checksum control, window size, and tcp flags
+    pub fn send_fake_advanced(
         &self,
         conn: &ConnInfo,
         payload: &[u8],
         ttl: u8,
         bad_checksum: bool,
+        window_size: Option<u16>,
+        tcp_flags: Option<u8>,
     ) -> Result<usize> {
         match (conn.src_ip, conn.dst_ip) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(dst_v4)) => {
-                let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+                let pkt = build_packet_stack_advanced(
+                    conn,
+                    payload,
+                    ttl,
+                    bad_checksum,
+                    window_size,
+                    tcp_flags,
+                );
                 if pkt.is_empty() {
                     return Err(Error::other(
                         "synthesized packet exceeds maximum stack buffer length",
@@ -112,7 +121,14 @@ impl RawSocket {
                     .fd_v6
                     .ok_or_else(|| Error::other("IPv6 raw socket not available"))?;
 
-                let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+                let pkt = build_packet_stack_advanced(
+                    conn,
+                    payload,
+                    ttl,
+                    bad_checksum,
+                    window_size,
+                    tcp_flags,
+                );
                 if pkt.is_empty() {
                     return Err(Error::other(
                         "synthesized packet exceeds maximum stack buffer length",
@@ -141,8 +157,19 @@ impl RawSocket {
                     Ok(res as usize)
                 }
             }
-            _ => Err(Error::other("Mismatched IP families in ConnInfo")),
+            _ => Err(Error::other("Mismatched IP families")),
         }
+    }
+
+    // transmits raw packet payload with custom ip time-to-live and tcp checksum control
+    pub fn send_fake_opts(
+        &self,
+        conn: &ConnInfo,
+        payload: &[u8],
+        ttl: u8,
+        bad_checksum: bool,
+    ) -> Result<usize> {
+        self.send_fake_advanced(conn, payload, ttl, bad_checksum, None, None)
     }
 
     #[inline]

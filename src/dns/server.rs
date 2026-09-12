@@ -109,6 +109,7 @@ pub struct DnsServer {
     pub safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>,
     pub dot_client: Option<Arc<crate::dns::dot::DotClient>>,
     pub doq_client: Option<Arc<crate::dns::doq::DoQClient>>,
+    pub dnscrypt_client: Option<Arc<tokio::sync::RwLock<crate::dns::dnscrypt_client::DnsCryptClient>>>,
     pub randomize_ecs: Arc<AtomicBool>,
     pub reject_ttl: Arc<AtomicU32>,
     shutdown_tx: broadcast::Sender<()>,
@@ -247,6 +248,7 @@ impl DnsServer {
             )),
             dot_client: None,
             doq_client: None,
+            dnscrypt_client: None,
             randomize_ecs: Arc::new(AtomicBool::new(false)),
             reject_ttl: Arc::new(AtomicU32::new(10)),
             shutdown_tx,
@@ -280,6 +282,15 @@ impl DnsServer {
     /// Sets DNS-over-QUIC (DoQ) client for upstream failover.
     pub fn with_doq_client(mut self, client: Option<Arc<crate::dns::doq::DoQClient>>) -> Self {
         self.doq_client = client;
+        self
+    }
+
+    /// Sets DNSCrypt v2 client for upstream resolution and failover.
+    pub fn with_dnscrypt_client(
+        mut self,
+        client: Option<Arc<tokio::sync::RwLock<crate::dns::dnscrypt_client::DnsCryptClient>>>,
+    ) -> Self {
+        self.dnscrypt_client = client;
         self
     }
 
@@ -380,6 +391,13 @@ impl DnsServer {
         self.skip_incompatible.store(skip_incomp, Ordering::Relaxed);
         self.direct_cert_fallback.store(direct_fallback, Ordering::Relaxed);
         self
+    }
+
+    /// Resolves matching anonymized relays for a target upstream resolver name using the configured routes matrix.
+    /// Exact server name match has highest priority, followed by wildcard "*" rule.
+    pub fn get_relays_for_server(&self, server_name: &str) -> Vec<String> {
+        let routes = self.anonymized_dns_routes.read().unwrap_or_else(|p| p.into_inner());
+        resolve_anonymized_dns_routes(&routes, server_name)
     }
 
     /// Configures TLS termination options for Local DoH (RFC 8484 HTTPS).
@@ -1096,6 +1114,32 @@ impl DnsServer {
                     }
                 }
             }
+            if let Some(ref dnscrypt) = self.dnscrypt_client {
+                let mut needs_cert = false;
+                {
+                    let dc = dnscrypt.read().await;
+                    if dc.cert.is_none() {
+                        needs_cert = true;
+                    }
+                }
+                if needs_cert {
+                    let mut dc = dnscrypt.write().await;
+                    if dc.cert.is_none() {
+                        if let Err(e) = dc.fetch_cert(effective_timeout).await {
+                            warn!("DNSCrypt failed to fetch certificate: {}", e);
+                        }
+                    }
+                }
+                let dc = dnscrypt.read().await;
+                if dc.cert.is_some() {
+                    match dc.resolve(effective_query, effective_timeout).await {
+                        Ok(resp) => return Ok((resp, "dnscrypt".to_string())),
+                        Err(e) => {
+                            warn!("DNSCrypt resolution failed ({}), falling back to DoH", e);
+                        }
+                    }
+                }
+            }
             if self.racing.load(Ordering::Relaxed) {
                 let r = self.resolver.read().await;
                 r.resolve_racing(effective_query).await
@@ -1113,6 +1157,15 @@ impl DnsServer {
             }
             Ok(Err(e)) => {
                 self.load_balancer.record_result(0, start_time.elapsed(), false);
+                if let Some(ref dnscrypt) = self.dnscrypt_client {
+                    let dc = dnscrypt.read().await;
+                    if dc.cert.is_some() {
+                        if let Ok(dc_resp) = dc.resolve(effective_query, effective_timeout).await {
+                            debug!("DNS query successfully resolved via DNSCrypt failover");
+                            return Ok((dc_resp, "dnscrypt_failover".to_string()));
+                        }
+                    }
+                }
                 if let Some(ref doq) = self.doq_client {
                     debug!("DoH resolution failed ({}), attempting failover to DNS-over-QUIC (DoQ)", e);
                     match doq.query(effective_query).await {
@@ -1141,6 +1194,15 @@ impl DnsServer {
             }
             Err(_) => {
                 self.load_balancer.record_result(0, effective_timeout, false);
+                if let Some(ref dnscrypt) = self.dnscrypt_client {
+                    let dc = dnscrypt.read().await;
+                    if dc.cert.is_some() {
+                        if let Ok(dc_resp) = dc.resolve(effective_query, effective_timeout).await {
+                            debug!("DNS query successfully resolved via DNSCrypt failover");
+                            return Ok((dc_resp, "dnscrypt_failover".to_string()));
+                        }
+                    }
+                }
                 if let Some(ref doq) = self.doq_client {
                     debug!("DoH query timed out, attempting failover to DNS-over-QUIC (DoQ)");
                     match doq.query(effective_query).await {
@@ -2168,6 +2230,28 @@ pub fn compute_adaptive_timeout(
     Duration::from_millis(effective_millis.max(200))
 }
 
+/// Resolves matching anonymized relays from a routing matrix for a target server name.
+/// Matches exact name (case-insensitive) first, then falls back to wildcard "*" if present.
+pub fn resolve_anonymized_dns_routes(
+    routes: &[crate::app::config::AnonymizedDnsRoute],
+    server_name: &str,
+) -> Vec<String> {
+    let clean = server_name.trim().to_lowercase();
+    // 1. Exact match
+    for route in routes {
+        if route.server_name.trim().to_lowercase() == clean {
+            return route.via.clone();
+        }
+    }
+    // 2. Wildcard fallback
+    for route in routes {
+        if route.server_name.trim() == "*" {
+            return route.via.clone();
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2600,6 +2684,52 @@ mod tests {
             .await
             .expect("should return youtube strict response");
         assert!(yt_resp.windows(4).any(|w| w == [216, 239, 38, 119]));
+    }
+
+    #[test]
+    fn test_anonymized_dns_routing_matrix() {
+        use crate::app::config::AnonymizedDnsRoute;
+
+        let routes = vec![
+            AnonymizedDnsRoute {
+                server_name: "cloudflare".to_string(),
+                via: vec!["anon-de".to_string(), "anon-nl".to_string()],
+            },
+            AnonymizedDnsRoute {
+                server_name: "quad9".to_string(),
+                via: vec!["anon-ch".to_string()],
+            },
+            AnonymizedDnsRoute {
+                server_name: "*".to_string(),
+                via: vec!["anon-fallback".to_string()],
+            },
+        ];
+
+        // Exact match
+        assert_eq!(
+            resolve_anonymized_dns_routes(&routes, "cloudflare"),
+            vec!["anon-de", "anon-nl"]
+        );
+        assert_eq!(
+            resolve_anonymized_dns_routes(&routes, "Cloudflare"),
+            vec!["anon-de", "anon-nl"]
+        );
+        assert_eq!(
+            resolve_anonymized_dns_routes(&routes, "quad9"),
+            vec!["anon-ch"]
+        );
+
+        // Wildcard match
+        assert_eq!(
+            resolve_anonymized_dns_routes(&routes, "google"),
+            vec!["anon-fallback"]
+        );
+
+        // No routes configured
+        assert_eq!(
+            resolve_anonymized_dns_routes(&[], "cloudflare"),
+            Vec::<String>::new()
+        );
     }
 }
 

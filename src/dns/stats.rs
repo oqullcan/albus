@@ -265,6 +265,68 @@ impl DnsStats {
         out
     }
 
+    /// Generates an epsilon-differentially private snapshot of telemetry metrics,
+    /// injecting calibrated Laplace noise to prevent query-volume side-channel deanonymization.
+    pub fn snapshot_dp(&self, epsilon: f64) -> DnsStatsSnapshot {
+        let total = add_laplace_noise(self.total_queries.load(Ordering::Relaxed), epsilon);
+        let hits = add_laplace_noise(self.cache_hits.load(Ordering::Relaxed), epsilon);
+        let ratio = if total > 0 {
+            ((hits as f64 / total as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        DnsStatsSnapshot {
+            total_queries: total,
+            cache_hits: hits,
+            blocked_domains: add_laplace_noise(self.blocked_domains.load(Ordering::Relaxed), epsilon),
+            uncloaked_cnames: add_laplace_noise(self.uncloaked_cnames.load(Ordering::Relaxed), epsilon),
+            rebinding_drops: add_laplace_noise(self.rebinding_drops.load(Ordering::Relaxed), epsilon),
+            cloaked_responses: add_laplace_noise(self.cloaked_responses.load(Ordering::Relaxed), epsilon),
+            captive_probes: add_laplace_noise(self.captive_probes.load(Ordering::Relaxed), epsilon),
+            upstream_queries: add_laplace_noise(self.upstream_queries.load(Ordering::Relaxed), epsilon),
+            network_changes: add_laplace_noise(self.network_changes.load(Ordering::Relaxed), epsilon),
+            dns64_synthesized: add_laplace_noise(self.dns64_synthesized.load(Ordering::Relaxed), epsilon),
+            cache_hit_ratio: ratio,
+            queries_udp: add_laplace_noise(self.queries_udp.load(Ordering::Relaxed), epsilon),
+            queries_tcp: add_laplace_noise(self.queries_tcp.load(Ordering::Relaxed), epsilon),
+            queries_doh: add_laplace_noise(self.queries_doh.load(Ordering::Relaxed), epsilon),
+            queries_dot: add_laplace_noise(self.queries_dot.load(Ordering::Relaxed), epsilon),
+            blocked_blocklist: add_laplace_noise(self.blocked_blocklist.load(Ordering::Relaxed), epsilon),
+            blocked_schedule: add_laplace_noise(self.blocked_schedule.load(Ordering::Relaxed), epsilon),
+            blocked_rebinding: add_laplace_noise(self.blocked_rebinding.load(Ordering::Relaxed), epsilon),
+            blocked_bogon: add_laplace_noise(self.blocked_bogon.load(Ordering::Relaxed), epsilon),
+            blocked_undelegated: add_laplace_noise(self.blocked_undelegated.load(Ordering::Relaxed), epsilon),
+            active_queries: self.active_queries.load(Ordering::Relaxed),
+            dnssec_validated: add_laplace_noise(self.dnssec_validated.load(Ordering::Relaxed), epsilon),
+            pqc_dnssec_validated: add_laplace_noise(self.pqc_dnssec_validated.load(Ordering::Relaxed), epsilon),
+            pqc_downgrade_prevented: add_laplace_noise(self.pqc_downgrade_prevented.load(Ordering::Relaxed), epsilon),
+        }
+    }
+
+    /// Returns Prometheus text formatted metrics protected by epsilon-differential privacy.
+    pub fn to_prometheus_text_dp(&self, epsilon: f64) -> String {
+        let snap = self.snapshot_dp(epsilon);
+        let mut out = String::with_capacity(2048);
+
+        out.push_str("# HELP albus_dns_queries_total Total DNS queries handled (differentially private).\n");
+        out.push_str("# TYPE albus_dns_queries_total counter\n");
+        out.push_str(&format!("albus_dns_queries_total{{protocol=\"udp\"}} {}\n", snap.queries_udp));
+        out.push_str(&format!("albus_dns_queries_total{{protocol=\"tcp\"}} {}\n", snap.queries_tcp));
+        out.push_str(&format!("albus_dns_queries_total{{protocol=\"doh\"}} {}\n", snap.queries_doh));
+        out.push_str(&format!("albus_dns_queries_total{{protocol=\"dot\"}} {}\n", snap.queries_dot));
+
+        out.push_str("# HELP albus_dns_cache_hits_total Total DNS responses served from memory cache (differentially private).\n");
+        out.push_str("# TYPE albus_dns_cache_hits_total counter\n");
+        out.push_str(&format!("albus_dns_cache_hits_total {}\n", snap.cache_hits));
+
+        out.push_str("# HELP albus_dns_cache_hit_ratio Current cache hit percentage (differentially private).\n");
+        out.push_str("# TYPE albus_dns_cache_hit_ratio gauge\n");
+        out.push_str(&format!("albus_dns_cache_hit_ratio {:.2}\n", snap.cache_hit_ratio));
+
+        out
+    }
+
     // writes current stats to volatile /run runtime path for albus monitor inspection
     pub fn dump_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let snap = self.snapshot();
@@ -294,6 +356,29 @@ impl DnsStats {
         }
         res?;
         Ok(())
+    }
+}
+
+/// Adds differential privacy Laplace noise scaled to privacy parameter epsilon (e.g. epsilon = 1.0).
+/// Sensitivity Delta f = 1 for single count increment.
+pub fn add_laplace_noise(val: u64, epsilon: f64) -> u64 {
+    if epsilon <= 0.0 {
+        return val;
+    }
+    let mut raw_bytes = [0u8; 8];
+    if crate::dns::entropy::fill_dual_entropy(&mut raw_bytes).is_err() {
+        return val;
+    }
+    let u_int = u64::from_le_bytes(raw_bytes);
+    let u = ((u_int as f64) + 1.0) / ((u64::MAX as f64) + 2.0);
+    let scale = 1.0 / epsilon;
+    let sgn = if u >= 0.5 { 1.0 } else { -1.0 };
+    let noise = -scale * sgn * (1.0 - 2.0 * (u - 0.5).abs()).ln();
+    let noisy = (val as f64) + noise;
+    if noisy < 0.0 {
+        0
+    } else {
+        noisy.round() as u64
     }
 }
 
@@ -367,5 +452,18 @@ mod tests {
         assert!(prom.contains("albus_dns_blocked_queries_total{reason=\"blocklist\"} 1"));
         assert!(prom.contains("albus_dns_blocked_queries_total{reason=\"schedule\"} 1"));
         assert!(prom.contains("albus_dns_cache_hit_ratio 50.00"));
+    }
+
+    #[test]
+    fn test_dns_stats_differential_privacy() {
+        let stats = DnsStats::new();
+        stats.total_queries.fetch_add(1000, Ordering::Relaxed);
+        stats.cache_hits.fetch_add(500, Ordering::Relaxed);
+
+        let snap_dp = stats.snapshot_dp(1.0);
+        assert!(snap_dp.total_queries > 0);
+        let prom_dp = stats.to_prometheus_text_dp(1.0);
+        assert!(prom_dp.contains("albus_dns_queries_total"));
+        assert!(prom_dp.contains("albus_dns_cache_hits_total"));
     }
 }

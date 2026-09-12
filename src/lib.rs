@@ -12,12 +12,19 @@ pub use app::monitor;
 pub use app::service;
 pub use app::status;
 
+pub use core::active_probe;
+pub use core::anti_injection;
 pub use core::autottl;
 pub use core::ebpf;
 pub use core::engine;
 pub use core::fake;
 pub use core::firewall;
+pub use core::ja4_mimic;
 pub use core::rawsock;
+pub use core::stack_morph;
+pub use core::traffic_morph;
+pub use core::xdp_filter;
+pub use app::defense_profile;
 
 #[cfg(test)]
 mod tests {

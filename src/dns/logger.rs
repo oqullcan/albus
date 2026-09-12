@@ -404,12 +404,8 @@ pub fn qtype_from_str(s: &str) -> Option<u16> {
                         }
                     }
                     IpAddr::V6(v6) => {
-                        if opts.ip_crypt.is_some() {
-                            let segs = v6.segments();
-                            format!(
-                                "{:x}:{:x}:{:x}:{:x}::[masked]",
-                                segs[0], segs[1], segs[2], segs[3]
-                            )
+                        if let Some(ref crypt) = opts.ip_crypt {
+                            format!("ip:{}", crypt.encrypt_v6(v6))
                         } else {
                             v6.to_string()
                         }

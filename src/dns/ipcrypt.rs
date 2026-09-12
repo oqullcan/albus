@@ -4,11 +4,18 @@
 //! preventing client ip disclosure in dns audit logs while preserving analytical grouping.
 
 use sha2::{Digest, Sha256};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct IpCrypt {
     key: [u8; 16],
+}
+
+impl std::fmt::Debug for IpCrypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IpCrypt { key: [REDACTED] }")
+    }
 }
 
 impl IpCrypt {
@@ -22,9 +29,10 @@ impl IpCrypt {
     /// deterministic testing. For production audit log pseudonymization where maximum security
     /// and entropy are required, a random 16-byte hex key should be provided via [`IpCrypt::from_hex`].
     pub fn from_passphrase(passphrase: &str) -> Self {
-        let hash = Sha256::digest(passphrase.as_bytes());
+        let mut hash = Sha256::digest(passphrase.as_bytes());
         let mut key = [0u8; 16];
         key.copy_from_slice(&hash[..16]);
+        hash.zeroize();
         Self { key }
     }
 
@@ -109,16 +117,87 @@ impl IpCrypt {
 
         Ipv4Addr::from(b)
     }
+
+    /// Format-preserving 128-bit IPv6 address permutation and pseudonymization.
+    /// Uses an 8-round constant-time Feistel network operating over four 32-bit words.
+    pub fn encrypt_v6(&self, ip: Ipv6Addr) -> Ipv6Addr {
+        let octets = ip.octets();
+        let mut w = [
+            u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]),
+            u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]),
+            u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]),
+            u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]]),
+        ];
+
+        let rk = self.derive_v6_round_keys();
+
+        // 8-round generalized balanced Feistel network
+        for round in 0..8 {
+            let k = rk[round % 4];
+            let f = feistel_round_f(w[0], k, round as u32);
+            let next_w1 = w[1] ^ f;
+            w[1] = w[2];
+            w[2] = w[3];
+            w[3] = w[0];
+            w[0] = next_w1;
+        }
+
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&w[0].to_be_bytes());
+        out[4..8].copy_from_slice(&w[1].to_be_bytes());
+        out[8..12].copy_from_slice(&w[2].to_be_bytes());
+        out[12..16].copy_from_slice(&w[3].to_be_bytes());
+        Ipv6Addr::from(out)
+    }
+
+    /// Decrypts / restores the original 128-bit IPv6 address from its pseudonym.
+    pub fn decrypt_v6(&self, ip: Ipv6Addr) -> Ipv6Addr {
+        let octets = ip.octets();
+        let mut w = [
+            u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]),
+            u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]),
+            u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]),
+            u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]]),
+        ];
+
+        let rk = self.derive_v6_round_keys();
+
+        // Reverse 8 rounds
+        for round in (0..8).rev() {
+            let k = rk[round % 4];
+            let prev_w0 = w[3];
+            let f = feistel_round_f(prev_w0, k, round as u32);
+            let prev_w1 = w[0] ^ f;
+            w[0] = prev_w0;
+            w[3] = w[2];
+            w[2] = w[1];
+            w[1] = prev_w1;
+        }
+
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&w[0].to_be_bytes());
+        out[4..8].copy_from_slice(&w[1].to_be_bytes());
+        out[8..12].copy_from_slice(&w[2].to_be_bytes());
+        out[12..16].copy_from_slice(&w[3].to_be_bytes());
+        Ipv6Addr::from(out)
+    }
+
+    #[inline(always)]
+    fn derive_v6_round_keys(&self) -> [u32; 4] {
+        [
+            u32::from_be_bytes([self.key[0], self.key[1], self.key[2], self.key[3]]),
+            u32::from_be_bytes([self.key[4], self.key[5], self.key[6], self.key[7]]),
+            u32::from_be_bytes([self.key[8], self.key[9], self.key[10], self.key[11]]),
+            u32::from_be_bytes([self.key[12], self.key[13], self.key[14], self.key[15]]),
+        ]
+    }
 }
 
-impl Drop for IpCrypt {
-    fn drop(&mut self) {
-        for b in self.key.iter_mut() {
-            unsafe {
-                std::ptr::write_volatile(b, 0);
-            }
-        }
-    }
+#[inline(always)]
+fn feistel_round_f(x: u32, k: u32, round: u32) -> u32 {
+    let mixed = x.wrapping_add(k).rotate_left(7);
+    let round_const = 0x9e3779b9u32.wrapping_mul(round.wrapping_add(1));
+    (mixed ^ round_const).rotate_left(13)
 }
 
 #[inline(always)]
@@ -184,5 +263,29 @@ mod tests {
 
         assert_eq!(crypt1.decrypt(enc1), ip);
         assert_eq!(crypt3.decrypt(enc3), ip);
+    }
+
+    #[test]
+    fn test_ipcrypt_v6_roundtrip() {
+        let key = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
+            0x23, 0x01,
+        ];
+        let ip_crypt = IpCrypt::new(key);
+
+        let original: Ipv6Addr = "2001:db8:85a3::8a2e:370:7334".parse().unwrap();
+        let encrypted = ip_crypt.encrypt_v6(original);
+        assert_ne!(original, encrypted);
+
+        let decrypted = ip_crypt.decrypt_v6(encrypted);
+        assert_eq!(original, decrypted);
+    }
+
+    #[test]
+    fn test_ipcrypt_debug_redacted() {
+        let crypt = IpCrypt::from_passphrase("super-confidential");
+        let debug_str = format!("{:?}", crypt);
+        assert!(debug_str.contains("REDACTED"));
+        assert!(!debug_str.contains("super-confidential"));
     }
 }

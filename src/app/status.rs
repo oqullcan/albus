@@ -19,6 +19,14 @@ pub fn show_status() {
     println!("  platform:   linux/{}", env::consts::ARCH);
     println!("  engine:     ebpf-sockops");
 
+    let (iface, gw) = crate::core::autottl::resolve_default_network_interface()
+        .map(|(i, g)| (i, g.to_string()))
+        .unwrap_or_else(|| ("auto".to_string(), "unknown".to_string()));
+    let restore_mss = crate::core::autottl::resolve_optimal_restore_mss();
+    println!("  outbound_iface: {}", iface);
+    println!("  gateway:        {}", gw);
+    println!("  restore_mss:    {} (PMTUD)", restore_mss);
+
     if !is_root() {
         println!("  (run with sudo for accurate capability detection)");
         return;

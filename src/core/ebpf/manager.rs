@@ -27,6 +27,8 @@ pub struct BpfManagerConfig {
     pub fake_sni: Option<String>,
     pub fake_bad_checksum: bool,
     pub fake_seq_offset: i32,
+    pub fake_window_size: Option<u16>,
+    pub fake_tcp_flags: Option<u8>,
     pub pqc: bool,
     pub auto_ttl_estimator: AutoTtlEstimator,
 }
@@ -110,6 +112,8 @@ impl BpfManager {
         let fake_bad_checksum = self.cfg.fake_bad_checksum;
         let fake_seq_offset = self.cfg.fake_seq_offset;
         let fake_ttl_fallback = self.cfg.fake_ttl;
+        let fake_window_size = self.cfg.fake_window_size;
+        let fake_tcp_flags = self.cfg.fake_tcp_flags;
         running.store(true, Ordering::SeqCst);
 
         self.engine = Some(engine);
@@ -120,6 +124,8 @@ impl BpfManager {
             fallback_ttl = self.cfg.fake_ttl,
             fake_sni = ?self.cfg.fake_sni,
             bad_checksum = self.cfg.fake_bad_checksum,
+            fake_window_size = ?self.cfg.fake_window_size,
+            fake_tcp_flags = ?self.cfg.fake_tcp_flags,
             pqc = self.cfg.pqc,
             ports = ?self.cfg.ports,
             "albus active — MSS fragmentation + Auto-TTL fake injection"
@@ -154,12 +160,30 @@ impl BpfManager {
                 .collect()
         };
 
+        // assemble decoy cleartext HTTP payloads for port 80 evasion
+        let fake_http_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
+            if sni != "www.google.com" && !sni.is_empty() {
+                vec![crate::core::fake::http::build_fake_http_request(sni)]
+            } else {
+                crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
+                    .iter()
+                    .map(|&s| crate::core::fake::http::build_fake_http_request(s))
+                    .collect()
+            }
+        } else {
+            crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
+                .iter()
+                .map(|&s| crate::core::fake::http::build_fake_http_request(s))
+                .collect()
+        };
+
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok();
             let mut decoy_idx: usize = 0;
+            let mut http_idx: usize = 0;
 
             while running_clone.load(Ordering::Relaxed) {
                 let mut received = false;
@@ -199,12 +223,24 @@ impl BpfManager {
                         IpAddr::V6(_) => fake_ttl_fallback,
                     };
 
-                    let payload: &[u8] = if fake_payloads.is_empty() {
+                    let is_http = conn.dst_port == 80 || conn.dst_port == 8080;
+                    let payload: &[u8] = if is_http {
+                        if fake_http_payloads.is_empty() {
+                            b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n"
+                        } else {
+                            &fake_http_payloads[http_idx % fake_http_payloads.len()]
+                        }
+                    } else if fake_payloads.is_empty() {
                         &FAKE_TLS_CLIENT_HELLO
                     } else {
                         &fake_payloads[decoy_idx % fake_payloads.len()]
                     };
-                    decoy_idx = decoy_idx.wrapping_add(1);
+
+                    if is_http {
+                        http_idx = http_idx.wrapping_add(1);
+                    } else {
+                        decoy_idx = decoy_idx.wrapping_add(1);
+                    }
 
                     let conn_to_inject = if fake_seq_offset != 0 {
                         conn.with_seq_offset(fake_seq_offset)
@@ -212,13 +248,16 @@ impl BpfManager {
                         conn
                     };
 
-                    if let Err(e) = raw_socket.send_fake_opts(
+                    if let Err(e) = raw_socket.send_fake_advanced(
                         &conn_to_inject,
                         payload,
                         optimal_ttl,
                         fake_bad_checksum,
+                        fake_window_size,
+                        fake_tcp_flags,
                     ) {
-                        warn!("Failed to inject fake ClientHello: {}", e);
+                        let proto_desc = if is_http { "fake HTTP request" } else { "fake ClientHello" };
+                        warn!("Failed to inject {}: {}", proto_desc, e);
                     } else {
                         let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
 
@@ -230,13 +269,16 @@ impl BpfManager {
                             }
                         }
 
+                        let event_desc = if is_http { "fake HTTP request injected" } else { "fake ClientHello injected" };
                         info!(
                             dst = %dst_desc,
                             seq = conn.seq,
                             ack = conn.ack,
                             ttl = optimal_ttl,
                             bad_cs = fake_bad_checksum,
-                            "fake ClientHello injected"
+                            win = ?fake_window_size,
+                            flags = ?fake_tcp_flags,
+                            "{}", event_desc
                         );
                     }
                 });
@@ -292,6 +334,8 @@ mod tests {
             fake_sni: Some("test.example.com".to_string()),
             fake_bad_checksum: false,
             fake_seq_offset: 0,
+            fake_window_size: None,
+            fake_tcp_flags: None,
             pqc: true,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
         }

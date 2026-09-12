@@ -40,12 +40,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "url",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

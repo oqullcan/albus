@@ -81,6 +81,34 @@ impl EchConfigCache {
     }
 }
 
+pub const TLS_EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
+
+/// Generates a standardized GREASE ECH (Encrypted Client Hello) TLS extension (RFC 9460).
+/// Injects randomized outer HPKE encapsulation to prevent middlebox DPI SNI-sniffing heuristics.
+pub fn generate_grease_ech_extension() -> Vec<u8> {
+    let mut enc = [0u8; 32];
+    let _ = crate::dns::entropy::fill_dual_entropy(&mut enc);
+
+    let mut payload = [0u8; 128];
+    let _ = crate::dns::entropy::fill_dual_entropy(&mut payload);
+
+    let mut ext_data = Vec::with_capacity(1 + 2 + 2 + 1 + 2 + 32 + 2 + 128);
+    ext_data.push(0x00); // outer
+    ext_data.extend_from_slice(&0x0001u16.to_be_bytes()); // HKDF-SHA256
+    ext_data.extend_from_slice(&0x0003u16.to_be_bytes()); // ChaCha20Poly1305
+    ext_data.push(enc[0]); // randomized config_id
+    ext_data.extend_from_slice(&(32u16).to_be_bytes());
+    ext_data.extend_from_slice(&enc);
+    ext_data.extend_from_slice(&(128u16).to_be_bytes());
+    ext_data.extend_from_slice(&payload);
+
+    let mut out = Vec::with_capacity(4 + ext_data.len());
+    out.extend_from_slice(&TLS_EXT_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+    out.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+    out.extend_from_slice(&ext_data);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +148,14 @@ mod tests {
         cache.insert(domain.to_string(), dummy_ech.clone());
         assert_eq!(cache.get(domain), Some(dummy_ech));
         assert_eq!(cache.get("unknown.com"), None);
+    }
+
+    #[test]
+    fn test_generate_grease_ech_extension() {
+        let ext = generate_grease_ech_extension();
+        assert!(ext.len() > 4);
+        assert_eq!(u16::from_be_bytes([ext[0], ext[1]]), TLS_EXT_ENCRYPTED_CLIENT_HELLO);
+        let len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
+        assert_eq!(ext.len(), 4 + len);
     }
 }

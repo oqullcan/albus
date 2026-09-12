@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use url::Url;
+use zeroize::Zeroize;
 
 pub const ODOH_HTTP_HEADER: &str = "application/oblivious-dns-message";
 
@@ -127,6 +128,12 @@ impl ODoHConfig {
 pub struct ODoHContext {
     sender_ctx: hpke::aead::AeadCtxS<HpkeAead, HpkeKdf, HpkeKem>,
     q_plain: Vec<u8>,
+}
+
+impl Drop for ODoHContext {
+    fn drop(&mut self) {
+        self.q_plain.zeroize();
+    }
 }
 
 /// client orchestrator handling oblivious query encapsulation and relay dispatch
@@ -382,8 +389,14 @@ impl ODoHClient {
             aad: &aad,
         };
 
-        let r_plain = cipher
-            .decrypt(&nonce, payload)
+        let decrypt_result = cipher
+            .decrypt(&nonce, payload);
+
+        secret.zeroize();
+        aead_key_bytes.zeroize();
+        aead_nonce_bytes.zeroize();
+
+        let r_plain = decrypt_result
             .map_err(|_| "aead authentication failure during odoh response decryption")?;
 
         if r_plain.len() < 4 {

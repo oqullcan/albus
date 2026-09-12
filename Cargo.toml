@@ -27,6 +27,8 @@ poly1305 = "0.8"
 aws-lc-rs = "1.18"
 tokio-rustls = "0.26"
 quinn = { version = "0.11", default-features = false, features = ["rustls"] }
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [build-dependencies]
 cc = "1.1"

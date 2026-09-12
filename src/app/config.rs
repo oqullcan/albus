@@ -28,6 +28,10 @@ pub struct Config {
     pub fake_bad_checksum: bool,
     #[serde(default)]
     pub fake_seq_offset: i32,
+    #[serde(default)]
+    pub fake_window_size: Option<u16>,
+    #[serde(default)]
+    pub fake_tcp_flags: Option<String>,
     #[serde(default = "default_true")]
     pub auto_ttl: bool,
     #[serde(default = "default_min_ttl")]
@@ -294,6 +298,18 @@ pub struct Config {
     pub cloak_ttl: u32,
     #[serde(default = "default_reject_ttl")]
     pub reject_ttl: u32,
+    #[serde(default)]
+    pub defense_profile: Option<String>,
+    #[serde(default)]
+    pub ja4_mimic: Option<String>,
+    #[serde(default)]
+    pub active_probe_defense: bool,
+    #[serde(default)]
+    pub xdp_filter: bool,
+    #[serde(default)]
+    pub sphinx_routing: bool,
+    #[serde(default)]
+    pub simd_accel: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,6 +470,8 @@ impl Default for Config {
             fake_sni: None,
             fake_bad_checksum: false,
             fake_seq_offset: 0,
+            fake_window_size: None,
+            fake_tcp_flags: None,
             auto_ttl: true,
             min_ttl: 3,
             max_ttl: 12,
@@ -587,6 +605,12 @@ impl Default for Config {
             pid_file: None,
             cloak_ttl: 300,
             reject_ttl: 10,
+            defense_profile: None,
+            ja4_mimic: None,
+            active_probe_defense: false,
+            xdp_filter: false,
+            sphinx_routing: false,
+            simd_accel: false,
         }
     }
 }

@@ -52,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.fake_sni = args.fake_sni;
                     cfg.fake_bad_checksum = args.fake_bad_checksum;
                     cfg.fake_seq_offset = args.fake_seq_offset;
+                    cfg.fake_window_size = args.fake_window_size;
+                    cfg.fake_tcp_flags = args.fake_tcp_flags.clone();
                     cfg.auto_ttl = args.auto_ttl;
                     cfg.min_ttl = args.min_ttl;
                     cfg.max_ttl = args.max_ttl;
@@ -521,6 +523,12 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
         cfg.dnscrypt_relays = r.clone();
     }
     cfg.fake_seq_offset = args.fake_seq_offset;
+    if args.fake_window_size.is_some() {
+        cfg.fake_window_size = args.fake_window_size;
+    }
+    if args.fake_tcp_flags.is_some() {
+        cfg.fake_tcp_flags = args.fake_tcp_flags.clone();
+    }
     cfg.dns_racing = args.dns_racing;
     if args.cache_min_ttl != 60 {
         cfg.cache_min_ttl = args.cache_min_ttl;
@@ -598,6 +606,24 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     }
     if let Some(lvl) = args.web_ui_privacy_level {
         cfg.web_ui_privacy_level = lvl;
+    }
+    if let Some(ref prof) = args.defense_profile {
+        cfg.defense_profile = Some(prof.clone());
+    }
+    if let Some(ref j4) = args.ja4_mimic {
+        cfg.ja4_mimic = Some(j4.clone());
+    }
+    if args.active_probe_defense {
+        cfg.active_probe_defense = true;
+    }
+    if args.xdp_filter {
+        cfg.xdp_filter = true;
+    }
+    if args.sphinx_routing {
+        cfg.sphinx_routing = true;
+    }
+    if args.simd_accel {
+        cfg.simd_accel = true;
     }
 
     // one-shot latency benchmark check
