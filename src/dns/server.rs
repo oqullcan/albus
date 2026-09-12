@@ -750,10 +750,11 @@ impl DnsServer {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let stats_path = crate::app::config::Config::volatile_stats_path();
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = stats_dump.dump_to_file("/run/albus/stats.json");
+                        let _ = stats_dump.dump_to_file(&stats_path);
                     }
                     _ = stats_shutdown_rx.recv() => break,
                 }
@@ -1624,7 +1625,13 @@ impl DnsServer {
         }
 
         match self.resolve_upstream(&outgoing_query).await {
-            Ok((resp_bytes, via)) => {
+            Ok((mut resp_bytes, via)) => {
+                // Ensure wire response transaction ID strictly matches client query ID (RFC 1035)
+                if resp_bytes.len() >= 2 && query_data.len() >= 2 {
+                    resp_bytes[0] = query_data[0];
+                    resp_bytes[1] = query_data[1];
+                }
+
                 // Anti-DNS-Rebinding validation
                 if self.anti_dns_rebinding.load(Ordering::Relaxed) {
                     if let Some(private_ip) = detect_dns_rebinding(&resp_bytes) {
@@ -1792,6 +1799,9 @@ impl DnsServer {
                             return Some(build_servfail_response(query_data));
                         }
                     }
+                } else if resp_bytes.len() >= 4 {
+                    // RFC 6840 Section 5.7: If local DNSSEC validation is not enabled, clear AD bit
+                    resp_bytes[3] &= !0x20;
                 }
 
                 // insert response into cache (supports negative caching and serve-stale)
@@ -2769,6 +2779,91 @@ mod tests {
             resolve_anonymized_dns_routes(&[], "cloudflare"),
             Vec::<String>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn test_response_transaction_id_and_ad_bit_preservation() {
+        let mut cloak = CloakEngine::new();
+        cloak.add_cloak_rule("local.example", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let server = DnsServer::new(
+            "cloudflare",
+            &[],
+            false,
+            false, // DNSSEC disabled
+            false,
+            false,
+            true,
+            true,
+            true,
+            true,
+            Arc::new(cloak),
+            Arc::new(RwLock::new(build_seed_blocklist())),
+            Arc::new(RwLock::new(DomainAllowlist::new())),
+            Arc::new(IpFilter::default()),
+            true,
+            false,
+            true,
+            DnsStats::new(),
+            true,
+            true,
+            "127.0.0.1:8053".parse().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(RwLock::new(ScheduleManager::new())),
+            None,
+            false,
+            "127.0.0.1:9153".parse().unwrap(),
+            None,
+            Arc::new(RwLock::new(ForwardingEngine::new())),
+            None,
+            None,
+            0.0,
+            60,
+            600,
+            60,
+            86400,
+            false,
+            Arc::new(CaptiveMap::new()),
+        )
+        .unwrap();
+
+        // 1. Canary query with distinct transaction ID
+        let canary_query = vec![
+            0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x09, b'l', b'e', b'a', b'k', b'-', b't', b'e', b's', b't',
+            0x05, b'a', b'l', b'b', b'u', b's',
+            0x08, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        let resp = server
+            .resolve_packet(&canary_query, "127.0.0.1".parse().unwrap())
+            .await
+            .expect("should return canary response");
+
+        // Transaction ID must match query exactly (RFC 1035)
+        assert_eq!(resp[0], 0xDE);
+        assert_eq!(resp[1], 0xAD);
+        // AD bit must be cleared because dnssec is disabled (RFC 6840)
+        assert_eq!(resp[3] & 0x20, 0);
+
+        // 2. Cloaked local query with different transaction ID
+        let cloak_query = vec![
+            0xBE, 0xEF, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, b'l', b'o', b'c', b'a', b'l',
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        let cloak_resp = server
+            .resolve_packet(&cloak_query, "127.0.0.1".parse().unwrap())
+            .await
+            .expect("should return cloaked response");
+
+        assert_eq!(cloak_resp[0], 0xBE);
+        assert_eq!(cloak_resp[1], 0xEF);
+        assert_eq!(cloak_resp[3] & 0x20, 0);
     }
 }
 

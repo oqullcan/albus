@@ -102,3 +102,11 @@ All notable changes to the Albus project are documented in this file.
 
 #### Documentation & Links
 - **GitHub Relative Links**: Cleaned all local `file:///...` links in `README.md` to standard relative markdown links (`[src/...](src/...)`, `[LICENSE](LICENSE)`).
+
+#### Runtime Resilience & Wire Protocol Parity
+- **Volatile Runtime Paths & Non-Root Resilience (`src/app/config.rs`, `src/core/engine.rs`, `src/dns/server.rs`, `src/app/monitor.rs`)**:
+  - Added dynamic resolution for volatile runtime directory paths (`Config::volatile_runtime_dir()`, `Config::volatile_stats_path()`, `Config::volatile_token_path()`) routing via `/run/albus/`, `$XDG_RUNTIME_DIR/albus/`, or `/run/user/<uid>/albus/`, preventing permission denials in unprivileged environments.
+  - Updated periodic telemetry dump in `server.rs` and monitor telemetry viewer in `monitor.rs` to dynamically access runtime metrics without hardcoded path assumptions.
+- **Wire Transaction ID Preservation & DNSSEC AD Bit Stripping (`src/dns/server.rs`)**:
+  - Guaranteed RFC 1035 wire transaction ID matching on all upstream responses (`resp_bytes[0..2] = query_data[0..2]`).
+  - Enforced RFC 6840 Section 5.7 compliance by clearing the AD bit when local DNSSEC validation is disabled.

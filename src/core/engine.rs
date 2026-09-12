@@ -136,7 +136,7 @@ impl Engine {
             let cache_path = if let Some(ref p) = cfg.blocklist_path {
                 std::path::PathBuf::from(p)
             } else if cfg.ram_only {
-                std::path::PathBuf::from("/run/albus/blocklist.bin")
+                Config::volatile_runtime_dir().join("blocklist.bin")
             } else {
                 std::path::PathBuf::from("/var/lib/albus/blocklist.bin")
             };
@@ -260,7 +260,7 @@ impl Engine {
                 let main_path = if cfg.query_log {
                     Some(std::path::PathBuf::from(cfg.query_log_path.clone().unwrap_or_else(|| {
                         if cfg.ram_only {
-                            "/run/albus/query.log".to_string()
+                            Config::volatile_runtime_dir().join("query.log").to_string_lossy().to_string()
                         } else {
                             "/var/log/albus/query.log".to_string()
                         }
@@ -271,7 +271,7 @@ impl Engine {
                 let nx_path = if cfg.nx_log {
                     Some(std::path::PathBuf::from(cfg.nx_log_path.clone().unwrap_or_else(|| {
                         if cfg.ram_only {
-                            "/run/albus/nx.log".to_string()
+                            Config::volatile_runtime_dir().join("nx.log").to_string_lossy().to_string()
                         } else {
                             "/var/log/albus/nx.log".to_string()
                         }
@@ -726,7 +726,7 @@ impl Engine {
                             "Web Monitoring Dashboard enabled without credentials; generated ephemeral password: {}",
                             token
                         );
-                        let token_path = std::path::Path::new("/run/albus/web_ui.token");
+                        let token_path = crate::app::config::Config::volatile_token_path();
                         if let Some(parent) = token_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
@@ -740,7 +740,7 @@ impl Engine {
                                 .truncate(true)
                                 .mode(0o600)
                                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                                .open(token_path)
+                                .open(&token_path)
                                 .and_then(|mut f| {
                                     use std::io::Write;
                                     f.write_all(token_content.as_bytes())?;

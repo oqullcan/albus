@@ -283,7 +283,8 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut stdout = stdout();
 
     let snap_opt: Option<crate::dns::DnsStatsSnapshot> =
-        std::fs::read_to_string("/run/albus/stats.json")
+        std::fs::read_to_string(crate::app::config::Config::volatile_stats_path())
+            .or_else(|_| std::fs::read_to_string("/run/albus/stats.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok());
 

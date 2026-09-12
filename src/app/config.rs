@@ -980,6 +980,24 @@ impl Config {
         }
     }
 
+    // resolves volatile runtime directory
+    pub fn volatile_runtime_dir() -> PathBuf {
+        Self::volatile_config_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("/run/albus"))
+            .to_path_buf()
+    }
+
+    // resolves volatile runtime stats telemetry path
+    pub fn volatile_stats_path() -> PathBuf {
+        Self::volatile_runtime_dir().join("stats.json")
+    }
+
+    // resolves volatile web ui authentication token path
+    pub fn volatile_token_path() -> PathBuf {
+        Self::volatile_runtime_dir().join("web_ui.token")
+    }
+
     // resolves durable persistent configuration path on physical disk (never returns volatile memory)
     pub fn default_config_path() -> PathBuf {
         // 1. check explicit ALBUS_CONFIG_USER environment variable
@@ -1709,5 +1727,17 @@ mod tests {
                 "documentation must list volatile_config_path as priority 1"
             );
         }
+    }
+
+    #[test]
+    fn test_volatile_runtime_paths() {
+        let runtime_dir = Config::volatile_runtime_dir();
+        let stats_path = Config::volatile_stats_path();
+        let token_path = Config::volatile_token_path();
+        let config_path = Config::volatile_config_path();
+
+        assert_eq!(stats_path, runtime_dir.join("stats.json"));
+        assert_eq!(token_path, runtime_dir.join("web_ui.token"));
+        assert_eq!(config_path, runtime_dir.join("config.json"));
     }
 }
