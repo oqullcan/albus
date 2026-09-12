@@ -12,6 +12,7 @@ pub use app::monitor;
 pub use app::service;
 pub use app::status;
 
+pub use app::defense_profile;
 pub use core::anti_injection;
 pub use core::autottl;
 pub use core::ebpf;
@@ -21,7 +22,6 @@ pub use core::firewall;
 pub use core::ja4_mimic;
 pub use core::rawsock;
 pub use core::stack_morph;
-pub use app::defense_profile;
 
 #[cfg(test)]
 mod tests {

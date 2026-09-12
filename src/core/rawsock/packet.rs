@@ -126,7 +126,15 @@ pub fn build_packet_stack_advanced(
     window_size: Option<u16>,
     tcp_flags: Option<u8>,
 ) -> StackPacket {
-    build_packet_stack_morphed(conn, payload, ttl, bad_checksum, window_size, tcp_flags, None)
+    build_packet_stack_morphed(
+        conn,
+        payload,
+        ttl,
+        bad_checksum,
+        window_size,
+        tcp_flags,
+        None,
+    )
 }
 
 // serializes ipv4 or ipv6 header and tcp segment morphing os fingerprints (tcp options, window, ttl)

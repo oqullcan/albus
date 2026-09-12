@@ -105,7 +105,11 @@ pub fn format_query_log(
             safe_details
         ),
         LogFormat::Ltsv => {
-            let cached = if entry.status == QueryStatus::CacheHit { 1 } else { 0 };
+            let cached = if entry.status == QueryStatus::CacheHit {
+                1
+            } else {
+                0
+            };
             format!(
                 "time:{}\thost:{}\tmessage:{}\ttype:{}\treturn:{}\tcached:{}\tduration:{}\tserver:{}\trelay:-\n",
                 entry.timestamp_epoch_secs,
@@ -293,24 +297,24 @@ impl QueryLogger {
         )
     }
 
-pub fn qtype_from_str(s: &str) -> Option<u16> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "A" => Some(1),
-        "NS" => Some(2),
-        "CNAME" => Some(5),
-        "SOA" => Some(6),
-        "PTR" => Some(12),
-        "HINFO" => Some(13),
-        "MX" => Some(15),
-        "TXT" => Some(16),
-        "AAAA" => Some(28),
-        "SRV" => Some(33),
-        "OPT" => Some(41),
-        "DNSKEY" => Some(48),
-        "HTTPS" => Some(65),
-        _ => s.trim().parse::<u16>().ok(),
+    pub fn qtype_from_str(s: &str) -> Option<u16> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "A" => Some(1),
+            "NS" => Some(2),
+            "CNAME" => Some(5),
+            "SOA" => Some(6),
+            "PTR" => Some(12),
+            "HINFO" => Some(13),
+            "MX" => Some(15),
+            "TXT" => Some(16),
+            "AAAA" => Some(28),
+            "SRV" => Some(33),
+            "OPT" => Some(41),
+            "DNSKEY" => Some(48),
+            "HTTPS" => Some(65),
+            _ => s.trim().parse::<u16>().ok(),
+        }
     }
-}
 
     pub fn start_with_formats<P1: AsRef<Path>, P2: AsRef<Path>>(
         main_path: Option<P1>,
@@ -678,7 +682,13 @@ mod tests {
             details: Some("quad9".to_string()),
         };
 
-        let ltsv_line = format_query_log(&entry, "192.168.1.10", "example.com", "quad9", LogFormat::Ltsv);
+        let ltsv_line = format_query_log(
+            &entry,
+            "192.168.1.10",
+            "example.com",
+            "quad9",
+            LogFormat::Ltsv,
+        );
         assert_eq!(
             ltsv_line,
             "time:1700000000\thost:192.168.1.10\tmessage:example.com\ttype:1\treturn:CACHE_HIT\tcached:1\tduration:1\tserver:quad9\trelay:-\n"
@@ -694,7 +704,13 @@ mod tests {
             details: None,
         };
 
-        let nx_ltsv = format_nx_log(&nx_entry, "10.0.0.5", "invalid.domain", "-", LogFormat::Ltsv);
+        let nx_ltsv = format_nx_log(
+            &nx_entry,
+            "10.0.0.5",
+            "invalid.domain",
+            "-",
+            LogFormat::Ltsv,
+        );
         assert_eq!(
             nx_ltsv,
             "time:1700000005\thost:10.0.0.5\tmessage:invalid.domain\ttype:28\n"
@@ -703,7 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dedicated_filter_logs() {
-        let temp_dir = std::env::temp_dir().join(format!("albus_filter_log_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("albus_filter_log_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let blocked_names_file = temp_dir.join("blocked_names.log");
@@ -764,7 +781,8 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-        let bn_content = fs::read_to_string(&blocked_names_file).expect("blocked names log must exist");
+        let bn_content =
+            fs::read_to_string(&blocked_names_file).expect("blocked names log must exist");
         assert!(bn_content.contains("ads.tracker.com"));
         assert!(!bn_content.contains("malware.host"));
 
@@ -772,7 +790,8 @@ mod tests {
         assert!(bi_content.contains("malware.host"));
         assert!(!bi_content.contains("ads.tracker.com"));
 
-        let an_content = fs::read_to_string(&allowed_names_file).expect("allowed names log must exist");
+        let an_content =
+            fs::read_to_string(&allowed_names_file).expect("allowed names log must exist");
         assert!(an_content.contains("trusted.internal"));
 
         let _ = fs::remove_dir_all(&temp_dir);

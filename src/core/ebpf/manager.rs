@@ -150,15 +150,16 @@ impl BpfManager {
             } else {
                 crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL.to_vec()
             };
-            let profiles: Vec<crate::core::ja4_mimic::BrowserProfile> = if let Some(prof) = self.cfg.ja4_profile {
-                vec![prof]
-            } else {
-                vec![
-                    crate::core::ja4_mimic::BrowserProfile::Chrome130,
-                    crate::core::ja4_mimic::BrowserProfile::Firefox130,
-                    crate::core::ja4_mimic::BrowserProfile::Safari18,
-                ]
-            };
+            let profiles: Vec<crate::core::ja4_mimic::BrowserProfile> =
+                if let Some(prof) = self.cfg.ja4_profile {
+                    vec![prof]
+                } else {
+                    vec![
+                        crate::core::ja4_mimic::BrowserProfile::Chrome130,
+                        crate::core::ja4_mimic::BrowserProfile::Firefox130,
+                        crate::core::ja4_mimic::BrowserProfile::Safari18,
+                    ]
+                };
             let mut payloads = Vec::with_capacity(pool.len() * profiles.len());
             for &sni in &pool {
                 for &prof in &profiles {
@@ -289,7 +290,10 @@ impl BpfManager {
                     };
 
                     let os_profile = if stack_morph {
-                        Some(stack_morph_profile.unwrap_or(crate::core::stack_morph::OsProfile::Windows11))
+                        Some(
+                            stack_morph_profile
+                                .unwrap_or(crate::core::stack_morph::OsProfile::Windows11),
+                        )
                     } else {
                         None
                     };
@@ -303,7 +307,11 @@ impl BpfManager {
                         fake_tcp_flags,
                         os_profile,
                     ) {
-                        let proto_desc = if is_http { "fake HTTP request" } else { "fake ClientHello" };
+                        let proto_desc = if is_http {
+                            "fake HTTP request"
+                        } else {
+                            "fake ClientHello"
+                        };
                         warn!("Failed to inject {}: {}", proto_desc, e);
                     } else {
                         let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
@@ -316,7 +324,11 @@ impl BpfManager {
                             }
                         }
 
-                        let event_desc = if is_http { "fake HTTP request injected" } else { "fake ClientHello injected" };
+                        let event_desc = if is_http {
+                            "fake HTTP request injected"
+                        } else {
+                            "fake ClientHello injected"
+                        };
                         info!(
                             dst = %dst_desc,
                             seq = conn.seq,

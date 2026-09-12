@@ -132,7 +132,10 @@ impl DotClient {
 
     /// Instantiates DotClient from either a preset name (quad9, cloudflare, google, mullvad)
     /// or an explicit IP/SocketAddr format (e.g. "9.9.9.9:853").
-    pub fn from_preset_or_addr(input: &str, pqc: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_preset_or_addr(
+        input: &str,
+        pqc: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let trimmed = input.trim();
         if let Some(client) = Self::from_preset(trimmed, pqc) {
             return Ok(client);
@@ -169,13 +172,16 @@ impl DotClient {
             return Err("query exceeds maximum 65535 octets".into());
         }
 
-        let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(self.server_addr)).await??;
+        let tcp_stream =
+            tokio::time::timeout(timeout, TcpStream::connect(self.server_addr)).await??;
         let _ = tcp_stream.set_nodelay(true);
 
         let server_name = rustls::pki_types::ServerName::try_from(self.hostname.clone())
             .map_err(|e| format!("invalid dot server hostname '{}': {:?}", self.hostname, e))?;
 
-        let mut tls_stream = tokio::time::timeout(timeout, self.connector.connect(server_name, tcp_stream)).await??;
+        let mut tls_stream =
+            tokio::time::timeout(timeout, self.connector.connect(server_name, tcp_stream))
+                .await??;
 
         let len_prefix = (query_wire_bytes.len() as u16).to_be_bytes();
         tokio::time::timeout(timeout, async {
@@ -226,10 +232,12 @@ mod tests {
     #[test]
     fn test_dot_client_pqc_creation() {
         let addr: SocketAddr = "1.1.1.1:853".parse().unwrap();
-        let client_pqc = DotClient::new(addr, "cloudflare-dns.com", true).expect("pqc client should initialize");
+        let client_pqc =
+            DotClient::new(addr, "cloudflare-dns.com", true).expect("pqc client should initialize");
         assert!(client_pqc.pqc);
 
-        let client_classical = DotClient::new(addr, "cloudflare-dns.com", false).expect("classical client should initialize");
+        let client_classical = DotClient::new(addr, "cloudflare-dns.com", false)
+            .expect("classical client should initialize");
         assert!(!client_classical.pqc);
     }
 }

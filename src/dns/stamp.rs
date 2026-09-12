@@ -70,7 +70,8 @@ impl DnsStamp {
             if next_pos != decoded.len() {
                 return Err("invalid dnscrypt relay stamp: unexpected trailing bytes".into());
             }
-            let (server_addr, bootstrap_ip) = if let Ok(sa) = server_addr_str.parse::<SocketAddr>() {
+            let (server_addr, bootstrap_ip) = if let Ok(sa) = server_addr_str.parse::<SocketAddr>()
+            {
                 let v4 = if let std::net::IpAddr::V4(ip) = sa.ip() {
                     Some(ip)
                 } else {
@@ -149,14 +150,20 @@ impl DnsStamp {
             (Some(sa), v4)
         } else if let Ok(ip) = server_addr_str.parse::<Ipv4Addr>() {
             let default_port = match protocol {
-                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay | StampProtocol::CryptDns => 443,
+                StampProtocol::DoH
+                | StampProtocol::ODoHTarget
+                | StampProtocol::ODoHRelay
+                | StampProtocol::CryptDns => 443,
                 StampProtocol::DoT | StampProtocol::DoQ => 853,
                 _ => 53,
             };
             (Some(SocketAddr::from((ip, default_port))), Some(ip))
         } else if let Ok(ip) = server_addr_str.parse::<std::net::Ipv6Addr>() {
             let default_port = match protocol {
-                StampProtocol::DoH | StampProtocol::ODoHTarget | StampProtocol::ODoHRelay | StampProtocol::CryptDns => 443,
+                StampProtocol::DoH
+                | StampProtocol::ODoHTarget
+                | StampProtocol::ODoHRelay
+                | StampProtocol::CryptDns => 443,
                 StampProtocol::DoT | StampProtocol::DoQ => 853,
                 _ => 53,
             };
@@ -501,7 +508,8 @@ mod tests {
         raw.extend_from_slice(host);
 
         // base64url encode
-        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut b64 = String::new();
         let chunks = raw.chunks(3);
         for chunk in chunks {
@@ -522,6 +530,9 @@ mod tests {
         let stamp_str = format!("sdns://{}", b64);
         let stamp = DnsStamp::parse(&stamp_str).expect("DoT stamp with bare IP must parse");
         assert_eq!(stamp.protocol, StampProtocol::DoT);
-        assert_eq!(stamp.server_addr, Some(SocketAddr::from(([9, 9, 9, 9], 853))));
+        assert_eq!(
+            stamp.server_addr,
+            Some(SocketAddr::from(([9, 9, 9, 9], 853)))
+        );
     }
 }

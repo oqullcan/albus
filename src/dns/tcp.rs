@@ -16,9 +16,9 @@ use tracing::{debug, error, info, warn};
 pub struct DnsTcpServer;
 
 impl DnsTcpServer {
-    // spawns tcp listener on 127.0.0.1:53 with tcp_quickack and rfc 7766 length-prefixed framing
-    pub fn start<F, Fut>(
-        bind_addr: SocketAddr,
+    // spawns tcp listener with tcp_quickack and rfc 7766 length-prefixed framing on a pre-bound listener
+    pub fn start_with_listener<F, Fut>(
+        listener: TcpListener,
         handler: F,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) where
@@ -28,54 +28,6 @@ impl DnsTcpServer {
         let handler_arc = Arc::new(handler);
 
         tokio::spawn(async move {
-            let std_listener = match std::net::TcpListener::bind(bind_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!("failed to bind TCP DNS listener to {}: {}", bind_addr, e);
-                    return;
-                }
-            };
-
-            #[cfg(unix)]
-            {
-                let fd = std_listener.as_raw_fd();
-                unsafe {
-                    let one: libc::c_int = 1;
-                    let _ = libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_REUSEADDR,
-                        &one as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&one) as libc::socklen_t,
-                    );
-
-                    #[cfg(target_os = "linux")]
-                    {
-                        let level = if bind_addr.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
-                        let opt = if bind_addr.is_ipv6() { libc::IPV6_FREEBIND } else { libc::IP_FREEBIND };
-                        let _ = libc::setsockopt(
-                            fd,
-                            level,
-                            opt,
-                            &one as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&one) as libc::socklen_t,
-                        );
-                    }
-                }
-            }
-
-            let _ = std_listener.set_nonblocking(true);
-            let listener = match TcpListener::from_std(std_listener) {
-                Ok(l) => {
-                    info!(addr = %bind_addr, "TCP DNS listener active on {}", bind_addr);
-                    l
-                }
-                Err(e) => {
-                    warn!("failed to convert TCP DNS listener to tokio: {}", e);
-                    return;
-                }
-            };
-
             const MAX_CONCURRENT_TCP_CONNS: usize = 256;
             let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TCP_CONNS));
 
@@ -163,6 +115,71 @@ impl DnsTcpServer {
                 }
             }
         });
+    }
+
+    // spawns tcp listener on bind_addr with tcp_quickack and rfc 7766 length-prefixed framing
+    pub fn start<F, Fut>(bind_addr: SocketAddr, handler: F, shutdown_rx: broadcast::Receiver<()>)
+    where
+        F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        let std_listener = match std::net::TcpListener::bind(bind_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("failed to bind TCP DNS listener to {}: {}", bind_addr, e);
+                return;
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            let fd = std_listener.as_raw_fd();
+            unsafe {
+                let one: libc::c_int = 1;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+
+                #[cfg(target_os = "linux")]
+                {
+                    let level = if bind_addr.is_ipv6() {
+                        libc::IPPROTO_IPV6
+                    } else {
+                        libc::IPPROTO_IP
+                    };
+                    let opt = if bind_addr.is_ipv6() {
+                        libc::IPV6_FREEBIND
+                    } else {
+                        libc::IP_FREEBIND
+                    };
+                    let _ = libc::setsockopt(
+                        fd,
+                        level,
+                        opt,
+                        &one as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&one) as libc::socklen_t,
+                    );
+                }
+            }
+        }
+
+        let _ = std_listener.set_nonblocking(true);
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(l) => {
+                info!(addr = %bind_addr, "TCP DNS listener active on {}", bind_addr);
+                l
+            }
+            Err(e) => {
+                warn!("failed to convert TCP DNS listener to tokio: {}", e);
+                return;
+            }
+        };
+
+        Self::start_with_listener(listener, handler, shutdown_rx);
     }
 }
 

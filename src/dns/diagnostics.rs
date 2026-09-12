@@ -402,7 +402,10 @@ pub async fn handle_resolve_command(
         Err(e) => {
             eprintln!("Upstream resolution failed: {}", e);
             if let Ok((_, upstream_name)) = res_aaaa {
-                println!("Secondary upstream query via {} took {:?}", upstream_name, elapsed_aaaa);
+                println!(
+                    "Secondary upstream query via {} took {:?}",
+                    upstream_name, elapsed_aaaa
+                );
             }
         }
     }
@@ -421,7 +424,11 @@ pub async fn handle_show_certs_command(
     println!("\nDoH Upstream Configuration:");
     println!("  Endpoint URL:       {}", cfg.doh_upstream);
     if !cfg.doh_bootstrap_ips.is_empty() {
-        let ips: Vec<String> = cfg.doh_bootstrap_ips.iter().map(|ip| ip.to_string()).collect();
+        let ips: Vec<String> = cfg
+            .doh_bootstrap_ips
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect();
         println!("  Bootstrap IPs:      {}", ips.join(", "));
     } else {
         println!("  Bootstrap IPs:      Preset default");
@@ -459,7 +466,11 @@ pub async fn handle_show_certs_command(
         println!("  Port:               853");
         println!(
             "  Post-Quantum (PQC): {}",
-            if cfg.pqc { "Enabled (Hybrid ML-KEM / Kyber-768)" } else { "Disabled" }
+            if cfg.pqc {
+                "Enabled (Hybrid ML-KEM / Kyber-768)"
+            } else {
+                "Disabled"
+            }
         );
     }
 
@@ -467,8 +478,13 @@ pub async fn handle_show_certs_command(
     if !cfg.client_rules.is_empty() {
         println!("\nPer-Client IP Filtering Profiles:");
         for p in &cfg.client_rules {
-            println!("  Profile '{}': IPs: {}, Blocklist Bypass: {}, Block IPv6: {:?}",
-                p.name, p.client_ips.join(", "), p.bypass_blocklist, p.block_ipv6);
+            println!(
+                "  Profile '{}': IPs: {}, Blocklist Bypass: {}, Block IPv6: {:?}",
+                p.name,
+                p.client_ips.join(", "),
+                p.bypass_blocklist,
+                p.block_ipv6
+            );
         }
     }
 
@@ -497,7 +513,11 @@ pub async fn handle_show_certs_command(
         println!("  Listen Address:     {}", cfg.local_doh_addr);
         println!(
             "  TLS Encryption:     {}",
-            if cfg.local_doh_tls { "Enabled (HTTPS)" } else { "Disabled (HTTP plaintext)" }
+            if cfg.local_doh_tls {
+                "Enabled (HTTPS)"
+            } else {
+                "Disabled (HTTP plaintext)"
+            }
         );
         if let Some(ref cert) = cfg.local_doh_cert_file {
             println!("  TLS Certificate:    {}", cert);
@@ -556,7 +576,9 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x00]); // 0 ar
 
         // Question: example.com A IN
-        resp.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        resp.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
         resp.extend_from_slice(&[0x00, 0x01]); // A
         resp.extend_from_slice(&[0x00, 0x01]); // IN
 
@@ -589,7 +611,10 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x00]); // 0 ar
 
         // Question: nonexistent.test A IN
-        resp.extend_from_slice(&[11, b'n', b'o', b'n', b'e', b'x', b'i', b's', b't', b'e', b'n', b't', 4, b't', b'e', b's', b't', 0]);
+        resp.extend_from_slice(&[
+            11, b'n', b'o', b'n', b'e', b'x', b'i', b's', b't', b'e', b'n', b't', 4, b't', b'e',
+            b's', b't', 0,
+        ]);
         resp.extend_from_slice(&[0x00, 0x01]);
         resp.extend_from_slice(&[0x00, 0x01]);
 

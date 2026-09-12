@@ -4,8 +4,8 @@
 //! enforcing discrete rfc 8467 query padding, and optionally forwarding requests
 //! across multi-hop http connect / socks5 / tor proxy tunnels.
 
-use std::sync::Arc;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::dns::padding::apply_edns_padding;
@@ -37,7 +37,10 @@ impl AnonymizedDoHClient {
         }
 
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/dns-message"));
+        default_headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/dns-message"),
+        );
         default_headers.insert(ACCEPT, HeaderValue::from_static("application/dns-message"));
 
         let client = builder
@@ -114,7 +117,10 @@ mod tests {
         headers.insert("user-agent", HeaderValue::from_static("Mozilla/5.0"));
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.195"));
         headers.insert("cookie", HeaderValue::from_static("session=abcdef"));
-        headers.insert("content-type", HeaderValue::from_static("application/dns-message"));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/dns-message"),
+        );
 
         assert_eq!(headers.len(), 4);
         scrub_identifying_headers(&mut headers);
@@ -133,7 +139,8 @@ mod tests {
             Some("socks5://127.0.0.1:9050"),
             None,
             true,
-        ).expect("client should initialize");
+        )
+        .expect("client should initialize");
 
         assert_eq!(client.target_url, "https://dns.quad9.net/dns-query");
         assert_eq!(client.relay_url.as_deref(), Some("socks5://127.0.0.1:9050"));

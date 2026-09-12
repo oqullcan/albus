@@ -130,7 +130,11 @@ pub fn apply_edns_options_with_payload_size(
             if let Some(q_end) = crate::dns::filter::extract_question_end(query) {
                 let opt_part = &query[q_end..];
                 // RFC 6891 OPT record: root label (0x00) + type 41 (0x00, 0x29) + udp size (2B) + flags (4B) + rdlen (2B)
-                if opt_part.len() >= 11 && opt_part[0] == 0x00 && opt_part[1] == 0x00 && opt_part[2] == 0x29 {
+                if opt_part.len() >= 11
+                    && opt_part[0] == 0x00
+                    && opt_part[1] == 0x00
+                    && opt_part[2] == 0x29
+                {
                     let client_do = (opt_part[7] & 0x80) != 0;
                     let mut stripped = query[..q_end].to_vec();
                     stripped[10] = 0;
@@ -232,7 +236,8 @@ mod tests {
         ];
         query.extend_from_slice(b"\x06google\x03com\x00\x00\x01\x00\x01");
 
-        let formatted = apply_edns_options_with_payload_size(&query, true, false, None, SAFE_EDNS_PAYLOAD_SIZE);
+        let formatted =
+            apply_edns_options_with_payload_size(&query, true, false, None, SAFE_EDNS_PAYLOAD_SIZE);
         let opt_start = query.len();
         // Payload size is bytes 3 and 4 after root label (offset opt_start + 3..opt_start + 5)
         let size = u16::from_be_bytes([formatted[opt_start + 3], formatted[opt_start + 4]]);
@@ -247,7 +252,9 @@ mod tests {
         ];
         query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
         // Existing 11-byte OPT RR: root label 0x00, type 41 (0x00, 0x29), size 4096 (0x10, 0x00), flags (0x00, 0x00, 0x80, 0x00 with DO bit), rdlen 0
-        query.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00]);
+        query.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+        ]);
 
         let padded = apply_edns_padding(&query, false);
         // arcount must still be 1
@@ -258,7 +265,7 @@ mod tests {
         assert_eq!(padded[opt_start], 0x00); // root label
         assert_eq!(&padded[opt_start + 1..opt_start + 3], &[0x00, 0x29]); // type 41
         assert_eq!(padded[opt_start + 7] & 0x80, 0x80); // DO bit preserved!
-        // padded length must be padded to a discrete boundary
+                                                        // padded length must be padded to a discrete boundary
         assert!(padded.len() > query.len());
     }
 }

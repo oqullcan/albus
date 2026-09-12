@@ -180,7 +180,10 @@ mod tests {
         assert_eq!(OsProfile::from_str("windows11"), Some(OsProfile::Windows11));
         assert_eq!(OsProfile::from_str("win"), Some(OsProfile::Windows11));
         assert_eq!(OsProfile::from_str("macos"), Some(OsProfile::MacOsSequoia));
-        assert_eq!(OsProfile::from_str("sequoia"), Some(OsProfile::MacOsSequoia));
+        assert_eq!(
+            OsProfile::from_str("sequoia"),
+            Some(OsProfile::MacOsSequoia)
+        );
         assert_eq!(OsProfile::from_str("ios"), Some(OsProfile::Ios18));
         assert_eq!(OsProfile::from_str("linux"), Some(OsProfile::LinuxStock));
         assert_eq!(OsProfile::from_str("ubuntu"), Some(OsProfile::LinuxStock));

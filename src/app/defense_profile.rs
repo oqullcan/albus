@@ -30,7 +30,9 @@ impl DefenseProfile {
         match s.to_lowercase().as_str() {
             "balanced" => Some(DefenseProfile::Balanced),
             "paranoid" => Some(DefenseProfile::Paranoid),
-            "maximum-privacy" | "max-privacy" | "maximumprivacy" => Some(DefenseProfile::MaximumPrivacy),
+            "maximum-privacy" | "max-privacy" | "maximumprivacy" => {
+                Some(DefenseProfile::MaximumPrivacy)
+            }
             "censorship-resistant" | "censor-resistant" | "censorshipresistant" => {
                 Some(DefenseProfile::CensorshipResistant)
             }
@@ -40,27 +42,42 @@ impl DefenseProfile {
 
     /// Returns whether stateful anti-injection filtering is enabled.
     pub fn enable_anti_injection(&self) -> bool {
-        matches!(self, DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant)
+        matches!(
+            self,
+            DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant
+        )
     }
 
     /// Returns whether JA4 fingerprint mimicry is enabled.
     pub fn enable_ja4_mimic(&self) -> bool {
-        matches!(self, DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant)
+        matches!(
+            self,
+            DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant
+        )
     }
 
     /// Returns whether OS TCP/IP stack morphing is enabled.
     pub fn enable_stack_morph(&self) -> bool {
-        matches!(self, DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant)
+        matches!(
+            self,
+            DefenseProfile::Paranoid | DefenseProfile::CensorshipResistant
+        )
     }
 
     /// Returns whether differential privacy telemetry is enabled.
     pub fn enable_differential_privacy(&self) -> bool {
-        matches!(self, DefenseProfile::MaximumPrivacy | DefenseProfile::Paranoid)
+        matches!(
+            self,
+            DefenseProfile::MaximumPrivacy | DefenseProfile::Paranoid
+        )
     }
 
     /// Returns whether hardware SIMD vectorization acceleration is prioritized.
     pub fn enable_simd_accel(&self) -> bool {
-        matches!(self, DefenseProfile::MaximumPrivacy | DefenseProfile::Paranoid)
+        matches!(
+            self,
+            DefenseProfile::MaximumPrivacy | DefenseProfile::Paranoid
+        )
     }
 
     /// Applies this defense profile's settings to a Config.
@@ -104,9 +121,18 @@ mod tests {
 
     #[test]
     fn test_defense_profile_parsing() {
-        assert_eq!(DefenseProfile::from_str("paranoid"), Some(DefenseProfile::Paranoid));
-        assert_eq!(DefenseProfile::from_str("max-privacy"), Some(DefenseProfile::MaximumPrivacy));
-        assert_eq!(DefenseProfile::from_str("censorship-resistant"), Some(DefenseProfile::CensorshipResistant));
+        assert_eq!(
+            DefenseProfile::from_str("paranoid"),
+            Some(DefenseProfile::Paranoid)
+        );
+        assert_eq!(
+            DefenseProfile::from_str("max-privacy"),
+            Some(DefenseProfile::MaximumPrivacy)
+        );
+        assert_eq!(
+            DefenseProfile::from_str("censorship-resistant"),
+            Some(DefenseProfile::CensorshipResistant)
+        );
         assert_eq!(DefenseProfile::from_str("invalid_mode"), None);
     }
 

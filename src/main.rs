@@ -21,7 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cli.list || cli.list_all {
         let cfg = Config::load_or_default();
         let filter = cli.list && !cli.list_all;
-        return handle_resolvers_list_custom(&cfg, filter, cli.include_relays, cli.json_output).await;
+        return handle_resolvers_list_custom(&cfg, filter, cli.include_relays, cli.json_output)
+            .await;
     }
 
     match cli.command {
@@ -261,8 +262,13 @@ async fn handle_resolvers_list_custom(
     if writeln!(
         stdout,
         "{:<32} {:<12} {:<24} DESCRIPTION\n{}",
-        "NAME", "PROTO", "ADDRESS", "-".repeat(95)
-    ).is_err() {
+        "NAME",
+        "PROTO",
+        "ADDRESS",
+        "-".repeat(95)
+    )
+    .is_err()
+    {
         return Ok(());
     }
 
@@ -298,11 +304,22 @@ async fn handle_resolvers_list_custom(
         } else {
             clean_desc
         };
-        if writeln!(stdout, "{:<32} {:<12} {:<24} {}", entry.name, proto, addr, desc).is_err() {
+        if writeln!(
+            stdout,
+            "{:<32} {:<12} {:<24} {}",
+            entry.name, proto, addr, desc
+        )
+        .is_err()
+        {
             return Ok(());
         }
     }
-    let _ = writeln!(stdout, "{}\nTotal verified resolvers: {}", "-".repeat(95), all_entries.len());
+    let _ = writeln!(
+        stdout,
+        "{}\nTotal verified resolvers: {}",
+        "-".repeat(95),
+        all_entries.len()
+    );
     Ok(())
 }
 
@@ -402,7 +419,10 @@ async fn handle_blocklist_command(
         );
     }
 
-    println!("Compiling domain blocklist from {} sources...", sources.len());
+    println!(
+        "Compiling domain blocklist from {} sources...",
+        sources.len()
+    );
     let count = albus::dns::compile_blocklist(
         &sources,
         args.allowlist.as_deref(),

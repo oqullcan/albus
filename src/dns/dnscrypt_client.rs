@@ -20,9 +20,8 @@ use zeroize::Zeroize;
 
 pub const DNSCRYPT_MAGIC_CERT: &[u8; 4] = b"DNSC";
 pub const DNSCRYPT_MAGIC_RESOLVER: &[u8; 8] = b"r6fnvWJ8";
-pub const DNSCRYPT_RELAY_MAGIC_STANDARD: &[u8; 10] = &[
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
-];
+pub const DNSCRYPT_RELAY_MAGIC_STANDARD: &[u8; 10] =
+    &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00];
 pub const DNSCRYPT_RELAY_HEADER_SIZE: usize = 8 + 2 + 16 + 2; // 28 bytes
 pub const DNSCRYPT_RELAY_MAGIC: &[u8; 9] = &[0xff; 9];
 pub const MIN_QUERY_PADDED_LEN: usize = 256;
@@ -121,7 +120,9 @@ impl DnsCryptCert {
         let peer_pk = UnparsedPublicKey::new(&ED25519, provider_pk);
 
         if !self.raw_cert.is_empty() && self.raw_cert.len() >= 72 {
-            return peer_pk.verify(&self.raw_cert[72..], &self.signature).is_ok();
+            return peer_pk
+                .verify(&self.raw_cert[72..], &self.signature)
+                .is_ok();
         }
 
         let mut signed_data = Vec::new();
@@ -158,7 +159,8 @@ impl DnsCryptCert {
                 Some(current) => {
                     if cert.serial > current.serial {
                         best = Some(cert.clone());
-                    } else if cert.serial == current.serial && cert.es_version > current.es_version {
+                    } else if cert.serial == current.serial && cert.es_version > current.es_version
+                    {
                         best = Some(cert.clone());
                     }
                 }
@@ -277,7 +279,8 @@ impl AnonymizedRelay {
     // unwraps relay header received by a relay server (supporting both standard 28-byte and legacy 9-byte formats)
     pub fn unwrap_packet(data: &[u8]) -> Result<(SocketAddr, &[u8]), &'static str> {
         // 1. check standard 28-byte format (8x 0xff + 2x 0x00 + 16B IP + 2B Port)
-        if data.len() >= DNSCRYPT_RELAY_HEADER_SIZE && &data[0..10] == DNSCRYPT_RELAY_MAGIC_STANDARD {
+        if data.len() >= DNSCRYPT_RELAY_HEADER_SIZE && &data[0..10] == DNSCRYPT_RELAY_MAGIC_STANDARD
+        {
             let ip_bytes = &data[10..26];
             let port = u16::from_be_bytes([data[26], data[27]]);
 
@@ -294,7 +297,10 @@ impl AnonymizedRelay {
                 IpAddr::V6(Ipv6Addr::from(octets))
             };
 
-            return Ok((SocketAddr::new(ip, port), &data[DNSCRYPT_RELAY_HEADER_SIZE..]));
+            return Ok((
+                SocketAddr::new(ip, port),
+                &data[DNSCRYPT_RELAY_HEADER_SIZE..],
+            ));
         }
 
         // 2. backwards-compatible legacy format (9x 0xff + 1B Family + 4B/16B IP + 2B Port)
@@ -755,7 +761,9 @@ impl PqSessionState {
             lock.expiry = None;
             return None;
         }
-        lock.ticket.as_ref().map(|t| (t.clone(), lock.resume_secret))
+        lock.ticket
+            .as_ref()
+            .map(|t| (t.clone(), lock.resume_secret))
     }
 
     pub fn store_encapsulation(&self, ct: Vec<u8>, key: [u8; 32], epoch: u64) {
@@ -776,7 +784,9 @@ impl PqSessionState {
             lock.encap_ct = None;
             return None;
         }
-        lock.encap_ct.as_ref().map(|ct| (ct.clone(), lock.encap_key))
+        lock.encap_ct
+            .as_ref()
+            .map(|ct| (ct.clone(), lock.encap_key))
     }
 }
 
@@ -896,7 +906,12 @@ impl DnsCryptClient {
             .ok_or_else(|| "DNSCrypt stamp missing server address")?;
         let provider_name = stamp.provider_name;
         let provider_pk = stamp.provider_pk.unwrap_or([0u8; 32]);
-        Ok(Self::new(server_addr, provider_name, provider_pk, relay_addr))
+        Ok(Self::new(
+            server_addr,
+            provider_name,
+            provider_pk,
+            relay_addr,
+        ))
     }
 
     /// Parses and verifies candidate certificates from a raw DNS response TXT record.
@@ -960,7 +975,8 @@ impl DnsCryptClient {
             }
             let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
             let _rclass = u16::from_be_bytes([resp[pos + 2], resp[pos + 3]]);
-            let _ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+            let _ttl =
+                u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
             let rdlength = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
             pos += 10;
 
@@ -1208,11 +1224,19 @@ impl DnsCryptClient {
             return Err("dnscrypt response packet too short".into());
         }
 
-        if encrypted_response[0..8].ct_eq(DNSCRYPT_MAGIC_RESOLVER).unwrap_u8() != 1 {
+        if encrypted_response[0..8]
+            .ct_eq(DNSCRYPT_MAGIC_RESOLVER)
+            .unwrap_u8()
+            != 1
+        {
             return Err("invalid dnscrypt resolver magic".into());
         }
 
-        if encrypted_response[8..20].ct_eq(expected_client_nonce).unwrap_u8() != 1 {
+        if encrypted_response[8..20]
+            .ct_eq(expected_client_nonce)
+            .unwrap_u8()
+            != 1
+        {
             return Err("client nonce mismatch in dnscrypt response".into());
         }
 
@@ -1396,8 +1420,7 @@ impl DnsCryptClient {
             let ticket_len = u16::from_be_bytes([control[9], control[10]]) as usize;
             if 11 + ticket_len <= control.len() {
                 let ticket = &control[11..11 + ticket_len];
-                if let Ok(resume_secret) =
-                    pq_resume_secret(&key, &cert.client_magic, &client_nonce)
+                if let Ok(resume_secret) = pq_resume_secret(&key, &cert.client_magic, &client_nonce)
                 {
                     self.pq_session.store_ticket(
                         ticket.to_vec(),
@@ -1409,8 +1432,8 @@ impl DnsCryptClient {
             }
         }
 
-        let clean_wire = unpad_response(body)
-            .ok_or_else(|| "invalid padding in pq dnscrypt response")?;
+        let clean_wire =
+            unpad_response(body).ok_or_else(|| "invalid padding in pq dnscrypt response")?;
 
         Ok(clean_wire.to_vec())
     }
@@ -2000,20 +2023,17 @@ mod tests {
 
             let client_unparsed = UnparsedPublicKey::new(&X25519, &client_pk);
             let mut shared_secret = [0u8; 32];
-            agreement::agree_ephemeral(
-                resolver_priv,
-                &client_unparsed,
-                "server dh",
-                |mat| {
-                    shared_secret.copy_from_slice(mat);
-                    Ok(())
-                },
-            )
+            agreement::agree_ephemeral(resolver_priv, &client_unparsed, "server dh", |mat| {
+                shared_secret.copy_from_slice(mat);
+                Ok(())
+            })
             .unwrap();
 
             let derived = derive_shared_key(&shared_secret, 2);
             let cipher = ChaCha20Poly1305::new(&Key::from(derived));
-            let plaintext = cipher.decrypt(&Nonce::from(client_nonce), ciphertext).unwrap();
+            let plaintext = cipher
+                .decrypt(&Nonce::from(client_nonce), ciphertext)
+                .unwrap();
             let unpadded = unpad_response(&plaintext).unwrap();
             assert_eq!(unpadded, b"tcp_ping_query_payload");
 
@@ -2352,8 +2372,7 @@ mod tests {
         assert_eq!(resume_query.len(), 424);
 
         let resume_wire_hash = Sha256::digest(&resume_query);
-        let expected_wire_hash =
-            "34be2e331b4d7c7e808e968c5efc9f25675a9de9064cb33f7c66950e0e4e6db7";
+        let expected_wire_hash = "34be2e331b4d7c7e808e968c5efc9f25675a9de9064cb33f7c66950e0e4e6db7";
         let wire_hash_hex: String = resume_wire_hash
             .iter()
             .map(|b| format!("{:02x}", b))
@@ -2410,7 +2429,8 @@ mod tests {
 
             assert_eq!(&buf1[0..8], &client_magic);
             let ct_kem = &buf1[8..8 + PQ_XWING_CIPHERTEXT_SIZE];
-            let client_nonce1 = &buf1[8 + PQ_XWING_CIPHERTEXT_SIZE..8 + PQ_XWING_CIPHERTEXT_SIZE + 12];
+            let client_nonce1 =
+                &buf1[8 + PQ_XWING_CIPHERTEXT_SIZE..8 + PQ_XWING_CIPHERTEXT_SIZE + 12];
             let enc_query1 = &buf1[8 + PQ_XWING_CIPHERTEXT_SIZE + 12..];
 
             // Server decapsulates ML-KEM-768
@@ -2492,7 +2512,8 @@ mod tests {
             // Compute expected resume secret for query 2
             let mut q1_nonce12 = [0u8; 12];
             q1_nonce12.copy_from_slice(client_nonce1);
-            let resume_sec = pq_resume_secret(&server_shared_key1, &client_magic, &q1_nonce12).unwrap();
+            let resume_sec =
+                pq_resume_secret(&server_shared_key1, &client_magic, &q1_nonce12).unwrap();
 
             // --- Query 2: Resumed query ---
             let mut buf2 = vec![0u8; 4096];
@@ -2511,7 +2532,8 @@ mod tests {
             let mut q2_nonce12 = [0u8; 12];
             q2_nonce12.copy_from_slice(client_nonce2);
             let server_resumed_key =
-                pq_resumed_shared_key(&resume_sec, &client_magic, &q2_nonce12, recv_ticket).unwrap();
+                pq_resumed_shared_key(&resume_sec, &client_magic, &q2_nonce12, recv_ticket)
+                    .unwrap();
 
             let mut nonce24_2 = [0u8; 24];
             nonce24_2[0..12].copy_from_slice(client_nonce2);
@@ -2547,8 +2569,13 @@ mod tests {
         });
 
         // 3. Client executes Query 1
-        let client = DnsCryptClient::new(resolver_addr, "mock.pq.resolver".to_string(), [0u8; 32], None)
-            .with_cert(test_cert);
+        let client = DnsCryptClient::new(
+            resolver_addr,
+            "mock.pq.resolver".to_string(),
+            [0u8; 32],
+            None,
+        )
+        .with_cert(test_cert);
 
         let resp1 = client
             .resolve_with_epoch(b"pq_query_payload_1", Duration::from_secs(3), 1000)
@@ -2558,7 +2585,10 @@ mod tests {
 
         // Client must now hold the resumption ticket in its session state
         let ticket_opt = client.pq_session.get_ticket(1000);
-        assert!(ticket_opt.is_some(), "session ticket must be stored after response 1");
+        assert!(
+            ticket_opt.is_some(),
+            "session ticket must be stored after response 1"
+        );
 
         // 4. Client executes Query 2 (resumption)
         let resp2 = client
@@ -2575,7 +2605,10 @@ mod tests {
         let mut available = std::collections::HashMap::new();
         available.insert("anon-de".to_string(), "192.0.2.1:443".parse().unwrap());
         available.insert("anon-nl".to_string(), "192.0.2.2:443".parse().unwrap());
-        available.insert("anon-wildcard".to_string(), "192.0.2.99:443".parse().unwrap());
+        available.insert(
+            "anon-wildcard".to_string(),
+            "192.0.2.99:443".parse().unwrap(),
+        );
 
         let routes = vec![
             crate::app::config::AnonymizedDnsRoute {
@@ -2611,7 +2644,8 @@ mod tests {
             server_name: "relay-stamp-test".to_string(),
             via: vec!["sdns://gQ8xODUuMjM2LjEwNC4yNDg".to_string()],
         }];
-        let stamp_relay = AnonymizedRelay::select_relay_for_server("relay-stamp-test", &stamp_routes, &available);
+        let stamp_relay =
+            AnonymizedRelay::select_relay_for_server("relay-stamp-test", &stamp_routes, &available);
         assert_eq!(stamp_relay, Some("185.236.104.248:443".parse().unwrap()));
     }
 
@@ -2697,7 +2731,10 @@ mod tests {
 
         let cert = client.fetch_cert(Duration::from_secs(2)).await.unwrap();
         assert_eq!(cert.serial, 9999);
-        assert_eq!(cert.client_magic, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(
+            cert.client_magic,
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        );
         assert!(client.cert.is_some());
 
         handle.await.unwrap();
@@ -2789,8 +2826,9 @@ mod tests {
             ],
         );
 
-        let parsed_certs = DnsCryptClient::parse_candidate_certs_from_response(&resp_bytes, &[0u8; 32])
-            .expect("should successfully parse 3 candidate certs");
+        let parsed_certs =
+            DnsCryptClient::parse_candidate_certs_from_response(&resp_bytes, &[0u8; 32])
+                .expect("should successfully parse 3 candidate certs");
         assert_eq!(parsed_certs.len(), 3);
 
         // At epoch 3000: cert_expired_high_serial is EXPIRED and MUST NOT be selected.
@@ -2847,7 +2885,9 @@ mod tests {
         );
 
         // At epoch 3000 (after ts_end 2000), fetch_cert_with_epoch MUST return Err (strict rejection)
-        let fetch_res = client.fetch_cert_with_epoch(Duration::from_secs(2), 3000).await;
+        let fetch_res = client
+            .fetch_cert_with_epoch(Duration::from_secs(2), 3000)
+            .await;
         assert!(
             fetch_res.is_err(),
             "fetch_cert_with_epoch must strictly fail when all certificates are expired"
@@ -2857,7 +2897,9 @@ mod tests {
 
         // When cert_ignore_timestamp is explicitly enabled, it accepts the cert even if expired
         client = client.with_cert_ignore_timestamp(true);
-        let fetch_ignored = client.fetch_cert_with_epoch(Duration::from_secs(2), 3000).await;
+        let fetch_ignored = client
+            .fetch_cert_with_epoch(Duration::from_secs(2), 3000)
+            .await;
         assert!(fetch_ignored.is_ok());
         assert_eq!(fetch_ignored.unwrap().serial, 1234);
 
@@ -2888,7 +2930,9 @@ mod tests {
         .with_cert(expired_cert);
 
         let dummy_query = vec![0u8; 32];
-        let res = client.resolve_with_epoch(&dummy_query, Duration::from_millis(50), 3000).await;
+        let res = client
+            .resolve_with_epoch(&dummy_query, Duration::from_millis(50), 3000)
+            .await;
         assert!(res.is_err());
         let err_text = res.unwrap_err().to_string();
         assert!(err_text.contains("expired or not yet valid"));

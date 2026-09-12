@@ -94,7 +94,8 @@ where
     Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
 {
     let _ = stream.set_nodelay(true);
-    let mut tls_stream = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await??;
+    let mut tls_stream =
+        tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await??;
 
     loop {
         let mut len_buf = [0u8; 2];

@@ -19,11 +19,8 @@ const MAX_DOH_REQUEST_SIZE: usize = 65536;
 
 impl LocalDoHServer {
     // spawns local doh http/1.1 listener on specified address (e.g. 127.0.0.1:8053)
-    pub fn start<F, Fut>(
-        bind_addr: SocketAddr,
-        handler: F,
-        shutdown_rx: broadcast::Receiver<()>,
-    ) where
+    pub fn start<F, Fut>(bind_addr: SocketAddr, handler: F, shutdown_rx: broadcast::Receiver<()>)
+    where
         F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
     {
@@ -128,11 +125,8 @@ pub fn create_tls_acceptor_from_files(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg)))
 }
 
-async fn process_doh_connection<S, F, Fut>(
-    mut stream: S,
-    peer_addr: SocketAddr,
-    handler: Arc<F>,
-) where
+async fn process_doh_connection<S, F, Fut>(mut stream: S, peer_addr: SocketAddr, handler: Arc<F>)
+where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
     F: Fn(Vec<u8>, SocketAddr) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
@@ -195,12 +189,14 @@ async fn process_doh_connection<S, F, Fut>(
                 body.len(),
                 body
             );
-            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes()))
+                .await;
             return;
         }
         HttpDnsRequest::BadRequest => {
             let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
-            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes())).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(resp.as_bytes()))
+                .await;
             return;
         }
     };

@@ -4,6 +4,32 @@ All notable changes to the Albus project are documented in this file.
 
 ## 2.1.0 - 2026-09-12
 
+### Production Robustness, Zero-Allocation Optimizations & System Resilience
+
+#### Cryptographic Entropy & Fast Range Randomness (`src/dns/entropy.rs`, `src/dns/balancer.rs`)
+- **Zero-Allocation Stack Buffers**: Updated `fill_dual_entropy` to use stack-allocated arrays for payloads `<= 64` bytes, eliminating heap allocation entirely during nonce generation (24-byte and 12-byte), symmetric key creation (32-byte), and 64-bit random sampling.
+- **Lemire Fast Range Rejection Sampling**: Implemented `random_u64()` and `random_usize(bound)` using Daniel Lemire's Fast Range algorithm with rejection sampling, eliminating modulo bias completely.
+- **Unbiased Load Balancing Strategy Execution**: Replaced nanosecond-time modulo operations in `LoadBalancer::select_candidates` (WP2) and `select_with_strategy` with `crate::dns::entropy::random_usize`. Ensures true uniform Power-of-Two selection (`c1 != c2`), genuine Fisher-Yates shuffling for `random`, unbiased top-pair selection for `p2`, and fair candidate picking for `ph`.
+
+#### Captive Portal Zero-Allocation Matching (`src/dns/captive.rs`)
+- Eliminated `format!(".{}", ...)` heap allocations inside `CaptiveMap::check` and `check_captive_portal` loops by introducing `domain_matches_or_subdomain`, achieving zero-allocation matching for built-in and custom captive portal domains.
+
+#### UDP Socket Pool Stale Packet Purging & Capacity Bound (`src/dns/udp_pool.rs`)
+- **Delayed Datagram Draining**: Added non-blocking kernel buffer drain (`while sock.try_recv(&mut drain_buf).is_ok() {}`) prior to returning an idle socket from `get_or_create`. Prevents late-arriving packets from previously timed-out transactions from contaminating subsequent query responses.
+- **Target Map Bounding**: Capped active pool destination tracking to 256 addresses in `return_conn` to prevent memory exhaustion under continuous distinct upstream probes.
+
+#### Systemd Socket Activation for RFC 7766 TCP DNS (`src/dns/tcp.rs`, `src/dns/server.rs`)
+- Added `DnsTcpServer::start_with_listener` and preserved inherited `systemd.tcp` listeners in `DnsServer::run`. When systemd socket activation is active, inherited TCP listeners are utilized directly, preventing port 53 `EADDRINUSE` bind conflicts.
+
+#### DNS Cache TTL Clamping Fix & Earliest-Expiring Eviction (`src/dns/cache.rs`)
+- **High-TTL Extraction Fix**: Fixed `extract_min_ttl` where `min_ttl` was previously initialized to 300, which capped all upstream record TTLs to 300 seconds regardless of `max_ttl` (86400s). Replaced with `Option<u32>` to accurately preserve long TTL records.
+- **Deterministic Eviction**: Upgraded full-cache eviction from arbitrary `map.keys().next()` to earliest-expiring entry eviction (`min_by_key(|(_, v)| v.expires_at)`).
+
+#### Coldstart Netprobe IPv6 Support & YouTube Nocookie Apex (`src/dns/netprobe.rs`, `src/dns/safesearch.rs`)
+- In `src/dns/netprobe.rs`, dynamically bound UDP sockets to `[::]:0` when probing IPv6 destinations, avoiding address family mismatch failures on IPv6 networks.
+- In `src/dns/safesearch.rs`, added apex domain `youtube-nocookie.com` to `is_youtube_domain` alongside `www.youtube-nocookie.com`.
+- In `src/dns/blocklist_generator.rs`, skipped AdBlock Plus `@@` exception lines during domain extraction and updated tests to use `std::env::temp_dir()`.
+
 ### Architecture Rationalization & Daemon Wiring Verification
 
 #### Elimination of Unintegrated / Simulated Modules

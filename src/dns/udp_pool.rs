@@ -62,6 +62,9 @@ impl UdpConnPool {
             if let Some(list) = guard.get_mut(&target) {
                 while let Some((sock, last_used)) = list.pop() {
                     if now.duration_since(last_used) <= self.max_idle_time {
+                        // Drain any stale/delayed datagrams received after previous query timeout
+                        let mut drain_buf = [0u8; 4096];
+                        while sock.try_recv(&mut drain_buf).is_ok() {}
                         return Ok(sock);
                     }
                 }
@@ -83,6 +86,10 @@ impl UdpConnPool {
     /// Returns a socket back into the pool for future reuse
     pub async fn return_conn(&self, target: SocketAddr, socket: Arc<UdpSocket>) {
         let mut guard = self.conns.lock().await;
+        // Limit total distinct addresses to prevent unbounded memory growth
+        if guard.len() >= 256 && !guard.contains_key(&target) {
+            return;
+        }
         let list = guard.entry(target).or_default();
         if list.len() < self.max_conns_per_addr {
             list.push((socket, Instant::now()));
@@ -141,5 +148,43 @@ mod tests {
 
         let guard = pool.conns.lock().await;
         assert!(guard.get(&target).is_none() || guard.get(&target).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_udp_pool_drains_stale_datagrams() {
+        // Bind mock UDP server
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let pool = UdpConnPool::new(2, Duration::from_secs(5));
+
+        // Acquire socket, send initial byte, and return to pool
+        let client_sock = pool.get_or_create(server_addr).await.unwrap();
+        client_sock.send(b"query1").await.unwrap();
+
+        let mut srv_buf = [0u8; 64];
+        let (n, client_addr) = server.recv_from(&mut srv_buf).await.unwrap();
+        assert_eq!(&srv_buf[..n], b"query1");
+
+        pool.return_conn(server_addr, client_sock.clone()).await;
+
+        // Simulate a late arriving response while socket is idle in pool
+        server
+            .send_to(b"late_delayed_response", client_addr)
+            .await
+            .unwrap();
+        // Give kernel network stack a moment to buffer the packet
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Next acquire must drain the stale packet automatically
+        let reused = pool.get_or_create(server_addr).await.unwrap();
+        assert!(Arc::ptr_eq(&client_sock, &reused));
+
+        // Socket buffer should now be empty (non-blocking try_recv fails with WouldBlock)
+        let mut check_buf = [0u8; 64];
+        assert!(
+            reused.try_recv(&mut check_buf).is_err(),
+            "stale packet must have been drained"
+        );
     }
 }

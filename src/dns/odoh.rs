@@ -389,8 +389,7 @@ impl ODoHClient {
             aad: &aad,
         };
 
-        let decrypt_result = cipher
-            .decrypt(&nonce, payload);
+        let decrypt_result = cipher.decrypt(&nonce, payload);
 
         secret.zeroize();
         aead_key_bytes.zeroize();

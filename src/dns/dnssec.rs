@@ -93,7 +93,10 @@ impl DnssecAlgorithm {
     /// Returns true if the algorithm is cryptographically deprecated or broken.
     #[inline]
     pub fn is_deprecated(&self) -> bool {
-        matches!(self, Self::RsaMd5 | Self::DsaSha1 | Self::RsaSha1 | Self::RsaSha1Nsec3)
+        matches!(
+            self,
+            Self::RsaMd5 | Self::DsaSha1 | Self::RsaSha1 | Self::RsaSha1Nsec3
+        )
     }
 
     /// Returns expected signature length in bytes if fixed for this algorithm.
@@ -261,7 +264,10 @@ impl RootTrustAnchor {
         let digest: [u8; 32] = Sha256::digest(&wire_dnskey).into();
 
         for anchor in &self.anchors {
-            if anchor.key_tag == computed_tag && anchor.algorithm == algorithm && anchor.digest_type == 2 {
+            if anchor.key_tag == computed_tag
+                && anchor.algorithm == algorithm
+                && anchor.digest_type == 2
+            {
                 if anchor.digest.as_slice().ct_eq(&digest).unwrap_u8() == 1 {
                     return true;
                 }
@@ -580,12 +586,24 @@ mod tests {
         assert_eq!(DnssecAlgorithm::from_u8(18), DnssecAlgorithm::MlDsa44);
         assert!(DnssecAlgorithm::MlDsa44.is_post_quantum());
         assert!(!DnssecAlgorithm::MlDsa44.is_deprecated());
-        assert_eq!(DnssecAlgorithm::MlDsa44.expected_signature_len(), Some(2420));
-        assert_eq!(DnssecAlgorithm::MlDsa44.expected_public_key_len(), Some(1312));
+        assert_eq!(
+            DnssecAlgorithm::MlDsa44.expected_signature_len(),
+            Some(2420)
+        );
+        assert_eq!(
+            DnssecAlgorithm::MlDsa44.expected_public_key_len(),
+            Some(1312)
+        );
 
-        assert_eq!(DnssecAlgorithm::from_u8(13), DnssecAlgorithm::EcdsaP256Sha256);
+        assert_eq!(
+            DnssecAlgorithm::from_u8(13),
+            DnssecAlgorithm::EcdsaP256Sha256
+        );
         assert!(!DnssecAlgorithm::EcdsaP256Sha256.is_post_quantum());
-        assert_eq!(DnssecAlgorithm::EcdsaP256Sha256.expected_signature_len(), Some(64));
+        assert_eq!(
+            DnssecAlgorithm::EcdsaP256Sha256.expected_signature_len(),
+            Some(64)
+        );
 
         assert_eq!(DnssecAlgorithm::from_u8(1), DnssecAlgorithm::RsaMd5);
         assert!(DnssecAlgorithm::RsaMd5.is_deprecated());

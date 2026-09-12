@@ -78,7 +78,13 @@ pub fn anonymize_log_line(line: &str, privacy_level: u8) -> String {
         }
         if let Ok(sock6) = token.parse::<std::net::SocketAddrV6>() {
             let seg = sock6.ip().segments();
-            return format!("[{:x}:{:x}:{:x}::0]:{}", seg[0], seg[1], seg[2], sock6.port());
+            return format!(
+                "[{:x}:{:x}:{:x}::0]:{}",
+                seg[0],
+                seg[1],
+                seg[2],
+                sock6.port()
+            );
         }
 
         if privacy_level >= 2 {
@@ -87,7 +93,9 @@ pub fn anonymize_log_line(line: &str, privacy_level: u8) -> String {
                 && !clean.starts_with('.')
                 && !clean.ends_with('.')
                 && !clean.chars().next().map_or(false, |c| c.is_ascii_digit())
-                && clean.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+                && clean
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
             {
                 let parts: Vec<&str> = clean.split('.').collect();
                 if parts.len() >= 2 {
@@ -226,10 +234,13 @@ async fn read_http_request(
         }
         let needed = content_length - body.len();
         let to_read = needed.min(temp.len());
-        let n = match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut temp[..to_read])).await {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => break,
-        };
+        let n =
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut temp[..to_read]))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => break,
+            };
         body.extend_from_slice(&temp[..n]);
     }
 
@@ -718,12 +729,23 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let stats = Arc::new(DnsStats::default());
-        stats.total_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        stats.blocked_bogon.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .total_queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .blocked_bogon
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let auth = Some(("testuser".to_string(), "testpass".to_string()));
-        tokio::spawn(WebUiServer::run_listener(listener, stats, auth, shutdown_rx, Instant::now(), None));
+        tokio::spawn(WebUiServer::run_listener(
+            listener,
+            stats,
+            auth,
+            shutdown_rx,
+            Instant::now(),
+            None,
+        ));
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))

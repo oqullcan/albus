@@ -45,30 +45,70 @@ fn verify_entropy_health(sample: u64) -> Result<(), &'static str> {
 /// Gathers dual-source cryptographic entropy (OS SystemRandom + CPU Hardware RDRAND)
 /// and blends them through SHA-256 compression to fill the target buffer.
 pub fn fill_dual_entropy(dest: &mut [u8]) -> Result<(), &'static str> {
-    let rng = SystemRandom::new();
+    if dest.is_empty() {
+        return Ok(());
+    }
 
-    // 1. Gather OS entropy
+    // Fast path: for common small buffers (nonces, keys, u64: <= 64 bytes),
+    // use stack-allocated arrays to eliminate heap allocation overhead entirely.
+    if dest.len() <= 64 {
+        let mut os_buf = [0u8; 64];
+        aws_lc_rs::rand::fill(&mut os_buf[..dest.len()])
+            .map_err(|_| "os entropy generation failed via SystemRandom")?;
+        let os_slice = &os_buf[..dest.len()];
+
+        let words_needed = (dest.len() + 7) / 8;
+        let mut hw_buf = [0u8; 64];
+        for i in 0..words_needed {
+            let hw_word = if let Some(word) = query_hardware_rdrand_u64() {
+                let _ = verify_entropy_health(word);
+                word
+            } else {
+                std::time::Instant::now().elapsed().as_nanos() as u64
+            };
+            hw_buf[i * 8..(i + 1) * 8].copy_from_slice(&hw_word.to_le_bytes());
+        }
+        let hw_slice = &hw_buf[..words_needed * 8];
+
+        let mut offset = 0;
+        let mut counter = 0u32;
+        while offset < dest.len() {
+            let mut hasher = Sha256::new();
+            hasher.update(os_slice);
+            hasher.update(hw_slice);
+            hasher.update(&counter.to_be_bytes());
+            let digest = hasher.finalize();
+
+            let chunk = (dest.len() - offset).min(32);
+            dest[offset..offset + chunk].copy_from_slice(&digest[..chunk]);
+            offset += chunk;
+            counter = counter.wrapping_add(1);
+        }
+
+        os_buf.zeroize();
+        hw_buf.zeroize();
+        return Ok(());
+    }
+
+    // Fallback path for large buffers (> 64 bytes)
     let mut os_buf = vec![0u8; dest.len()];
     aws_lc_rs::rand::fill(&mut os_buf)
         .map_err(|_| "os entropy generation failed via SystemRandom")?;
 
-    // 2. Gather CPU Hardware entropy if available
-    let mut hw_entropy = Vec::with_capacity((dest.len() + 7) / 8 * 8);
-    for _ in 0..((dest.len() + 7) / 8) {
+    let words_needed = (dest.len() + 7) / 8;
+    let mut hw_entropy = Vec::with_capacity(words_needed * 8);
+    for _ in 0..words_needed {
         if let Some(hw_word) = query_hardware_rdrand_u64() {
             let _ = verify_entropy_health(hw_word);
             hw_entropy.extend_from_slice(&hw_word.to_le_bytes());
         } else {
-            // If RDRAND not available on CPU, use nanosecond monotonic counter as secondary seed
             let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
             hw_entropy.extend_from_slice(&nanos.to_le_bytes());
         }
     }
 
-    // 3. Cryptographic fusion: Hash(OS_Entropy || HW_Entropy || Counter)
     let mut offset = 0;
     let mut counter = 0u32;
-
     while offset < dest.len() {
         let mut hasher = Sha256::new();
         hasher.update(&os_buf);
@@ -82,7 +122,6 @@ pub fn fill_dual_entropy(dest: &mut [u8]) -> Result<(), &'static str> {
         counter = counter.wrapping_add(1);
     }
 
-    // Clean up temporary entropy buffers immediately
     os_buf.zeroize();
     hw_entropy.zeroize();
 
@@ -110,6 +149,41 @@ pub fn generate_key_32() -> [u8; 32] {
     key
 }
 
+/// Generates a cryptographically uniform 64-bit unsigned integer.
+pub fn random_u64() -> u64 {
+    let mut buf = [0u8; 8];
+    if fill_dual_entropy(&mut buf).is_ok() {
+        u64::from_le_bytes(buf)
+    } else if let Some(hw) = query_hardware_rdrand_u64() {
+        hw
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+}
+
+/// Generates an unbiased random index in `0..bound` using Lemire's Fast Range algorithm
+/// with rejection sampling to eliminate modulo bias.
+pub fn random_usize(bound: usize) -> usize {
+    if bound <= 1 {
+        return 0;
+    }
+    let mut x = random_u64();
+    let mut m = (x as u128) * (bound as u128);
+    let mut l = m as u64;
+    if l < (bound as u64) {
+        let t = (bound as u64).wrapping_neg() % (bound as u64);
+        while l < t {
+            x = random_u64();
+            m = (x as u128) * (bound as u128);
+            l = m as u64;
+        }
+    }
+    (m >> 64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +208,26 @@ mod tests {
         let mut buf = [0u8; 64];
         fill_dual_entropy(&mut buf).expect("fill should succeed");
         assert_ne!(buf, [0u8; 64]);
+
+        let mut large_buf = [0u8; 128];
+        fill_dual_entropy(&mut large_buf).expect("large fill should succeed");
+        assert_ne!(large_buf, [0u8; 128]);
+    }
+
+    #[test]
+    fn test_random_u64_and_random_usize() {
+        let r1 = random_u64();
+        let r2 = random_u64();
+        assert_ne!(r1, r2);
+
+        // random_usize bounds test
+        for bound in [2, 3, 7, 10, 100] {
+            for _ in 0..50 {
+                let idx = random_usize(bound);
+                assert!(idx < bound);
+            }
+        }
+        assert_eq!(random_usize(0), 0);
+        assert_eq!(random_usize(1), 0);
     }
 }

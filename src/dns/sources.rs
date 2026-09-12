@@ -83,7 +83,9 @@ impl ServerFilterOptions {
         let entry_lower = entry.name.to_ascii_lowercase();
         for disabled in &self.disabled_server_names {
             let dis_clean = disabled.trim().to_ascii_lowercase();
-            if !dis_clean.is_empty() && (entry_lower == dis_clean || entry_lower.starts_with(&format!("{}-", dis_clean))) {
+            if !dis_clean.is_empty()
+                && (entry_lower == dis_clean || entry_lower.starts_with(&format!("{}-", dis_clean)))
+            {
                 return false;
             }
         }

@@ -57,12 +57,12 @@ impl BrowserProfile {
                 0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
             ],
             BrowserProfile::Firefox130 => &[
-                0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
-                0xc00a, 0xc009, 0xc013, 0xc014, 0x009c,
+                0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a,
+                0xc009, 0xc013, 0xc014, 0x009c,
             ],
             BrowserProfile::Safari18 => &[
-                0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8,
-                0xc00a, 0xc009,
+                0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8, 0xc00a,
+                0xc009,
             ],
         }
     }
@@ -89,12 +89,12 @@ impl BrowserProfile {
                 0xfe0d, // encrypted_client_hello
             ],
             BrowserProfile::Firefox130 => &[
-                0x0000, 0x000a, 0x000b, 0x000d, 0x0010, 0x0017, 0x0023, 0x002b, 0x002d,
-                0x0033, 0xff01, 0x001b, 0xfe0d,
+                0x0000, 0x000a, 0x000b, 0x000d, 0x0010, 0x0017, 0x0023, 0x002b, 0x002d, 0x0033,
+                0xff01, 0x001b, 0xfe0d,
             ],
             BrowserProfile::Safari18 => &[
-                0x0000, 0x000a, 0x000b, 0x000d, 0x0010, 0x0012, 0x0017, 0x0023, 0x002b,
-                0x002d, 0x0033, 0xfe0d,
+                0x0000, 0x000a, 0x000b, 0x000d, 0x0010, 0x0012, 0x0017, 0x0023, 0x002b, 0x002d,
+                0x0033, 0xfe0d,
             ],
         }
     }
@@ -295,7 +295,11 @@ mod tests {
 
     #[test]
     fn test_synthesize_client_hello_format() {
-        let hello = synthesize_client_hello(BrowserProfile::Chrome130, "example.com", &["h2", "http/1.1"]);
+        let hello = synthesize_client_hello(
+            BrowserProfile::Chrome130,
+            "example.com",
+            &["h2", "http/1.1"],
+        );
         assert!(hello.len() > 100);
         assert_eq!(hello[0], 0x16); // Handshake
         assert_eq!(hello[1], 0x03);
@@ -305,12 +309,30 @@ mod tests {
 
     #[test]
     fn test_browser_profile_from_str() {
-        assert_eq!(BrowserProfile::from_str("chrome130"), Some(BrowserProfile::Chrome130));
-        assert_eq!(BrowserProfile::from_str("chrome"), Some(BrowserProfile::Chrome130));
-        assert_eq!(BrowserProfile::from_str("firefox"), Some(BrowserProfile::Firefox130));
-        assert_eq!(BrowserProfile::from_str("mozilla"), Some(BrowserProfile::Firefox130));
-        assert_eq!(BrowserProfile::from_str("safari"), Some(BrowserProfile::Safari18));
-        assert_eq!(BrowserProfile::from_str("apple"), Some(BrowserProfile::Safari18));
+        assert_eq!(
+            BrowserProfile::from_str("chrome130"),
+            Some(BrowserProfile::Chrome130)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("chrome"),
+            Some(BrowserProfile::Chrome130)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("firefox"),
+            Some(BrowserProfile::Firefox130)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("mozilla"),
+            Some(BrowserProfile::Firefox130)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("safari"),
+            Some(BrowserProfile::Safari18)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("apple"),
+            Some(BrowserProfile::Safari18)
+        );
         assert_eq!(BrowserProfile::from_str("unknown_browser"), None);
     }
 }

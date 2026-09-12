@@ -154,7 +154,10 @@ mod tests {
     fn test_generate_grease_ech_extension() {
         let ext = generate_grease_ech_extension();
         assert!(ext.len() > 4);
-        assert_eq!(u16::from_be_bytes([ext[0], ext[1]]), TLS_EXT_ENCRYPTED_CLIENT_HELLO);
+        assert_eq!(
+            u16::from_be_bytes([ext[0], ext[1]]),
+            TLS_EXT_ENCRYPTED_CLIENT_HELLO
+        );
         let len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
         assert_eq!(ext.len(), 4 + len);
     }

@@ -24,7 +24,8 @@ fn test_wire_level_ja4_mimic_difference() {
     let chrome_raw = build_fake_client_hello_advanced(host, true, true);
 
     // 3. Synthesized Firefox 130 and Safari 18 ClientHellos
-    let firefox_raw = synthesize_client_hello(BrowserProfile::Firefox130, host, &["h2", "http/1.1"]);
+    let firefox_raw =
+        synthesize_client_hello(BrowserProfile::Firefox130, host, &["h2", "http/1.1"]);
     let safari_raw = synthesize_client_hello(BrowserProfile::Safari18, host, &["h2", "http/1.1"]);
 
     // Wire verification:
@@ -123,14 +124,21 @@ fn test_wire_level_stack_morph_difference() {
     // Wire verification:
     // Default packet has standard 20-byte IP header + 20-byte TCP header (data offset = 5 = 0x50)
     let def_bytes = pkt_default.as_slice();
-    assert_eq!(def_bytes[20 + 12] >> 4, 5, "default data offset is 5 (no options)");
+    assert_eq!(
+        def_bytes[20 + 12] >> 4,
+        5,
+        "default data offset is 5 (no options)"
+    );
     let def_win = u16::from_be_bytes([def_bytes[20 + 14], def_bytes[20 + 15]]);
     assert_eq!(def_win, 502, "default window size is 502");
 
     // Windows 11 packet has TCP options (MSS, WScale, SACK, TS) -> data offset > 5
     let win_bytes = pkt_win11.as_slice();
     let win_offset = win_bytes[20 + 12] >> 4;
-    assert!(win_offset > 5, "Windows 11 TCP header must include TCP options");
+    assert!(
+        win_offset > 5,
+        "Windows 11 TCP header must include TCP options"
+    );
     let win_ttl = win_bytes[8];
     assert_eq!(win_ttl, 128, "Windows 11 default TTL is 128");
     let win_window = u16::from_be_bytes([win_bytes[20 + 14], win_bytes[20 + 15]]);
@@ -203,7 +211,10 @@ fn test_wire_level_ipcrypt_batch_and_secure_mem() {
     let crypt = IpCrypt::new(key);
 
     // Verify key memory is locked in physical RAM via mlock
-    assert!(crypt.is_locked(), "IpCrypt key must be locked in physical RAM via mlock");
+    assert!(
+        crypt.is_locked(),
+        "IpCrypt key must be locked in physical RAM via mlock"
+    );
 
     let client_ips = vec![
         Ipv4Addr::new(192, 168, 1, 100),
@@ -254,7 +265,10 @@ fn test_wire_level_defense_profile_pipeline_activation() {
     // Verify OsProfile and BrowserProfile parsing from strings
     assert_eq!(OsProfile::from_str("macos"), Some(OsProfile::MacOsSequoia));
     assert_eq!(OsProfile::from_str("linux"), Some(OsProfile::LinuxStock));
-    assert_eq!(BrowserProfile::from_str("firefox"), Some(BrowserProfile::Firefox130));
+    assert_eq!(
+        BrowserProfile::from_str("firefox"),
+        Some(BrowserProfile::Firefox130)
+    );
 
     // Verify wire-level packets for LinuxStock profile
     let conn = ConnInfo::new_v4(
@@ -276,5 +290,8 @@ fn test_wire_level_defense_profile_pipeline_activation() {
     );
     let linux_bytes = pkt_linux.as_slice();
     assert_eq!(linux_bytes[8], 64); // Linux TTL = 64
-    assert_eq!(u16::from_be_bytes([linux_bytes[20 + 14], linux_bytes[20 + 15]]), 64240); // Linux Window = 64240
+    assert_eq!(
+        u16::from_be_bytes([linux_bytes[20 + 14], linux_bytes[20 + 15]]),
+        64240
+    ); // Linux Window = 64240
 }

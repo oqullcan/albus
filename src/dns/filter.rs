@@ -328,7 +328,11 @@ pub fn build_hinfo_response(query: &[u8], ttl: u32) -> Vec<u8> {
     resp.push(os.len() as u8);
     resp.extend_from_slice(os);
 
-    append_edns_ede(&mut resp, 15, "This query has been locally blocked by albus");
+    append_edns_ede(
+        &mut resp,
+        15,
+        "This query has been locally blocked by albus",
+    );
 
     resp
 }
@@ -382,7 +386,12 @@ pub fn build_sinkhole_response_custom(query: &[u8], ip: IpAddr, ttl: u32) -> Vec
 }
 
 // flexible dispatcher for blocked query responses matching dnscrypt-proxy
-pub fn build_blocked_response(query: &[u8], qtype: u16, response_format: &str, ttl: u32) -> Vec<u8> {
+pub fn build_blocked_response(
+    query: &[u8],
+    qtype: u16,
+    response_format: &str,
+    ttl: u32,
+) -> Vec<u8> {
     let fmt = response_format.trim().to_ascii_lowercase();
     if fmt == "refused" {
         let mut r = build_refused_response(query);
@@ -392,11 +401,16 @@ pub fn build_blocked_response(query: &[u8], qtype: u16, response_format: &str, t
         build_hinfo_response(query, ttl)
     } else if fmt.starts_with("a:") || fmt.contains('.') {
         let (v4_str, v6_str) = if let Some((part1, part2)) = fmt.split_once(',') {
-            (part1.trim_start_matches("a:"), part2.trim_start_matches("aaaa:"))
+            (
+                part1.trim_start_matches("a:"),
+                part2.trim_start_matches("aaaa:"),
+            )
         } else {
             (fmt.trim_start_matches("a:"), "::")
         };
-        let v4_ip = v4_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+        let v4_ip = v4_str
+            .parse::<Ipv4Addr>()
+            .unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
         let v6_ip = v6_str.parse::<Ipv6Addr>().unwrap_or(Ipv6Addr::UNSPECIFIED);
 
         if qtype == 1 {
@@ -520,9 +534,9 @@ mod tests {
     #[test]
     fn test_build_hinfo_and_blocked_response() {
         let query = vec![
-            0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'b', b'l', b'o', b'c', b'k', b'e', b'd', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'b',
+            b'l', b'o', b'c', b'k', b'e', b'd', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
         ];
 
         // 1. HINFO mode

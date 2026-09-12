@@ -41,7 +41,11 @@ impl ClientSubnet {
             10..=126 => (nanos & 0x7F) as u8,
             _ => 185,
         };
-        let b1 = if b1 == 0 || b1 == 10 || b1 == 127 { 185 } else { b1 };
+        let b1 = if b1 == 0 || b1 == 10 || b1 == 127 {
+            185
+        } else {
+            b1
+        };
         let b2 = ((nanos >> 8) & 0xFF) as u8;
         let b3 = ((nanos >> 16) & 0xFF) as u8;
         Self::new(IpAddr::V4(Ipv4Addr::new(b1, b2, b3, 0)), 24)

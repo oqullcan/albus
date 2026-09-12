@@ -107,13 +107,15 @@ impl LoadBalancer {
 
     pub fn with_timeout_load_reduction(self, factor: f64) -> Self {
         let clamped = factor.clamp(0.1, 1.0);
-        self.timeout_load_reduction.store(clamped.to_bits(), Ordering::Relaxed);
+        self.timeout_load_reduction
+            .store(clamped.to_bits(), Ordering::Relaxed);
         self
     }
 
     pub fn set_timeout_load_reduction(&self, factor: f64) {
         let clamped = factor.clamp(0.1, 1.0);
-        self.timeout_load_reduction.store(clamped.to_bits(), Ordering::Relaxed);
+        self.timeout_load_reduction
+            .store(clamped.to_bits(), Ordering::Relaxed);
     }
 
     /// Computes effective query timeout based on dynamic load conditions.
@@ -130,8 +132,12 @@ impl LoadBalancer {
             return base_timeout;
         }
 
-        let total_failed: u64 = stats_guard.iter().map(|s| s.failed_queries.load(Ordering::Relaxed)).sum();
-        let avg_rtt: f64 = stats_guard.iter().map(|s| s.rtt_ms()).sum::<f64>() / stats_guard.len() as f64;
+        let total_failed: u64 = stats_guard
+            .iter()
+            .map(|s| s.failed_queries.load(Ordering::Relaxed))
+            .sum();
+        let avg_rtt: f64 =
+            stats_guard.iter().map(|s| s.rtt_ms()).sum::<f64>() / stats_guard.len() as f64;
 
         if total_failed > 0 || avg_rtt > 150.0 {
             let reduced_ms = (base_timeout.as_millis() as f64 * factor).max(100.0);
@@ -162,16 +168,11 @@ impl LoadBalancer {
             return vec![0];
         }
 
-        // 1. pick two random candidates (c1 != c2)
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as usize;
-
-        let c1 = now_nanos % count;
-        let mut c2 = (now_nanos / 7) % count;
-        if c2 == c1 {
-            c2 = (c1 + 1) % count;
+        // 1. pick two distinct random candidates uniformly (c1 != c2)
+        let c1 = crate::dns::entropy::random_usize(count);
+        let mut c2 = crate::dns::entropy::random_usize(count - 1);
+        if c2 >= c1 {
+            c2 += 1;
         }
 
         let score1 = stats_guard[c1].score();
@@ -202,11 +203,6 @@ impl LoadBalancer {
             return (0..count).collect();
         }
 
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as usize;
-
         match strategy.to_ascii_lowercase().as_str() {
             "first" => {
                 let mut indexed: Vec<(usize, f64)> = stats_guard
@@ -220,7 +216,7 @@ impl LoadBalancer {
             "random" => {
                 let mut indices: Vec<usize> = (0..count).collect();
                 for i in (1..count).rev() {
-                    let j = (now_nanos + i * 17) % (i + 1);
+                    let j = crate::dns::entropy::random_usize(i + 1);
                     indices.swap(i, j);
                 }
                 indices
@@ -234,7 +230,7 @@ impl LoadBalancer {
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top1 = indexed[0].0;
                 let top2 = indexed[1].0;
-                let (chosen, other) = if (now_nanos % 2) == 0 {
+                let (chosen, other) = if crate::dns::entropy::random_usize(2) == 0 {
                     (top1, top2)
                 } else {
                     (top2, top1)
@@ -253,7 +249,7 @@ impl LoadBalancer {
                     .collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let half = (count / 2).max(1);
-                let chosen_idx = now_nanos % half;
+                let chosen_idx = crate::dns::entropy::random_usize(half);
                 let winner = indexed[chosen_idx].0;
                 let mut res = vec![winner];
                 for (idx, _) in indexed {
@@ -334,5 +330,35 @@ mod tests {
         let reduced = lb.effective_timeout(base_timeout);
         // 1000ms * 0.5 = 500ms
         assert_eq!(reduced, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_strategies_selection() {
+        let names = vec![
+            "cf".to_string(),
+            "q9".to_string(),
+            "google".to_string(),
+            "adguard".to_string(),
+        ];
+        let lb = LoadBalancer::new(&names);
+
+        // random strategy produces all 4 distinct indices
+        let r = lb.select_with_strategy("random");
+        assert_eq!(r.len(), 4);
+        let mut sorted = r.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
+
+        // first strategy
+        let f = lb.select_with_strategy("first");
+        assert_eq!(f.len(), 4);
+
+        // p2 strategy
+        let p2 = lb.select_with_strategy("p2");
+        assert_eq!(p2.len(), 4);
+
+        // ph strategy
+        let ph = lb.select_with_strategy("ph");
+        assert_eq!(ph.len(), 4);
     }
 }

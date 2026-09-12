@@ -63,10 +63,20 @@ impl Engine {
         };
         let auto_ttl_estimator = AutoTtlEstimator::new(auto_ttl_config);
 
-        let ja4_profile = cfg.ja4_mimic.as_deref().and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
-        let stack_morph_profile = cfg.stack_morph.as_deref().and_then(crate::core::stack_morph::OsProfile::from_str);
+        let ja4_profile = cfg
+            .ja4_mimic
+            .as_deref()
+            .and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
+        let stack_morph_profile = cfg
+            .stack_morph
+            .as_deref()
+            .and_then(crate::core::stack_morph::OsProfile::from_str);
         let anti_injection_filter = if cfg.anti_injection {
-            Some(Arc::new(crate::core::anti_injection::AntiInjectionFilter::new(cfg.anti_injection_ttl_tolerance)))
+            Some(Arc::new(
+                crate::core::anti_injection::AntiInjectionFilter::new(
+                    cfg.anti_injection_ttl_tolerance,
+                ),
+            ))
         } else {
             None
         };
@@ -90,7 +100,10 @@ impl Engine {
             fake_bad_checksum: cfg.fake_bad_checksum,
             fake_seq_offset: cfg.fake_seq_offset,
             fake_window_size: cfg.fake_window_size,
-            fake_tcp_flags: cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
+            fake_tcp_flags: cfg
+                .fake_tcp_flags
+                .as_deref()
+                .and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: cfg.pqc,
             ja4_mimic: cfg.ja4_mimic.is_some(),
             ja4_profile,
@@ -105,7 +118,10 @@ impl Engine {
             let mut cloak = CloakEngine::new().with_cloak_ttl(cfg.cloak_ttl);
             if cfg.load_system_hosts {
                 match cloak.load_hosts_file("/etc/hosts") {
-                    Ok(n) => info!(count = n, "Loaded system /etc/hosts into DNS cloaking & reverse PTR engine"),
+                    Ok(n) => info!(
+                        count = n,
+                        "Loaded system /etc/hosts into DNS cloaking & reverse PTR engine"
+                    ),
                     Err(e) => debug!("Could not read /etc/hosts: {}", e),
                 }
             }
@@ -264,40 +280,72 @@ impl Engine {
                     None
                 };
                 let main_path = if cfg.query_log {
-                    Some(std::path::PathBuf::from(cfg.query_log_path.clone().unwrap_or_else(|| {
-                        if cfg.ram_only {
-                            Config::volatile_runtime_dir().join("query.log").to_string_lossy().to_string()
-                        } else {
-                            "/var/log/albus/query.log".to_string()
-                        }
-                    })))
+                    Some(std::path::PathBuf::from(
+                        cfg.query_log_path.clone().unwrap_or_else(|| {
+                            if cfg.ram_only {
+                                Config::volatile_runtime_dir()
+                                    .join("query.log")
+                                    .to_string_lossy()
+                                    .to_string()
+                            } else {
+                                "/var/log/albus/query.log".to_string()
+                            }
+                        }),
+                    ))
                 } else {
                     None
                 };
                 let nx_path = if cfg.nx_log {
-                    Some(std::path::PathBuf::from(cfg.nx_log_path.clone().unwrap_or_else(|| {
-                        if cfg.ram_only {
-                            Config::volatile_runtime_dir().join("nx.log").to_string_lossy().to_string()
-                        } else {
-                            "/var/log/albus/nx.log".to_string()
-                        }
-                    })))
+                    Some(std::path::PathBuf::from(
+                        cfg.nx_log_path.clone().unwrap_or_else(|| {
+                            if cfg.ram_only {
+                                Config::volatile_runtime_dir()
+                                    .join("nx.log")
+                                    .to_string_lossy()
+                                    .to_string()
+                            } else {
+                                "/var/log/albus/nx.log".to_string()
+                            }
+                        }),
+                    ))
                 } else {
                     None
                 };
                 let opts = crate::dns::logger::LoggerOptions {
                     main_path,
                     nx_path,
-                    blocked_names_path: cfg.blocked_names_log_path.as_ref().map(std::path::PathBuf::from),
-                    blocked_ips_path: cfg.blocked_ips_log_path.as_ref().map(std::path::PathBuf::from),
-                    allowed_names_path: cfg.allowed_names_log_path.as_ref().map(std::path::PathBuf::from),
-                    allowed_ips_path: cfg.allowed_ips_log_path.as_ref().map(std::path::PathBuf::from),
-                    main_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.query_log_format),
+                    blocked_names_path: cfg
+                        .blocked_names_log_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from),
+                    blocked_ips_path: cfg
+                        .blocked_ips_log_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from),
+                    allowed_names_path: cfg
+                        .allowed_names_log_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from),
+                    allowed_ips_path: cfg
+                        .allowed_ips_log_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from),
+                    main_format: crate::dns::logger::LogFormat::parse_lenient(
+                        &cfg.query_log_format,
+                    ),
                     nx_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.nx_log_format),
-                    blocked_names_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.blocked_names_log_format),
-                    blocked_ips_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.blocked_ips_log_format),
-                    allowed_names_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.allowed_names_log_format),
-                    allowed_ips_format: crate::dns::logger::LogFormat::parse_lenient(&cfg.allowed_ips_log_format),
+                    blocked_names_format: crate::dns::logger::LogFormat::parse_lenient(
+                        &cfg.blocked_names_log_format,
+                    ),
+                    blocked_ips_format: crate::dns::logger::LogFormat::parse_lenient(
+                        &cfg.blocked_ips_log_format,
+                    ),
+                    allowed_names_format: crate::dns::logger::LogFormat::parse_lenient(
+                        &cfg.allowed_names_log_format,
+                    ),
+                    allowed_ips_format: crate::dns::logger::LogFormat::parse_lenient(
+                        &cfg.allowed_ips_log_format,
+                    ),
                     ip_crypt,
                     max_bytes: 10 * 1024 * 1024,
                     max_backups: 5,
@@ -450,12 +498,16 @@ impl Engine {
                 parsed_listen_addrs
             };
 
-            let mut client_rules_engine = crate::dns::ClientRuleEngine::from_configs(&cfg.client_rules);
+            let mut client_rules_engine =
+                crate::dns::ClientRuleEngine::from_configs(&cfg.client_rules);
             if let Some(ref path) = cfg.client_rules_file {
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(cfgs) = serde_json::from_str::<Vec<crate::dns::ClientProfileConfig>>(&content) {
+                    if let Ok(cfgs) =
+                        serde_json::from_str::<Vec<crate::dns::ClientProfileConfig>>(&content)
+                    {
                         for p in cfgs {
-                            client_rules_engine.add_profile(crate::dns::ClientProfile::from_config(&p));
+                            client_rules_engine
+                                .add_profile(crate::dns::ClientProfile::from_config(&p));
                         }
                     }
                 }
@@ -507,7 +559,9 @@ impl Engine {
                 let relay_addr = if !cfg.dnscrypt_relays.is_empty() {
                     let r = &cfg.dnscrypt_relays[0];
                     if r.starts_with("sdns://") {
-                        crate::dns::stamp::DnsStamp::parse(r).ok().and_then(|s| s.server_addr)
+                        crate::dns::stamp::DnsStamp::parse(r)
+                            .ok()
+                            .and_then(|s| s.server_addr)
                     } else {
                         r.parse::<SocketAddr>().ok()
                     }
@@ -520,7 +574,10 @@ impl Engine {
                 };
 
                 if first_server.starts_with("sdns://") {
-                    match crate::dns::dnscrypt_client::DnsCryptClient::from_stamp_str(first_server, relay_addr) {
+                    match crate::dns::dnscrypt_client::DnsCryptClient::from_stamp_str(
+                        first_server,
+                        relay_addr,
+                    ) {
                         Ok(client) => {
                             let client = client
                                 .with_force_tcp(cfg.force_tcp)
@@ -530,18 +587,28 @@ impl Engine {
                             Some(Arc::new(tokio::sync::RwLock::new(client)))
                         }
                         Err(e) => {
-                            warn!("Failed to parse DNSCrypt server stamp ({}): {}", first_server, e);
+                            warn!(
+                                "Failed to parse DNSCrypt server stamp ({}): {}",
+                                first_server, e
+                            );
                             None
                         }
                     }
                 } else {
                     // Raw address format (e.g. 9.9.9.9:8443)
-                    let s_addr = first_server.parse::<SocketAddr>().unwrap_or_else(|_| "9.9.9.9:8443".parse().unwrap());
+                    let s_addr = first_server
+                        .parse::<SocketAddr>()
+                        .unwrap_or_else(|_| "9.9.9.9:8443".parse().unwrap());
                     let provider_name = "2.dnscrypt-cert.quad9.net".to_string();
-                    let client = crate::dns::dnscrypt_client::DnsCryptClient::new(s_addr, provider_name, [0u8; 32], relay_addr)
-                        .with_force_tcp(cfg.force_tcp)
-                        .with_cert_ignore_timestamp(cfg.cert_ignore_timestamp)
-                        .with_ephemeral_keys(cfg.dnscrypt_ephemeral_keys);
+                    let client = crate::dns::dnscrypt_client::DnsCryptClient::new(
+                        s_addr,
+                        provider_name,
+                        [0u8; 32],
+                        relay_addr,
+                    )
+                    .with_force_tcp(cfg.force_tcp)
+                    .with_cert_ignore_timestamp(cfg.cert_ignore_timestamp)
+                    .with_ephemeral_keys(cfg.dnscrypt_ephemeral_keys);
                     info!(upstream = %first_server, relay = ?relay_addr, "Configured DNSCrypt v2 upstream client");
                     Some(Arc::new(tokio::sync::RwLock::new(client)))
                 }
@@ -791,17 +858,16 @@ impl Engine {
         }
 
         // 3.1 create PID file if configured
-        let _pid_guard = self
-            .cfg
-            .pid_file
-            .as_ref()
-            .and_then(|p| match crate::dns::system::PidFileGuard::create(p) {
-                Ok(guard) => Some(guard),
-                Err(e) => {
-                    warn!("failed to create PID file at '{}': {}", p, e);
-                    None
-                }
-            });
+        let _pid_guard =
+            self.cfg.pid_file.as_ref().and_then(
+                |p| match crate::dns::system::PidFileGuard::create(p) {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        warn!("failed to create PID file at '{}': {}", p, e);
+                        None
+                    }
+                },
+            );
 
         // 3.2 drop root privileges if user_name is specified in configuration
         if let Some(ref user) = self.cfg.user_name {
@@ -886,8 +952,14 @@ impl Engine {
         };
         let auto_ttl_estimator = AutoTtlEstimator::new(auto_ttl_config);
 
-        let ja4_profile = new_cfg.ja4_mimic.as_deref().and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
-        let stack_morph_profile = new_cfg.stack_morph.as_deref().and_then(crate::core::stack_morph::OsProfile::from_str);
+        let ja4_profile = new_cfg
+            .ja4_mimic
+            .as_deref()
+            .and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
+        let stack_morph_profile = new_cfg
+            .stack_morph
+            .as_deref()
+            .and_then(crate::core::stack_morph::OsProfile::from_str);
 
         let bpf_cfg = BpfManagerConfig {
             mss: new_cfg.mss,
@@ -907,14 +979,20 @@ impl Engine {
             fake_bad_checksum: new_cfg.fake_bad_checksum,
             fake_seq_offset: new_cfg.fake_seq_offset,
             fake_window_size: new_cfg.fake_window_size,
-            fake_tcp_flags: new_cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
+            fake_tcp_flags: new_cfg
+                .fake_tcp_flags
+                .as_deref()
+                .and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: new_cfg.pqc,
             ja4_mimic: new_cfg.ja4_mimic.is_some(),
             ja4_profile,
             stack_morph: new_cfg.stack_morph.is_some(),
             stack_morph_profile,
             auto_ttl_estimator,
-            anti_injection: self.dns_server.as_ref().and_then(|s| s.anti_injection.clone()),
+            anti_injection: self
+                .dns_server
+                .as_ref()
+                .and_then(|s| s.anti_injection.clone()),
         };
 
         if let Err(e) = self.bpf_manager.reload_maps(&bpf_cfg) {

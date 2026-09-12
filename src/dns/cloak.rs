@@ -53,12 +53,16 @@ impl CloakEngine {
 
     pub fn add_cname_rule(&mut self, domain: &str, target_domain: &str) {
         let clean = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        let target_clean = target_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let target_clean = target_domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         if clean.starts_with("*.") {
             let suffix = clean[1..].to_string();
             self.wildcard_cname_rules.push((suffix, target_clean));
         } else if clean.starts_with('=') {
-            self.exact_cname_rules.insert(clean[1..].to_string(), target_clean);
+            self.exact_cname_rules
+                .insert(clean[1..].to_string(), target_clean);
         } else {
             self.exact_cname_rules.insert(clean, target_clean);
         }
@@ -158,7 +162,8 @@ impl CloakEngine {
 
     /// Loads cloaking rules from a file.
     pub fn load_cloaking_rules_file(&mut self, path: &str) -> Result<usize, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read cloaking rules from {}: {}", path, e))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read cloaking rules from {}: {}", path, e))?;
         self.load_cloaking_rules_str(&content)
     }
 
@@ -170,7 +175,11 @@ impl CloakEngine {
         if qtype == 12 {
             if let Some(ip) = parse_arpa_to_ip(&lower) {
                 if let Some(target_domain) = self.reverse_rules.get(&ip) {
-                    return Some(build_synthetic_ptr_response(query, target_domain, self.cloak_ttl));
+                    return Some(build_synthetic_ptr_response(
+                        query,
+                        target_domain,
+                        self.cloak_ttl,
+                    ));
                 }
             }
             return None;
@@ -182,7 +191,9 @@ impl CloakEngine {
         } else {
             self.wildcard_rules
                 .iter()
-                .find(|(suffix, _)| lower.ends_with(suffix) || lower == suffix.trim_start_matches('.'))
+                .find(|(suffix, _)| {
+                    lower.ends_with(suffix) || lower == suffix.trim_start_matches('.')
+                })
                 .map(|(_, ip)| *ip)
         };
 
@@ -215,7 +226,9 @@ impl CloakEngine {
         } else {
             self.wildcard_cname_rules
                 .iter()
-                .find(|(suffix, _)| lower.ends_with(suffix) || lower == suffix.trim_start_matches('.'))
+                .find(|(suffix, _)| {
+                    lower.ends_with(suffix) || lower == suffix.trim_start_matches('.')
+                })
                 .map(|(_, target)| target.as_str())
         };
 
@@ -227,7 +240,10 @@ impl CloakEngine {
             } else {
                 self.wildcard_rules
                     .iter()
-                    .find(|(suffix, _)| target_lower.ends_with(suffix) || target_lower == suffix.trim_start_matches('.'))
+                    .find(|(suffix, _)| {
+                        target_lower.ends_with(suffix)
+                            || target_lower == suffix.trim_start_matches('.')
+                    })
                     .map(|(_, ip)| *ip)
             };
 
@@ -596,11 +612,14 @@ mod tests {
     fn test_cname_cloaking_and_flattening() {
         let mut engine = CloakEngine::new();
         engine.add_cname_rule("safegoogle.com", "forcesafesearch.google.com");
-        engine.add_cloak_rule("forcesafesearch.google.com", IpAddr::V4(Ipv4Addr::new(216, 239, 38, 120)));
+        engine.add_cloak_rule(
+            "forcesafesearch.google.com",
+            IpAddr::V4(Ipv4Addr::new(216, 239, 38, 120)),
+        );
 
         let query = vec![
-            0x77, 0x88, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x0a, b's', b'a', b'f', b'e', b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x77, 0x88, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, b's',
+            b'a', b'f', b'e', b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
             0x00, 0x01, 0x00, 0x01,
         ];
 
@@ -647,20 +666,24 @@ mod tests {
         assert_eq!(loaded, 6);
 
         let query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'p', b'r', b'i', b'n', b't', b'e', b'r', 0x03, b'l', b'a', b'n', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'p',
+            b'r', b'i', b'n', b't', b'e', b'r', 0x03, b'l', b'a', b'n', 0x00, 0x00, 0x01, 0x00,
+            0x01,
         ];
-        let resp = engine.resolve_cloaked("printer.lan", 1, &query).expect("must resolve printer.lan");
+        let resp = engine
+            .resolve_cloaked("printer.lan", 1, &query)
+            .expect("must resolve printer.lan");
         assert!(resp.windows(4).any(|w| w == [192, 168, 1, 200]));
 
         let ptr_query = vec![
-            0x55, 0x66, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x03, b'2', b'0', b'0', 0x01, b'1', 0x03, b'1', b'6', b'8', 0x03, b'1', b'9', b'2',
-            0x07, b'i', b'n', b'-', b'a', b'd', b'd', b'r', 0x04, b'a', b'r', b'p', b'a', 0x00,
-            0x00, 0x0c, 0x00, 0x01,
+            0x55, 0x66, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'2',
+            b'0', b'0', 0x01, b'1', 0x03, b'1', b'6', b'8', 0x03, b'1', b'9', b'2', 0x07, b'i',
+            b'n', b'-', b'a', b'd', b'd', b'r', 0x04, b'a', b'r', b'p', b'a', 0x00, 0x00, 0x0c,
+            0x00, 0x01,
         ];
-        let ptr_resp = engine.resolve_cloaked("200.1.168.192.in-addr.arpa", 12, &ptr_query).expect("must resolve PTR");
+        let ptr_resp = engine
+            .resolve_cloaked("200.1.168.192.in-addr.arpa", 12, &ptr_query)
+            .expect("must resolve PTR");
         assert!(ptr_resp.windows(7).any(|w| w == b"printer"));
     }
 
@@ -669,11 +692,12 @@ mod tests {
         let mut engine = CloakEngine::new().with_cloak_ttl(120);
         engine.add_cloak_rule("custom.lan", "10.0.0.5".parse().unwrap());
         let query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x06, b'c', b'u', b's', b't', b'o', b'm', 0x03, b'l', b'a', b'n', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, b'c',
+            b'u', b's', b't', b'o', b'm', 0x03, b'l', b'a', b'n', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
-        let resp = engine.resolve_cloaked("custom.lan", 1, &query).expect("must resolve");
+        let resp = engine
+            .resolve_cloaked("custom.lan", 1, &query)
+            .expect("must resolve");
         // TTL 120u32 is [0x00, 0x00, 0x00, 0x78]
         assert!(resp.windows(4).any(|w| w == [0x00, 0x00, 0x00, 0x78]));
     }

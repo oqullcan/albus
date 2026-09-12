@@ -154,7 +154,10 @@ pub struct Config {
     pub web_ui_pass: Option<String>,
     #[serde(default = "default_privacy_level", alias = "privacy_level")]
     pub web_ui_privacy_level: u8,
-    #[serde(default = "default_max_query_log_entries", alias = "max_query_log_entries")]
+    #[serde(
+        default = "default_max_query_log_entries",
+        alias = "max_query_log_entries"
+    )]
     pub web_ui_max_query_log_entries: usize,
     #[serde(default)]
     pub dnscrypt_servers: Vec<String>,
@@ -1702,7 +1705,10 @@ mod tests {
     #[test]
     fn test_config_security_defaults_and_doc_parity() {
         let cfg = Config::default();
-        assert_eq!(cfg.web_ui, false, "web_ui must default to false for defense-in-depth");
+        assert_eq!(
+            cfg.web_ui, false,
+            "web_ui must default to false for defense-in-depth"
+        );
         assert_eq!(cfg.web_ui_user, None, "web_ui_user must default to None");
         assert_eq!(cfg.web_ui_pass, None, "web_ui_pass must default to None");
 

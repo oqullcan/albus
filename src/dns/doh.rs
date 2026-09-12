@@ -225,7 +225,8 @@ impl SingleDoHClient {
             builder.with_no_client_auth()
         };
         if http3 {
-            client_config.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+            client_config.alpn_protocols =
+                vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
         } else {
             client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         }
@@ -304,7 +305,8 @@ impl SingleDoHClient {
                             }
                         }
                         if bootstrap_addrs.is_empty() {
-                            let fallback = resolve_host_via_bootstrap_resolvers(host_str, port, &[]);
+                            let fallback =
+                                resolve_host_via_bootstrap_resolvers(host_str, port, &[]);
                             bootstrap_addrs.extend(fallback);
                         }
                     }
@@ -1055,16 +1057,24 @@ MC4CAQAwBQYDK2VwBCIEII1my9yC6gDHipAN+m87pQ1AECzquF5mj3NU+c6Yg7a7
             None,
             None,
         );
-        assert!(client.is_ok(), "HTTP/3 SingleDoHClient initialization must succeed: {:?}", client.as_ref().err());
+        assert!(
+            client.is_ok(),
+            "HTTP/3 SingleDoHClient initialization must succeed: {:?}",
+            client.as_ref().err()
+        );
         let c = client.unwrap();
         assert!(c.http3, "HTTP/3 flag must be true");
 
-        let resolver = DoHResolver::new_with_options("cloudflare,quad9", &[], true, true, None, None, None);
-        assert!(resolver.is_ok(), "HTTP/3 DoHResolver initialization must succeed: {:?}", resolver.as_ref().err());
+        let resolver =
+            DoHResolver::new_with_options("cloudflare,quad9", &[], true, true, None, None, None);
+        assert!(
+            resolver.is_ok(),
+            "HTTP/3 DoHResolver initialization must succeed: {:?}",
+            resolver.as_ref().err()
+        );
         let r = resolver.unwrap();
         assert_eq!(r.clients().len(), 2);
         assert!(r.clients()[0].http3);
         assert!(r.clients()[1].http3);
     }
 }
-

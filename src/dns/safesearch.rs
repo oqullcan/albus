@@ -120,7 +120,11 @@ impl SafeSearchEngine {
         }
 
         // 5. Yandex SafeSearch Check
-        if clean == "yandex.ru" || clean == "yandex.com" || clean == "yandex.com.tr" || clean == "ya.ru" {
+        if clean == "yandex.ru"
+            || clean == "yandex.com"
+            || clean == "yandex.com.tr"
+            || clean == "ya.ru"
+        {
             if qtype == 1 {
                 return Some(SafeSearchOverride::Ipv4(YANDEX_SAFESEARCH_V4));
             } else {
@@ -164,6 +168,7 @@ fn is_youtube_domain(d: &str) -> bool {
         || d == "m.youtube.com"
         || d == "youtubei.googleapis.com"
         || d == "youtube.googleapis.com"
+        || d == "youtube-nocookie.com"
         || d == "www.youtube-nocookie.com"
 }
 
@@ -250,13 +255,22 @@ mod tests {
         let engine = SafeSearchEngine::new(true, YouTubeMode::None);
 
         let google_a = engine.check("www.google.com", 1);
-        assert_eq!(google_a, Some(SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4)));
+        assert_eq!(
+            google_a,
+            Some(SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4))
+        );
 
         let google_aaaa = engine.check("google.com.tr", 28);
-        assert_eq!(google_aaaa, Some(SafeSearchOverride::Ipv6(GOOGLE_SAFESEARCH_V6)));
+        assert_eq!(
+            google_aaaa,
+            Some(SafeSearchOverride::Ipv6(GOOGLE_SAFESEARCH_V6))
+        );
 
         let google_uk = engine.check("www.google.co.uk", 1);
-        assert_eq!(google_uk, Some(SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4)));
+        assert_eq!(
+            google_uk,
+            Some(SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4))
+        );
 
         // Non-search Google domains must not be redirected
         assert_eq!(engine.check("google.golang.org", 1), None);
@@ -267,7 +281,10 @@ mod tests {
         assert_eq!(bing_a, Some(SafeSearchOverride::Ipv4(BING_SAFESEARCH_V4)));
 
         let duck_a = engine.check("duckduckgo.com", 1);
-        assert_eq!(duck_a, Some(SafeSearchOverride::Ipv4(DUCKDUCKGO_SAFESEARCH_V4)));
+        assert_eq!(
+            duck_a,
+            Some(SafeSearchOverride::Ipv4(DUCKDUCKGO_SAFESEARCH_V4))
+        );
 
         let unrelated = engine.check("github.com", 1);
         assert_eq!(unrelated, None);
@@ -278,18 +295,25 @@ mod tests {
         let engine_strict = SafeSearchEngine::new(false, YouTubeMode::Strict);
         let yt_strict = engine_strict.check("www.youtube.com", 1);
         assert_eq!(yt_strict, Some(SafeSearchOverride::Ipv4(YOUTUBE_STRICT_V4)));
+        let yt_nocookie = engine_strict.check("youtube-nocookie.com", 1);
+        assert_eq!(
+            yt_nocookie,
+            Some(SafeSearchOverride::Ipv4(YOUTUBE_STRICT_V4))
+        );
 
         let engine_moderate = SafeSearchEngine::new(false, YouTubeMode::Moderate);
         let yt_moderate = engine_moderate.check("youtube.com", 1);
-        assert_eq!(yt_moderate, Some(SafeSearchOverride::Ipv4(YOUTUBE_MODERATE_V4)));
+        assert_eq!(
+            yt_moderate,
+            Some(SafeSearchOverride::Ipv4(YOUTUBE_MODERATE_V4))
+        );
     }
 
     #[test]
     fn test_build_safesearch_response_packet() {
         let query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 6, b'g', b'o',
+            b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
         ];
         let ovr = SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4);
         let resp = build_safesearch_response(&query, "google.com", 1, &ovr);

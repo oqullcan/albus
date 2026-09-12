@@ -33,10 +33,18 @@ impl VectorLevel {
 /// Bulk XORs data with a 32-byte key stream using wide word vectorization.
 pub fn vectorized_bulk_xor(dest: &mut [u8], key: &[u8; 32]) {
     let key_u64 = [
-        u64::from_ne_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]]),
-        u64::from_ne_bytes([key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15]]),
-        u64::from_ne_bytes([key[16], key[17], key[18], key[19], key[20], key[21], key[22], key[23]]),
-        u64::from_ne_bytes([key[24], key[25], key[26], key[27], key[28], key[29], key[30], key[31]]),
+        u64::from_ne_bytes([
+            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+        ]),
+        u64::from_ne_bytes([
+            key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+        ]),
+        u64::from_ne_bytes([
+            key[16], key[17], key[18], key[19], key[20], key[21], key[22], key[23],
+        ]),
+        u64::from_ne_bytes([
+            key[24], key[25], key[26], key[27], key[28], key[29], key[30], key[31],
+        ]),
     ];
 
     let mut chunks_exact = dest.chunks_exact_mut(32);

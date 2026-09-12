@@ -174,8 +174,9 @@ impl DnsCache {
         if map.len() >= self.max_entries {
             map.retain(|_, v| v.stale_until > now);
             if map.len() >= self.max_entries {
-                if let Some(oldest_key) = map.keys().next().cloned() {
-                    map.remove(&oldest_key);
+                if let Some((oldest_key, _)) = map.iter().min_by_key(|(_, v)| v.expires_at) {
+                    let k = oldest_key.clone();
+                    map.remove(&k);
                 }
             }
         }
@@ -334,16 +335,16 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
         return 60;
     }
 
-    let mut min_ttl = 300u32;
+    let mut min_ttl: Option<u32> = None;
     let mut pos = 12;
 
     for _ in 0..qdcount {
         pos = match skip_dns_name(data, pos) {
             Some(p) => p,
-            None => return min_ttl,
+            None => return min_ttl.unwrap_or(300),
         };
         if pos + 4 > data.len() {
-            return min_ttl;
+            return min_ttl.unwrap_or(300);
         }
         pos += 4; // qtype + qclass
     }
@@ -369,12 +370,12 @@ pub fn extract_min_ttl(data: &[u8]) -> u32 {
         let rdlength = ((data[pos + 8] as usize) << 8) | (data[pos + 9] as usize);
         pos += 10 + rdlength;
 
-        if ttl > 0 && ttl < min_ttl {
-            min_ttl = ttl;
+        if ttl > 0 {
+            min_ttl = Some(min_ttl.map_or(ttl, |m| m.min(ttl)));
         }
     }
 
-    min_ttl
+    min_ttl.unwrap_or(300)
 }
 
 #[cfg(test)]
@@ -453,5 +454,16 @@ mod tests {
         let entry = map.get(&key).expect("should be cached");
         assert!(entry.is_negative);
         assert_eq!(entry.original_ttl, 30); // clamped to neg_min_ttl: 30
+    }
+
+    #[test]
+    fn test_extract_min_ttl_large_ttl() {
+        let resp = vec![
+            0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01, // Answer with TTL 3600 (0x0E10)
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x04, 1, 1, 1, 1,
+        ];
+        assert_eq!(extract_min_ttl(&resp), 3600);
     }
 }

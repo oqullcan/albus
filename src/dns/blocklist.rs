@@ -888,12 +888,14 @@ doubleclick.net
         let path = temp_dir.join("test_patterns_roundtrip.bin");
 
         let mut builder = BlocklistBuilder::new();
-        builder.add_text_lines(r#"
+        builder.add_text_lines(
+            r#"
             doubleclick.net
             =exact-match.com
             *tracker*
             telemetry.*
-        "#);
+        "#,
+        );
 
         let compiled = builder.build();
         assert!(!compiled.patterns.is_empty());

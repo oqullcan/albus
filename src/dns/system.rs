@@ -162,7 +162,10 @@ pub fn lookup_user_ids(user_name: &str) -> std::result::Result<(libc::uid_t, lib
         } else if let Ok(parsed_uid) = user_name.parse::<u32>() {
             Ok((parsed_uid as libc::uid_t, parsed_uid as libc::gid_t))
         } else {
-            Err(format!("user '{}' not found in system user database", user_name))
+            Err(format!(
+                "user '{}' not found in system user database",
+                user_name
+            ))
         }
     }
 }
@@ -199,7 +202,12 @@ pub fn drop_privileges(user_name: &str) -> std::result::Result<(), String> {
         }
     }
 
-    tracing::info!(user = user_name, uid = uid, gid = gid, "process privileges successfully dropped");
+    tracing::info!(
+        user = user_name,
+        uid = uid,
+        gid = gid,
+        "process privileges successfully dropped"
+    );
     Ok(())
 }
 
@@ -475,7 +483,10 @@ mod tests {
 
         {
             let guard = PidFileGuard::create(&pid_path).expect("PID file creation should succeed");
-            assert!(pid_path.exists(), "PID file must exist while guard is active");
+            assert!(
+                pid_path.exists(),
+                "PID file must exist while guard is active"
+            );
             let content = fs::read_to_string(&pid_path).expect("PID file must be readable");
             let parsed_pid: u32 = content.trim().parse().expect("PID content must be numeric");
             assert_eq!(parsed_pid, std::process::id());
@@ -483,7 +494,10 @@ mod tests {
         }
 
         // After guard is dropped, PID file must be automatically removed
-        assert!(!pid_path.exists(), "PID file must be cleaned up on guard drop");
+        assert!(
+            !pid_path.exists(),
+            "PID file must be cleaned up on guard drop"
+        );
     }
 
     #[test]

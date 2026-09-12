@@ -4,11 +4,11 @@
 //! providing zero round-trip connection resumption (0-rtt), multiplexing without
 //! head-of-line blocking, and connection migration resilience.
 
+use quinn::{ClientConfig, Endpoint};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use quinn::{ClientConfig, Endpoint};
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -17,10 +17,7 @@ pub static DOQ_PRESETS: LazyLock<HashMap<&'static str, (SocketAddr, &'static str
         let mut m = HashMap::new();
         m.insert(
             "adguard",
-            (
-                "94.140.14.14:853".parse().unwrap(),
-                "dns.adguard-dns.com",
-            ),
+            ("94.140.14.14:853".parse().unwrap(), "dns.adguard-dns.com"),
         );
         m.insert(
             "adguard-unfiltered",
@@ -31,10 +28,7 @@ pub static DOQ_PRESETS: LazyLock<HashMap<&'static str, (SocketAddr, &'static str
         );
         m.insert(
             "nextdns",
-            (
-                "45.90.28.0:853".parse().unwrap(),
-                "dns.nextdns.io",
-            ),
+            ("45.90.28.0:853".parse().unwrap(), "dns.nextdns.io"),
         );
         m
     });
@@ -85,7 +79,9 @@ impl DoQClient {
     }
 
     /// Instantiates DoQ client from preset name or explicit socket address / url.
-    pub fn from_preset_or_addr(input: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_preset_or_addr(
+        input: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let trimmed = input.trim().trim_start_matches("quic://");
         if let Some(client) = Self::from_preset(trimmed) {
             return Ok(client);
@@ -104,7 +100,9 @@ impl DoQClient {
         Err(format!("unknown DoQ preset or invalid address: '{}'", input).into())
     }
 
-    async fn get_or_create_endpoint(&self) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_or_create_endpoint(
+        &self,
+    ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
         let mut ep_lock = self.endpoint.lock().await;
         if let Some(ref ep) = *ep_lock {
             return Ok(ep.clone());

@@ -8,15 +8,15 @@ pub mod blocklist;
 pub mod blocklist_generator;
 pub mod cache;
 pub mod captive;
-pub mod cloak;
 pub mod client_rules;
+pub mod cloak;
 pub mod diagnostics;
 pub mod dns64;
 pub mod dnscrypt_client;
 pub mod dnssec;
 pub mod doh;
-pub mod dot;
 pub mod doq;
+pub mod dot;
 pub mod ech;
 pub mod ecs;
 pub mod entropy;
@@ -34,8 +34,8 @@ pub mod netprobe;
 pub mod odoh;
 pub mod padding;
 pub mod pattern;
-pub mod schedule;
 pub mod safesearch;
+pub mod schedule;
 pub mod secure_mem;
 pub mod server;
 pub mod simd_crypto;
@@ -52,23 +52,26 @@ pub mod watcher;
 pub mod web_ui;
 
 pub use allowlist::DomainAllowlist;
-pub use anonymized_doh::{AnonymizedDoHClient, scrub_identifying_headers};
+pub use anonymized_doh::{scrub_identifying_headers, AnonymizedDoHClient};
 pub use benchmark::{run_benchmark, BenchmarkOptions, BenchmarkResult};
-pub use captive::CaptiveMap;
 pub use blocklist::{build_seed_blocklist, fetch_and_compile_hagezi, CompactBlocklist};
 pub use blocklist_generator::compile_blocklist;
-pub use cloak::CloakEngine;
+pub use captive::CaptiveMap;
 pub use client_rules::{ClientDecision, ClientProfile, ClientProfileConfig, ClientRuleEngine};
+pub use cloak::CloakEngine;
 pub use dnscrypt_client::{AnonymizedRelay, DnsCryptCert, DnsCryptClient};
-pub use entropy::{fill_dual_entropy, generate_key_32, generate_nonce_12, generate_nonce_24};
 pub use dnssec::{
-    check_anti_downgrade, inspect_response_dnssec, DnssecAlgorithm, DnssecReport, DowngradeViolation,
-    RootTrustAnchor,
+    check_anti_downgrade, inspect_response_dnssec, DnssecAlgorithm, DnssecReport,
+    DowngradeViolation, RootTrustAnchor,
 };
 pub use doh::{extract_upstream_ips, extract_upstream_ips_v6};
-pub use dot::{DotClient, DOT_PRESETS};
 pub use doq::{DoQClient, DOQ_PRESETS};
+pub use dot::{DotClient, DOT_PRESETS};
 pub use ecs::ClientSubnet;
+pub use entropy::{
+    fill_dual_entropy, generate_key_32, generate_nonce_12, generate_nonce_24, random_u64,
+    random_usize,
+};
 pub use forward::{ForwardRule, ForwardingEngine};
 pub use ip_filter::{IpFilter, IpRule};
 pub use ipcrypt::IpCrypt;
@@ -81,18 +84,23 @@ pub use netmon::NetworkMonitor;
 pub use netprobe::wait_for_network;
 pub use odoh::{ODoHClient, DEFAULT_ODOH_RELAY, DEFAULT_ODOH_TARGET};
 pub use pattern::{PatternMatcher, PatternRule};
-pub use schedule::{ScheduleConfig, ScheduleManager};
 pub use safesearch::{SafeSearchEngine, SafeSearchOverride, YouTubeMode};
+pub use schedule::{ScheduleConfig, ScheduleManager};
 pub use secure_mem::{lock_memory, unlock_memory, SecureKey};
 pub use server::DnsServer;
-pub use simd_crypto::{vectorized_batch_encrypt_v4, vectorized_batch_encrypt_v6, vectorized_bulk_xor, VectorLevel};
+pub use simd_crypto::{
+    vectorized_batch_encrypt_v4, vectorized_batch_encrypt_v6, vectorized_bulk_xor, VectorLevel,
+};
 pub use sources::{
-    parse_resolver_markdown, MinisignPublicKey, RemoteResolverEntry, ServerFilterOptions, SourceConfig, SourceManager,
+    parse_resolver_markdown, MinisignPublicKey, RemoteResolverEntry, ServerFilterOptions,
+    SourceConfig, SourceManager,
 };
 pub use ssrf::{is_ssrf_risk, is_ssrf_risk_ip};
 pub use stamp::{DnsStamp, StampProtocol};
 pub use stats::{DnsStats, DnsStatsSnapshot};
-pub use system::{cleanup_system_dns, get_systemd_sockets, restore_system_dns, set_system_dns, SystemdSockets};
+pub use system::{
+    cleanup_system_dns, get_systemd_sockets, restore_system_dns, set_system_dns, SystemdSockets,
+};
 pub use tcp::DnsTcpServer;
 pub use tls_auth::TlsClientAuth;
 pub use udp_pool::UdpConnPool;

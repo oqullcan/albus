@@ -24,19 +24,30 @@ pub async fn wait_for_network(addr: &str, timeout_secs: i32) -> bool {
 
     while start.elapsed() < max_duration {
         // Try TCP connect first (with a short 1s timeout per attempt)
-        let tcp_attempt = tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await;
+        let tcp_attempt =
+            tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr))
+                .await;
 
         if let Ok(Ok(_)) = tcp_attempt {
-            info!("netprobe: network connectivity verified via TCP to {}", addr);
+            info!(
+                "netprobe: network connectivity verified via TCP to {}",
+                addr
+            );
             return true;
         }
 
         // Also test UDP routing probe
-        if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        let bind_addr = if addr.starts_with('[')
+            || addr
+                .parse::<std::net::SocketAddr>()
+                .map(|s| s.is_ipv6())
+                .unwrap_or(false)
+        {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        if let Ok(socket) = tokio::net::UdpSocket::bind(bind_addr).await {
             if socket.connect(addr).await.is_ok() {
                 let dummy_ping = [0u8; 1];
                 if socket.send(&dummy_ping).await.is_ok() {

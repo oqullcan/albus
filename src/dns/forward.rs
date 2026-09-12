@@ -213,14 +213,20 @@ impl ForwardingEngine {
                     }
                     let idx = rule.counter.fetch_add(1, Ordering::Relaxed) % servers.len();
                     let target = servers[idx];
-                    match self.forward_query_with_proxy(query, target, rule.via_proxy).await {
+                    match self
+                        .forward_query_with_proxy(query, target, rule.via_proxy)
+                        .await
+                    {
                         Ok(resp) => return Some(Ok(resp)),
                         Err(e) => last_err = Some(e),
                     }
                 }
                 ForwardTargetItem::Bootstrap => {
                     for target in &self.bootstrap_resolvers {
-                        match self.forward_query_with_proxy(query, *target, rule.via_proxy).await {
+                        match self
+                            .forward_query_with_proxy(query, *target, rule.via_proxy)
+                            .await
+                        {
                             Ok(resp) => return Some(Ok(resp)),
                             Err(e) => last_err = Some(e),
                         }
@@ -229,7 +235,10 @@ impl ForwardingEngine {
                 ForwardTargetItem::Dhcp => {
                     let dhcp_resolvers = detect_dhcp_resolvers();
                     for target in dhcp_resolvers {
-                        match self.forward_query_with_proxy(query, target, rule.via_proxy).await {
+                        match self
+                            .forward_query_with_proxy(query, target, rule.via_proxy)
+                            .await
+                        {
                             Ok(resp) => return Some(Ok(resp)),
                             Err(e) => last_err = Some(e),
                         }
@@ -238,7 +247,10 @@ impl ForwardingEngine {
                 ForwardTargetItem::ResolvConf(path) => {
                     let rc_resolvers = parse_resolv_conf_nameservers(path);
                     for target in rc_resolvers {
-                        match self.forward_query_with_proxy(query, target, rule.via_proxy).await {
+                        match self
+                            .forward_query_with_proxy(query, target, rule.via_proxy)
+                            .await
+                        {
                             Ok(resp) => return Some(Ok(resp)),
                             Err(e) => last_err = Some(e),
                         }
@@ -369,7 +381,10 @@ impl ForwardingEngine {
         proxy_url: &str,
     ) -> Result<Vec<u8>, std::io::Error> {
         let parsed_url = url::Url::parse(proxy_url).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid socks5 proxy URL: {}", e))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid socks5 proxy URL: {}", e),
+            )
         })?;
         let host = parsed_url.host_str().unwrap_or("127.0.0.1");
         let port = parsed_url.port().unwrap_or(1080);
@@ -593,7 +608,10 @@ mod tests {
         let corp_rule = engine.find_rule("corp.lan").expect("corp.lan rule found");
         assert_eq!(corp_rule.via_proxy, false);
         assert_eq!(corp_rule.sequence.len(), 4);
-        assert!(matches!(corp_rule.sequence[0], ForwardTargetItem::Explicit(_)));
+        assert!(matches!(
+            corp_rule.sequence[0],
+            ForwardTargetItem::Explicit(_)
+        ));
         assert_eq!(corp_rule.sequence[1], ForwardTargetItem::Dhcp);
         assert_eq!(corp_rule.sequence[2], ForwardTargetItem::Bootstrap);
         assert_eq!(

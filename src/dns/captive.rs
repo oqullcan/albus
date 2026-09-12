@@ -10,6 +10,17 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+#[inline]
+fn domain_matches_or_subdomain(name: &str, target: &str) -> bool {
+    if name == target {
+        return true;
+    }
+    if let Some(prefix) = name.strip_suffix(target) {
+        return prefix.ends_with('.');
+    }
+    false
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CaptiveMap {
     custom_entries: Vec<(String, IpAddr)>,
@@ -50,7 +61,7 @@ impl CaptiveMap {
     pub fn check(&self, domain: &str, qtype: u16) -> Option<IpAddr> {
         let lower = domain.trim_end_matches('.').to_ascii_lowercase();
         for (d, ip) in &self.custom_entries {
-            if &lower == d || lower.ends_with(&format!(".{}", d)) {
+            if domain_matches_or_subdomain(&lower, d) {
                 match (qtype, ip) {
                     (1, IpAddr::V4(_)) => return Some(*ip),
                     (28, IpAddr::V6(_)) => return Some(*ip),
@@ -120,7 +131,7 @@ const CAPTIVE_PROBES: &[CaptiveEntry] = &[
 pub fn check_captive_portal(domain: &str, qtype: u16) -> Option<IpAddr> {
     let lower = domain.trim_end_matches('.').to_ascii_lowercase();
     for entry in CAPTIVE_PROBES {
-        if lower == entry.domain || lower.ends_with(&format!(".{}", entry.domain)) {
+        if domain_matches_or_subdomain(&lower, entry.domain) {
             return match qtype {
                 1 => Some(IpAddr::V4(entry.ipv4)), // Type A
                 28 => {
@@ -229,8 +240,14 @@ mod tests {
         );
         // Comma-separated multiple IPs (IPv4 and IPv6)
         map.load_from_text("custom.captive.com 1.2.3.4, 5.6.7.8, 2001:db8::1\n");
-        assert_eq!(map.check("custom.captive.com", 1), Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(map.check("custom.captive.com", 28), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            map.check("custom.captive.com", 1),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            map.check("custom.captive.com", 28),
+            Some("2001:db8::1".parse().unwrap())
+        );
         // Built-in fallback still works
         assert!(map.check("captive.apple.com", 1).is_some());
     }

@@ -3,9 +3,9 @@
 //! permits configuring distinct filtering profiles, blocklists, allowlists, and
 //! ipv6 policies based on the incoming dns client source ip or cidr subnet.
 
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 
 use crate::dns::ip_filter::IpRule;
 use crate::dns::pattern::PatternMatcher;

@@ -109,7 +109,8 @@ pub struct DnsServer {
     pub safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>,
     pub dot_client: Option<Arc<crate::dns::dot::DotClient>>,
     pub doq_client: Option<Arc<crate::dns::doq::DoQClient>>,
-    pub dnscrypt_client: Option<Arc<tokio::sync::RwLock<crate::dns::dnscrypt_client::DnsCryptClient>>>,
+    pub dnscrypt_client:
+        Option<Arc<tokio::sync::RwLock<crate::dns::dnscrypt_client::DnsCryptClient>>>,
     pub randomize_ecs: Arc<AtomicBool>,
     pub reject_ttl: Arc<AtomicU32>,
     pub anti_injection: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>,
@@ -223,7 +224,9 @@ impl DnsServer {
             listen_addresses: vec!["127.0.0.1:53".parse().unwrap()],
             max_clients: Arc::new(AtomicUsize::new(250)),
             lb_strategy: Arc::new(StdRwLock::new("wp2".to_string())),
-            load_balancer: Arc::new(crate::dns::balancer::LoadBalancer::new(&[upstreams_csv.to_string()])),
+            load_balancer: Arc::new(crate::dns::balancer::LoadBalancer::new(&[
+                upstreams_csv.to_string()
+            ])),
             fragments_blocked: Arc::new(StdRwLock::new(vec![
                 "cisco".to_string(),
                 "cleanbrowsing-adult".to_string(),
@@ -258,13 +261,19 @@ impl DnsServer {
     }
 
     /// Sets stateful anti-injection filter for detecting middlebox tampering.
-    pub fn with_anti_injection(mut self, filter: Arc<crate::core::anti_injection::AntiInjectionFilter>) -> Self {
+    pub fn with_anti_injection(
+        mut self,
+        filter: Arc<crate::core::anti_injection::AntiInjectionFilter>,
+    ) -> Self {
         self.anti_injection = Some(filter);
         self
     }
 
     /// Sets optional stateful anti-injection filter for detecting middlebox tampering.
-    pub fn with_optional_anti_injection(mut self, filter: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>) -> Self {
+    pub fn with_optional_anti_injection(
+        mut self,
+        filter: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>,
+    ) -> Self {
         self.anti_injection = filter;
         self
     }
@@ -276,13 +285,19 @@ impl DnsServer {
     }
 
     /// Sets per-client IP filtering rules engine.
-    pub fn with_client_rules(mut self, rules: Arc<crate::dns::client_rules::ClientRuleEngine>) -> Self {
+    pub fn with_client_rules(
+        mut self,
+        rules: Arc<crate::dns::client_rules::ClientRuleEngine>,
+    ) -> Self {
         self.client_rules = rules;
         self
     }
 
     /// Sets SafeSearch enforcement engine.
-    pub fn with_safesearch(mut self, safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>) -> Self {
+    pub fn with_safesearch(
+        mut self,
+        safesearch: Arc<crate::dns::safesearch::SafeSearchEngine>,
+    ) -> Self {
         self.safesearch = safesearch;
         self
     }
@@ -340,7 +355,8 @@ impl DnsServer {
 
     /// Configures whether TLS session tickets are disabled for DoH.
     pub fn with_tls_disable_session_tickets(self, disabled: bool) -> Self {
-        self.tls_disable_session_tickets.store(disabled, Ordering::Relaxed);
+        self.tls_disable_session_tickets
+            .store(disabled, Ordering::Relaxed);
         self
     }
 
@@ -403,14 +419,18 @@ impl DnsServer {
     ) -> Self {
         *self.anonymized_dns_routes.write().unwrap() = routes;
         self.skip_incompatible.store(skip_incomp, Ordering::Relaxed);
-        self.direct_cert_fallback.store(direct_fallback, Ordering::Relaxed);
+        self.direct_cert_fallback
+            .store(direct_fallback, Ordering::Relaxed);
         self
     }
 
     /// Resolves matching anonymized relays for a target upstream resolver name using the configured routes matrix.
     /// Exact server name match has highest priority, followed by wildcard "*" rule.
     pub fn get_relays_for_server(&self, server_name: &str) -> Vec<String> {
-        let routes = self.anonymized_dns_routes.read().unwrap_or_else(|p| p.into_inner());
+        let routes = self
+            .anonymized_dns_routes
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         resolve_anonymized_dns_routes(&routes, server_name)
     }
 
@@ -474,25 +494,34 @@ impl DnsServer {
         self.pqc.store(cfg.pqc, Ordering::Relaxed);
         self.http3.store(cfg.http3, Ordering::Relaxed);
         self.racing.store(cfg.dns_racing, Ordering::Relaxed);
-        self.anti_dns_rebinding.store(cfg.anti_dns_rebinding, Ordering::Relaxed);
-        self.block_undelegated.store(cfg.block_undelegated, Ordering::Relaxed);
+        self.anti_dns_rebinding
+            .store(cfg.anti_dns_rebinding, Ordering::Relaxed);
+        self.block_undelegated
+            .store(cfg.block_undelegated, Ordering::Relaxed);
         self.edns_padding.store(cfg.edns_padding, Ordering::Relaxed);
-        self.uncloak_cnames.store(cfg.uncloak_cnames, Ordering::Relaxed);
+        self.uncloak_cnames
+            .store(cfg.uncloak_cnames, Ordering::Relaxed);
         self.dns64.store(cfg.dns64, Ordering::Relaxed);
         *self.query_meta.write().unwrap() = cfg.query_meta.clone();
         self.max_clients.store(cfg.max_clients, Ordering::Relaxed);
         *self.lb_strategy.write().unwrap() = cfg.lb_strategy.clone();
         *self.fragments_blocked.write().unwrap() = cfg.fragments_blocked.clone();
         *self.anonymized_dns_routes.write().unwrap() = cfg.anonymized_dns_routes.clone();
-        self.skip_incompatible.store(cfg.skip_incompatible, Ordering::Relaxed);
-        self.direct_cert_fallback.store(cfg.direct_cert_fallback, Ordering::Relaxed);
+        self.skip_incompatible
+            .store(cfg.skip_incompatible, Ordering::Relaxed);
+        self.direct_cert_fallback
+            .store(cfg.direct_cert_fallback, Ordering::Relaxed);
         *self.blocked_query_response.write().unwrap() = cfg.blocked_query_response.clone();
         self.offline_mode.store(cfg.offline_mode, Ordering::Relaxed);
-        self.ignore_system_dns.store(cfg.ignore_system_dns, Ordering::Relaxed);
+        self.ignore_system_dns
+            .store(cfg.ignore_system_dns, Ordering::Relaxed);
         self.cloaked_ptr.store(cfg.cloaked_ptr, Ordering::Relaxed);
-        self.tls_disable_session_tickets.store(cfg.tls_disable_session_tickets, Ordering::Relaxed);
-        self.cert_refresh_delay.store(cfg.cert_refresh_delay, Ordering::Relaxed);
-        self.cert_ignore_timestamp.store(cfg.cert_ignore_timestamp, Ordering::Relaxed);
+        self.tls_disable_session_tickets
+            .store(cfg.tls_disable_session_tickets, Ordering::Relaxed);
+        self.cert_refresh_delay
+            .store(cfg.cert_refresh_delay, Ordering::Relaxed);
+        self.cert_ignore_timestamp
+            .store(cfg.cert_ignore_timestamp, Ordering::Relaxed);
         self.udp_pool_enabled.store(cfg.udp_pool, Ordering::Relaxed);
         self.reject_ttl.store(cfg.reject_ttl, Ordering::Relaxed);
         self.cache.clear();
@@ -599,8 +628,16 @@ fn create_tuned_udp_socket(
 
             #[cfg(target_os = "linux")]
             {
-                let level = if addr.is_ipv6() { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP };
-                let opt = if addr.is_ipv6() { libc::IPV6_FREEBIND } else { libc::IP_FREEBIND };
+                let level = if addr.is_ipv6() {
+                    libc::IPPROTO_IPV6
+                } else {
+                    libc::IPPROTO_IP
+                };
+                let opt = if addr.is_ipv6() {
+                    libc::IPV6_FREEBIND
+                } else {
+                    libc::IP_FREEBIND
+                };
                 let _ = libc::setsockopt(
                     fd,
                     level,
@@ -682,12 +719,21 @@ impl DnsServer {
         };
 
         let mut udp_sockets = Vec::new();
+        let mut tcp_listeners = Vec::new();
         if let Some(systemd) = crate::dns::system::get_systemd_sockets() {
             for std_sock in systemd.udp {
                 if let Ok(addr) = std_sock.local_addr() {
                     if let Ok(tokio_sock) = tokio::net::UdpSocket::from_std(std_sock) {
                         info!(addr = %addr, "Using systemd activated UDP socket");
                         udp_sockets.push((addr, Arc::new(tokio_sock)));
+                    }
+                }
+            }
+            for std_tcp in systemd.tcp {
+                if let Ok(addr) = std_tcp.local_addr() {
+                    if let Ok(tokio_tcp) = tokio::net::TcpListener::from_std(std_tcp) {
+                        info!(addr = %addr, "Using systemd activated TCP listener");
+                        tcp_listeners.push((addr, tokio_tcp));
                     }
                 }
             }
@@ -778,7 +824,11 @@ impl DnsServer {
             });
         }
 
-        let canary_probe_target = addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]);
+        let canary_probe_target = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .copied()
+            .unwrap_or(addrs[0]);
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -929,23 +979,42 @@ impl DnsServer {
             }
         }
 
-        // 5. spawn RFC 7766 TCP listener on all configured listen_addresses
+        // 5. spawn RFC 7766 TCP listener on all configured listen_addresses or inherited systemd sockets
         if self.tcp_listener {
-            for addr in &addrs {
-                let s_tcp = server_arc.clone();
-                let rx = self.shutdown_tx.subscribe();
-                let tcp_bind = *addr;
-                DnsTcpServer::start(
-                    tcp_bind,
-                    move |query, peer| {
-                        let s = s_tcp.clone();
-                        async move {
-                            s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
-                            s.resolve_packet(&query, peer.ip()).await
-                        }
-                    },
-                    rx,
-                );
+            if !tcp_listeners.is_empty() {
+                for (addr, listener) in tcp_listeners {
+                    let s_tcp = server_arc.clone();
+                    let rx = self.shutdown_tx.subscribe();
+                    info!(addr = %addr, "Spawning RFC 7766 TCP listener from inherited systemd socket");
+                    DnsTcpServer::start_with_listener(
+                        listener,
+                        move |query, peer| {
+                            let s = s_tcp.clone();
+                            async move {
+                                s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
+                                s.resolve_packet(&query, peer.ip()).await
+                            }
+                        },
+                        rx,
+                    );
+                }
+            } else {
+                for addr in &addrs {
+                    let s_tcp = server_arc.clone();
+                    let rx = self.shutdown_tx.subscribe();
+                    let tcp_bind = *addr;
+                    DnsTcpServer::start(
+                        tcp_bind,
+                        move |query, peer| {
+                            let s = s_tcp.clone();
+                            async move {
+                                s.stats.queries_tcp.fetch_add(1, Ordering::Relaxed);
+                                s.resolve_packet(&query, peer.ip()).await
+                            }
+                        },
+                        rx,
+                    );
+                }
             }
         }
 
@@ -954,7 +1023,9 @@ impl DnsServer {
             let s_doh = server_arc.clone();
             let rx = self.shutdown_tx.subscribe();
             let tls_acceptor = if self.local_doh_tls {
-                if let (Some(ref cert), Some(ref key)) = (&self.local_doh_cert_file, &self.local_doh_key_file) {
+                if let (Some(ref cert), Some(ref key)) =
+                    (&self.local_doh_cert_file, &self.local_doh_key_file)
+                {
                     match crate::dns::local_doh::create_tls_acceptor_from_files(cert, key) {
                         Ok(acc) => Some(acc),
                         Err(e) => {
@@ -986,8 +1057,14 @@ impl DnsServer {
         if self.local_dot {
             let s_dot = server_arc.clone();
             let rx = self.shutdown_tx.subscribe();
-            let cert_file = self.local_dot_cert_file.as_deref().or(self.local_doh_cert_file.as_deref());
-            let key_file = self.local_dot_key_file.as_deref().or(self.local_doh_key_file.as_deref());
+            let cert_file = self
+                .local_dot_cert_file
+                .as_deref()
+                .or(self.local_doh_cert_file.as_deref());
+            let key_file = self
+                .local_dot_key_file
+                .as_deref()
+                .or(self.local_doh_key_file.as_deref());
 
             if let (Some(c), Some(k)) = (cert_file, key_file) {
                 match crate::dns::local_dot::create_dot_tls_acceptor_from_files(c, k) {
@@ -1124,8 +1201,15 @@ impl DnsServer {
         // Broken implementations workaround: clamp EDNS buffer size if upstream matches fragments_blocked
         let effective_query = {
             let upstream = self.upstream_desc.read().unwrap_or_else(|p| p.into_inner());
-            let blocked = self.fragments_blocked.read().unwrap_or_else(|p| p.into_inner());
-            let is_blocked = blocked.iter().any(|b| upstream.to_ascii_lowercase().contains(&b.to_ascii_lowercase()));
+            let blocked = self
+                .fragments_blocked
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            let is_blocked = blocked.iter().any(|b| {
+                upstream
+                    .to_ascii_lowercase()
+                    .contains(&b.to_ascii_lowercase())
+            });
             if is_blocked && outgoing_query.len() > 1252 {
                 &outgoing_query[..1252]
             } else {
@@ -1184,11 +1268,13 @@ impl DnsServer {
         let doh_result = tokio::time::timeout(effective_timeout, query_fut).await;
         match doh_result {
             Ok(Ok((res, via))) => {
-                self.load_balancer.record_result(0, start_time.elapsed(), true);
+                self.load_balancer
+                    .record_result(0, start_time.elapsed(), true);
                 Ok((res, via))
             }
             Ok(Err(e)) => {
-                self.load_balancer.record_result(0, start_time.elapsed(), false);
+                self.load_balancer
+                    .record_result(0, start_time.elapsed(), false);
                 if let Some(ref dnscrypt) = self.dnscrypt_client {
                     let dc = dnscrypt.read().await;
                     if dc.cert.is_some() {
@@ -1199,7 +1285,10 @@ impl DnsServer {
                     }
                 }
                 if let Some(ref doq) = self.doq_client {
-                    debug!("DoH resolution failed ({}), attempting failover to DNS-over-QUIC (DoQ)", e);
+                    debug!(
+                        "DoH resolution failed ({}), attempting failover to DNS-over-QUIC (DoQ)",
+                        e
+                    );
                     match doq.query(effective_query).await {
                         Ok(doq_resp) => {
                             debug!("DNS query successfully resolved via DoQ failover");
@@ -1211,7 +1300,10 @@ impl DnsServer {
                     }
                 }
                 if let Some(ref dot) = self.dot_client {
-                    debug!("DoH resolution failed ({}), attempting failover to DNS-over-TLS (DoT)", e);
+                    debug!(
+                        "DoH resolution failed ({}), attempting failover to DNS-over-TLS (DoT)",
+                        e
+                    );
                     match dot.query(effective_query).await {
                         Ok(dot_resp) => {
                             debug!("DNS query successfully resolved via DoT failover");
@@ -1225,7 +1317,8 @@ impl DnsServer {
                 Err(e)
             }
             Err(_) => {
-                self.load_balancer.record_result(0, effective_timeout, false);
+                self.load_balancer
+                    .record_result(0, effective_timeout, false);
                 if let Some(ref dnscrypt) = self.dnscrypt_client {
                     let dc = dnscrypt.read().await;
                     if dc.cert.is_some() {
@@ -1332,7 +1425,10 @@ impl DnsServer {
             }
             _ => {}
         }
-        let client_bypassed = matches!(client_decision, crate::dns::client_rules::ClientDecision::Allowed(_));
+        let client_bypassed = matches!(
+            client_decision,
+            crate::dns::client_rules::ClientDecision::Allowed(_)
+        );
 
         // 1. intercept mozilla firefox doh canary (use-application-dns.net) to force local proxy
         if let Some(key) = &query_key {
@@ -1382,10 +1478,7 @@ impl DnsServer {
                     Some("safesearch"),
                 );
                 return Some(crate::dns::safesearch::build_safesearch_response(
-                    query_data,
-                    &key.name,
-                    key.qtype,
-                    &ovr,
+                    query_data, &key.name, key.qtype, &ovr,
                 ));
             }
         }
@@ -1429,10 +1522,7 @@ impl DnsServer {
                         return Some(resp);
                     }
                     Err(e) => {
-                        debug!(
-                            "ForwardingEngine split-dns failed for {}: {}",
-                            key.name, e
-                        );
+                        debug!("ForwardingEngine split-dns failed for {}: {}", key.name, e);
                     }
                 }
             } else if let Some(target_forwarder) = self.cloak.get_forward_target(&key.name) {
@@ -1504,8 +1594,17 @@ impl DnsServer {
                         start_time,
                         Some(&format!("schedule:{}", sched_name)),
                     );
-                    let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
-                    return Some(build_blocked_response(query_data, key.qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
+                    let blocked_strategy = self
+                        .blocked_query_response
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    return Some(build_blocked_response(
+                        query_data,
+                        key.qtype,
+                        &blocked_strategy,
+                        self.reject_ttl.load(Ordering::Relaxed),
+                    ));
                 }
 
                 let is_blocked = if client_bypassed {
@@ -1530,14 +1629,26 @@ impl DnsServer {
                         start_time,
                         Some("hagezi_block"),
                     );
-                    let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
-                    return Some(build_blocked_response(query_data, key.qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
+                    let blocked_strategy = self
+                        .blocked_query_response
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    return Some(build_blocked_response(
+                        query_data,
+                        key.qtype,
+                        &blocked_strategy,
+                        self.reject_ttl.load(Ordering::Relaxed),
+                    ));
                 }
             }
         }
 
         // 8. synthesize instant nodata response for aaaa queries if ipv6 blocking is enabled
-        if self.block_ipv6.load(Ordering::Relaxed) && !self.dns64.load(Ordering::Relaxed) && is_aaaa_query(query_data) {
+        if self.block_ipv6.load(Ordering::Relaxed)
+            && !self.dns64.load(Ordering::Relaxed)
+            && is_aaaa_query(query_data)
+        {
             self.maybe_log_query(
                 client_ip,
                 &domain,
@@ -1609,19 +1720,18 @@ impl DnsServer {
             } else {
                 self.edns_client_subnet.as_ref().unwrap_or(&default_zero)
             };
-            apply_edns_options_with_ecs(
-                query_data,
-                is_dnssec,
-                is_padding,
-                Some(effective_ecs),
-            )
+            apply_edns_options_with_ecs(query_data, is_dnssec, is_padding, Some(effective_ecs))
         } else if is_dnssec {
             enable_dnssec_do(query_data)
         } else {
             query_data.to_vec()
         };
 
-        let qm = self.query_meta.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let qm = self
+            .query_meta
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let outgoing_query = if !qm.is_empty() {
             inject_query_meta(&outgoing_query, &qm)
         } else {
@@ -1676,13 +1786,18 @@ impl DnsServer {
                     let ips = extract_resolved_ips(&resp_bytes);
                     if !ips.is_empty() {
                         let verdict = anti_inj.inspect_dns_response(&domain, &ips);
-                        if let crate::core::anti_injection::InjectionVerdict::DropInjectedDns(reason) = verdict {
+                        if let crate::core::anti_injection::InjectionVerdict::DropInjectedDns(
+                            reason,
+                        ) = verdict
+                        {
                             warn!(
                                 domain = %domain,
                                 reason = %reason,
                                 "Censor-injected DNS response detected and dropped by Anti-Injection filter"
                             );
-                            self.stats.injected_dns_dropped.fetch_add(1, Ordering::Relaxed);
+                            self.stats
+                                .injected_dns_dropped
+                                .fetch_add(1, Ordering::Relaxed);
                             self.maybe_log_query(
                                 client_ip,
                                 &domain,
@@ -1745,8 +1860,17 @@ impl DnsServer {
                                     start_time,
                                     Some(&target),
                                 );
-                                 let blocked_strategy = self.blocked_query_response.read().unwrap_or_else(|p| p.into_inner()).clone();
-                                return Some(build_blocked_response(query_data, qtype, &blocked_strategy, self.reject_ttl.load(Ordering::Relaxed)));
+                                let blocked_strategy = self
+                                    .blocked_query_response
+                                    .read()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clone();
+                                return Some(build_blocked_response(
+                                    query_data,
+                                    qtype,
+                                    &blocked_strategy,
+                                    self.reject_ttl.load(Ordering::Relaxed),
+                                ));
                             }
                         }
                     }
@@ -1795,16 +1919,22 @@ impl DnsServer {
                         self.stats.dnssec_validated.fetch_add(1, Ordering::Relaxed);
                     }
                     if dnssec_report.has_pqc_rrsig && dnssec_report.authenticated {
-                        self.stats.pqc_dnssec_validated.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .pqc_dnssec_validated
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     if self.pqc.load(Ordering::Relaxed) {
-                        if let Err(downgrade_err) = crate::dns::dnssec::check_anti_downgrade(&dnssec_report) {
+                        if let Err(downgrade_err) =
+                            crate::dns::dnssec::check_anti_downgrade(&dnssec_report)
+                        {
                             warn!(
                                 domain = %domain,
                                 violation = %downgrade_err,
                                 "Anti-downgrade policy triggered: returning SERVFAIL"
                             );
-                            self.stats.pqc_downgrade_prevented.fetch_add(1, Ordering::Relaxed);
+                            self.stats
+                                .pqc_downgrade_prevented
+                                .fetch_add(1, Ordering::Relaxed);
                             self.maybe_log_query(
                                 client_ip,
                                 &domain,
@@ -2079,7 +2209,11 @@ pub fn build_canary_query() -> Vec<u8> {
 // actively probes local loopback resolver to verify canary responsiveness and detect dns leaks
 async fn run_active_canary_probe(target: SocketAddr) {
     let probe_res = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
-        let bind_local = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind_local = if target.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let sock = tokio::net::UdpSocket::bind(bind_local).await?;
         let query = build_canary_query();
         sock.send_to(&query, target).await?;
@@ -2477,7 +2611,9 @@ mod tests {
 
     #[test]
     fn test_dns_server_post_quantum_dnssec_and_anti_downgrade() {
-        use crate::dns::dnssec::{check_anti_downgrade, inspect_response_dnssec, DowngradeViolation};
+        use crate::dns::dnssec::{
+            check_anti_downgrade, inspect_response_dnssec, DowngradeViolation,
+        };
         use std::sync::atomic::Ordering;
 
         let stats = Arc::new(DnsStats::default());
@@ -2491,9 +2627,8 @@ mod tests {
             0x00, 0x00, // NSCOUNT = 0
             0x00, 0x00, // ARCOUNT = 0
             // Question: example.com IN A
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
-            // Answer 1: A record
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01, // Answer 1: A record
             0xC0, 0x0C, // Name pointer
             0x00, 0x01, 0x00, 0x01, // Type A, Class IN
             0x00, 0x00, 0x01, 0x2C, // TTL = 300
@@ -2544,21 +2679,15 @@ mod tests {
             0x00, 0x01, // NSCOUNT = 1 (DS record in authority)
             0x00, 0x00, // ARCOUNT = 0
             // Question: example.com IN A
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
-            // Answer 1: A record
-            0xC0, 0x0C,
-            0x00, 0x01, 0x00, 0x01,
-            0x00, 0x00, 0x01, 0x2C,
-            0x00, 0x04, 93, 184, 216, 34,
-            // Authority 1: DS record signaling Algorithm 18
-            0xC0, 0x0C,
-            0x00, 0x2B, 0x00, 0x01, // Type DS (43), Class IN
-            0x00, 0x00, 0x01, 0x2C,
-            0x00, 0x24, // RDLENGTH = 36
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01, // Answer 1: A record
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x04, 93, 184, 216,
+            34, // Authority 1: DS record signaling Algorithm 18
+            0xC0, 0x0C, 0x00, 0x2B, 0x00, 0x01, // Type DS (43), Class IN
+            0x00, 0x00, 0x01, 0x2C, 0x00, 0x24, // RDLENGTH = 36
             0x04, 0xD2, // Key Tag = 1234
-            18, // Algorithm = ML-DSA-44
-            2,  // Digest Type = SHA-256
+            18,   // Algorithm = ML-DSA-44
+            2,    // Digest Type = SHA-256
         ];
         downgraded_resp.extend_from_slice(&[0xBB; 32]); // SHA-256 digest
 
@@ -2570,7 +2699,9 @@ mod tests {
         assert_eq!(check_res, Err(DowngradeViolation::PqcSignatureStripped));
 
         // When downgrade is detected:
-        stats.pqc_downgrade_prevented.fetch_add(1, Ordering::Relaxed);
+        stats
+            .pqc_downgrade_prevented
+            .fetch_add(1, Ordering::Relaxed);
         let servfail = build_servfail_response(&downgraded_resp);
         assert_eq!(servfail[3] & 0x0F, 0x02); // RCODE = 2 (SERVFAIL)
         assert_eq!(stats.pqc_downgrade_prevented.load(Ordering::Relaxed), 1);
@@ -2586,8 +2717,8 @@ mod tests {
             0x00, 0x00, // NSCOUNT = 0
             0x00, 0x00, // ARCOUNT = 0
             // example.com A IN
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01,
         ];
 
         let meta = vec!["token:SecretValue123".to_string(), "user:alice".to_string()];
@@ -2604,15 +2735,26 @@ mod tests {
         assert_eq!(&tail[1..3], &16u16.to_be_bytes()); // Type TXT
         assert_eq!(&tail[3..5], &1u16.to_be_bytes()); // Class IN
         assert_eq!(&tail[5..9], &86400u32.to_be_bytes()); // TTL 86400
-        assert!(tail.windows("token:SecretValue123".len()).any(|w| w == b"token:SecretValue123"));
+        assert!(tail
+            .windows("token:SecretValue123".len())
+            .any(|w| w == b"token:SecretValue123"));
         assert!(tail.windows("user:alice".len()).any(|w| w == b"user:alice"));
     }
 
     #[test]
     fn test_with_listen_addresses() {
-        let server = DnsServer::with_defaults("https://cloudflare-dns.com/dns-query", &[], false, false, false)
-            .unwrap();
-        assert_eq!(server.listen_addresses, vec!["127.0.0.1:53".parse::<SocketAddr>().unwrap()]);
+        let server = DnsServer::with_defaults(
+            "https://cloudflare-dns.com/dns-query",
+            &[],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            server.listen_addresses,
+            vec!["127.0.0.1:53".parse::<SocketAddr>().unwrap()]
+        );
 
         let custom_addrs = vec![
             "127.0.0.1:5353".parse::<SocketAddr>().unwrap(),
@@ -2728,9 +2870,8 @@ mod tests {
 
         // Test Google SafeSearch A query interception
         let google_query = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x06, b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, b'g',
+            b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
         let resp = server
             .resolve_packet(&google_query, "127.0.0.1".parse().unwrap())
@@ -2741,9 +2882,9 @@ mod tests {
 
         // Test YouTube Strict Mode A query interception (VIP 216.239.38.119)
         let yt_query = vec![
-            0x56, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'y', b'o', b'u', b't', b'u', b'b', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0x56, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'y',
+            b'o', b'u', b't', b'u', b'b', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
         ];
         let yt_resp = server
             .resolve_packet(&yt_query, "127.0.0.1".parse().unwrap())
@@ -2849,11 +2990,9 @@ mod tests {
 
         // 1. Canary query with distinct transaction ID
         let canary_query = vec![
-            0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x09, b'l', b'e', b'a', b'k', b'-', b't', b'e', b's', b't',
-            0x05, b'a', b'l', b'b', b'u', b's',
-            0x08, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, b'l',
+            b'e', b'a', b'k', b'-', b't', b'e', b's', b't', 0x05, b'a', b'l', b'b', b'u', b's',
+            0x08, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
         let resp = server
             .resolve_packet(&canary_query, "127.0.0.1".parse().unwrap())
@@ -2868,10 +3007,9 @@ mod tests {
 
         // 2. Cloaked local query with different transaction ID
         let cloak_query = vec![
-            0xBE, 0xEF, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x05, b'l', b'o', b'c', b'a', b'l',
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x00,
-            0x00, 0x01, 0x00, 0x01,
+            0xBE, 0xEF, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, b'l',
+            b'o', b'c', b'a', b'l', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x00, 0x00,
+            0x01, 0x00, 0x01,
         ];
         let cloak_resp = server
             .resolve_packet(&cloak_query, "127.0.0.1".parse().unwrap())
@@ -2883,4 +3021,3 @@ mod tests {
         assert_eq!(cloak_resp[3] & 0x20, 0);
     }
 }
-

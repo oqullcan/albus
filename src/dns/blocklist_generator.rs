@@ -22,7 +22,12 @@ pub fn parse_domain_list(content: &str) -> HashSet<String> {
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') || trimmed.starts_with(';') {
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('!')
+            || trimmed.starts_with(';')
+            || trimmed.starts_with("@@")
+        {
             continue;
         }
 
@@ -61,10 +66,19 @@ pub fn parse_domain_list(content: &str) -> HashSet<String> {
 
         // Format 3: Hosts file: 0.0.0.0 example.com or 127.0.0.1 example.com
         let parts: Vec<&str> = line_clean.split_whitespace().collect();
-        if parts.len() >= 2 && (parts[0] == "0.0.0.0" || parts[0] == "127.0.0.1" || parts[0] == "::1" || parts[0] == "::") {
+        if parts.len() >= 2
+            && (parts[0] == "0.0.0.0"
+                || parts[0] == "127.0.0.1"
+                || parts[0] == "::1"
+                || parts[0] == "::")
+        {
             for &host in &parts[1..] {
                 let clean_d = clean_domain_name(host);
-                if is_valid_domain(&clean_d) && clean_d != "localhost" && clean_d != "local" && !clean_d.ends_with(".localdomain") {
+                if is_valid_domain(&clean_d)
+                    && clean_d != "localhost"
+                    && clean_d != "local"
+                    && !clean_d.ends_with(".localdomain")
+                {
                     domains.insert(clean_d);
                 }
             }
@@ -130,7 +144,10 @@ fn clean_domain_name(s: &str) -> String {
 
 /// Basic sanity check to ensure a domain candidate contains valid characters and has a dot.
 fn is_valid_domain(d: &str) -> bool {
-    let clean = d.trim_start_matches('*').trim_start_matches('.').trim_start_matches('=');
+    let clean = d
+        .trim_start_matches('*')
+        .trim_start_matches('.')
+        .trim_start_matches('=');
     if clean.is_empty() || clean.len() > 253 {
         return false;
     }
@@ -167,7 +184,11 @@ pub async fn compile_blocklist(
             match fs::read_to_string(file_path) {
                 Ok(content) => {
                     let parsed = parse_domain_list(&content);
-                    info!(source = file_path, count = parsed.len(), "Loaded local blocklist file");
+                    info!(
+                        source = file_path,
+                        count = parsed.len(),
+                        "Loaded local blocklist file"
+                    );
                     all_domains.extend(parsed);
                 }
                 Err(e) => warn!("Failed to read local blocklist file {}: {}", file_path, e),
@@ -175,17 +196,23 @@ pub async fn compile_blocklist(
         } else if src_trimmed.starts_with("http://") || src_trimmed.starts_with("https://") {
             info!(url = src_trimmed, "Downloading blocklist feed...");
             match client.get(src_trimmed).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.text().await {
-                        Ok(body) => {
-                            let parsed = parse_domain_list(&body);
-                            info!(url = src_trimmed, count = parsed.len(), "Downloaded and parsed blocklist feed");
-                            all_domains.extend(parsed);
-                        }
-                        Err(e) => warn!("Failed to read response body from {}: {}", src_trimmed, e),
+                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                    Ok(body) => {
+                        let parsed = parse_domain_list(&body);
+                        info!(
+                            url = src_trimmed,
+                            count = parsed.len(),
+                            "Downloaded and parsed blocklist feed"
+                        );
+                        all_domains.extend(parsed);
                     }
-                }
-                Ok(resp) => warn!("Feed {} returned HTTP status {}", src_trimmed, resp.status()),
+                    Err(e) => warn!("Failed to read response body from {}: {}", src_trimmed, e),
+                },
+                Ok(resp) => warn!(
+                    "Feed {} returned HTTP status {}",
+                    src_trimmed,
+                    resp.status()
+                ),
                 Err(e) => warn!("Failed to download feed {}: {}", src_trimmed, e),
             }
         }
@@ -196,7 +223,11 @@ pub async fn compile_blocklist(
         if Path::new(path).exists() {
             if let Ok(content) = fs::read_to_string(path) {
                 let parsed = parse_domain_list(&content);
-                info!(path = path, count = parsed.len(), "Appended local additions");
+                info!(
+                    path = path,
+                    count = parsed.len(),
+                    "Appended local additions"
+                );
                 all_domains.extend(parsed);
             }
         }
@@ -208,7 +239,11 @@ pub async fn compile_blocklist(
             let allow = parse_allowlist(path);
             let before = all_domains.len();
             all_domains.retain(|d| !allow.contains(d));
-            info!(path = path, removed = before - all_domains.len(), "Filtered allowlisted domains");
+            info!(
+                path = path,
+                removed = before - all_domains.len(),
+                "Filtered allowlisted domains"
+            );
         }
     }
 
@@ -230,7 +265,10 @@ pub async fn compile_blocklist(
     // 6. Write output file
     let mut out_content = String::new();
     out_content.push_str("# Albus compiled domain blocklist\n");
-    out_content.push_str(&format!("# Total active blocked domains: {}\n\n", sorted_domains.len()));
+    out_content.push_str(&format!(
+        "# Total active blocked domains: {}\n\n",
+        sorted_domains.len()
+    ));
 
     for domain in &sorted_domains {
         if let Some(schedule) = time_restrictions.get(domain) {
@@ -241,7 +279,11 @@ pub async fn compile_blocklist(
     }
 
     fs::write(output_path, out_content)?;
-    info!(output = output_path, total = sorted_domains.len(), "Compiled domain blocklist saved successfully");
+    info!(
+        output = output_path,
+        total = sorted_domains.len(),
+        "Compiled domain blocklist saved successfully"
+    );
 
     Ok(sorted_domains.len())
 }
@@ -256,6 +298,7 @@ mod tests {
         # AdBlock Plus rule
         ||adserver.com^$third-party
         ||tracking.net^
+        @@||exception-allowed.org^
 
         # Dnsmasq rule
         address=/badsite.org/0.0.0.0
@@ -280,6 +323,7 @@ mod tests {
         assert!(parsed.contains("spy.net"));
         assert!(parsed.contains("analytics.com"));
         assert!(parsed.contains("*.wildcard-tracker.com"));
+        assert!(!parsed.contains("exception-allowed.org"));
     }
 
     #[test]
@@ -287,10 +331,10 @@ mod tests {
         let content = "0.0.0.0 ad.com\n0.0.0.0 allowed.com\n";
         let mut parsed = parse_domain_list(content);
 
-        let allow_tmp = "/tmp/albus_test_allow.tmp";
-        fs::write(allow_tmp, "allowed.com\n").unwrap();
-        let allow = parse_allowlist(allow_tmp);
-        let _ = fs::remove_file(allow_tmp);
+        let allow_tmp = std::env::temp_dir().join("albus_test_allow.tmp");
+        fs::write(&allow_tmp, "allowed.com\n").unwrap();
+        let allow = parse_allowlist(&allow_tmp);
+        let _ = fs::remove_file(&allow_tmp);
 
         parsed.retain(|d| !allow.contains(d));
         assert!(parsed.contains("ad.com"));

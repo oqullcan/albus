@@ -61,22 +61,23 @@ async fn probe_doh(
     let mut latencies = Vec::new();
     let mut dnssec_detected = false;
 
-    let resolver = match DoHResolver::new_with_options(endpoint, &[], false, false, None, None, None) {
-        Ok(r) => r,
-        Err(_) => {
-            return BenchmarkResult {
-                name: name.to_string(),
-                protocol: "DoH",
-                endpoint: endpoint.to_string(),
-                min_ms: 0.0,
-                avg_ms: 0.0,
-                max_ms: 0.0,
-                success_rate: 0.0,
-                dnssec: false,
-                responsive: false,
-            };
-        }
-    };
+    let resolver =
+        match DoHResolver::new_with_options(endpoint, &[], false, false, None, None, None) {
+            Ok(r) => r,
+            Err(_) => {
+                return BenchmarkResult {
+                    name: name.to_string(),
+                    protocol: "DoH",
+                    endpoint: endpoint.to_string(),
+                    min_ms: 0.0,
+                    avg_ms: 0.0,
+                    max_ms: 0.0,
+                    success_rate: 0.0,
+                    dnssec: false,
+                    responsive: false,
+                };
+            }
+        };
 
     for _ in 0..count {
         let start = Instant::now();
@@ -205,8 +206,10 @@ pub async fn run_benchmark(
     cfg: &Config,
     opts: &BenchmarkOptions,
 ) -> Result<Vec<BenchmarkResult>, Box<dyn std::error::Error + Send + Sync>> {
-    println!("Starting resolver benchmark for query '{}' (probes: {}, concurrency: {})...",
-        opts.domain, opts.count, opts.concurrency);
+    println!(
+        "Starting resolver benchmark for query '{}' (probes: {}, concurrency: {})...",
+        opts.domain, opts.count, opts.concurrency
+    );
 
     let query_wire = build_dns_query(&opts.domain, 1);
     let timeout = Duration::from_secs(opts.timeout_secs);
@@ -219,7 +222,10 @@ pub async fn run_benchmark(
         ("cloudflare", "https://cloudflare-dns.com/dns-query"),
         ("quad9", "https://dns.quad9.net/dns-query"),
         ("mullvad", "https://dns.mullvad.net/dns-query"),
-        ("mullvad-adblock", "https://adblock.dns.mullvad.net/dns-query"),
+        (
+            "mullvad-adblock",
+            "https://adblock.dns.mullvad.net/dns-query",
+        ),
         ("google", "https://dns.google/dns-query"),
         ("adguard-dns", "https://dns.adguard-dns.com/dns-query"),
     ];
@@ -276,7 +282,8 @@ pub async fn run_benchmark(
                     match stamp.protocol {
                         StampProtocol::DoH => {
                             if let Some(ref filter) = opts.protocol_filter {
-                                if filter.to_lowercase() != "all" && filter.to_lowercase() != "doh" {
+                                if filter.to_lowercase() != "all" && filter.to_lowercase() != "doh"
+                                {
                                     continue;
                                 }
                             }
@@ -292,7 +299,8 @@ pub async fn run_benchmark(
                         }
                         StampProtocol::DoT => {
                             if let Some(ref filter) = opts.protocol_filter {
-                                if filter.to_lowercase() != "all" && filter.to_lowercase() != "dot" {
+                                if filter.to_lowercase() != "all" && filter.to_lowercase() != "dot"
+                                {
                                     continue;
                                 }
                             }
@@ -323,13 +331,14 @@ pub async fn run_benchmark(
     }
 
     // Sort results: responsive servers first, then sorted by avg latency ascending
-    results.sort_by(|a, b| {
-        match (a.responsive, b.responsive) {
-            (true, true) => a.avg_ms.partial_cmp(&b.avg_ms).unwrap_or(std::cmp::Ordering::Equal),
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.name.cmp(&b.name),
-        }
+    results.sort_by(|a, b| match (a.responsive, b.responsive) {
+        (true, true) => a
+            .avg_ms
+            .partial_cmp(&b.avg_ms)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.name.cmp(&b.name),
     });
 
     display_results(&results, opts.top);
@@ -339,8 +348,10 @@ pub async fn run_benchmark(
 
 // prints formatted ascii benchmark comparison table
 pub fn display_results(results: &[BenchmarkResult], top_n: usize) {
-    println!("\n{:<4} {:<24} {:<8} {:<12} {:<14} {:<10} DNSSEC",
-        "RANK", "RESOLVER NAME", "PROTO", "AVG (MS)", "MIN / MAX (MS)", "SUCCESS");
+    println!(
+        "\n{:<4} {:<24} {:<8} {:<12} {:<14} {:<10} DNSSEC",
+        "RANK", "RESOLVER NAME", "PROTO", "AVG (MS)", "MIN / MAX (MS)", "SUCCESS"
+    );
     println!("{}", "-".repeat(82));
 
     let display_items = results.iter().take(top_n);
@@ -355,22 +366,32 @@ pub fn display_results(results: &[BenchmarkResult], top_n: usize) {
             let min_max = format!("{:.1} / {:.1}", r.min_ms, r.max_ms);
             let success = format!("{:.0}%", r.success_rate);
             let dnssec_str = if r.dnssec { "Yes" } else { "No" };
-            println!("{:<4} {:<24} {:<8} {:<12.1} {:<14} {:<10} {}",
-                rank, r.name, r.protocol, r.avg_ms, min_max, success, dnssec_str);
+            println!(
+                "{:<4} {:<24} {:<8} {:<12.1} {:<14} {:<10} {}",
+                rank, r.name, r.protocol, r.avg_ms, min_max, success, dnssec_str
+            );
         } else {
-            println!("{:<4} {:<24} {:<8} {:<12} {:<14} {:<10} -",
-                rank, r.name, r.protocol, "TIMEOUT", "-", "0%");
+            println!(
+                "{:<4} {:<24} {:<8} {:<12} {:<14} {:<10} -",
+                rank, r.name, r.protocol, "TIMEOUT", "-", "0%"
+            );
         }
         rank += 1;
     }
 
     println!("{}", "-".repeat(82));
     let responsive_count = results.iter().filter(|r| r.responsive).count();
-    println!("Benchmark completed: {} tested, {} responsive.", results.len(), responsive_count);
+    println!(
+        "Benchmark completed: {} tested, {} responsive.",
+        results.len(),
+        responsive_count
+    );
 
     if let Some(best) = fastest {
-        println!("Fastest recommended: {} ({}) with {:.1} ms average latency.\n",
-            best.name, best.protocol, best.avg_ms);
+        println!(
+            "Fastest recommended: {} ({}) with {:.1} ms average latency.\n",
+            best.name, best.protocol, best.avg_ms
+        );
     }
 }
 
@@ -381,7 +402,14 @@ mod tests {
     #[test]
     fn test_compute_result_calculation() {
         let latencies = vec![20.0, 30.0, 40.0];
-        let res = compute_result("test-resolver", "DoH", "https://test.invalid", latencies, 3, true);
+        let res = compute_result(
+            "test-resolver",
+            "DoH",
+            "https://test.invalid",
+            latencies,
+            3,
+            true,
+        );
         assert!(res.responsive);
         assert_eq!(res.min_ms, 20.0);
         assert_eq!(res.max_ms, 40.0);
@@ -392,7 +420,14 @@ mod tests {
 
     #[test]
     fn test_compute_result_all_timeouts() {
-        let res = compute_result("unreachable", "DoH", "https://unreachable.invalid", vec![], 3, false);
+        let res = compute_result(
+            "unreachable",
+            "DoH",
+            "https://unreachable.invalid",
+            vec![],
+            3,
+            false,
+        );
         assert!(!res.responsive);
         assert_eq!(res.success_rate, 0.0);
     }
