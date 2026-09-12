@@ -125,7 +125,8 @@ impl CompactBlocklist {
         let mut file = fs::File::create(path)?;
         // magic header: ALBUSBLK
         file.write_all(b"ALBUSBLK")?;
-        file.write_all(&1u32.to_le_bytes())?; // version 1
+        let version = if self.patterns.is_empty() { 1u32 } else { 2u32 };
+        file.write_all(&version.to_le_bytes())?;
         file.write_all(&(self.total_domains as u64).to_le_bytes())?;
         file.write_all(&(self.labels.len() as u32).to_le_bytes())?;
         file.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
@@ -140,6 +141,19 @@ impl CompactBlocklist {
             )
         };
         file.write_all(node_bytes)?;
+
+        // write pattern rules for version 2
+        if version == 2 {
+            let rules = self.patterns.all_rules();
+            file.write_all(&(rules.len() as u32).to_le_bytes())?;
+            for rule in rules {
+                let rule_str = rule.to_rule_string();
+                let bytes = rule_str.as_bytes();
+                file.write_all(&(bytes.len() as u16).to_le_bytes())?;
+                file.write_all(bytes)?;
+            }
+        }
+
         file.sync_all()?;
         Ok(())
     }
@@ -189,7 +203,7 @@ impl CompactBlocklist {
         let mut v_buf = [0u8; 4];
         reader.read_exact(&mut v_buf)?;
         let version = u32::from_le_bytes(v_buf);
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported blocklist binary version",
@@ -301,11 +315,35 @@ impl CompactBlocklist {
             }
         }
 
+        let mut patterns = crate::dns::pattern::PatternMatcher::new();
+        if version == 2 {
+            let mut p_buf = [0u8; 4];
+            reader.read_exact(&mut p_buf)?;
+            let patterns_count = u32::from_le_bytes(p_buf) as usize;
+            const MAX_BLOCKLIST_PATTERNS: usize = 1_000_000;
+            if patterns_count > MAX_BLOCKLIST_PATTERNS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "blocklist pattern count exceeds safety ceiling",
+                ));
+            }
+            for _ in 0..patterns_count {
+                let mut l_buf = [0u8; 2];
+                reader.read_exact(&mut l_buf)?;
+                let str_len = u16::from_le_bytes(l_buf) as usize;
+                let mut s_buf = vec![0u8; str_len];
+                reader.read_exact(&mut s_buf)?;
+                if let Ok(s) = std::str::from_utf8(&s_buf) {
+                    patterns.add_rule(s);
+                }
+            }
+        }
+
         Ok(Self {
             labels,
             nodes,
             total_domains,
-            patterns: crate::dns::pattern::PatternMatcher::new(),
+            patterns,
         })
     }
 }
@@ -840,6 +878,43 @@ doubleclick.net
 
         // Non-matching
         assert!(!loaded.check("clean-site.org"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_binary_serialization_with_patterns_roundtrip() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_patterns_roundtrip.bin");
+
+        let mut builder = BlocklistBuilder::new();
+        builder.add_text_lines(r#"
+            doubleclick.net
+            =exact-match.com
+            *tracker*
+            telemetry.*
+        "#);
+
+        let compiled = builder.build();
+        assert!(!compiled.patterns.is_empty());
+        compiled.save_to_file(&path).unwrap();
+
+        let loaded = CompactBlocklist::load_from_file(&path).unwrap();
+        assert_eq!(loaded.total_domains, compiled.total_domains);
+
+        // Trie suffix match
+        assert!(loaded.check("doubleclick.net"));
+        assert!(loaded.check("sub.doubleclick.net"));
+
+        // Exact pattern match
+        assert!(loaded.check("exact-match.com"));
+        assert!(!loaded.check("sub.exact-match.com"));
+
+        // Substring pattern match
+        assert!(loaded.check("global-tracker.org"));
+
+        // Prefix pattern match
+        assert!(loaded.check("telemetry.corp.internal"));
 
         let _ = fs::remove_file(&path);
     }

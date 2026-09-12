@@ -121,7 +121,33 @@ pub fn apply_edns_options_with_payload_size(
         return out;
     }
 
-    // if arcount > 0, return query as-is
+    // if a single additional record exists and it's an OPT record (RFC 6891), replace it
+    // with our configured padded OPT record (preserving client's DO flag if set)
+    if arcount == 1 {
+        let ancount = ((query[6] as usize) << 8) | (query[7] as usize);
+        let nscount = ((query[8] as usize) << 8) | (query[9] as usize);
+        if ancount == 0 && nscount == 0 {
+            if let Some(q_end) = crate::dns::filter::extract_question_end(query) {
+                let opt_part = &query[q_end..];
+                // RFC 6891 OPT record: root label (0x00) + type 41 (0x00, 0x29) + udp size (2B) + flags (4B) + rdlen (2B)
+                if opt_part.len() >= 11 && opt_part[0] == 0x00 && opt_part[1] == 0x00 && opt_part[2] == 0x29 {
+                    let client_do = (opt_part[7] & 0x80) != 0;
+                    let mut stripped = query[..q_end].to_vec();
+                    stripped[10] = 0;
+                    stripped[11] = 0;
+                    return apply_edns_options_with_payload_size(
+                        &stripped,
+                        dnssec || client_do,
+                        padding,
+                        ecs,
+                        payload_size,
+                    );
+                }
+            }
+        }
+    }
+
+    // if arcount > 0 and not a standard standalone OPT record, return query as-is
     query.to_vec()
 }
 
@@ -211,5 +237,28 @@ mod tests {
         // Payload size is bytes 3 and 4 after root label (offset opt_start + 3..opt_start + 5)
         let size = u16::from_be_bytes([formatted[opt_start + 3], formatted[opt_start + 4]]);
         assert_eq!(size, 1252);
+    }
+
+    #[test]
+    fn test_apply_edns_replaces_existing_opt_record() {
+        // Construct query that already has an empty OPT RR (arcount = 1)
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        // Existing 11-byte OPT RR: root label 0x00, type 41 (0x00, 0x29), size 4096 (0x10, 0x00), flags (0x00, 0x00, 0x80, 0x00 with DO bit), rdlen 0
+        query.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00]);
+
+        let padded = apply_edns_padding(&query, false);
+        // arcount must still be 1
+        assert_eq!(padded[10], 0x00);
+        assert_eq!(padded[11], 0x01);
+        // DO bit from existing client query must be preserved
+        let opt_start = 12 + 13 + 4; // header(12) + example.com(13) + type/class(4) = 29
+        assert_eq!(padded[opt_start], 0x00); // root label
+        assert_eq!(&padded[opt_start + 1..opt_start + 3], &[0x00, 0x29]); // type 41
+        assert_eq!(padded[opt_start + 7] & 0x80, 0x80); // DO bit preserved!
+        // padded length must be padded to a discrete boundary
+        assert!(padded.len() > query.len());
     }
 }

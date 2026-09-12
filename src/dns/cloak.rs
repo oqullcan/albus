@@ -182,7 +182,7 @@ impl CloakEngine {
         } else {
             self.wildcard_rules
                 .iter()
-                .find(|(suffix, _)| lower.ends_with(suffix))
+                .find(|(suffix, _)| lower.ends_with(suffix) || lower == suffix.trim_start_matches('.'))
                 .map(|(_, ip)| *ip)
         };
 
@@ -215,7 +215,7 @@ impl CloakEngine {
         } else {
             self.wildcard_cname_rules
                 .iter()
-                .find(|(suffix, _)| lower.ends_with(suffix))
+                .find(|(suffix, _)| lower.ends_with(suffix) || lower == suffix.trim_start_matches('.'))
                 .map(|(_, target)| target.as_str())
         };
 
@@ -227,7 +227,7 @@ impl CloakEngine {
             } else {
                 self.wildcard_rules
                     .iter()
-                    .find(|(suffix, _)| target_lower.ends_with(suffix))
+                    .find(|(suffix, _)| target_lower.ends_with(suffix) || target_lower == suffix.trim_start_matches('.'))
                     .map(|(_, ip)| *ip)
             };
 
@@ -275,6 +275,13 @@ impl CloakEngine {
         query: &[u8],
         target: SocketAddr,
     ) -> Result<Vec<u8>, std::io::Error> {
+        if query.len() < 12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dns query too short",
+            ));
+        }
+
         let bind_addr = if target.is_ipv6() {
             "[::]:0"
         } else {
@@ -286,13 +293,23 @@ impl CloakEngine {
 
         let mut buf = [0u8; 4096];
         let timeout = Duration::from_millis(2000);
-        let len = tokio::time::timeout(timeout, sock.recv(&mut buf))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "split-dns forward timeout")
-            })??;
+        let start = std::time::Instant::now();
 
-        Ok(buf[..len].to_vec())
+        loop {
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "split-dns forward timeout")
+            })?;
+
+            let len = tokio::time::timeout(remaining, sock.recv(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "split-dns forward timeout")
+                })??;
+
+            if len >= 12 && buf[0] == query[0] && buf[1] == query[1] {
+                return Ok(buf[..len].to_vec());
+            }
+        }
     }
 }
 
@@ -554,6 +571,11 @@ mod tests {
             .resolve_cloaked("router.internal", 1, &query)
             .expect("must resolve wildcard");
         assert!(wild_resp.windows(4).any(|w| w == [10, 0, 0, 1]));
+
+        let apex_resp = engine
+            .resolve_cloaked("internal", 1, &query)
+            .expect("must resolve apex wildcard");
+        assert!(apex_resp.windows(4).any(|w| w == [10, 0, 0, 1]));
 
         assert!(engine.resolve_cloaked("google.com", 1, &query).is_none());
 

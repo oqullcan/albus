@@ -11,7 +11,7 @@ use std::path::Path;
 #[derive(Clone, Debug, Default)]
 pub struct DomainAllowlist {
     exact: HashSet<String>,
-    wildcards: Vec<String>,
+    wildcards: HashSet<String>,
 }
 
 impl DomainAllowlist {
@@ -36,13 +36,13 @@ impl DomainAllowlist {
 
         if let Some(rest) = trimmed.strip_prefix("*.") {
             let normalized = Self::normalize(rest);
-            if !normalized.is_empty() && !self.wildcards.contains(&normalized) {
-                self.wildcards.push(normalized);
+            if !normalized.is_empty() {
+                self.wildcards.insert(normalized);
             }
         } else if let Some(rest) = trimmed.strip_prefix('.') {
             let normalized = Self::normalize(rest);
-            if !normalized.is_empty() && !self.wildcards.contains(&normalized) {
-                self.wildcards.push(normalized);
+            if !normalized.is_empty() {
+                self.wildcards.insert(normalized);
             }
         } else if let Some(rest) = trimmed.strip_prefix('=') {
             // explicit exact match
@@ -94,12 +94,22 @@ impl DomainAllowlist {
         }
 
         let normalized = Self::normalize(domain);
+        if normalized.is_empty() {
+            return false;
+        }
+
         if self.exact.contains(&normalized) {
             return true;
         }
 
-        for suffix in &self.wildcards {
-            if normalized == *suffix || normalized.ends_with(&format!(".{}", suffix)) {
+        if self.wildcards.contains(&normalized) {
+            return true;
+        }
+
+        let mut rem = normalized.as_str();
+        while let Some(dot) = rem.find('.') {
+            rem = &rem[dot + 1..];
+            if self.wildcards.contains(rem) {
                 return true;
             }
         }

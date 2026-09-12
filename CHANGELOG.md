@@ -130,3 +130,21 @@ All notable changes to the Albus project are documented in this file.
   - Decays and updates TTL values across both answer and authority records, preventing stale authority records and clamping min TTL across all returned records.
 - **Split-DNS Forwarding Socket Isolation & RFC 1035 Match (`src/dns/forward.rs`)**:
   - Connected forwarding UDP socket directly to target to filter out stray middlebox packets and enforced RFC 1035 transaction ID validation on incoming responses.
+
+#### Performance Optimization, Pattern Persistence & Resolver Hardening
+- **Zero-Allocation Suffix & Wildcard Matching (`src/dns/pattern.rs`, `src/dns/allowlist.rs`)**:
+  - Replaced linear `Vec<String>` and repeated `format!(".{}", suffix)` heap allocations with `HashSet<String>` domain label boundary iteration (`while let Some(dot_idx) = rem.find('.')`), eliminating heap allocations during DNS query evaluation and guaranteeing O(labels) lookup complexity.
+- **Binary Blocklist Pattern Persistence (`src/dns/blocklist.rs`)**:
+  - Introduced Version 2 binary cache format for `CompactBlocklist`, serializing exact domain match rules, substring patterns, and prefixes across disk cache reloads without dropping rules, while maintaining backward compatibility with Version 1 files.
+- **Cloaking Wildcard Apex Match & Split-DNS Verification (`src/dns/cloak.rs`)**:
+  - Fixed wildcard rules in `CloakEngine` to resolve the apex domain (`internal`) as well as subdomains (`router.internal`).
+  - Enforced minimum query length check and RFC 1035 wire transaction ID matching in `CloakEngine::forward_query` to drop stray or spoofed split-DNS responses.
+- **SafeSearch Domain Targeting Guard (`src/dns/safesearch.rs`)**:
+  - Refined `is_google_search_domain` to target authentic search endpoints (`google.com`, `google.co.uk`, `google.com.tr`, `google.de`) while preserving developer and package repositories (`google.golang.org`, `google.dev`, `google.internal`).
+- **Passive Hop Distance Estimation (`src/core/autottl/probe.rs`)**:
+  - Implemented `estimate_hops_from_ttl` and `record_observed_ttl` in `AutoTtlEstimator` to passively learn hop distances from incoming IP packets using OS initial TTL heuristics, and added private/loopback path recognition.
+- **EDNS0 OPT Record Replacement & DO Flag Preservation (`src/dns/padding.rs`)**:
+  - Upgraded `apply_edns_options_with_payload_size` to handle client queries arriving with an empty standalone OPT record (`arcount == 1`), preserving the client's DO flag and applying discrete RFC 8467 padding and ECS zero-scope anonymity.
+- **IP Wildcard Pattern Matching (`src/dns/ip_filter.rs`)**:
+  - Enhanced `IpRule::Wildcard` to support prefix (`127.*`), suffix (`*.1`), and middle (`10.*.254`) wildcard patterns.
+

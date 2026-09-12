@@ -12,12 +12,23 @@ pub enum PatternRule {
     Suffix(String),    // *.example.com or example.com (matches example.com and all subdomains)
 }
 
+impl PatternRule {
+    pub fn to_rule_string(&self) -> String {
+        match self {
+            PatternRule::Exact(d) => format!("={}", d),
+            PatternRule::Substring(s) => format!("*{}*", s),
+            PatternRule::Prefix(p) => format!("{}*", p),
+            PatternRule::Suffix(s) => format!("*.{}", s),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PatternMatcher {
     exact: HashSet<String>,
     substrings: Vec<String>,
     prefixes: Vec<String>,
-    suffixes: Vec<String>,
+    suffixes: HashSet<String>,
 }
 
 impl PatternMatcher {
@@ -104,15 +115,36 @@ impl PatternMatcher {
                 self.exact.insert(d);
             }
             PatternRule::Substring(s) => {
-                self.substrings.push(s);
+                if !self.substrings.contains(&s) {
+                    self.substrings.push(s);
+                }
             }
             PatternRule::Prefix(p) => {
-                self.prefixes.push(p);
+                if !self.prefixes.contains(&p) {
+                    self.prefixes.push(p);
+                }
             }
             PatternRule::Suffix(s) => {
-                self.suffixes.push(s);
+                self.suffixes.insert(s);
             }
         }
+    }
+
+    pub fn all_rules(&self) -> Vec<PatternRule> {
+        let mut rules = Vec::with_capacity(self.len());
+        for e in &self.exact {
+            rules.push(PatternRule::Exact(e.clone()));
+        }
+        for s in &self.substrings {
+            rules.push(PatternRule::Substring(s.clone()));
+        }
+        for p in &self.prefixes {
+            rules.push(PatternRule::Prefix(p.clone()));
+        }
+        for s in &self.suffixes {
+            rules.push(PatternRule::Suffix(s.clone()));
+        }
+        rules
     }
 
     pub fn is_empty(&self) -> bool {
@@ -128,6 +160,9 @@ impl PatternMatcher {
 
     pub fn matches(&self, domain: &str) -> bool {
         let clean = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if clean.is_empty() {
+            return false;
+        }
 
         // 1. Exact match check
         if self.exact.contains(&clean) {
@@ -148,9 +183,14 @@ impl PatternMatcher {
             }
         }
 
-        // 4. Suffix/subdomain match check
-        for suff in &self.suffixes {
-            if clean == *suff || clean.ends_with(&format!(".{}", suff)) {
+        // 4. Suffix/subdomain match check (O(labels) lookup with 0 heap allocations)
+        if self.suffixes.contains(&clean) {
+            return true;
+        }
+        let mut remainder = clean.as_str();
+        while let Some(dot_idx) = remainder.find('.') {
+            remainder = &remainder[dot_idx + 1..];
+            if self.suffixes.contains(remainder) {
                 return true;
             }
         }

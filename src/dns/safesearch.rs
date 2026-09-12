@@ -133,13 +133,27 @@ impl SafeSearchEngine {
 }
 
 fn is_google_search_domain(d: &str) -> bool {
-    if d == "google.com" || d == "www.google.com" {
+    let clean = d.trim().trim_end_matches('.').to_ascii_lowercase();
+    if clean == "google.com" || clean == "www.google.com" {
         return true;
     }
-    // match international TLDs: google.co.uk, google.com.tr, google.de, etc.
-    let parts: Vec<&str> = d.split('.').collect();
-    if parts.len() >= 2 && (parts[0] == "google" || (parts.len() >= 3 && parts[0] == "www" && parts[1] == "google")) {
-        return true;
+    let parts: Vec<&str> = clean.split('.').collect();
+    // Case 1: google.<ccTLD> (e.g. google.de, google.fr, google.ca)
+    if parts.len() == 2 && parts[0] == "google" {
+        return parts[1].len() == 2 || parts[1] == "cat";
+    }
+    // Case 2: www.google.<ccTLD> (e.g. www.google.de, www.google.it)
+    if parts.len() == 3 && parts[0] == "www" && parts[1] == "google" {
+        return parts[2].len() == 2 || parts[2] == "cat";
+    }
+    // Case 3: google.<sld>.<ccTLD> (e.g. google.co.uk, google.com.tr, google.co.jp)
+    const VALID_SLDS: &[&str] = &["com", "co", "org", "net", "edu", "gov", "ac", "ne", "it"];
+    if parts.len() == 3 && parts[0] == "google" {
+        return VALID_SLDS.contains(&parts[1]) && parts[2].len() == 2;
+    }
+    // Case 4: www.google.<sld>.<ccTLD> (e.g. www.google.co.uk, www.google.com.tr)
+    if parts.len() == 4 && parts[0] == "www" && parts[1] == "google" {
+        return VALID_SLDS.contains(&parts[2]) && parts[3].len() == 2;
     }
     false
 }
@@ -240,6 +254,14 @@ mod tests {
 
         let google_aaaa = engine.check("google.com.tr", 28);
         assert_eq!(google_aaaa, Some(SafeSearchOverride::Ipv6(GOOGLE_SAFESEARCH_V6)));
+
+        let google_uk = engine.check("www.google.co.uk", 1);
+        assert_eq!(google_uk, Some(SafeSearchOverride::Ipv4(GOOGLE_SAFESEARCH_V4)));
+
+        // Non-search Google domains must not be redirected
+        assert_eq!(engine.check("google.golang.org", 1), None);
+        assert_eq!(engine.check("google.dev", 1), None);
+        assert_eq!(engine.check("mail.google.com", 1), None);
 
         let bing_a = engine.check("www.bing.com", 1);
         assert_eq!(bing_a, Some(SafeSearchOverride::Ipv4(BING_SAFESEARCH_V4)));

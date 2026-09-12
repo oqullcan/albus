@@ -70,8 +70,8 @@ impl IpRule {
             }
             IpRule::Wildcard(pat) => {
                 let ip_str = ip.to_string().to_ascii_lowercase();
-                if let Some(prefix) = pat.strip_suffix('*') {
-                    ip_str.starts_with(prefix)
+                if let Some((prefix, suffix)) = pat.split_once('*') {
+                    ip_str.starts_with(prefix) && ip_str.ends_with(suffix)
                 } else {
                     ip_str == *pat
                 }
@@ -349,6 +349,12 @@ mod tests {
         assert!(filter.is_blocked("192.168.1.100".parse().unwrap()));
         // 192.168.1.50 is allowed by allowed rule!
         assert!(!filter.is_blocked("192.168.1.50".parse().unwrap()));
+
+        // Middle wildcard test
+        let mut f_mid = IpFilter::default();
+        f_mid.add_blocked_rule(IpRule::Wildcard("10.*.254".to_string()));
+        assert!(f_mid.is_blocked("10.50.1.254".parse().unwrap()));
+        assert!(!f_mid.is_blocked("10.50.1.253".parse().unwrap()));
 
         // IPv6 CIDR match
         assert!(filter.is_blocked("2606:4700:1:ffff::1".parse().unwrap()));

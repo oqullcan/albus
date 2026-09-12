@@ -83,6 +83,16 @@ impl AutoTtlEstimator {
         debug!(ip = %dst_ip, total_hops = estimated_hops, optimal_ttl = optimal_ttl, "Auto-TTL estimated");
         self.cache.insert(dst_ip, optimal_ttl);
     }
+
+    /// Passively records an observed incoming packet TTL, deriving hop distance and caching the optimal evasion TTL.
+    pub fn record_observed_ttl(&self, dst_ip: Ipv4Addr, observed_ttl: u8) {
+        if !self.config.enabled {
+            return;
+        }
+        let hops = estimate_hops_from_ttl(observed_ttl);
+        let optimal = self.calculate_optimal_ttl(hops);
+        self.cache.insert(dst_ip, optimal);
+    }
 }
 
 // parses /proc/net/route to determine the primary outbound interface and gateway
@@ -130,8 +140,29 @@ pub fn resolve_optimal_restore_mss() -> u16 {
     1460
 }
 
+/// Estimates network router hop distance from observed IP packet TTL using standard initial TTL heuristics.
+pub fn estimate_hops_from_ttl(received_ttl: u8) -> u8 {
+    let initial_ttl: u8 = if received_ttl <= 32 {
+        32
+    } else if received_ttl <= 64 {
+        64
+    } else if received_ttl <= 128 {
+        128
+    } else {
+        255
+    };
+    initial_ttl.saturating_sub(received_ttl).max(1)
+}
+
 // sends synthetic traceroute probe to estimate network layer router hop count
 pub async fn measure_hop_distance(dst_ip: Ipv4Addr) -> u8 {
+    if dst_ip.is_loopback() {
+        return 1;
+    }
+    if dst_ip.is_private() {
+        return 2;
+    }
+
     let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(_) => return 12,
@@ -218,5 +249,25 @@ mod tests {
         if let Some(mtu) = detect_interface_mtu("lo") {
             assert!(mtu > 0);
         }
+    }
+
+    #[test]
+    fn test_estimate_hops_from_ttl_and_observed_recording() {
+        assert_eq!(estimate_hops_from_ttl(54), 10); // 64 - 54
+        assert_eq!(estimate_hops_from_ttl(118), 10); // 128 - 118
+        assert_eq!(estimate_hops_from_ttl(245), 10); // 255 - 245
+        assert_eq!(estimate_hops_from_ttl(28), 4); // 32 - 28
+
+        let estimator = AutoTtlEstimator::new(AutoTtlConfig::default());
+        let ip = Ipv4Addr::new(93, 184, 216, 34);
+        estimator.record_observed_ttl(ip, 54); // 10 hops -> optimal TTL 6
+        assert_eq!(estimator.get_ttl(ip), 6);
+    }
+
+    #[tokio::test]
+    async fn test_measure_hop_distance_private_and_loopback() {
+        assert_eq!(measure_hop_distance(Ipv4Addr::new(127, 0, 0, 1)).await, 1);
+        assert_eq!(measure_hop_distance(Ipv4Addr::new(192, 168, 1, 1)).await, 2);
+        assert_eq!(measure_hop_distance(Ipv4Addr::new(10, 0, 0, 1)).await, 2);
     }
 }
