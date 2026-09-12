@@ -31,7 +31,9 @@ pub struct BpfManagerConfig {
     pub fake_tcp_flags: Option<u8>,
     pub pqc: bool,
     pub ja4_mimic: bool,
+    pub ja4_profile: Option<crate::core::ja4_mimic::BrowserProfile>,
     pub stack_morph: bool,
+    pub stack_morph_profile: Option<crate::core::stack_morph::OsProfile>,
     pub auto_ttl_estimator: AutoTtlEstimator,
 }
 
@@ -117,6 +119,7 @@ impl BpfManager {
         let fake_window_size = self.cfg.fake_window_size;
         let fake_tcp_flags = self.cfg.fake_tcp_flags;
         let stack_morph = self.cfg.stack_morph;
+        let stack_morph_profile = self.cfg.stack_morph_profile;
         running.store(true, Ordering::SeqCst);
 
         self.engine = Some(engine);
@@ -145,11 +148,15 @@ impl BpfManager {
             } else {
                 crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL.to_vec()
             };
-            let profiles = [
-                crate::core::ja4_mimic::BrowserProfile::Chrome130,
-                crate::core::ja4_mimic::BrowserProfile::Firefox130,
-                crate::core::ja4_mimic::BrowserProfile::Safari18,
-            ];
+            let profiles: Vec<crate::core::ja4_mimic::BrowserProfile> = if let Some(prof) = self.cfg.ja4_profile {
+                vec![prof]
+            } else {
+                vec![
+                    crate::core::ja4_mimic::BrowserProfile::Chrome130,
+                    crate::core::ja4_mimic::BrowserProfile::Firefox130,
+                    crate::core::ja4_mimic::BrowserProfile::Safari18,
+                ]
+            };
             let mut payloads = Vec::with_capacity(pool.len() * profiles.len());
             for &sni in &pool {
                 for &prof in &profiles {
@@ -275,7 +282,7 @@ impl BpfManager {
                     };
 
                     let os_profile = if stack_morph {
-                        Some(crate::core::stack_morph::OsProfile::Windows11)
+                        Some(stack_morph_profile.unwrap_or(crate::core::stack_morph::OsProfile::Windows11))
                     } else {
                         None
                     };
@@ -371,7 +378,9 @@ mod tests {
             fake_tcp_flags: None,
             pqc: true,
             ja4_mimic: false,
+            ja4_profile: None,
             stack_morph: false,
+            stack_morph_profile: None,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
         }
     }

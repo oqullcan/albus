@@ -39,6 +39,10 @@ All notable changes to the Albus project are documented in this file.
   - Dual-source CPU RDRAND + OS CSPRNG blending with continuous FIPS 140-2 repetition health checking wired into differential privacy telemetry noise and packet randomization.
 - **Post-Quantum DNSSEC Trust Anchors (`src/dns/dnssec.rs`)**:
   - Enforces RFC 4035 anti-downgrade and IANA root trust anchor pinning (KSK-2017 and KSK-2024) with upstream AD bit verification.
+- **Unified CLI and Config Pipeline Reconciliation (`src/app/config.rs`, `src/app/defense_profile.rs`, `src/main.rs`)**:
+  - Implemented `Config::merge_run_args` and `Config::apply_defense_profile` to eliminate duplicated boilerplate and guarantee that all CLI parameters (`--mss`, `--fake-sni`, `--defense-profile`, etc.) override file defaults completely and consistently.
+  - Added dynamic string parsers `OsProfile::from_str` and `BrowserProfile::from_str` to wire custom OS targets (macOS, Windows, Linux) and browser profiles (Chrome, Firefox, Safari) into `BpfManager` packet crafting loops.
+  - Defense profiles (`Paranoid`, `CensorshipResistant`, `MaximumPrivacy`) now genuinely activate underlying defenses (`anti_injection`, `ja4_mimic`, `stack_morph`, `simd_accel`) in the live daemon pipeline.
 
 #### Wire-Level Integration Verification (`tests/wire_level_evasion_integration.rs`)
 - Added comprehensive integration tests proving wire-observable differences:
@@ -46,6 +50,7 @@ All notable changes to the Albus project are documented in this file.
   - `test_wire_level_stack_morph_difference`: Verifies that morphed TCP segments carry authentic OS TCP options and window sizes.
   - `test_wire_level_anti_injection_defense`: Verifies dropping of censor-injected TCP RSTs (divergent TTL / out-of-window seq) and GFW poisoned DNS responses.
   - `test_wire_level_ipcrypt_batch_and_secure_mem`: Verifies physical RAM locking (`is_locked()`), batch vs scalar pseudonymization equivalence, and decryption roundtrips.
+  - `test_wire_level_defense_profile_pipeline_activation`: Verifies CLI `--defense-profile paranoid` end-to-end activation of anti-injection, JA4 mimicry, stack morphing, and SIMD acceleration via `merge_run_args()`.
 
 ### Security & Cryptographic Hardening
 

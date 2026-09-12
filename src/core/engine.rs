@@ -30,7 +30,9 @@ pub struct Engine {
 
 impl Engine {
     // initializes engine subsystems and configures runtime parameters
-    pub fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(mut cfg: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        cfg.apply_defense_profile();
+
         // resolve upstream doh resolver ips to populate bpf exclusion map
         let mut exclude_ips = if cfg.doh_enabled {
             extract_upstream_ips(&cfg.doh_upstream, &cfg.doh_bootstrap_ips)
@@ -61,6 +63,9 @@ impl Engine {
         };
         let auto_ttl_estimator = AutoTtlEstimator::new(auto_ttl_config);
 
+        let ja4_profile = cfg.ja4_mimic.as_deref().and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
+        let stack_morph_profile = cfg.stack_morph.as_deref().and_then(crate::core::stack_morph::OsProfile::from_str);
+
         // assemble bpf manager configuration parameters
         let bpf_cfg = BpfManagerConfig {
             mss: cfg.mss,
@@ -83,7 +88,9 @@ impl Engine {
             fake_tcp_flags: cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: cfg.pqc,
             ja4_mimic: cfg.ja4_mimic.is_some(),
+            ja4_profile,
             stack_morph: cfg.stack_morph.is_some(),
+            stack_morph_profile,
             auto_ttl_estimator,
         };
 
@@ -831,7 +838,8 @@ impl Engine {
 
     // reloads persistent configuration and updates ebpf kernel maps live without process restart
     pub async fn reload_config(&mut self) {
-        let new_cfg = Config::load_or_default();
+        let mut new_cfg = Config::load_or_default();
+        new_cfg.apply_defense_profile();
         info!(
             "Reloading configuration from {}",
             Config::default_config_path().display()
@@ -871,6 +879,9 @@ impl Engine {
         };
         let auto_ttl_estimator = AutoTtlEstimator::new(auto_ttl_config);
 
+        let ja4_profile = new_cfg.ja4_mimic.as_deref().and_then(crate::core::ja4_mimic::BrowserProfile::from_str);
+        let stack_morph_profile = new_cfg.stack_morph.as_deref().and_then(crate::core::stack_morph::OsProfile::from_str);
+
         let bpf_cfg = BpfManagerConfig {
             mss: new_cfg.mss,
             min_mss: new_cfg.min_mss,
@@ -892,7 +903,9 @@ impl Engine {
             fake_tcp_flags: new_cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: new_cfg.pqc,
             ja4_mimic: new_cfg.ja4_mimic.is_some(),
+            ja4_profile,
             stack_morph: new_cfg.stack_morph.is_some(),
+            stack_morph_profile,
             auto_ttl_estimator,
         };
 

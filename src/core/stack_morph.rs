@@ -12,6 +12,16 @@ pub enum OsProfile {
 }
 
 impl OsProfile {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "windows" | "windows11" | "win" | "win11" => Some(Self::Windows11),
+            "macos" | "macossequoia" | "mac" | "sequoia" | "apple" => Some(Self::MacOsSequoia),
+            "ios" | "ios18" | "iphone" => Some(Self::Ios18),
+            "linux" | "linuxstock" | "ubuntu" => Some(Self::LinuxStock),
+            _ => None,
+        }
+    }
+
     pub fn default_ttl(&self) -> u8 {
         match self {
             Self::Windows11 => 128,
@@ -163,5 +173,17 @@ mod tests {
         let linux_opts = OsProfile::LinuxStock.build_tcp_options(1460, 7, 100, 0);
         assert_eq!(linux_opts[4], 4); // SACK Permitted
         assert_eq!(linux_opts[5], 2);
+    }
+
+    #[test]
+    fn test_os_profile_from_str() {
+        assert_eq!(OsProfile::from_str("windows11"), Some(OsProfile::Windows11));
+        assert_eq!(OsProfile::from_str("win"), Some(OsProfile::Windows11));
+        assert_eq!(OsProfile::from_str("macos"), Some(OsProfile::MacOsSequoia));
+        assert_eq!(OsProfile::from_str("sequoia"), Some(OsProfile::MacOsSequoia));
+        assert_eq!(OsProfile::from_str("ios"), Some(OsProfile::Ios18));
+        assert_eq!(OsProfile::from_str("linux"), Some(OsProfile::LinuxStock));
+        assert_eq!(OsProfile::from_str("ubuntu"), Some(OsProfile::LinuxStock));
+        assert_eq!(OsProfile::from_str("unknown_os"), None);
     }
 }

@@ -1106,6 +1106,324 @@ impl Config {
         }
         None
     }
+
+    /// Applies active defense profile settings if defense_profile is set.
+    pub fn apply_defense_profile(&mut self) {
+        if let Some(ref prof_str) = self.defense_profile {
+            if let Some(profile) = crate::app::defense_profile::DefenseProfile::from_str(prof_str) {
+                profile.apply(self);
+            }
+        }
+    }
+
+    /// Merges command-line arguments into configuration schema.
+    pub fn merge_run_args(&mut self, args: &crate::app::cli::RunArgs) {
+        if args.fake_ttl != 8 {
+            self.fake_ttl = args.fake_ttl;
+        }
+        if let Some(ref sni) = args.fake_sni {
+            self.fake_sni = Some(sni.clone());
+        }
+        if args.fake_bad_checksum {
+            self.fake_bad_checksum = true;
+        }
+        if args.fake_seq_offset != 0 {
+            self.fake_seq_offset = args.fake_seq_offset;
+        }
+        if let Some(win) = args.fake_window_size {
+            self.fake_window_size = Some(win);
+        }
+        if let Some(ref flags) = args.fake_tcp_flags {
+            self.fake_tcp_flags = Some(flags.clone());
+        }
+        if !args.auto_ttl {
+            self.auto_ttl = false;
+        }
+        if args.min_ttl != 3 {
+            self.min_ttl = args.min_ttl;
+        }
+        if args.max_ttl != 12 {
+            self.max_ttl = args.max_ttl;
+        }
+        if !args.doh {
+            self.doh_enabled = false;
+        }
+        if !args.dns_racing {
+            self.dns_racing = false;
+        }
+        if args.doh_upstream != "quad9" {
+            self.doh_upstream = args.doh_upstream.clone();
+        }
+        if !args.doh_bootstrap_ips.is_empty() {
+            self.doh_bootstrap_ips = args.doh_bootstrap_ips.clone();
+        }
+        if !args.dnssec {
+            self.dnssec = false;
+        }
+        if !args.block_quic {
+            self.block_quic = false;
+        }
+        if !args.block_stun {
+            self.block_stun = false;
+        }
+        if !args.kill_switch {
+            self.kill_switch = false;
+        }
+        if args.network_lockdown {
+            self.network_lockdown = true;
+        }
+        if !args.block_ipv6 {
+            self.block_ipv6 = false;
+        }
+        if args.mss != 88 {
+            self.mss = args.mss;
+        }
+        if args.min_mss != 64 {
+            self.min_mss = args.min_mss;
+        }
+        if args.restore_after_bytes != 600 {
+            self.restore_after_bytes = args.restore_after_bytes;
+        }
+        if args.restore_mss != 0 {
+            self.restore_mss = args.restore_mss;
+        }
+        if args.ports != [443] {
+            self.ports = args.ports.clone();
+        }
+        if args.cgroup != "/sys/fs/cgroup" {
+            self.cgroup_path = args.cgroup.clone();
+        }
+        if !args.pqc {
+            self.pqc = false;
+        }
+        if args.ram_only {
+            self.ram_only = true;
+        }
+        if !args.anti_dns_rebinding {
+            self.anti_dns_rebinding = false;
+        }
+        if !args.block_undelegated {
+            self.block_undelegated = false;
+        }
+        if !args.edns_padding {
+            self.edns_padding = false;
+        }
+        if !args.blocklist {
+            self.blocklist = false;
+        }
+        if let Some(ref path) = args.blocklist_path {
+            self.blocklist_path = Some(path.clone());
+        }
+        if let Some(ref domains) = args.allow_domains {
+            self.allow_domains = domains.clone();
+        }
+        if let Some(ref path) = args.allowlist_path {
+            self.allowlist_path = Some(path.clone());
+        }
+        if args.dns64 {
+            self.dns64 = true;
+        }
+        if !args.block_bogons {
+            self.block_bogons = false;
+        }
+        if !args.uncloak_cnames {
+            self.uncloak_cnames = false;
+        }
+        if !args.netmon {
+            self.netmon = false;
+        }
+        if !args.tcp_listener {
+            self.tcp_listener = false;
+        }
+        if !args.local_doh {
+            self.local_doh = false;
+        }
+        if args.local_doh_addr != "127.0.0.1:8053" {
+            self.local_doh_addr = args.local_doh_addr.clone();
+        }
+        if args.query_log {
+            self.query_log = true;
+        }
+        if let Some(ref path) = args.query_log_path {
+            self.query_log_path = Some(path.clone());
+        }
+        if let Some(ref key) = args.ipcrypt_key {
+            self.ipcrypt_key = Some(key.clone());
+        }
+        if args.odoh {
+            self.odoh_enabled = true;
+        }
+        if let Some(ref relay) = args.odoh_relay {
+            self.odoh_relay = Some(relay.clone());
+        }
+        if let Some(ref target) = args.odoh_target {
+            self.odoh_target = Some(target.clone());
+        }
+        if let Some(ref proxy) = args.socks5_proxy {
+            self.socks5_proxy = Some(proxy.clone());
+        }
+        if args.tor {
+            self.tor = true;
+        }
+        if args.nx_log {
+            self.nx_log = true;
+        }
+        if let Some(ref path) = args.nx_log_path {
+            self.nx_log_path = Some(path.clone());
+        }
+        if let Some(ref ecs) = args.edns_client_subnet {
+            self.edns_client_subnet = Some(ecs.clone());
+        }
+        if args.metrics {
+            self.metrics = true;
+        }
+        if args.metrics_addr != "127.0.0.1:9153" {
+            self.metrics_addr = args.metrics_addr.clone();
+        }
+        if let Some(ref cert) = args.tls_client_cert {
+            self.tls_client_cert = Some(cert.clone());
+        }
+        if let Some(ref key) = args.tls_client_key {
+            self.tls_client_key = Some(key.clone());
+        }
+        if let Some(ref path) = args.forwarding_rules_path {
+            self.forwarding_rules_path = Some(path.clone());
+        }
+        if args.cache_neg_min_ttl != 60 {
+            self.cache_neg_min_ttl = args.cache_neg_min_ttl;
+        }
+        if args.cache_neg_max_ttl != 600 {
+            self.cache_neg_max_ttl = args.cache_neg_max_ttl;
+        }
+        if let Some(ref path) = args.tls_key_log_file {
+            self.tls_key_log_file = Some(path.clone());
+        }
+        if (args.timeout_load_reduction - 0.75).abs() > f64::EPSILON {
+            self.timeout_load_reduction = args.timeout_load_reduction;
+        }
+        if let Some(w) = args.web_ui {
+            self.web_ui = w;
+        }
+        if let Some(ref addr) = args.web_ui_addr {
+            self.web_ui_addr = addr.clone();
+        }
+        if let Some(ref user) = args.web_ui_user {
+            self.web_ui_user = Some(user.clone());
+        }
+        if let Some(ref pass) = args.web_ui_pass {
+            self.web_ui_pass = Some(pass.clone());
+        }
+        if let Some(ref s) = args.dnscrypt_servers {
+            self.dnscrypt_servers = s.clone();
+        }
+        if let Some(ref r) = args.dnscrypt_relays {
+            self.dnscrypt_relays = r.clone();
+        }
+        if args.cache_min_ttl != 60 {
+            self.cache_min_ttl = args.cache_min_ttl;
+        }
+        if args.cache_max_ttl != 86400 {
+            self.cache_max_ttl = args.cache_max_ttl;
+        }
+        if let Some(ref path) = args.blocked_ips_file {
+            self.blocked_ips_file = Some(path.clone());
+        }
+        if let Some(ref path) = args.allowed_ips_file {
+            self.allowed_ips_file = Some(path.clone());
+        }
+        if let Some(ref ips) = args.allowed_ips {
+            self.allowed_ips = ips.clone();
+        }
+        if let Some(ref path) = args.blocked_names_log {
+            self.blocked_names_log_path = Some(path.clone());
+        }
+        if let Some(ref path) = args.blocked_ips_log {
+            self.blocked_ips_log_path = Some(path.clone());
+        }
+        if let Some(ref path) = args.allowed_names_log {
+            self.allowed_names_log_path = Some(path.clone());
+        }
+        if let Some(ref path) = args.allowed_ips_log {
+            self.allowed_ips_log_path = Some(path.clone());
+        }
+        if args.force_tcp {
+            self.force_tcp = true;
+        }
+        if let Some(ref path) = args.captive_map_file {
+            self.captive_portals_map_file = Some(path.clone());
+        }
+        if let Some(ref dot) = args.dot_upstream {
+            self.dot_upstream = Some(dot.clone());
+        }
+        if let Some(ref path) = args.client_rules_file {
+            self.client_rules_file = Some(path.clone());
+        }
+        if let Some(ref relays) = args.anonymized_doh_relays {
+            self.anonymized_doh_relays = relays.clone();
+        }
+        if let Some(v) = args.safe_search {
+            self.safe_search = v;
+        }
+        if let Some(ref mode) = args.youtube_restricted_mode {
+            self.youtube_restricted_mode = Some(mode.clone());
+        }
+        if let Some(v) = args.local_dot {
+            self.local_dot = v;
+        }
+        if let Some(ref addr) = args.local_dot_addr {
+            self.local_dot_addr = addr.clone();
+        }
+        if let Some(v) = args.randomize_ecs {
+            self.randomize_ecs = v;
+        }
+        if let Some(v) = args.load_system_hosts {
+            self.load_system_hosts = v;
+        }
+        if let Some(ref doq) = args.doq_upstream {
+            self.doq_upstream = Some(doq.clone());
+        }
+        if let Some(ref p) = args.pidfile {
+            self.pid_file = Some(p.clone());
+        }
+        if args.cloak_ttl != 10 && args.cloak_ttl != 300 {
+            self.cloak_ttl = args.cloak_ttl;
+        }
+        if args.reject_ttl != 10 {
+            self.reject_ttl = args.reject_ttl;
+        }
+        if let Some(ref fb) = args.fragments_blocked {
+            self.fragments_blocked = fb.clone();
+        }
+        if let Some(ref path) = args.cloaking_rules_path {
+            self.cloaking_rules_path = Some(path.clone());
+        }
+        if let Some(lvl) = args.web_ui_privacy_level {
+            self.web_ui_privacy_level = lvl;
+        }
+        if let Some(ref prof) = args.defense_profile {
+            self.defense_profile = Some(prof.clone());
+        }
+        if let Some(ref j4) = args.ja4_mimic {
+            self.ja4_mimic = Some(j4.clone());
+        }
+        if let Some(ref sm) = args.stack_morph {
+            self.stack_morph = Some(sm.clone());
+        }
+        if args.anti_injection {
+            self.anti_injection = true;
+        }
+        if let Some(tol) = args.anti_injection_ttl_tolerance {
+            self.anti_injection_ttl_tolerance = tol;
+        }
+        if args.simd_accel {
+            self.simd_accel = true;
+        }
+        if args.verbose {
+            self.verbose = true;
+        }
+
+        self.apply_defense_profile();
+    }
 }
 
 #[cfg(test)]

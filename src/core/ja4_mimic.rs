@@ -16,6 +16,15 @@ pub enum BrowserProfile {
 }
 
 impl BrowserProfile {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "chrome" | "chrome130" | "chromium" | "google" => Some(Self::Chrome130),
+            "firefox" | "firefox130" | "mozilla" | "ff" => Some(Self::Firefox130),
+            "safari" | "safari18" | "apple" => Some(Self::Safari18),
+            _ => None,
+        }
+    }
+
     /// Returns the standardized JA4 string for this profile with SNI present and h2 ALPN.
     pub fn expected_ja4(&self) -> String {
         compute_ja4_fingerprint(
@@ -288,5 +297,16 @@ mod tests {
         assert_eq!(hello[1], 0x03);
         assert_eq!(hello[2], 0x01);
         assert_eq!(hello[5], 0x01); // ClientHello
+    }
+
+    #[test]
+    fn test_browser_profile_from_str() {
+        assert_eq!(BrowserProfile::from_str("chrome130"), Some(BrowserProfile::Chrome130));
+        assert_eq!(BrowserProfile::from_str("chrome"), Some(BrowserProfile::Chrome130));
+        assert_eq!(BrowserProfile::from_str("firefox"), Some(BrowserProfile::Firefox130));
+        assert_eq!(BrowserProfile::from_str("mozilla"), Some(BrowserProfile::Firefox130));
+        assert_eq!(BrowserProfile::from_str("safari"), Some(BrowserProfile::Safari18));
+        assert_eq!(BrowserProfile::from_str("apple"), Some(BrowserProfile::Safari18));
+        assert_eq!(BrowserProfile::from_str("unknown_browser"), None);
     }
 }

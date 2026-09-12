@@ -224,3 +224,57 @@ fn test_wire_level_ipcrypt_batch_and_secure_mem() {
     let decrypted = batch_decrypt_v4(&crypt, &batch_encrypted);
     assert_eq!(decrypted, client_ips);
 }
+
+#[test]
+fn test_wire_level_defense_profile_pipeline_activation() {
+    use albus::app::cli::{Cli, Commands};
+    use albus::app::config::Config;
+    use clap::Parser;
+
+    // Simulate CLI run with albus run --defense-profile paranoid
+    let cli = Cli::parse_from(["albus", "run", "--defense-profile", "paranoid"]);
+    let run_args = match cli.command {
+        Some(Commands::Run(args)) => args,
+        _ => cli.run_args,
+    };
+
+    let mut cfg = Config::default();
+    assert!(!cfg.anti_injection);
+    assert!(cfg.ja4_mimic.is_none());
+    assert!(cfg.stack_morph.is_none());
+    assert!(!cfg.simd_accel);
+
+    cfg.merge_run_args(&run_args);
+
+    assert!(cfg.anti_injection);
+    assert_eq!(cfg.ja4_mimic.as_deref(), Some("chrome130"));
+    assert_eq!(cfg.stack_morph.as_deref(), Some("windows11"));
+    assert!(cfg.simd_accel);
+
+    // Verify OsProfile and BrowserProfile parsing from strings
+    assert_eq!(OsProfile::from_str("macos"), Some(OsProfile::MacOsSequoia));
+    assert_eq!(OsProfile::from_str("linux"), Some(OsProfile::LinuxStock));
+    assert_eq!(BrowserProfile::from_str("firefox"), Some(BrowserProfile::Firefox130));
+
+    // Verify wire-level packets for LinuxStock profile
+    let conn = ConnInfo::new_v4(
+        Ipv4Addr::new(192, 168, 1, 50),
+        Ipv4Addr::new(1, 1, 1, 1),
+        49152,
+        443,
+        2000,
+        0,
+    );
+    let pkt_linux = build_packet_stack_morphed(
+        &conn,
+        b"PING",
+        64,
+        false,
+        None,
+        None,
+        Some(OsProfile::LinuxStock),
+    );
+    let linux_bytes = pkt_linux.as_slice();
+    assert_eq!(linux_bytes[8], 64); // Linux TTL = 64
+    assert_eq!(u16::from_be_bytes([linux_bytes[20 + 14], linux_bytes[20 + 15]]), 64240); // Linux Window = 64240
+}
