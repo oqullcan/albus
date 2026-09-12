@@ -266,6 +266,7 @@ pub struct LoggerOptions {
     pub max_bytes: u64,
     pub max_backups: usize,
     pub ignored_qtypes: Vec<String>,
+    pub simd_accel: bool,
 }
 
 pub struct QueryLogger {
@@ -359,12 +360,13 @@ pub fn qtype_from_str(s: &str) -> Option<u16> {
             max_bytes,
             max_backups,
             ignored_qtypes,
+            simd_accel: false,
         };
         Self::start_full(opts)
     }
 
     pub fn start_full(opts: LoggerOptions) -> Arc<Self> {
-        let (tx, mut rx) = mpsc::channel::<QueryLogEntry>(2048);
+        let (tx, mut rx) = mpsc::channel::<QueryLogEntry>(8192);
         let ignored_set: std::collections::HashSet<u16> = opts
             .ignored_qtypes
             .iter()
@@ -398,14 +400,24 @@ pub fn qtype_from_str(s: &str) -> Option<u16> {
                 let client_display = match entry.client_ip {
                     IpAddr::V4(v4) => {
                         if let Some(ref crypt) = opts.ip_crypt {
-                            format!("ip:{}", crypt.encrypt(v4))
+                            if opts.simd_accel {
+                                let enc = crate::dns::ipcrypt_batch::batch_encrypt_v4(crypt, &[v4]);
+                                format!("ip:{}", enc[0])
+                            } else {
+                                format!("ip:{}", crypt.encrypt(v4))
+                            }
                         } else {
                             v4.to_string()
                         }
                     }
                     IpAddr::V6(v6) => {
                         if let Some(ref crypt) = opts.ip_crypt {
-                            format!("ip:{}", crypt.encrypt_v6(v6))
+                            if opts.simd_accel {
+                                let enc = crate::dns::ipcrypt_batch::batch_encrypt_v6(crypt, &[v6]);
+                                format!("ip:{}", enc[0])
+                            } else {
+                                format!("ip:{}", crypt.encrypt_v6(v6))
+                            }
                         } else {
                             v6.to_string()
                         }
@@ -715,6 +727,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             max_backups: 1,
             ignored_qtypes: vec![],
+            simd_accel: false,
         };
 
         let logger = QueryLogger::start_full(opts);

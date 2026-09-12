@@ -28,6 +28,7 @@ aws-lc-rs = "1.18"
 tokio-rustls = "0.26"
 quinn = { version = "0.11", default-features = false, features = ["rustls"] }
 subtle = "2.6"
+curve25519-dalek = { version = "5.0.0", default-features = false, features = ["alloc"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [build-dependencies]

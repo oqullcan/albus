@@ -112,6 +112,7 @@ pub struct DnsServer {
     pub dnscrypt_client: Option<Arc<tokio::sync::RwLock<crate::dns::dnscrypt_client::DnsCryptClient>>>,
     pub randomize_ecs: Arc<AtomicBool>,
     pub reject_ttl: Arc<AtomicU32>,
+    pub anti_injection: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -251,8 +252,21 @@ impl DnsServer {
             dnscrypt_client: None,
             randomize_ecs: Arc::new(AtomicBool::new(false)),
             reject_ttl: Arc::new(AtomicU32::new(10)),
+            anti_injection: None,
             shutdown_tx,
         })
+    }
+
+    /// Sets stateful anti-injection filter for detecting middlebox tampering.
+    pub fn with_anti_injection(mut self, filter: Arc<crate::core::anti_injection::AntiInjectionFilter>) -> Self {
+        self.anti_injection = Some(filter);
+        self
+    }
+
+    /// Sets optional stateful anti-injection filter for detecting middlebox tampering.
+    pub fn with_optional_anti_injection(mut self, filter: Option<Arc<crate::core::anti_injection::AntiInjectionFilter>>) -> Self {
+        self.anti_injection = filter;
+        self
     }
 
     /// Sets the TTL returned in synthetic responses for blocked/rejected queries.
@@ -1630,6 +1644,31 @@ impl DnsServer {
                             Some("dns_rebind"),
                         );
                         return Some(build_refused_response(query_data));
+                    }
+                }
+
+                // Stateful Anti-Injection filter (middlebox poisoning detection)
+                if let Some(ref anti_inj) = self.anti_injection {
+                    let ips = extract_resolved_ips(&resp_bytes);
+                    if !ips.is_empty() {
+                        let verdict = anti_inj.inspect_dns_response(&domain, &ips);
+                        if let crate::core::anti_injection::InjectionVerdict::DropInjectedDns(reason) = verdict {
+                            warn!(
+                                domain = %domain,
+                                reason = %reason,
+                                "Censor-injected DNS response detected and dropped by Anti-Injection filter"
+                            );
+                            self.stats.injected_dns_dropped.fetch_add(1, Ordering::Relaxed);
+                            self.maybe_log_query(
+                                client_ip,
+                                &domain,
+                                qtype,
+                                QueryStatus::Refused,
+                                start_time,
+                                Some("anti_injection_drop"),
+                            );
+                            return Some(build_refused_response(query_data));
+                        }
                     }
                 }
 

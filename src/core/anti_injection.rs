@@ -4,9 +4,26 @@
 //! by evaluating ttl hop-count discrepancies, tcp sequence window drift, and cryptographic flow tags.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+/// Known GFW / middlebox spoofed DNS injection addresses (documented signatures).
+pub const KNOWN_CENSOR_POISON_IPS_V4: &[Ipv4Addr] = &[
+    Ipv4Addr::new(37, 61, 54, 158),
+    Ipv4Addr::new(46, 82, 174, 68),
+    Ipv4Addr::new(59, 24, 3, 173),
+    Ipv4Addr::new(78, 16, 49, 15),
+    Ipv4Addr::new(8, 7, 198, 45),
+    Ipv4Addr::new(93, 46, 8, 89),
+    Ipv4Addr::new(159, 106, 121, 75),
+    Ipv4Addr::new(203, 98, 7, 65),
+    Ipv4Addr::new(243, 185, 187, 39),
+    Ipv4Addr::new(211, 139, 139, 169),
+    Ipv4Addr::new(10, 10, 34, 34),
+    Ipv4Addr::new(1, 2, 3, 4),
+    Ipv4Addr::new(0, 0, 0, 0),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionVerdict {
@@ -92,6 +109,31 @@ impl AntiInjectionFilter {
         InjectionVerdict::Legitimate
     }
 
+    /// Validates DNS response IPs and transaction characteristics against censor injection signatures.
+    pub fn inspect_dns_response(&self, _domain: &str, resolved_ips: &[IpAddr]) -> InjectionVerdict {
+        for &ip in resolved_ips {
+            match ip {
+                IpAddr::V4(v4) => {
+                    if KNOWN_CENSOR_POISON_IPS_V4.contains(&v4) {
+                        return InjectionVerdict::DropInjectedDns(
+                            "resolved IP matches known middlebox DNS poisoning signature",
+                        );
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    // Censors often inject documentation ranges (2001:db8::) or invalid prefixes
+                    let segments = v6.segments();
+                    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+                        return InjectionVerdict::DropInjectedDns(
+                            "resolved IPv6 matches documentation range injected by censor middlebox",
+                        );
+                    }
+                }
+            }
+        }
+        InjectionVerdict::Legitimate
+    }
+
     /// Cleans up stale flow states older than timeout.
     pub fn cleanup_stale(&self, timeout: Duration) {
         if let Ok(mut lock) = self.flows.write() {
@@ -141,6 +183,36 @@ mod tests {
                 assert!(reason.contains("out-of-window"));
             }
             _ => panic!("blind injected RST must be dropped"),
+        }
+    }
+
+    #[test]
+    fn test_anti_injection_dns_poisoning() {
+        let filter = AntiInjectionFilter::new(3);
+
+        // Legitimate resolution
+        let legit_ips = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
+        assert_eq!(
+            filter.inspect_dns_response("example.com", &legit_ips),
+            InjectionVerdict::Legitimate
+        );
+
+        // Known GFW injected IP (37.61.54.158)
+        let poisoned_ips = [IpAddr::V4(Ipv4Addr::new(37, 61, 54, 158))];
+        match filter.inspect_dns_response("twitter.com", &poisoned_ips) {
+            InjectionVerdict::DropInjectedDns(reason) => {
+                assert!(reason.contains("known middlebox DNS poisoning signature"));
+            }
+            _ => panic!("injected DNS response must be dropped"),
+        }
+
+        // Censor injected documentation range IPv6 (2001:db8::1)
+        let poisoned_v6 = ["2001:db8::1".parse().unwrap()];
+        match filter.inspect_dns_response("youtube.com", &poisoned_v6) {
+            InjectionVerdict::DropInjectedDns(reason) => {
+                assert!(reason.contains("documentation range"));
+            }
+            _ => panic!("injected IPv6 DNS response must be dropped"),
         }
     }
 }

@@ -3,13 +3,14 @@
 //! transforms 32-bit ipv4 addresses into deterministic pseudo-ipv4 addresses using a 16-byte key,
 //! preventing client ip disclosure in dns audit logs while preserving analytical grouping.
 
+use crate::dns::secure_mem::SecureKey;
 use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone)]
 pub struct IpCrypt {
-    key: [u8; 16],
+    key: SecureKey<16>,
 }
 
 impl std::fmt::Debug for IpCrypt {
@@ -20,7 +21,9 @@ impl std::fmt::Debug for IpCrypt {
 
 impl IpCrypt {
     pub fn new(key: [u8; 16]) -> Self {
-        Self { key }
+        Self {
+            key: SecureKey::from_bytes(key),
+        }
     }
 
     /// Derives a deterministic 128-bit key from an arbitrary human-readable passphrase using SHA-256.
@@ -33,7 +36,9 @@ impl IpCrypt {
         let mut key = [0u8; 16];
         key.copy_from_slice(&hash[..16]);
         hash.zeroize();
-        Self { key }
+        Self {
+            key: SecureKey::from_bytes(key),
+        }
     }
 
     // parses 16-byte (32-character) hex string into key
@@ -48,7 +53,19 @@ impl IpCrypt {
             key[i] = u8::from_str_radix(byte_str, 16)
                 .map_err(|e| format!("invalid hex at byte {}: {}", i, e))?;
         }
-        Ok(Self { key })
+        Ok(Self {
+            key: SecureKey::from_bytes(key),
+        })
+    }
+
+    /// Returns whether the underlying key memory is locked in physical RAM.
+    pub fn is_locked(&self) -> bool {
+        self.key.is_locked()
+    }
+
+    /// Returns the raw 16-byte key as a reference.
+    pub fn key_bytes(&self) -> &[u8; 16] {
+        self.key.as_bytes()
     }
 
     // encrypts / pseudonymizes an ipv4 address

@@ -3,7 +3,10 @@
 pub mod packet;
 pub mod types;
 
-pub use packet::{build_packet_stack_advanced, build_packet_stack_opts, parse_tcp_flags};
+pub use packet::{
+    build_packet_stack_advanced, build_packet_stack_morphed, build_packet_stack_opts,
+    parse_tcp_flags,
+};
 pub use types::ConnInfo;
 
 use std::io::{Error, Result};
@@ -78,15 +81,38 @@ impl RawSocket {
         window_size: Option<u16>,
         tcp_flags: Option<u8>,
     ) -> Result<usize> {
+        self.send_fake_morphed(
+            conn,
+            payload,
+            ttl,
+            bad_checksum,
+            window_size,
+            tcp_flags,
+            None,
+        )
+    }
+
+    // transmits raw packet payload with optional OS stack fingerprint morphing (options, window size, ttl)
+    pub fn send_fake_morphed(
+        &self,
+        conn: &ConnInfo,
+        payload: &[u8],
+        ttl: u8,
+        bad_checksum: bool,
+        window_size: Option<u16>,
+        tcp_flags: Option<u8>,
+        os_profile: Option<crate::core::stack_morph::OsProfile>,
+    ) -> Result<usize> {
         match (conn.src_ip, conn.dst_ip) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(dst_v4)) => {
-                let pkt = build_packet_stack_advanced(
+                let pkt = build_packet_stack_morphed(
                     conn,
                     payload,
                     ttl,
                     bad_checksum,
                     window_size,
                     tcp_flags,
+                    os_profile,
                 );
                 if pkt.is_empty() {
                     return Err(Error::other(
@@ -121,13 +147,14 @@ impl RawSocket {
                     .fd_v6
                     .ok_or_else(|| Error::other("IPv6 raw socket not available"))?;
 
-                let pkt = build_packet_stack_advanced(
+                let pkt = build_packet_stack_morphed(
                     conn,
                     payload,
                     ttl,
                     bad_checksum,
                     window_size,
                     tcp_flags,
+                    os_profile,
                 );
                 if pkt.is_empty() {
                     return Err(Error::other(

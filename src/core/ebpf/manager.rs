@@ -30,6 +30,8 @@ pub struct BpfManagerConfig {
     pub fake_window_size: Option<u16>,
     pub fake_tcp_flags: Option<u8>,
     pub pqc: bool,
+    pub ja4_mimic: bool,
+    pub stack_morph: bool,
     pub auto_ttl_estimator: AutoTtlEstimator,
 }
 
@@ -114,6 +116,7 @@ impl BpfManager {
         let fake_ttl_fallback = self.cfg.fake_ttl;
         let fake_window_size = self.cfg.fake_window_size;
         let fake_tcp_flags = self.cfg.fake_tcp_flags;
+        let stack_morph = self.cfg.stack_morph;
         running.store(true, Ordering::SeqCst);
 
         self.engine = Some(engine);
@@ -121,13 +124,10 @@ impl BpfManager {
         info!(
             mss = self.cfg.mss,
             min_mss = self.cfg.min_mss,
-            fallback_ttl = self.cfg.fake_ttl,
-            fake_sni = ?self.cfg.fake_sni,
-            bad_checksum = self.cfg.fake_bad_checksum,
-            fake_window_size = ?self.cfg.fake_window_size,
-            fake_tcp_flags = ?self.cfg.fake_tcp_flags,
-            pqc = self.cfg.pqc,
+            restore_mss = self.cfg.restore_mss,
             ports = ?self.cfg.ports,
+            ja4_mimic = self.cfg.ja4_mimic,
+            stack_morph = self.cfg.stack_morph,
             "albus active — MSS fragmentation + Auto-TTL fake injection"
         );
 
@@ -135,7 +135,33 @@ impl BpfManager {
         let running_clone = running.clone();
 
         // assemble decoy clienthello payloads: rotate across pool if no custom sni is forced
-        let fake_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
+        let fake_payloads: Vec<Vec<u8>> = if self.cfg.ja4_mimic {
+            let pool: Vec<&str> = if let Some(ref sni) = fake_sni {
+                if sni != "www.google.com" && !sni.is_empty() {
+                    vec![sni.as_str()]
+                } else {
+                    crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL.to_vec()
+                }
+            } else {
+                crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL.to_vec()
+            };
+            let profiles = [
+                crate::core::ja4_mimic::BrowserProfile::Chrome130,
+                crate::core::ja4_mimic::BrowserProfile::Firefox130,
+                crate::core::ja4_mimic::BrowserProfile::Safari18,
+            ];
+            let mut payloads = Vec::with_capacity(pool.len() * profiles.len());
+            for &sni in &pool {
+                for &prof in &profiles {
+                    payloads.push(crate::core::ja4_mimic::synthesize_client_hello(
+                        prof,
+                        sni,
+                        &["h2", "http/1.1"],
+                    ));
+                }
+            }
+            payloads
+        } else if let Some(ref sni) = fake_sni {
             if sni != "www.google.com" && !sni.is_empty() {
                 vec![
                     crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc),
@@ -248,13 +274,20 @@ impl BpfManager {
                         conn
                     };
 
-                    if let Err(e) = raw_socket.send_fake_advanced(
+                    let os_profile = if stack_morph {
+                        Some(crate::core::stack_morph::OsProfile::Windows11)
+                    } else {
+                        None
+                    };
+
+                    if let Err(e) = raw_socket.send_fake_morphed(
                         &conn_to_inject,
                         payload,
                         optimal_ttl,
                         fake_bad_checksum,
                         fake_window_size,
                         fake_tcp_flags,
+                        os_profile,
                     ) {
                         let proto_desc = if is_http { "fake HTTP request" } else { "fake ClientHello" };
                         warn!("Failed to inject {}: {}", proto_desc, e);
@@ -337,6 +370,8 @@ mod tests {
             fake_window_size: None,
             fake_tcp_flags: None,
             pqc: true,
+            ja4_mimic: false,
+            stack_morph: false,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
         }
     }

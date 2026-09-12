@@ -97,6 +97,14 @@ impl<const N: usize> Drop for SecureKey<N> {
     }
 }
 
+impl<const N: usize> PartialEq for SecureKey<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<const N: usize> Eq for SecureKey<N> {}
+
 impl<const N: usize> Clone for SecureKey<N> {
     fn clone(&self) -> Self {
         Self::from_bytes(self.data)

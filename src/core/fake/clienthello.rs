@@ -13,6 +13,19 @@ pub fn build_fake_client_hello(sni_host: &str) -> Vec<u8> {
 
 // constructs valid tls clienthello with optional post-quantum cryptography (ml-kem / kyber768) extensions
 pub fn build_fake_client_hello_opts(sni_host: &str, pqc: bool) -> Vec<u8> {
+    build_fake_client_hello_advanced(sni_host, pqc, false)
+}
+
+// constructs valid tls clienthello with optional pqc and browser ja4 mimicry
+pub fn build_fake_client_hello_advanced(sni_host: &str, pqc: bool, ja4_mimic: bool) -> Vec<u8> {
+    if ja4_mimic {
+        return crate::core::ja4_mimic::synthesize_client_hello(
+            crate::core::ja4_mimic::BrowserProfile::Chrome130,
+            sni_host,
+            &["h2", "http/1.1"],
+        );
+    }
+
     let sni_bytes = sni_host.as_bytes();
     let sni_len = sni_bytes.len();
 

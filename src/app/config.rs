@@ -303,11 +303,11 @@ pub struct Config {
     #[serde(default)]
     pub ja4_mimic: Option<String>,
     #[serde(default)]
-    pub active_probe_defense: bool,
+    pub stack_morph: Option<String>,
     #[serde(default)]
-    pub xdp_filter: bool,
-    #[serde(default)]
-    pub sphinx_routing: bool,
+    pub anti_injection: bool,
+    #[serde(default = "default_anti_injection_ttl_tolerance")]
+    pub anti_injection_ttl_tolerance: u8,
     #[serde(default)]
     pub simd_accel: bool,
 }
@@ -412,6 +412,10 @@ fn default_privacy_level() -> u8 {
 
 fn default_max_query_log_entries() -> usize {
     100
+}
+
+fn default_anti_injection_ttl_tolerance() -> u8 {
+    4
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
@@ -607,9 +611,9 @@ impl Default for Config {
             reject_ttl: 10,
             defense_profile: None,
             ja4_mimic: None,
-            active_probe_defense: false,
-            xdp_filter: false,
-            sphinx_routing: false,
+            stack_morph: None,
+            anti_injection: false,
+            anti_injection_ttl_tolerance: 4,
             simd_accel: false,
         }
     }

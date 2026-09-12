@@ -17,12 +17,14 @@ pub enum BrowserProfile {
 
 impl BrowserProfile {
     /// Returns the standardized JA4 string for this profile with SNI present and h2 ALPN.
-    pub fn expected_ja4(&self) -> &'static str {
-        match self {
-            BrowserProfile::Chrome130 => "t13d1516h2_8daaf6152771_b18509832019",
-            BrowserProfile::Firefox130 => "t13d1413h2_2b2029707e4d_fec4f74d0e65",
-            BrowserProfile::Safari18 => "t13d1112h2_b69b59571811_98a3b8364808",
-        }
+    pub fn expected_ja4(&self) -> String {
+        compute_ja4_fingerprint(
+            true,
+            true,
+            self.cipher_suites(),
+            self.extension_order(),
+            Some("h2"),
+        )
     }
 
     /// Cipher suites ordered according to the specific browser implementation.

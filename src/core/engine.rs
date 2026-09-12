@@ -82,6 +82,8 @@ impl Engine {
             fake_window_size: cfg.fake_window_size,
             fake_tcp_flags: cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: cfg.pqc,
+            ja4_mimic: cfg.ja4_mimic.is_some(),
+            stack_morph: cfg.stack_morph.is_some(),
             auto_ttl_estimator,
         };
 
@@ -287,6 +289,7 @@ impl Engine {
                     max_bytes: 10 * 1024 * 1024,
                     max_backups: 5,
                     ignored_qtypes: cfg.ignored_qtypes.clone(),
+                    simd_accel: cfg.simd_accel,
                 };
                 Some(crate::dns::logger::QueryLogger::start_full(opts))
             } else {
@@ -607,6 +610,11 @@ impl Engine {
                 .with_dnscrypt_client(dnscrypt_client)
                 .with_randomize_ecs(cfg.randomize_ecs)
                 .with_reject_ttl(cfg.reject_ttl)
+                .with_optional_anti_injection(if cfg.anti_injection {
+                    Some(Arc::new(crate::core::anti_injection::AntiInjectionFilter::new(cfg.anti_injection_ttl_tolerance)))
+                } else {
+                    None
+                })
                 .with_local_dot(
                     cfg.local_dot,
                     local_dot_addr,
@@ -640,14 +648,17 @@ impl Engine {
                 info!("activated defense operational profile: {:?}", profile);
             }
         }
-        if self.cfg.active_probe_defense {
-            info!("active probe and replay attack defense enabled (rolling bloom filter)");
+        if self.cfg.ja4_mimic.is_some() {
+            info!("JA4 TLS ClientHello fingerprint mimicry enabled");
         }
-        if self.cfg.xdp_filter {
-            info!("in-kernel XDP packet filter and zero-copy drop enabled");
+        if self.cfg.stack_morph.is_some() {
+            info!("TCP/IP OS stack fingerprint morphing enabled");
         }
-        if self.cfg.sphinx_routing {
-            info!("Sphinx onion mixnet routing enabled");
+        if self.cfg.anti_injection {
+            info!(
+                ttl_tolerance = self.cfg.anti_injection_ttl_tolerance,
+                "stateful middlebox injection defense enabled"
+            );
         }
         if self.cfg.simd_accel {
             info!("SIMD / AVX2 cryptographic vectorization enabled");
@@ -880,6 +891,8 @@ impl Engine {
             fake_window_size: new_cfg.fake_window_size,
             fake_tcp_flags: new_cfg.fake_tcp_flags.as_deref().and_then(crate::core::rawsock::packet::parse_tcp_flags),
             pqc: new_cfg.pqc,
+            ja4_mimic: new_cfg.ja4_mimic.is_some(),
+            stack_morph: new_cfg.stack_morph.is_some(),
             auto_ttl_estimator,
         };
 

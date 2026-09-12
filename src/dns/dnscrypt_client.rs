@@ -888,49 +888,11 @@ impl DnsCryptClient {
         Ok(Self::new(server_addr, provider_name, provider_pk, relay_addr))
     }
 
-    // queries server for txt records matching provider_name to discover and validate dnscrypt certificates
-    pub async fn fetch_cert(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<DnsCryptCert, Box<dyn std::error::Error + Send + Sync>> {
-        let mut query = Vec::with_capacity(512);
-        // Transaction ID
-        query.extend_from_slice(&[0x12, 0x34]);
-        // Flags: standard query, recursion desired (0x0100)
-        query.extend_from_slice(&[0x01, 0x00]);
-        // QDCOUNT: 1
-        query.extend_from_slice(&[0x00, 0x01]);
-        // ANCOUNT: 0
-        query.extend_from_slice(&[0x00, 0x00]);
-        // NSCOUNT: 0
-        query.extend_from_slice(&[0x00, 0x00]);
-        // ARCOUNT: 1 (EDNS0 OPT RR)
-        query.extend_from_slice(&[0x00, 0x01]);
-
-        // QNAME: provider_name
-        for part in self.provider_name.split('.') {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                query.push(trimmed.len() as u8);
-                query.extend_from_slice(trimmed.as_bytes());
-            }
-        }
-        query.push(0x00); // end of name
-
-        // QTYPE: TXT (16)
-        query.extend_from_slice(&[0x00, 0x10]);
-        // QCLASS: IN (1)
-        query.extend_from_slice(&[0x00, 0x01]);
-
-        // OPT pseudo-RR (RFC 6891) for EDNS0 buffer size 4096
-        query.push(0x00); // root
-        query.extend_from_slice(&[0x00, 0x29]); // type 41 (OPT)
-        query.extend_from_slice(&[0x10, 0x00]); // UDP payload size: 4096 bytes
-        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // extended RCODE and flags
-        query.extend_from_slice(&[0x00, 0x00]); // RDLEN: 0
-
-        // Send query packet to server
-        let resp = self.send_packet(self.server_addr, &query, timeout).await?;
+    /// Parses and verifies candidate certificates from a raw DNS response TXT record.
+    pub fn parse_candidate_certs_from_response(
+        resp: &[u8],
+        provider_pk: &[u8; 32],
+    ) -> Result<Vec<DnsCryptCert>, Box<dyn std::error::Error + Send + Sync>> {
         if resp.len() < 12 {
             return Err("response packet too short".into());
         }
@@ -1012,8 +974,8 @@ impl DnsCryptClient {
 
                 if txt_data.len() >= 124 && &txt_data[0..4] == DNSCRYPT_MAGIC_CERT {
                     if let Ok(cert) = DnsCryptCert::parse(&txt_data) {
-                        let is_zero_pk = self.provider_pk == [0u8; 32];
-                        if is_zero_pk || cert.verify_signature(&self.provider_pk) {
+                        let is_zero_pk = provider_pk == &[0u8; 32];
+                        if is_zero_pk || cert.verify_signature(provider_pk) {
                             candidate_certs.push(cert);
                         }
                     }
@@ -1022,22 +984,77 @@ impl DnsCryptClient {
             pos += rdlength;
         }
 
-        if candidate_certs.is_empty() {
-            return Err("no valid dnscrypt certificates found in response".into());
-        }
+        Ok(candidate_certs)
+    }
 
+    /// Queries server for TXT records matching provider_name to discover and validate certificates using real system clock.
+    pub async fn fetch_cert(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<DnsCryptCert, Box<dyn std::error::Error + Send + Sync>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
+        self.fetch_cert_with_epoch(timeout, now).await
+    }
+
+    /// Queries server for TXT records with an explicit UNIX epoch timestamp for deterministic validity testing.
+    pub async fn fetch_cert_with_epoch(
+        &mut self,
+        timeout: Duration,
+        epoch_secs: u32,
+    ) -> Result<DnsCryptCert, Box<dyn std::error::Error + Send + Sync>> {
+        let mut query = Vec::with_capacity(512);
+        // Transaction ID
+        query.extend_from_slice(&[0x12, 0x34]);
+        // Flags: standard query, recursion desired (0x0100)
+        query.extend_from_slice(&[0x01, 0x00]);
+        // QDCOUNT: 1
+        query.extend_from_slice(&[0x00, 0x01]);
+        // ANCOUNT: 0
+        query.extend_from_slice(&[0x00, 0x00]);
+        // NSCOUNT: 0
+        query.extend_from_slice(&[0x00, 0x00]);
+        // ARCOUNT: 1 (EDNS0 OPT RR)
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        // QNAME: provider_name
+        for part in self.provider_name.split('.') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                query.push(trimmed.len() as u8);
+                query.extend_from_slice(trimmed.as_bytes());
+            }
+        }
+        query.push(0x00); // end of name
+
+        // QTYPE: TXT (16)
+        query.extend_from_slice(&[0x00, 0x10]);
+        // QCLASS: IN (1)
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        // OPT pseudo-RR (RFC 6891) for EDNS0 buffer size 4096
+        query.push(0x00); // root
+        query.extend_from_slice(&[0x00, 0x29]); // type 41 (OPT)
+        query.extend_from_slice(&[0x10, 0x00]); // UDP payload size: 4096 bytes
+        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // extended RCODE and flags
+        query.extend_from_slice(&[0x00, 0x00]); // RDLEN: 0
+
+        // Send query packet to server
+        let resp = self.send_packet(self.server_addr, &query, timeout).await?;
+        let candidate_certs = Self::parse_candidate_certs_from_response(&resp, &self.provider_pk)?;
+
+        if candidate_certs.is_empty() {
+            return Err("no valid dnscrypt certificates found in response".into());
+        }
 
         let best = if self.cert_ignore_timestamp {
             candidate_certs.into_iter().max_by_key(|c| c.serial)
         } else {
-            DnsCryptCert::select_best_cert(&candidate_certs, now)
-                .or_else(|| candidate_certs.into_iter().max_by_key(|c| c.serial))
+            DnsCryptCert::select_best_cert(&candidate_certs, epoch_secs)
         }
-        .ok_or_else(|| "no acceptable dnscrypt certificate selected")?;
+        .ok_or_else(|| "no acceptable valid dnscrypt certificate selected (all candidate certificates expired or invalid)")?;
 
         self.cert = Some(best.clone());
         if !self.ephemeral_keys {
@@ -2665,5 +2682,196 @@ mod tests {
         assert!(client.cert.is_some());
 
         handle.await.unwrap();
+    }
+
+    fn build_mock_dns_cert_response(tx_id: &[u8; 2], cert_bytes_list: &[Vec<u8>]) -> Vec<u8> {
+        let mut resp = Vec::new();
+        resp.extend_from_slice(tx_id); // tx id
+        resp.extend_from_slice(&[0x81, 0x80]); // standard response, no error
+        resp.extend_from_slice(&[0x00, 0x01]); // qdcount: 1
+        resp.extend_from_slice(&(cert_bytes_list.len() as u16).to_be_bytes()); // ancount
+        resp.extend_from_slice(&[0x00, 0x00]); // nscount: 0
+        resp.extend_from_slice(&[0x00, 0x00]); // arcount: 0
+
+        // Question: 2.dnscrypt-cert.example.com TXT IN
+        for part in ["2", "dnscrypt-cert", "example", "com"] {
+            resp.push(part.len() as u8);
+            resp.extend_from_slice(part.as_bytes());
+        }
+        resp.push(0x00);
+        resp.extend_from_slice(&[0x00, 0x10]); // TXT
+        resp.extend_from_slice(&[0x00, 0x01]); // IN
+
+        for cert_bytes in cert_bytes_list {
+            resp.extend_from_slice(&[0xc0, 0x0c]); // pointer to QNAME
+            resp.extend_from_slice(&[0x00, 0x10]); // type TXT
+            resp.extend_from_slice(&[0x00, 0x01]); // class IN
+            resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // ttl 60
+
+            let mut txt_rdata = Vec::new();
+            for chunk in cert_bytes.chunks(255) {
+                txt_rdata.push(chunk.len() as u8);
+                txt_rdata.extend_from_slice(chunk);
+            }
+            resp.extend_from_slice(&(txt_rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&txt_rdata);
+        }
+
+        resp
+    }
+
+    #[test]
+    fn test_multi_cert_selection_highest_valid_serial() {
+        let cert_expired_high_serial = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x11; 32],
+            client_magic: [0x11; 8],
+            serial: 99999, // very high serial, but expired!
+            ts_start: 1000,
+            ts_end: 2000,
+            raw_cert: Vec::new(),
+        };
+
+        let cert_valid_low_serial = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x22; 32],
+            client_magic: [0x22; 8],
+            serial: 100, // valid, but lower serial
+            ts_start: 2500,
+            ts_end: 5000,
+            raw_cert: Vec::new(),
+        };
+
+        let cert_valid_high_serial = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x33; 32],
+            client_magic: [0x33; 8],
+            serial: 500, // valid, highest serial among valid ones
+            ts_start: 2500,
+            ts_end: 5000,
+            raw_cert: Vec::new(),
+        };
+
+        let resp_bytes = build_mock_dns_cert_response(
+            &[0x12, 0x34],
+            &[
+                cert_expired_high_serial.to_bytes(),
+                cert_valid_low_serial.to_bytes(),
+                cert_valid_high_serial.to_bytes(),
+            ],
+        );
+
+        let parsed_certs = DnsCryptClient::parse_candidate_certs_from_response(&resp_bytes, &[0u8; 32])
+            .expect("should successfully parse 3 candidate certs");
+        assert_eq!(parsed_certs.len(), 3);
+
+        // At epoch 3000: cert_expired_high_serial is EXPIRED and MUST NOT be selected.
+        // cert_valid_high_serial (serial 500) must be chosen over cert_valid_low_serial (serial 100).
+        let best_valid = DnsCryptCert::select_best_cert(&parsed_certs, 3000)
+            .expect("must select a valid unexpired certificate");
+        assert_eq!(best_valid.serial, 500);
+        assert_eq!(best_valid.client_magic, [0x33; 8]);
+
+        // If timestamps are ignored, the highest serial overall (99999) would be picked
+        let best_ignored = parsed_certs.iter().max_by_key(|c| c.serial).unwrap();
+        assert_eq!(best_ignored.serial, 99999);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cert_with_epoch_rejects_expired_certs_strictly() {
+        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        // Single expired cert: expired at 2000, query occurs at 3000
+        let expired_cert = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x44; 32],
+            client_magic: [0x44; 8],
+            serial: 1234,
+            ts_start: 1000,
+            ts_end: 2000,
+            raw_cert: Vec::new(),
+        };
+        let cert_bytes = expired_cert.to_bytes();
+
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let (n, peer) = mock_socket.recv_from(&mut buf).await.unwrap();
+            let tx_id = [buf[0], buf[1]];
+            let resp = build_mock_dns_cert_response(&tx_id, &[cert_bytes.clone()]);
+            mock_socket.send_to(&resp, peer).await.unwrap();
+
+            // second query for cert_ignore_timestamp test
+            let (n2, peer2) = mock_socket.recv_from(&mut buf).await.unwrap();
+            let tx_id2 = [buf[0], buf[1]];
+            let resp2 = build_mock_dns_cert_response(&tx_id2, &[cert_bytes]);
+            mock_socket.send_to(&resp2, peer2).await.unwrap();
+        });
+
+        let mut client = DnsCryptClient::new(
+            mock_addr,
+            "2.dnscrypt-cert.example.com".to_string(),
+            [0u8; 32],
+            None,
+        );
+
+        // At epoch 3000 (after ts_end 2000), fetch_cert_with_epoch MUST return Err (strict rejection)
+        let fetch_res = client.fetch_cert_with_epoch(Duration::from_secs(2), 3000).await;
+        assert!(
+            fetch_res.is_err(),
+            "fetch_cert_with_epoch must strictly fail when all certificates are expired"
+        );
+        let err_msg = fetch_res.unwrap_err().to_string();
+        assert!(err_msg.contains("all candidate certificates expired or invalid"));
+
+        // When cert_ignore_timestamp is explicitly enabled, it accepts the cert even if expired
+        client = client.with_cert_ignore_timestamp(true);
+        let fetch_ignored = client.fetch_cert_with_epoch(Duration::from_secs(2), 3000).await;
+        assert!(fetch_ignored.is_ok());
+        assert_eq!(fetch_ignored.unwrap().serial, 1234);
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_with_epoch_strictly_rejects_expired_cert() {
+        let expired_cert = DnsCryptCert {
+            cert_magic: *DNSCRYPT_MAGIC_CERT,
+            es_version: 2,
+            protocol_minor: 0,
+            signature: [0u8; 64],
+            resolver_pk: vec![0x55; 32],
+            client_magic: [0x55; 8],
+            serial: 42,
+            ts_start: 1000,
+            ts_end: 2000,
+            raw_cert: Vec::new(),
+        };
+
+        let client = DnsCryptClient::new(
+            "127.0.0.1:443".parse().unwrap(),
+            "2.dnscrypt-cert.example.com".to_string(),
+            [0u8; 32],
+            None,
+        )
+        .with_cert(expired_cert);
+
+        let dummy_query = vec![0u8; 32];
+        let res = client.resolve_with_epoch(&dummy_query, Duration::from_millis(50), 3000).await;
+        assert!(res.is_err());
+        let err_text = res.unwrap_err().to_string();
+        assert!(err_text.contains("expired or not yet valid"));
     }
 }

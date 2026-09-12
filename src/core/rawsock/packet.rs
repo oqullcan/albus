@@ -115,6 +115,8 @@ pub fn build_packet_stack_opts(
     build_packet_stack_advanced(conn, payload, ttl, bad_checksum, None, None)
 }
 
+use crate::core::stack_morph::OsProfile;
+
 // serializes ipv4 or ipv6 header and tcp segment with customizable window size and tcp flags
 pub fn build_packet_stack_advanced(
     conn: &ConnInfo,
@@ -124,13 +126,39 @@ pub fn build_packet_stack_advanced(
     window_size: Option<u16>,
     tcp_flags: Option<u8>,
 ) -> StackPacket {
+    build_packet_stack_morphed(conn, payload, ttl, bad_checksum, window_size, tcp_flags, None)
+}
+
+// serializes ipv4 or ipv6 header and tcp segment morphing os fingerprints (tcp options, window, ttl)
+pub fn build_packet_stack_morphed(
+    conn: &ConnInfo,
+    payload: &[u8],
+    ttl: u8,
+    bad_checksum: bool,
+    window_size: Option<u16>,
+    tcp_flags: Option<u8>,
+    os_profile: Option<OsProfile>,
+) -> StackPacket {
     let mut pkt = StackPacket::new();
     let effective_flags = tcp_flags.unwrap_or(0x18);
-    let effective_win = window_size.unwrap_or(502);
+    let (tcp_options, default_win, default_ttl) = if let Some(profile) = os_profile {
+        (
+            profile.build_tcp_options(1460, 7, 0x12345678, 0),
+            profile.default_window_size(),
+            profile.default_ttl(),
+        )
+    } else {
+        (Vec::new(), 502, 64)
+    };
+
+    let effective_win = window_size.unwrap_or(default_win);
+    let effective_ttl = if ttl == 0 { default_ttl } else { ttl };
+    let tcp_opts_len = tcp_options.len();
+    let tcp_hdr_len = 20 + tcp_opts_len;
+    let data_offset_words = (tcp_hdr_len / 4) as u8;
 
     match (conn.src_ip, conn.dst_ip) {
         (std::net::IpAddr::V6(src6), std::net::IpAddr::V6(dst6)) => {
-            let tcp_hdr_len = 20;
             let ip_hdr_len = 40;
             let total_len = ip_hdr_len + tcp_hdr_len + payload.len();
 
@@ -144,7 +172,7 @@ pub fn build_packet_stack_advanced(
             let payload_len = (tcp_hdr_len + payload.len()) as u16;
             ip6_hdr[4..6].copy_from_slice(&payload_len.to_be_bytes());
             ip6_hdr[6] = 6; // next header: tcp (6)
-            ip6_hdr[7] = ttl; // hop limit
+            ip6_hdr[7] = effective_ttl; // hop limit
             ip6_hdr[8..24].copy_from_slice(&src6.octets());
             ip6_hdr[24..40].copy_from_slice(&dst6.octets());
 
@@ -156,7 +184,7 @@ pub fn build_packet_stack_advanced(
             tcp_hdr[2..4].copy_from_slice(&conn.dst_port.to_be_bytes());
             tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
             tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
-            tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
+            tcp_hdr[12] = data_offset_words << 4;
             tcp_hdr[13] = effective_flags;
             tcp_hdr[14..16].copy_from_slice(&effective_win.to_be_bytes());
 
@@ -169,6 +197,9 @@ pub fn build_packet_stack_advanced(
             let next_hdr = [0x00, 0x00, 0x00, 6];
             pseudo_sum = checksum_partial(&next_hdr, pseudo_sum);
             pseudo_sum = checksum_partial(&tcp_hdr, pseudo_sum);
+            if !tcp_options.is_empty() {
+                pseudo_sum = checksum_partial(&tcp_options, pseudo_sum);
+            }
             pseudo_sum = checksum_partial(payload, pseudo_sum);
 
             let tcp_cs = if bad_checksum {
@@ -181,15 +212,18 @@ pub fn build_packet_stack_advanced(
             tcp_hdr[17] = tcp_cs as u8;
 
             pkt.buf[40..60].copy_from_slice(&tcp_hdr);
+            if !tcp_options.is_empty() {
+                pkt.buf[60..60 + tcp_opts_len].copy_from_slice(&tcp_options);
+            }
 
-            let payload_end = 60 + payload.len();
-            pkt.buf[60..payload_end].copy_from_slice(payload);
+            let payload_start = 60 + tcp_opts_len;
+            let payload_end = payload_start + payload.len();
+            pkt.buf[payload_start..payload_end].copy_from_slice(payload);
             pkt.len = payload_end;
 
             pkt
         }
         (std::net::IpAddr::V4(src4), std::net::IpAddr::V4(dst4)) => {
-            let tcp_hdr_len = 20;
             let ip_hdr_len = 20;
             let total_len = ip_hdr_len + tcp_hdr_len + payload.len();
 
@@ -207,7 +241,7 @@ pub fn build_packet_stack_advanced(
             ip_hdr[5] = 0x34;
             ip_hdr[6] = 0x40; // flags: don't fragment (df) bit set
             ip_hdr[7] = 0x00;
-            ip_hdr[8] = ttl;
+            ip_hdr[8] = effective_ttl;
             ip_hdr[9] = 6; // transport protocol: tcp (6)
             ip_hdr[12..16].copy_from_slice(&src4.octets());
             ip_hdr[16..20].copy_from_slice(&dst4.octets());
@@ -224,13 +258,13 @@ pub fn build_packet_stack_advanced(
             tcp_hdr[2..4].copy_from_slice(&conn.dst_port.to_be_bytes());
             tcp_hdr[4..8].copy_from_slice(&conn.seq.to_be_bytes());
             tcp_hdr[8..12].copy_from_slice(&conn.ack.to_be_bytes());
-            tcp_hdr[12] = 0x50; // data offset: 5 (20 bytes, no options)
+            tcp_hdr[12] = data_offset_words << 4;
             tcp_hdr[13] = effective_flags;
             tcp_hdr[14..16].copy_from_slice(&effective_win.to_be_bytes());
             tcp_hdr[18] = 0; // urgent pointer
             tcp_hdr[19] = 0;
 
-            // 3. compute tcp checksum over pseudo-header + tcp header + payload
+            // 3. compute tcp checksum over pseudo-header + tcp header + options + payload
             let tcp_seg_len = (tcp_hdr_len + payload.len()) as u16;
             let mut pseudo_sum: u32 = 0;
             pseudo_sum = checksum_partial(&src4.octets(), pseudo_sum);
@@ -238,6 +272,9 @@ pub fn build_packet_stack_advanced(
             let proto_and_len = [0x00, 6, (tcp_seg_len >> 8) as u8, tcp_seg_len as u8];
             pseudo_sum = checksum_partial(&proto_and_len, pseudo_sum);
             pseudo_sum = checksum_partial(&tcp_hdr, pseudo_sum);
+            if !tcp_options.is_empty() {
+                pseudo_sum = checksum_partial(&tcp_options, pseudo_sum);
+            }
             pseudo_sum = checksum_partial(payload, pseudo_sum);
 
             let tcp_cs = if bad_checksum {
@@ -250,10 +287,14 @@ pub fn build_packet_stack_advanced(
             tcp_hdr[17] = tcp_cs as u8;
 
             pkt.buf[20..40].copy_from_slice(&tcp_hdr);
+            if !tcp_options.is_empty() {
+                pkt.buf[40..40 + tcp_opts_len].copy_from_slice(&tcp_options);
+            }
 
             // 4. append transport layer payload
-            let payload_end = 40 + payload.len();
-            pkt.buf[40..payload_end].copy_from_slice(payload);
+            let payload_start = 40 + tcp_opts_len;
+            let payload_end = payload_start + payload.len();
+            pkt.buf[payload_start..payload_end].copy_from_slice(payload);
             pkt.len = payload_end;
 
             pkt

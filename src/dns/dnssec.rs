@@ -1,5 +1,8 @@
-//! post-quantum dnssec validation, ml-dsa-44 (algorithm 18) rrsig inspection,
-//! and rfc 4035 anti-downgrade local policy engine.
+//! Post-quantum DNSSEC algorithm presence inspection (ML-DSA, SLH-DSA),
+//! IANA root trust anchor pinning (KSK-2017, KSK-2024), and RFC 4035 anti-downgrade policy engine.
+//!
+//! Note: Detects post-quantum algorithms and defends against downgrade attacks while relying on
+//! upstream resolver authenticated data (AD bit) validation without local ML-DSA signature computation.
 
 use std::fmt;
 

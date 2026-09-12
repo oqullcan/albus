@@ -594,17 +594,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub ja4_mimic: Option<String>,
 
-    // enable active probe and replay attack defense with rolling bloom filter and honeytokens
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub active_probe_defense: bool,
+    // target os tcp/ip stack signature morphing (windows11, macos, ios, linux)
+    #[arg(long, visible_alias = "os-profile")]
+    pub stack_morph: Option<String>,
 
-    // enable in-kernel xdp driver packet filtering and anti-rst drop
+    // enable stateful anti-injection filter against censor rst and dns poisoning
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub xdp_filter: bool,
+    pub anti_injection: bool,
 
-    // enable sphinx multi-hop onion mixnet routing
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub sphinx_routing: bool,
+    // max ttl hop-count divergence tolerance for anti-injection filter (default: 4)
+    #[arg(long)]
+    pub anti_injection_ttl_tolerance: Option<u8>,
 
     // enable simd / avx2 hardware cryptographic acceleration
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]

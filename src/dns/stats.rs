@@ -48,6 +48,8 @@ pub struct DnsStatsSnapshot {
     pub pqc_dnssec_validated: u64,
     #[serde(default)]
     pub pqc_downgrade_prevented: u64,
+    #[serde(default)]
+    pub injected_dns_dropped: u64,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +77,7 @@ pub struct DnsStats {
     pub dnssec_validated: AtomicU64,
     pub pqc_dnssec_validated: AtomicU64,
     pub pqc_downgrade_prevented: AtomicU64,
+    pub injected_dns_dropped: AtomicU64,
 }
 
 impl DnsStats {
@@ -116,6 +119,7 @@ impl DnsStats {
             dnssec_validated: self.dnssec_validated.load(Ordering::Relaxed),
             pqc_dnssec_validated: self.pqc_dnssec_validated.load(Ordering::Relaxed),
             pqc_downgrade_prevented: self.pqc_downgrade_prevented.load(Ordering::Relaxed),
+            injected_dns_dropped: self.injected_dns_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -301,6 +305,7 @@ impl DnsStats {
             dnssec_validated: add_laplace_noise(self.dnssec_validated.load(Ordering::Relaxed), epsilon),
             pqc_dnssec_validated: add_laplace_noise(self.pqc_dnssec_validated.load(Ordering::Relaxed), epsilon),
             pqc_downgrade_prevented: add_laplace_noise(self.pqc_downgrade_prevented.load(Ordering::Relaxed), epsilon),
+            injected_dns_dropped: add_laplace_noise(self.injected_dns_dropped.load(Ordering::Relaxed), epsilon),
         }
     }
 

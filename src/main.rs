@@ -613,14 +613,14 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     if let Some(ref j4) = args.ja4_mimic {
         cfg.ja4_mimic = Some(j4.clone());
     }
-    if args.active_probe_defense {
-        cfg.active_probe_defense = true;
+    if let Some(ref sm) = args.stack_morph {
+        cfg.stack_morph = Some(sm.clone());
     }
-    if args.xdp_filter {
-        cfg.xdp_filter = true;
+    if args.anti_injection {
+        cfg.anti_injection = true;
     }
-    if args.sphinx_routing {
-        cfg.sphinx_routing = true;
+    if let Some(tol) = args.anti_injection_ttl_tolerance {
+        cfg.anti_injection_ttl_tolerance = tol;
     }
     if args.simd_accel {
         cfg.simd_accel = true;
