@@ -71,19 +71,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         println!("albus configuration saved to {}", path.display());
                     }
 
-                    // if background daemon is actively running, notify it via SIGHUP to apply maps live
+                    // if background daemon is actively running, notify it via SIGHUP to apply maps live.
                     // NOTE: SIGHUP only hot-reloads eBPF maps; firewall/DNS changes need restart.
-                    // Only root may signal the service (reload_service enforces root).
-                    let is_active = std::process::Command::new("/usr/bin/systemctl")
-                        .args(["is-active", "--quiet", "albus.service"])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if is_active {
-                        let _ = std::process::Command::new("/usr/bin/systemctl")
-                            .args(["kill", "-s", "HUP", "albus.service"])
-                            .status();
-                        println!("live configuration reloaded into running albus daemon (SIGHUP)");
+                    // Only attempt the privileged signal as root: as an unprivileged user,
+                    // `systemctl kill` would pop a polkit prompt on every save, so skip it.
+                    if is_root() {
+                        let is_active = std::process::Command::new("/usr/bin/systemctl")
+                            .args(["is-active", "--quiet", "albus.service"])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        if is_active {
+                            let _ = std::process::Command::new("/usr/bin/systemctl")
+                                .args(["kill", "-s", "HUP", "albus.service"])
+                                .status();
+                            println!("live configuration reloaded into running albus daemon (SIGHUP)");
+                        }
+                    } else {
+                        println!(
+                            "saved (unprivileged): restart albus.service to apply to the running daemon"
+                        );
                     }
 
                     Ok(())

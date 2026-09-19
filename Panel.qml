@@ -45,6 +45,9 @@ Panel {
   property bool blockIpv6Enabled: true
   property string toastMessage: ""
   property bool isConfigLoading: false
+  // suppresses the draft-save toast when syncing the user file after a
+  // privileged apply (keeps a single source of truth without toast spam)
+  property bool suppressSaveToast: false
 
   // preserved CLI configuration parameters not directly exposed in UI
   property var storedPorts: [443]
@@ -464,9 +467,11 @@ Panel {
     if (!configGetProc.running) configGetProc.running = true
   }
 
-  function applyAndSave() {
-    if (root.isConfigLoading) return
-    autoApplyTimer.stop()
+  // builds `albus config set` argv from UI state without side effects.
+  // returns {ok:true, args:[...]} or {ok:false, reason:"..."} (reason shown
+  // only on explicit apply; auto-apply stays silent to avoid toast spam).
+  function buildConfigArgs() {
+    if (root.isConfigLoading) return { ok: false, reason: "" }
     var args = ["config", "set"]
 
     var upstream = root.activeDnsKey
@@ -476,7 +481,7 @@ Panel {
       var trimmedUrl = root.customDnsUrl.trim()
       // backend enforces https-only; refuse http and bare-host input here too
       if (trimmedUrl === "" || !trimmedUrl.startsWith("https://") || trimmedUrl.length > 256) {
-        return
+        return { ok: false, reason: "Custom URL must start with https://" }
       }
       upstream = trimmedUrl
     }
@@ -487,7 +492,7 @@ Panel {
     var p2 = root.customBootstrapSecondary.trim()
     if ((p1 !== "" && !ipRegex.test(p1)) || (p2 !== "" && !ipRegex.test(p2))) {
       // User is mid-typing an IP address; don't execute incomplete CLI call
-      return
+      return { ok: false, reason: "Bootstrap IP incomplete" }
     }
 
     var boots = []
@@ -503,7 +508,7 @@ Panel {
     var _dataArgs = [root.customMss, root.customMinMss, root.customFakeSni, root.customFakeTtl]
     for (var _di = 0; _di < _dataArgs.length; _di++) {
       var _dv = String(_dataArgs[_di] || "").trim()
-      if (_dv !== "" && _dv.charAt(0) === "-") return
+      if (_dv !== "" && _dv.charAt(0) === "-") return { ok: false, reason: "Value looks like a flag" }
     }
     var ttlVal = parseInt(root.customFakeTtl.trim(), 10)
     if (isNaN(ttlVal) || ttlVal <= 0) {
@@ -518,7 +523,7 @@ Panel {
     }
     if (root.customFakeSni.trim() !== "") {
       var _sni = root.customFakeSni.trim()
-      if (_sni.length > 253 || !/^[A-Za-z0-9._-]+$/.test(_sni)) return
+      if (_sni.length > 253 || !/^[A-Za-z0-9._-]+$/.test(_sni)) return { ok: false, reason: "Invalid Fake SNI" }
       args.push("--fake-sni", _sni)
     }
     args.push("--fake-bad-checksum", root.fakeBadChecksum ? "true" : "false")
@@ -541,8 +546,35 @@ Panel {
       args.push("--cgroup", root.storedCgroup)
     }
 
-    configSetProc.command = ["/usr/local/bin/albus"].concat(args)
+    return { ok: true, args: args }
+  }
+
+  // draft save: unprivileged user config only, never touches the daemon,
+  // so typing never pops a password dialog.
+  function applyAndSave() {
+    if (root.isConfigLoading) return
+    autoApplyTimer.stop()
+    var r = root.buildConfigArgs()
+    if (!r.ok) return
+
+    configSetProc.command = ["/usr/local/bin/albus"].concat(r.args)
     configSetProc.running = true
+  }
+
+  // explicit privileged apply: persists system-wide (/etc/albus, root-owned
+  // /usr/local/bin/albus binary only — never the checkout) then restarts.
+  // This is the action that actually reaches the daemon; one prompt, on click.
+  function applySystemWide() {
+    if (root.isConfigLoading) return
+    autoApplyTimer.stop()
+    var r = root.buildConfigArgs()
+    if (!r.ok) {
+      if (r.reason !== "") root.showToast(r.reason)
+      return
+    }
+    root.isBusy = true
+    configSetRootProc.command = ["/usr/bin/pkexec", "/usr/local/bin/albus"].concat(r.args)
+    configSetRootProc.running = true
   }
 
   function toggleDaemon() {
@@ -688,16 +720,34 @@ Panel {
     command: []
     running: false
     onExited: function(code) {
+      var quiet = root.suppressSaveToast
+      root.suppressSaveToast = false
       if (code === 0) {
-        root.showToast("Settings applied")
-        if (root.isRunning) {
-          daemonActionProc.command = ["/usr/bin/systemctl", "restart", "albus.service"]
-          daemonActionProc.running = true
-        } else {
-          root.refreshStatus()
-        }
+        if (!quiet) root.showToast("Settings saved — press Restart Service to apply")
+        root.refreshStatus()
       } else {
         root.showToast("Failed to save settings")
+      }
+    }
+  }
+
+  Process {
+    id: configSetRootProc
+    command: []
+    running: false
+    onExited: function(code) {
+      if (code === 0) {
+        root.showToast("Settings applied system-wide")
+        // mirror into the user file so reopen shows the same selection
+        // (daemon reads /etc/albus; panel reads ~/.config — keep them in sync)
+        root.suppressSaveToast = true
+        root.applyAndSave()
+        daemonActionProc.command = ["/usr/bin/systemctl", "restart", "albus.service"]
+        daemonActionProc.running = true
+      } else {
+        root.isBusy = false
+        root.showToast("Failed to apply settings")
+        root.refreshStatus()
       }
     }
   }
@@ -770,7 +820,7 @@ Panel {
         if (t === "1") root.activeTab = 0
         else if (t === "2") root.activeTab = 1
         else if (t === " " || t === "t" || t === "T") root.toggleDaemon()
-        else if (t === "r" || t === "R") root.restartDaemon()
+        else if (t === "r" || t === "R") root.applySystemWide()
         else if (t === "c" || t === "C") root.purgeDnsCache()
         else if (t === "p" || t === "P") root.togglePause()
         else if (t === "j" || t === "J") {
@@ -1400,7 +1450,7 @@ Panel {
                   text: "Restart Service"
                   bordered: true
                   fontSize: Style.font.caption
-                  onClicked: root.restartDaemon()
+                  onClicked: root.applySystemWide()
                 }
 
                 Button {
