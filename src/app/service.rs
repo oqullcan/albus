@@ -194,12 +194,13 @@ ExecStopPost={exec_stop}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/run /etc/resolv.conf
 
 [Install]
 WantedBy=multi-user.target

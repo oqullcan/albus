@@ -34,34 +34,37 @@ fn ip6tables_base() -> Command {
     c
 }
 
-/// Idempotent insert: `iptables -C ... || iptables -I ...`
+/// Idempotent insert: `iptables -C OUTPUT ... || iptables -I OUTPUT ...`
 fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
-    let mut check_args: Vec<&str> = vec!["-C"];
-    check_args.extend_from_slice(args);
+    let mut spec: Vec<&str> = Vec::with_capacity(args.len() + 4);
+    spec.extend_from_slice(args);
+    spec.extend_from_slice(&["-m", "comment", "--comment", comment]);
+
+    let mut check_args: Vec<&str> = vec!["-C", "OUTPUT"];
+    check_args.extend_from_slice(&spec);
+    // use output() so the expected "Bad rule" miss on absent rules stays out of the journal
     let check_ok = if v6 {
         ip6tables_base()
             .args(&check_args)
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|o| o.status.success())
             .unwrap_or(false)
     } else {
         iptables_base()
             .args(&check_args)
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|o| o.status.success())
             .unwrap_or(false)
     };
     if check_ok {
         return;
     }
     let mut insert_args: Vec<&str> = vec!["-I", "OUTPUT"];
-    insert_args.extend_from_slice(args);
-    insert_args.extend_from_slice(&["-m", "comment", "--comment", comment]);
-    // strip duplicate OUTPUT if caller included it
+    insert_args.extend_from_slice(&spec);
     let res = if v6 {
-        ip6tables_base().args(&insert_args[1..]).status()
+        ip6tables_base().args(&insert_args).status()
     } else {
-        iptables_base().args(&insert_args[1..]).status()
+        iptables_base().args(&insert_args).status()
     };
     if let Err(e) = res {
         warn!("failed to insert firewall rule {:?}: {}", args, e);
@@ -70,28 +73,37 @@ fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
 
 /// Bounded delete: avoids infinite loop if binary is shimmed.
 fn delete_rule_bounded(v6: bool, args: &[&str]) {
-    for _ in 0..MAX_RULE_DELETE_ITER {
-        let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
-        del_args.extend_from_slice(args);
-        let status = if v6 {
-            ip6tables_base().args(&del_args[1..]).status()
-        } else {
-            iptables_base().args(&del_args[1..]).status()
-        };
-        match status {
-            Ok(s) if s.success() => continue,
-            _ => break,
+    // 1. new-style rules (with per-feature comments)
+    for comment in [
+        "albus-quic",
+        "albus-stun",
+        "albus-kill",
+        "albus-lockdown",
+        "albus",
+    ] {
+        for _ in 0..MAX_RULE_DELETE_ITER {
+            let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
+            del_args.extend_from_slice(args);
+            del_args.extend_from_slice(&["-m", "comment", "--comment", comment]);
+            let status = if v6 {
+                ip6tables_base().args(&del_args).status()
+            } else {
+                iptables_base().args(&del_args).status()
+            };
+            match status {
+                Ok(s) if s.success() => continue,
+                _ => break,
+            }
         }
     }
-    // also try with comment match (for rules created by new version)
+    // 2. legacy rules without comment match (pre-hardening installs)
     for _ in 0..MAX_RULE_DELETE_ITER {
         let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
         del_args.extend_from_slice(args);
-        del_args.extend_from_slice(&["-m", "comment", "--comment", "albus"]);
         let status = if v6 {
-            ip6tables_base().args(&del_args[1..]).status()
+            ip6tables_base().args(&del_args).status()
         } else {
-            iptables_base().args(&del_args[1..]).status()
+            iptables_base().args(&del_args).status()
         };
         match status {
             Ok(s) if s.success() => continue,
