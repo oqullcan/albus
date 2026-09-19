@@ -115,7 +115,11 @@ static inline int handle_established(struct bpf_sock_ops *skops, struct albus_co
         }
     }
 
-    __u16 dst_port = (__u16)(bpf_ntohl(skops->remote_port) >> 16);
+    // NOTE: skops->remote_port arrives with the port bytes first; bpf_ntohl
+    // followed by a 16-bit truncation yields the host-order port. Do NOT
+    // shift right by 16 here (that reads the zero padding and matches no
+    // target port, silently disabling all bypass — see v2.1.0 regression).
+    __u16 dst_port = (__u16)bpf_ntohl(skops->remote_port);
     __u8 *is_target = bpf_map_lookup_elem(&target_ports, &dst_port);
     if (!is_target) {
         return BPF_OK;
