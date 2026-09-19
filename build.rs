@@ -2,6 +2,21 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn clang_binary() -> String {
+    // pin CC env if valid absolute path, else prefer absolute system clang
+    if let Ok(cc) = env::var("CC") {
+        if cc.starts_with('/') && PathBuf::from(&cc).exists() {
+            return cc;
+        }
+    }
+    for p in ["/usr/bin/clang", "/usr/lib/llvm/bin/clang"] {
+        if PathBuf::from(p).exists() {
+            return p.to_string();
+        }
+    }
+    "clang".to_string()
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bpf_src = PathBuf::from("bpf/sockops.bpf.c");
@@ -10,8 +25,9 @@ fn main() {
     println!("cargo:rerun-if-changed=bpf/sockops.bpf.c");
     println!("cargo:rerun-if-changed=bpf/include/bpf_helpers.h");
     println!("cargo:rerun-if-changed=bpf/include/bpf_endian.h");
+    println!("cargo:rerun-if-env-changed=CC");
 
-    let status = Command::new("clang")
+    let status = Command::new(clang_binary())
         .args([
             "-target",
             "bpf",
@@ -30,13 +46,22 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:rustc-env=ALBUS_BPF_BYTECODE={}", bpf_out.to_str().unwrap());
+            println!(
+                "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
+                bpf_out.to_str().unwrap()
+            );
         }
         _ => {
             // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
             let fallback = PathBuf::from("bpf/sockops.bpf.o");
             if fallback.exists() {
-                println!("cargo:rustc-env=ALBUS_BPF_BYTECODE={}", fallback.to_str().unwrap());
+                eprintln!(
+                    "warning: clang failed, using stale fallback bpf/sockops.bpf.o — verify hash before release"
+                );
+                println!(
+                    "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
+                    fallback.to_str().unwrap()
+                );
             } else {
                 panic!("Failed to compile eBPF bytecode and no fallback sockops.bpf.o found");
             }

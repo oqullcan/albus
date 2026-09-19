@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 pub struct DnsCacheKey {
     pub name: String,
     pub qtype: u16,
+    pub do_bit: bool,
 }
 
 // cached response payload with calculated wall-clock expiry instant
@@ -88,7 +89,7 @@ impl DnsCache {
             None => return,
         };
 
-        let ttl_secs = extract_min_ttl(response_bytes).clamp(5, 3600);
+        let ttl_secs = extract_min_ttl(response_bytes).clamp(5, 600);
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
 
         let mut map = match self.entries.lock() {
@@ -156,9 +157,15 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     }
 
     let qtype = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
+    // include DO-bit in cache key so dnssec on/off responses are not cross-served
+    let do_bit = data.len() >= 12 && {
+        let arcount = ((data[10] as u16) << 8) | (data[11] as u16);
+        arcount > 0
+    };
     Some(DnsCacheKey {
         name: labels.join("."),
         qtype,
+        do_bit,
     })
 }
 
@@ -247,10 +254,8 @@ mod tests {
 
         let query1 = vec![
             0x12, 0x34, // ID 0x1234
-            0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, // Type A
+            0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+            b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, // Type A
             0x00, 0x01, // Class IN
         ];
 
@@ -258,7 +263,10 @@ mod tests {
         fake_resp[2] = 0x81;
         fake_resp[3] = 0x80;
         fake_resp[7] = 0x01; // ancount = 1
-        fake_resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216, 34]);
+        fake_resp.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216,
+            34,
+        ]);
 
         cache.insert(&query1, &fake_resp);
 

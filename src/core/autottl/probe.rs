@@ -68,7 +68,9 @@ impl AutoTtlEstimator {
         } else if total_hops <= 12 {
             ((total_hops / 2) + 1).clamp(self.config.min_ttl, self.config.max_ttl)
         } else {
-            self.config.default_ttl.clamp(self.config.min_ttl, self.config.max_ttl)
+            self.config
+                .default_ttl
+                .clamp(self.config.min_ttl, self.config.max_ttl)
         }
     }
 

@@ -58,24 +58,44 @@ pub struct Config {
 }
 
 // default initial mss clamped to 88 bytes to force clienthello fragmentation across packets
-fn default_mss() -> u16 { 88 }
+fn default_mss() -> u16 {
+    88
+}
 // default lower bound for mss jitter randomization (64 bytes)
-fn default_min_mss() -> u16 { 64 }
+fn default_min_mss() -> u16 {
+    64
+}
 // default byte threshold before kernel returns to native line-rate mss
-fn default_restore_bytes() -> u32 { 600 }
+fn default_restore_bytes() -> u32 {
+    600
+}
 // standard https port
-fn default_ports() -> Vec<u16> { vec![443] }
+fn default_ports() -> Vec<u16> {
+    vec![443]
+}
 // default unified cgroup v2 mount point
-fn default_cgroup() -> String { "/sys/fs/cgroup".to_string() }
+fn default_cgroup() -> String {
+    "/sys/fs/cgroup".to_string()
+}
 // fallback hop ttl value
-fn default_ttl() -> u8 { 8 }
+fn default_ttl() -> u8 {
+    8
+}
 // lower bound clamp for auto-ttl
-fn default_min_ttl() -> u8 { 3 }
+fn default_min_ttl() -> u8 {
+    3
+}
 // upper bound clamp for auto-ttl
-fn default_max_ttl() -> u8 { 12 }
-fn default_true() -> bool { true }
+fn default_max_ttl() -> u8 {
+    12
+}
+fn default_true() -> bool {
+    true
+}
 // default upstream resolver
-fn default_upstream() -> String { "quad9".to_string() }
+fn default_upstream() -> String {
+    "quad9".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -121,7 +141,9 @@ fn is_valid_username(username: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
-    bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 // safely resolves the home directory of SUDO_USER validating format and passwd entry
@@ -178,11 +200,40 @@ impl FsPrivilegeGuard {
         let current_euid = unsafe { libc::geteuid() };
         if current_euid == 0 {
             if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-                if let (Ok(uid), Ok(gid)) = (uid_s.trim().parse::<libc::uid_t>(), gid_s.trim().parse::<libc::gid_t>()) {
+                if let (Ok(uid), Ok(gid)) = (
+                    uid_s.trim().parse::<libc::uid_t>(),
+                    gid_s.trim().parse::<libc::gid_t>(),
+                ) {
                     if uid != 0 {
+                        // cross-check SUDO_UID against passwd database (anti-spoof)
+                        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+                            if is_valid_username(&sudo_user) {
+                                if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
+                                    unsafe {
+                                        let pwd = libc::getpwnam(c_user.as_ptr());
+                                        if !pwd.is_null() && (*pwd).pw_uid != uid {
+                                            return Self { active: false };
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         unsafe {
-                            libc::setfsgid(gid);
-                            libc::setfsuid(uid);
+                            // drop supplementary groups first to close DAC bypass
+                            let _ = libc::setgroups(0, std::ptr::null());
+                            if libc::setfsgid(gid) != 0 {
+                                return Self { active: false };
+                            }
+                            if libc::setfsuid(uid) != 0 {
+                                libc::setfsgid(0);
+                                return Self { active: false };
+                            }
+                            // verify drop actually took effect
+                            if libc::setfsgid(gid) != 0 || libc::setfsuid(uid) != 0 {
+                                libc::setfsuid(0);
+                                libc::setfsgid(0);
+                                return Self { active: false };
+                            }
                         }
                         return Self { active: true };
                     }
@@ -218,10 +269,26 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     };
 
     if let Some(parent) = p.parent() {
+        // refuse symlink parents (TOCTOU mitigation for create_dir_all -> open window)
+        if let Ok(meta) = fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: parent is symlink at {}",
+                        parent.display()
+                    ),
+                ));
+            }
+        }
+        let existed = parent.exists();
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            // only chmod newly created dirs — never downgrade existing ~/.config etc.
+            if !existed {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
     }
 
@@ -232,10 +299,22 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
     let mut file = options.open(p)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: refusing to write non-regular file at {}",
+                p.display()
+            ),
+        ));
+    }
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -267,7 +346,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     if !meta.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("security violation: refusing to read non-regular file at {}", p.display()),
+            format!(
+                "security violation: refusing to read non-regular file at {}",
+                p.display()
+            ),
         ));
     }
 
@@ -282,7 +364,11 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
                 if file_uid != 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        format!("security violation: system config {} owned by untrusted uid {}", p.display(), file_uid),
+                        format!(
+                            "security violation: system config {} owned by untrusted uid {}",
+                            p.display(),
+                            file_uid
+                        ),
                     ));
                 }
             } else if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
@@ -290,7 +376,11 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
                     if file_uid != 0 && file_uid != sudo_uid {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
-                            format!("security violation: user config {} owned by untrusted uid {}", p.display(), file_uid),
+                            format!(
+                                "security violation: user config {} owned by untrusted uid {}",
+                                p.display(),
+                                file_uid
+                            ),
                         ));
                     }
                 }
@@ -298,7 +388,11 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
         } else if file_uid != current_uid && file_uid != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("security violation: config {} owned by untrusted uid {}", p.display(), file_uid),
+                format!(
+                    "security violation: config {} owned by untrusted uid {}",
+                    p.display(),
+                    file_uid
+                ),
             ));
         }
     }
@@ -309,7 +403,104 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     Ok(content)
 }
 
+/// Validates cgroup path: absolute, no symlink, is dir, looks like cgroup2.
+pub fn validate_cgroup_path(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if path.is_empty() || path.len() > 256 || !path.starts_with('/') {
+        return Err("cgroup path must be absolute".into());
+    }
+    if path.contains("..") {
+        return Err("cgroup path must not contain ..".into());
+    }
+    let p = Path::new(path);
+    if let Ok(meta) = fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            return Err("security violation: cgroup path must not be a symlink".into());
+        }
+    }
+    // only enforce dir shape when path exists (allows --help / tests without cgroup mounted)
+    if p.exists() && !p.is_dir() {
+        return Err("cgroup path must be a directory".into());
+    }
+    Ok(())
+}
+
 impl Config {
+    /// Validates tunable ranges to prevent DoS / BPF map overflow / malformed state.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.mss < 64 || self.mss > 1460 {
+            return Err(format!("invalid mss {} (expected 64..=1460)", self.mss).into());
+        }
+        if self.min_mss > self.mss {
+            return Err(format!("min_mss {} > mss {}", self.min_mss, self.mss).into());
+        }
+        if self.min_mss < 32 || self.min_mss > 1460 {
+            return Err(format!("invalid min_mss {}", self.min_mss).into());
+        }
+        if self.ports.is_empty() || self.ports.len() > 64 {
+            return Err(format!("invalid ports len {} (expected 1..=64)", self.ports.len()).into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.ports {
+            if *p == 0 {
+                return Err("port 0 is invalid".into());
+            }
+            if !seen.insert(p) {
+                return Err(format!("duplicate port {}", p).into());
+            }
+        }
+        if self.min_ttl > self.max_ttl {
+            return Err(format!("min_ttl {} > max_ttl {}", self.min_ttl, self.max_ttl).into());
+        }
+        if self.max_ttl > 64 {
+            return Err(format!("max_ttl {} too large", self.max_ttl).into());
+        }
+        if let Some(ref sni) = self.fake_sni {
+            if sni.len() > 253
+                || sni.contains(|c: char| c.is_whitespace() || c == ';' || c == '$' || c == '`')
+            {
+                return Err("invalid fake_sni".into());
+            }
+            // basic hostname shape
+            if !sni
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
+                return Err("invalid fake_sni charset".into());
+            }
+        }
+        validate_cgroup_path(&self.cgroup_path)?;
+        if self.doh_upstream.len() > 1024 {
+            return Err("doh_upstream too long".into());
+        }
+        Ok(())
+    }
+
+    /// Root daemons must not load attacker-owned --config files.
+    pub fn load_from_file_root_checked<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(unix)]
+        {
+            if crate::core::ebpf::is_root() {
+                let meta = fs::symlink_metadata(path.as_ref())?;
+                if meta.file_type().is_symlink() {
+                    return Err(
+                        "security violation: --config must not be a symlink when running as root"
+                            .into(),
+                    );
+                }
+                use std::os::unix::fs::MetadataExt;
+                if meta.uid() != 0 {
+                    return Err(format!(
+                        "security violation: --config owned by uid {} (expected root) when running as root",
+                        meta.uid()
+                    )
+                    .into());
+                }
+            }
+        }
+        Self::load_from_file(path)
+    }
     // resolves secure volatile shared memory / runtime directory path
     pub fn volatile_config_path() -> PathBuf {
         if crate::core::ebpf::is_root() {
@@ -331,11 +522,13 @@ impl Config {
                 return sudo_cfg;
             }
         }
-        // 2. check current process home (for user-level execution)
+        // 2. check current process home (for user-level execution) — validate shape
         if let Ok(home) = std::env::var("HOME") {
-            let user_cfg = PathBuf::from(&home).join(".config/albus/config.json");
-            if !user_cfg.starts_with("/root") {
-                return user_cfg;
+            if home.starts_with('/') && !home.contains("..") && home.len() <= 256 {
+                let user_cfg = PathBuf::from(&home).join(".config/albus/config.json");
+                if !user_cfg.starts_with("/root") {
+                    return user_cfg;
+                }
             }
         }
         // 3. system-wide fallback (never arbitrarily guess a user from /home when root)
@@ -343,14 +536,19 @@ impl Config {
     }
 
     // loads configuration payload from a specified filesystem path safely rejecting symlinks
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = safe_read(path)?;
         let cfg: Config = serde_json::from_str(&content)?;
         Ok(cfg)
     }
 
     // writes serialized json payload to disk and volatile tmpfs safely rejecting symlinks
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn save_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json = serde_json::to_string_pretty(self)?;
 
         // 1. write volatile runtime copy (in isolated tmpfs: /run/albus or $XDG_RUNTIME_DIR/albus)
@@ -438,7 +636,8 @@ mod tests {
 
     #[test]
     fn test_safe_read_rejects_symlink() {
-        let temp_dir = std::env::temp_dir().join(format!("albus_test_symlink_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("albus_test_symlink_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let real_file = temp_dir.join("real.json");
@@ -452,7 +651,10 @@ mod tests {
         assert!(result.is_err(), "safe_read must reject symlinks");
 
         let write_result = safe_write(&symlink_file, "{\"mss\": 99}");
-        assert!(write_result.is_err(), "safe_write must reject symlinks via O_NOFOLLOW");
+        assert!(
+            write_result.is_err(),
+            "safe_write must reject symlinks via O_NOFOLLOW"
+        );
 
         let _ = fs::remove_file(&symlink_file);
         let _ = fs::remove_file(&real_file);

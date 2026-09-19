@@ -165,7 +165,8 @@ Panel {
   }
 
   function showToast(msg) {
-    root.toastMessage = msg
+    // notification body is markup-capable on the host: strip before handoff
+    root.toastMessage = plain(msg, 200)
     toastTimer.restart()
   }
 
@@ -207,7 +208,7 @@ Panel {
 
   function copyToClipboard(text) {
     if (!text) return
-    copyProc.command = ["wl-copy", text]
+    copyProc.command = ["/usr/bin/wl-copy", "--", text]
     copyProc.running = true
     showToast("Copied to clipboard")
   }
@@ -219,6 +220,18 @@ Panel {
       .replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "")
       .replace(/\[\d+m/g, "")
       .replace(/[^\x20-\x7E\t\n\r]/g, "")
+  }
+
+  // strips markup for host-owned sinks the plugin cannot pin to PlainText
+  // (tooltip/notification/host labels render as AutoText): removes < > &
+  // plus C0/C1/bidi controls and caps length. sanitizeLabel alone is not enough.
+  function plain(str, maxLen) {
+    if (!str) return ""
+    var cap = maxLen || 200
+    var s = String(str).replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
+    s = s.replace(/&/g, "").replace(/</g, "").replace(/>/g, "")
+    if (s.length > cap) s = s.slice(0, cap)
+    return s
   }
 
   function parseStatusJson(raw) {
@@ -461,7 +474,8 @@ Panel {
       upstream = root.mullvadProfile === "standard" ? "mullvad" : "mullvad-" + root.mullvadProfile
     } else if (upstream === "custom") {
       var trimmedUrl = root.customDnsUrl.trim()
-      if (trimmedUrl === "" || (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://") && trimmedUrl.indexOf(".") === -1)) {
+      // backend enforces https-only; refuse http and bare-host input here too
+      if (trimmedUrl === "" || !trimmedUrl.startsWith("https://") || trimmedUrl.length > 256) {
         return
       }
       upstream = trimmedUrl
@@ -485,6 +499,12 @@ Panel {
 
     args.push("--mss", root.customMss.trim() !== "" ? root.customMss.trim() : "88")
     args.push("--min-mss", root.customMinMss.trim() !== "" ? root.customMinMss.trim() : "64")
+    // option injection guard: data args must never look like flags
+    var _dataArgs = [root.customMss, root.customMinMss, root.customFakeSni, root.customFakeTtl]
+    for (var _di = 0; _di < _dataArgs.length; _di++) {
+      var _dv = String(_dataArgs[_di] || "").trim()
+      if (_dv !== "" && _dv.charAt(0) === "-") return
+    }
     var ttlVal = parseInt(root.customFakeTtl.trim(), 10)
     if (isNaN(ttlVal) || ttlVal <= 0) {
       args.push("--auto-ttl", "true")
@@ -497,7 +517,9 @@ Panel {
       root.autoTtlEnabled = false
     }
     if (root.customFakeSni.trim() !== "") {
-      args.push("--fake-sni", root.customFakeSni.trim())
+      var _sni = root.customFakeSni.trim()
+      if (_sni.length > 253 || !/^[A-Za-z0-9._-]+$/.test(_sni)) return
+      args.push("--fake-sni", _sni)
     }
     args.push("--fake-bad-checksum", root.fakeBadChecksum ? "true" : "false")
     args.push("--block-quic", root.blockQuicEnabled ? "true" : "false")
@@ -519,28 +541,28 @@ Panel {
       args.push("--cgroup", root.storedCgroup)
     }
 
-    configSetProc.command = ["albus"].concat(args)
+    configSetProc.command = ["/usr/local/bin/albus"].concat(args)
     configSetProc.running = true
   }
 
   function toggleDaemon() {
     root.isBusy = true
     if (root.isRunning) {
-      daemonActionProc.command = ["systemctl", "stop", "albus.service"]
+      daemonActionProc.command = ["/usr/bin/systemctl", "stop", "albus.service"]
     } else {
-      daemonActionProc.command = ["systemctl", "start", "albus.service"]
+      daemonActionProc.command = ["/usr/bin/systemctl", "start", "albus.service"]
     }
     daemonActionProc.running = true
   }
 
   function restartDaemon() {
     root.isBusy = true
-    daemonActionProc.command = ["systemctl", "restart", "albus.service"]
+    daemonActionProc.command = ["/usr/bin/systemctl", "restart", "albus.service"]
     daemonActionProc.running = true
   }
 
   function purgeDnsCache() {
-    flushCacheProc.command = ["systemctl", "kill", "-s", "SIGUSR1", "albus.service"]
+    flushCacheProc.command = ["/usr/bin/systemctl", "kill", "-s", "SIGUSR1", "albus.service"]
     flushCacheProc.running = true
   }
 
@@ -560,27 +582,57 @@ Panel {
   // subprocess definitions
   Process {
     id: statusProc
-    command: ["albus", "status", "--json"]
+    command: ["/usr/local/bin/albus", "status", "--json"]
     running: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var s = root.parseStatusJson(text)
-        if (s) {
-          root.isRunning = s.active
+    property string outBuf: ""
+    property int outBytes: 0
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        // producer-side byte budget: cap + 1 detects overflow instead of truncating
+        if (statusProc.outBytes + chunk.length > 65537) {
+          statusProc.signal(9)
+          statusProc.outBuf = ""
+          statusProc.outBytes = 0
+          return
         }
+        statusProc.outBytes += chunk.length
+        statusProc.outBuf += chunk
+      }
+    }
+    onExited: function(code) {
+      var s = root.parseStatusJson(statusProc.outBuf.slice(0, 65536))
+      statusProc.outBuf = ""
+      statusProc.outBytes = 0
+      if (s) {
+        root.isRunning = s.active
       }
     }
   }
 
   Process {
     id: configGetProc
-    command: ["albus", "config", "get"]
+    command: ["/usr/local/bin/albus", "config", "get"]
     running: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var cfg = root.parseConfigJson(text)
+    property string outBuf: ""
+    property int outBytes: 0
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (configGetProc.outBytes + chunk.length > 65537) {
+          configGetProc.signal(9)
+          configGetProc.outBuf = ""
+          configGetProc.outBytes = 0
+          return
+        }
+        configGetProc.outBytes += chunk.length
+        configGetProc.outBuf += chunk
+      }
+    }
+    onExited: function(code) {
+      var cfg = root.parseConfigJson(configGetProc.outBuf.slice(0, 65536))
+      configGetProc.outBuf = ""
+      configGetProc.outBytes = 0
         if (cfg) {
           root.isConfigLoading = true
 
@@ -628,7 +680,6 @@ Panel {
 
           root.isConfigLoading = false
         }
-      }
     }
   }
 
@@ -640,7 +691,7 @@ Panel {
       if (code === 0) {
         root.showToast("Settings applied")
         if (root.isRunning) {
-          daemonActionProc.command = ["systemctl", "restart", "albus.service"]
+          daemonActionProc.command = ["/usr/bin/systemctl", "restart", "albus.service"]
           daemonActionProc.running = true
         } else {
           root.refreshStatus()
@@ -664,7 +715,7 @@ Panel {
 
   Process {
     id: terminalProc
-    command: ["xdg-terminal-exec", "albus", "monitor"]
+    command: ["/usr/bin/xdg-terminal-exec", "/usr/local/bin/albus", "monitor"]
     running: false
   }
 
@@ -674,13 +725,14 @@ Panel {
     running: false
   }
 
-  // journalctl event stream collector
+  // journalctl event stream collector (bounded: per-line cap + 120-event model cap)
   Process {
     id: streamProc
-    command: ["journalctl", "-u", "albus.service", "-n", "40", "-f", "--no-pager", "-o", "cat"]
+    command: ["/usr/bin/journalctl", "-u", "albus.service", "-n", "40", "-f", "--no-pager", "-o", "cat"]
     running: root.opened && root.activeTab === 1
     stdout: SplitParser {
       onRead: function(line) {
+        if (line.length > 2048) line = line.slice(0, 2048)
         root.appendStreamEvent(line)
       }
     }
@@ -765,6 +817,7 @@ Panel {
                 height: Math.max(albusTitle.implicitHeight, statusText.implicitHeight)
 
                 Text {
+                  textFormat: Text.PlainText;
                   id: albusTitle
                   text: "ALBUS"
                   font.family: root.fontFamily
@@ -775,6 +828,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText;
                   id: statusText
                   text: root.isRunning ? "● ACTIVE" : "○ STANDBY"
                   font.family: "monospace"
@@ -786,6 +840,7 @@ Panel {
               }
 
               Text {
+                  textFormat: Text.PlainText;
                 width: parent.width
                 text: root.isBusy ? "Applying rules..." : (root.isRunning ? ("eBPF sock_ops • ML-KEM-768 • " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent")) : "Engine is offline")
                 font.family: root.fontFamily
@@ -1064,7 +1119,8 @@ Panel {
                 visible: root.activeDnsKey === "custom"
                 spacing: Style.space(4)
 
-                Text { text: "Endpoint URL"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                Text {
+                  textFormat: Text.PlainText; text: "Endpoint URL"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                 TextField {
                   width: parent.width
                   placeholderText: "https://doh.example.com/dns-query"
@@ -1082,7 +1138,8 @@ Panel {
                   Column {
                     width: (parent.width - Style.space(6)) / 2
                     spacing: 2
-                    Text { text: "Bootstrap IP 1"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                    Text {
+                  textFormat: Text.PlainText; text: "Bootstrap IP 1"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
                       placeholderText: "e.g. 45.90.28.0"
@@ -1100,7 +1157,8 @@ Panel {
                   Column {
                     width: (parent.width - Style.space(6)) / 2
                     spacing: 2
-                    Text { text: "Bootstrap IP 2"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                    Text {
+                  textFormat: Text.PlainText; text: "Bootstrap IP 2"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                     TextField {
                       width: parent.width
                       placeholderText: "e.g. 45.90.30.0"
@@ -1130,7 +1188,8 @@ Panel {
                 Column {
                   width: (parent.width - Style.space(12)) / 3
                   spacing: 2
-                  Text { text: "TCP MSS"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  Text {
+                  textFormat: Text.PlainText; text: "TCP MSS"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                   TextField {
                     width: parent.width
                     text: root.customMss
@@ -1147,7 +1206,8 @@ Panel {
                 Column {
                   width: (parent.width - Style.space(12)) / 3
                   spacing: 2
-                  Text { text: "Min MSS (Jitter)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  Text {
+                  textFormat: Text.PlainText; text: "Min MSS (Jitter)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                   TextField {
                     width: parent.width
                     text: root.customMinMss
@@ -1164,7 +1224,8 @@ Panel {
                 Column {
                   width: (parent.width - Style.space(12)) / 3
                   spacing: 2
-                  Text { text: "TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  Text {
+                  textFormat: Text.PlainText; text: "TTL (0 = Auto)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                   TextField {
                     width: parent.width
                     text: root.customFakeTtl
@@ -1183,7 +1244,8 @@ Panel {
               Column {
                 width: parent.width
                 spacing: 2
-                Text { text: "Fake SNI (Pool / Custom)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                Text {
+                  textFormat: Text.PlainText; text: "Fake SNI (Pool / Custom)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
                 TextField {
                   width: parent.width
                   text: root.customFakeSni
@@ -1413,6 +1475,7 @@ Panel {
                       spacing: 0
 
                       Text {
+                  textFormat: Text.PlainText;
                         text: String(modelData.count)
                         font.bold: true
                         font.family: "monospace"
@@ -1422,6 +1485,7 @@ Panel {
                       }
 
                       Text {
+                  textFormat: Text.PlainText;
                         text: modelData.label
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption - 2
@@ -1537,6 +1601,7 @@ Panel {
                       }
 
                       Text {
+                  textFormat: Text.PlainText;
                         text: root.eventRateText
                         font.family: "monospace"
                         font.pixelSize: Style.font.caption - 2
@@ -1644,6 +1709,7 @@ Panel {
                         Layout.alignment: Qt.AlignVCenter
 
                         Text {
+                  textFormat: Text.PlainText;
                           id: catText
                           anchors.centerIn: parent
                           text: modelData.category
@@ -1689,6 +1755,7 @@ Panel {
                         Layout.alignment: Qt.AlignVCenter
 
                         Text {
+                  textFormat: Text.PlainText;
                           id: tagText
                           anchors.centerIn: parent
                           text: modelData.tag || ""
@@ -1747,6 +1814,7 @@ Panel {
                   }
 
                   Text {
+                  textFormat: Text.PlainText;
                     id: jumpText
                     anchors.centerIn: parent
                     text: "Jump to latest"
@@ -1786,6 +1854,7 @@ Panel {
             implicitHeight: Math.max(leftHint.implicitHeight, rightHint.implicitHeight)
 
             Text {
+                  textFormat: Text.PlainText;
               id: leftHint
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -1796,6 +1865,7 @@ Panel {
             }
 
             Text {
+                  textFormat: Text.PlainText;
               id: rightHint
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter

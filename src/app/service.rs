@@ -1,21 +1,24 @@
 //! systemd service unit generator, process supervision, and journal telemetry streaming.
 
-use std::fs;
-use std::path::Path;
-use std::process::Command;
 use crate::app::cli::{RunArgs, ServiceCommands};
 use crate::core::ebpf::is_root;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::process::Command;
 
 const SERVICE_FILE_PATH: &str = "/etc/systemd/system/albus.service";
 const SYSTEM_BIN_PATH: &str = "/usr/local/bin/albus";
 const POLKIT_RULE_PATH: &str = "/etc/polkit-1/rules.d/albus.rules";
+const SYSTEMCTL_BIN: &str = "/usr/bin/systemctl";
+const JOURNALCTL_BIN: &str = "/usr/bin/journalctl";
 
 const POLKIT_RULE_CONTENT: &str = r#"polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units") {
         var unit = action.lookup("unit");
         if (unit == "albus.service") {
             if (subject.isInGroup("wheel") || subject.isInGroup("sudo")) {
-                return polkit.Result.YES;
+                return polkit.Result.AUTH_ADMIN;
             }
         }
     }
@@ -23,7 +26,9 @@ const POLKIT_RULE_CONTENT: &str = r#"polkit.addRule(function(action, subject) {
 "#;
 
 // dispatches systemd lifecycle actions
-pub fn handle_service_command(cmd: ServiceCommands) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn handle_service_command(
+    cmd: ServiceCommands,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cmd {
         ServiceCommands::Install(args) => install_service(&args),
         ServiceCommands::Uninstall => uninstall_service(),
@@ -36,26 +41,144 @@ pub fn handle_service_command(cmd: ServiceCommands) -> Result<(), Box<dyn std::e
     }
 }
 
+fn systemctl() -> Command {
+    let mut c = Command::new(SYSTEMCTL_BIN);
+    c.env_clear();
+    c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    c
+}
+
+/// Fail-closed atomic write for root-owned files: rejects symlinks, enforces mode.
+fn secure_write_root_file(
+    path: &str,
+    content: &str,
+    mode: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let p = Path::new(path);
+    // 1. reject symlink at final component (TOCTOU-safe open follows)
+    if let Ok(meta) = fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            return Err(
+                format!("security violation: refusing to write symlink at {}", path).into(),
+            );
+        }
+    }
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(p)?;
+    // 2. verify we opened a regular file owned by root
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(format!("security violation: {} is not a regular file", path).into());
+    }
+    #[cfg(unix)]
+    {
+        if meta.uid() != 0 {
+            return Err(format!("security violation: {} owned by uid {}", path, meta.uid()).into());
+        }
+    }
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    Ok(())
+}
+
+/// Validates that a path is safe to embed in a systemd ExecStart line (no shell metachars).
+fn validate_exec_path(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if path.is_empty() || path.len() > 512 || !path.starts_with('/') {
+        return Err("security violation: exec path must be absolute".into());
+    }
+    for ch in [
+        ' ', '"', '\'', '\n', '\r', '\t', ';', '$', '`', '&', '|', '>', '<', '*', '?', '~', '#',
+        '\\', '(', ')', '{', '}',
+    ] {
+        if path.contains(ch) {
+            return Err(format!(
+                "security violation: exec path contains forbidden char {:?}",
+                ch
+            )
+            .into());
+        }
+    }
+    if path.contains("..") {
+        return Err("security violation: exec path contains ..".into());
+    }
+    Ok(())
+}
+
+/// After copying, verifies SYSTEM_BIN_PATH is a root-owned regular file (not symlink) and canonicalizes it.
+fn verify_installed_binary() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let p = Path::new(SYSTEM_BIN_PATH);
+    let meta = fs::symlink_metadata(p)
+        .map_err(|e| format!("installed binary missing at {}: {}", SYSTEM_BIN_PATH, e))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("security violation: {} is a symlink", SYSTEM_BIN_PATH).into());
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "security violation: {} is not a regular file",
+            SYSTEM_BIN_PATH
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    {
+        if meta.uid() != 0 {
+            return Err(format!(
+                "security violation: {} owned by uid {} (expected root)",
+                SYSTEM_BIN_PATH,
+                meta.uid()
+            )
+            .into());
+        }
+    }
+    let canon = fs::canonicalize(p)?;
+    let canon_str = canon.to_str().ok_or("non-utf8 binary path")?.to_string();
+    if canon_str != SYSTEM_BIN_PATH {
+        return Err(format!(
+            "security violation: canonical binary path {} != {}",
+            canon_str, SYSTEM_BIN_PATH
+        )
+        .into());
+    }
+    validate_exec_path(&canon_str)?;
+    Ok(canon_str)
+}
+
 // generates systemd unit file with AmbientCapabilities, installs polkit rule, and enables auto-start
 fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service install requires root privileges — run with sudo".into());
     }
 
-    // copy binary to standard system execution path
+    // copy binary to standard system execution path — FAIL CLOSED, no fallback
     let exe_path = std::env::current_exe()?;
-    let _ = fs::copy(&exe_path, SYSTEM_BIN_PATH);
+    fs::copy(&exe_path, SYSTEM_BIN_PATH).map_err(|e| {
+        format!(
+            "failed to copy {} to {}: {} — aborting install (refusing caller-controlled fallback)",
+            exe_path.display(),
+            SYSTEM_BIN_PATH,
+            e
+        )
+    })?;
 
-    let exe_str = if Path::new(SYSTEM_BIN_PATH).exists() {
-        SYSTEM_BIN_PATH
-    } else {
-        exe_path.to_str().unwrap_or(SYSTEM_BIN_PATH)
-    };
+    // verify installed copy is root-owned, non-symlink, canonical
+    let exe_str = verify_installed_binary()?;
 
     let exec_start = format!("{} run", exe_str);
     let exec_stop = format!("{} cleanup", exe_str);
 
-    // format systemd service specification
+    // format systemd service specification (least-privilege capabilities + hardening)
     let unit_content = format!(
         r#"[Unit]
 Description=albus — High-Performance eBPF DPI Bypass & DoH DNS Service
@@ -71,30 +194,39 @@ ExecStopPost={exec_stop}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 "#,
     );
 
-    fs::write(SERVICE_FILE_PATH, unit_content)?;
+    secure_write_root_file(SERVICE_FILE_PATH, &unit_content, 0o600)?;
     println!("Created systemd service unit: {}", SERVICE_FILE_PATH);
 
-    // install passwordless polkit authorization rule for desktop widget management
+    // install polkit authorization rule (fail closed — no silent half-install)
     if let Some(parent) = Path::new(POLKIT_RULE_PATH).parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
-    if let Err(e) = fs::write(POLKIT_RULE_PATH, POLKIT_RULE_CONTENT) {
-        println!("Warning: Could not write polkit rule: {}", e);
-    } else {
-        println!("Created polkit authorization rule: {}", POLKIT_RULE_PATH);
-    }
+    secure_write_root_file(POLKIT_RULE_PATH, POLKIT_RULE_CONTENT, 0o644)?;
+    println!("Created polkit authorization rule: {}", POLKIT_RULE_PATH);
 
-    // reload daemon manager and enable unit
-    let _ = Command::new("systemctl").arg("daemon-reload").status()?;
-    let _ = Command::new("systemctl").args(["enable", "--now", "albus.service"]).status()?;
+    // reload daemon manager and enable unit (absolute path, checked)
+    let reload = systemctl().arg("daemon-reload").status()?;
+    if !reload.success() {
+        return Err("systemctl daemon-reload failed — aborting".into());
+    }
+    let enable = systemctl()
+        .args(["enable", "--now", "albus.service"])
+        .status()?;
+    if !enable.success() {
+        return Err("systemctl enable --now albus.service failed".into());
+    }
 
     println!("albus binary copied to /usr/local/bin/albus");
     println!("albus service installed, enabled, and started successfully!");
@@ -104,26 +236,48 @@ WantedBy=multi-user.target
     Ok(())
 }
 
+// securely removes a root-owned file, refusing symlinks
+fn secure_remove_file(path: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(
+                    format!("security violation: refusing to remove symlink at {}", path).into(),
+                );
+            }
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+    }
+}
+
 // uninstalls service unit and restores network state
 fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service uninstall requires root privileges — run with sudo".into());
     }
 
-    if Path::new(SERVICE_FILE_PATH).exists() {
-        println!("Stopping and disabling albus.service...");
-        let _ = Command::new("systemctl").args(["stop", "albus.service"]).status();
-        let _ = Command::new("systemctl").args(["disable", "albus.service"]).status();
-        let _ = fs::remove_file(SERVICE_FILE_PATH);
-        let _ = Command::new("systemctl").arg("daemon-reload").status();
-        println!("Removed {}", SERVICE_FILE_PATH);
-    } else {
-        println!("No albus.service file found at {}", SERVICE_FILE_PATH);
+    // stop/disable/remove unit without exists() TOCTOU
+    let stop = systemctl().args(["stop", "albus.service"]).status();
+    let _ = stop;
+    let disable = systemctl().args(["disable", "albus.service"]).status();
+    let _ = disable;
+    match secure_remove_file(SERVICE_FILE_PATH) {
+        Ok(true) => println!("Removed {}", SERVICE_FILE_PATH),
+        Ok(false) => println!("No albus.service file found at {}", SERVICE_FILE_PATH),
+        Err(e) => return Err(e),
+    }
+    let reload = systemctl().arg("daemon-reload").status()?;
+    if !reload.success() {
+        return Err("systemctl daemon-reload failed during uninstall".into());
     }
 
-    if Path::new(POLKIT_RULE_PATH).exists() {
-        let _ = fs::remove_file(POLKIT_RULE_PATH);
-        println!("Removed {}", POLKIT_RULE_PATH);
+    match secure_remove_file(POLKIT_RULE_PATH) {
+        Ok(true) => println!("Removed {}", POLKIT_RULE_PATH),
+        Ok(false) => {}
+        Err(e) => return Err(e),
     }
 
     crate::core::firewall::unblock_quic();
@@ -136,7 +290,7 @@ fn start_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service start requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["start", "albus.service"]).status()?;
+    let status = systemctl().args(["start", "albus.service"]).status()?;
     if status.success() {
         println!("albus.service started.");
     } else {
@@ -149,7 +303,7 @@ fn stop_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service stop requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["stop", "albus.service"]).status()?;
+    let status = systemctl().args(["stop", "albus.service"]).status()?;
     if status.success() {
         println!("albus.service stopped.");
     } else {
@@ -162,7 +316,7 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service restart requires root privileges — run with sudo".into());
     }
-    let status = Command::new("systemctl").args(["restart", "albus.service"]).status()?;
+    let status = systemctl().args(["restart", "albus.service"]).status()?;
     if status.success() {
         println!("albus.service restarted.");
     } else {
@@ -172,7 +326,12 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let status = Command::new("systemctl").args(["kill", "-s", "HUP", "albus.service"]).status()?;
+    if !is_root() {
+        return Err("albus service reload requires root privileges — run with sudo".into());
+    }
+    let status = systemctl()
+        .args(["kill", "-s", "HUP", "albus.service"])
+        .status()?;
     if status.success() {
         println!("albus.service configuration reloaded live via SIGHUP.");
     } else {
@@ -182,11 +341,15 @@ fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn show_service_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new("systemctl").args(["status", "albus.service"]).status()?;
+    let _ = Command::new(SYSTEMCTL_BIN)
+        .args(["status", "albus.service"])
+        .status()?;
     Ok(())
 }
 
 fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new("journalctl").args(["-u", "albus.service", "-f", "-n", "50"]).status()?;
+    let _ = Command::new(JOURNALCTL_BIN)
+        .args(["-u", "albus.service", "-f", "-n", "50"])
+        .status()?;
     Ok(())
 }

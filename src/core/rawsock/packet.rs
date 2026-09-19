@@ -353,14 +353,7 @@ mod tests {
         use std::net::Ipv6Addr;
         let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let dst = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
-        let conn = ConnInfo::new_v6(
-            src,
-            dst,
-            54321,
-            443,
-            2000,
-            4000,
-        );
+        let conn = ConnInfo::new_v6(src, dst, 54321, 443, 2000, 4000);
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let ttl = 64;
 
@@ -369,8 +362,8 @@ mod tests {
 
         // ipv6 header checks
         assert_eq!(pkt[0], 0x60); // version 6
-        assert_eq!(pkt[6], 6);    // next header: tcp
-        assert_eq!(pkt[7], 64);   // hop limit
+        assert_eq!(pkt[6], 6); // next header: tcp
+        assert_eq!(pkt[7], 64); // hop limit
         assert_eq!(&pkt[8..24], &src.octets());
         assert_eq!(&pkt[24..40], &dst.octets());
 

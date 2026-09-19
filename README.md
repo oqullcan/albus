@@ -29,7 +29,7 @@
 | **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
 | **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs` cryptographic provider. |
 | **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
-| **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` enables passwordless desktop management for `wheel`/`sudo` users. |
+| **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` requires admin authentication (`AUTH_ADMIN`) for `wheel`/`sudo` users to manage `albus.service`. |
 
 ---
 
@@ -179,6 +179,34 @@ Albus includes a first-party Omarchy Quattro desktop panel widget (`BarWidget.qm
 mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev
 cp manifest.json BarWidget.qml Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
 omarchy-shell shell rescanPlugins
+```
+
+---
+
+## Removal
+
+```bash
+omarchy plugin remove io.github.oqullcan.albus.dev
+```
+
+What persists after plugin removal (plugin directory only is deleted):
+
+| Artifact | Path | Deleted by | Kept? |
+|---|---|---|---|
+| systemd unit | `/etc/systemd/system/albus.service` | `sudo albus service uninstall` | kept (run uninstall first) |
+| polkit rule | `/etc/polkit-1/rules.d/albus.rules` | `sudo albus service uninstall` | kept |
+| installed binary | `/usr/local/bin/albus` | manual (owned by root after install) | kept |
+| user config | `~/.config/albus/config.json`, `/etc/albus/config.json` | manual | kept (preferences) |
+| runtime state | `/run/albus/` | reboot / `sudo albus cleanup` | volatile |
+| DNS / firewall | `/etc/resolv.conf`, iptables rules | `sudo albus cleanup` + uninstall | restored by cleanup |
+| widget state | `~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/` | `omarchy plugin remove` | deleted |
+
+Full teardown:
+
+```bash
+sudo albus service uninstall
+sudo albus cleanup
+omarchy plugin remove io.github.oqullcan.albus.dev
 ```
 
 ---

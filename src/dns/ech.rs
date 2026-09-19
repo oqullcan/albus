@@ -16,14 +16,20 @@ pub fn parse_https_ech_config(rdata: &[u8]) -> Option<Vec<u8>> {
     let _priority = ((rdata[0] as u16) << 8) | (rdata[1] as u16);
     let mut pos = 2;
 
-    // parse targetname uncompressed domain labels
+    // parse targetname uncompressed domain labels (bounds-checked each step)
     while pos < rdata.len() {
         let label_len = rdata[pos] as usize;
         pos += 1;
         if label_len == 0 {
             break;
         }
-        pos += label_len;
+        if label_len > 63 {
+            return None;
+        }
+        pos = pos.checked_add(label_len)?;
+        if pos > rdata.len() {
+            return None;
+        }
     }
 
     if pos > rdata.len() {
@@ -35,8 +41,10 @@ pub fn parse_https_ech_config(rdata: &[u8]) -> Option<Vec<u8>> {
     let mut param_pos = 0;
 
     while param_pos + 4 <= params_data.len() {
-        let param_key = ((params_data[param_pos] as u16) << 8) | (params_data[param_pos + 1] as u16);
-        let param_len = ((params_data[param_pos + 2] as usize) << 8) | (params_data[param_pos + 3] as usize);
+        let param_key =
+            ((params_data[param_pos] as u16) << 8) | (params_data[param_pos + 1] as u16);
+        let param_len =
+            ((params_data[param_pos + 2] as usize) << 8) | (params_data[param_pos + 3] as usize);
         param_pos += 4;
 
         if param_pos + param_len > params_data.len() {
@@ -68,7 +76,14 @@ impl EchConfigCache {
     }
 
     pub fn insert(&self, domain: String, ech_config: Vec<u8>) {
+        if domain.len() > 253 || ech_config.len() > 4096 {
+            return;
+        }
         if let Ok(mut guard) = self.inner.write() {
+            // bound memory: simple eviction when too many domains
+            if guard.len() >= 1024 {
+                guard.clear();
+            }
             guard.insert(domain, ech_config);
         }
     }

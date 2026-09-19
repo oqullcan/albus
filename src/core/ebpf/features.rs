@@ -41,8 +41,18 @@ pub fn has_btf() -> bool {
 // parses linux kernel release string (e.g. "6.13.5-arch1", "5.15.0-generic") into (major, minor)
 pub fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.trim().split('.');
-    let major = parts.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()?;
+    let major = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    let minor = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u32>()
+        .ok()?;
     Some((major, minor))
 }
 
@@ -87,7 +97,12 @@ pub fn list_active_interfaces() -> Vec<String> {
 
 // aggregates root, cgroup v2, sock_ops, and btf co-re capability flags
 pub fn capability_summary() -> (bool, bool, bool, bool) {
-    (is_root(), is_cgroup_v2("/sys/fs/cgroup"), have_sock_ops(), has_btf())
+    (
+        is_root(),
+        is_cgroup_v2("/sys/fs/cgroup"),
+        have_sock_ops(),
+        has_btf(),
+    )
 }
 
 #[cfg(test)]

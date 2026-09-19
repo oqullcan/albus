@@ -51,7 +51,10 @@ impl BpfManager {
     }
 
     // reloads ebpf maps live at runtime without stopping or detaching the program
-    pub fn reload_maps(&mut self, new_cfg: &BpfManagerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn reload_maps(
+        &mut self,
+        new_cfg: &BpfManagerConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cfg = new_cfg.clone();
         if let Some(handles) = self.map_handles {
             let bpf_cfg = BpfConfig::new(
@@ -78,7 +81,10 @@ impl BpfManager {
     }
 
     // loads ebpf, attaches to cgroup, initializes maps, and starts event polling loop
-    pub fn start(&mut self, dns_server: Option<Arc<DnsServer>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn start(
+        &mut self,
+        dns_server: Option<Arc<DnsServer>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Loading eBPF sock_ops program");
 
         let engine = BpfEngine::load_and_attach(&self.cfg.cgroup_path)?;
@@ -123,17 +129,26 @@ impl BpfManager {
         // assemble decoy clienthello payloads: rotate across pool if no custom sni is forced
         let fake_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
             if sni != "www.google.com" && !sni.is_empty() {
-                vec![crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc)]
+                vec![
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc),
+                ]
             } else {
                 crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                     .iter()
-                    .map(|&s| crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc))
+                    .map(|&s| {
+                        crate::core::fake::clienthello::build_fake_client_hello_opts(
+                            s,
+                            self.cfg.pqc,
+                        )
+                    })
                     .collect()
             }
         } else {
             crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                 .iter()
-                .map(|&s| crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc))
+                .map(|&s| {
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc)
+                })
                 .collect()
         };
 
@@ -148,29 +163,45 @@ impl BpfManager {
                 let mut received = false;
                 engine_poll.poll_events(|raw_evt: RawConnEvent| {
                     received = true;
-                    let conn = if raw_evt.family == 10 {
+                    // NOTE: RawConnEvent is #[repr(packed)] — never take references to its
+                    // fields (unaligned). Copy out via read_unaligned first.
+                    let (src_ip, dst_ip, src_port, dst_port, seq, ack, family, src_ip6, dst_ip6) = unsafe {
+                        let p = &raw_evt as *const RawConnEvent;
+                        (
+                            std::ptr::addr_of!((*p).src_ip).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_ip).read_unaligned(),
+                            std::ptr::addr_of!((*p).src_port).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_port).read_unaligned(),
+                            std::ptr::addr_of!((*p).seq).read_unaligned(),
+                            std::ptr::addr_of!((*p).ack).read_unaligned(),
+                            std::ptr::addr_of!((*p).family).read_unaligned(),
+                            std::ptr::addr_of!((*p).src_ip6).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_ip6).read_unaligned(),
+                        )
+                    };
+                    let conn = if family == 10 {
                         let mut src_octets = [0u8; 16];
                         let mut dst_octets = [0u8; 16];
                         for i in 0..4 {
-                            src_octets[i * 4..(i + 1) * 4].copy_from_slice(&raw_evt.src_ip6[i].to_ne_bytes());
-                            dst_octets[i * 4..(i + 1) * 4].copy_from_slice(&raw_evt.dst_ip6[i].to_ne_bytes());
+                            src_octets[i * 4..(i + 1) * 4].copy_from_slice(&src_ip6[i].to_ne_bytes());
+                            dst_octets[i * 4..(i + 1) * 4].copy_from_slice(&dst_ip6[i].to_ne_bytes());
                         }
                         ConnInfo::new_v6(
                             Ipv6Addr::from(src_octets),
                             Ipv6Addr::from(dst_octets),
-                            raw_evt.src_port,
-                            raw_evt.dst_port,
-                            raw_evt.seq,
-                            raw_evt.ack,
+                            src_port,
+                            dst_port,
+                            seq,
+                            ack,
                         )
                     } else {
                         ConnInfo::new_v4(
-                            Ipv4Addr::from(raw_evt.src_ip.to_ne_bytes()),
-                            Ipv4Addr::from(raw_evt.dst_ip.to_ne_bytes()),
-                            raw_evt.src_port,
-                            raw_evt.dst_port,
-                            raw_evt.seq,
-                            raw_evt.ack,
+                            Ipv4Addr::from(src_ip.to_ne_bytes()),
+                            Ipv4Addr::from(dst_ip.to_ne_bytes()),
+                            src_port,
+                            dst_port,
+                            seq,
+                            ack,
                         )
                     };
 

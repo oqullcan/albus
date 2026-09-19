@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cfg.pqc = args.pqc;
                     cfg.ram_only = args.ram_only;
                     cfg.verbose = args.verbose;
+                    cfg.validate()?;
 
                     let path = Config::default_config_path();
                     cfg.save_to_file(&path)?;
@@ -71,13 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
 
                     // if background daemon is actively running, notify it via SIGHUP to apply maps live
-                    let is_active = std::process::Command::new("systemctl")
+                    // NOTE: SIGHUP only hot-reloads eBPF maps; firewall/DNS changes need restart.
+                    // Only root may signal the service (reload_service enforces root).
+                    let is_active = std::process::Command::new("/usr/bin/systemctl")
                         .args(["is-active", "--quiet", "albus.service"])
                         .status()
                         .map(|s| s.success())
                         .unwrap_or(false);
                     if is_active {
-                        let _ = std::process::Command::new("systemctl")
+                        let _ = std::process::Command::new("/usr/bin/systemctl")
                             .args(["kill", "-s", "HUP", "albus.service"])
                             .status();
                         println!("live configuration reloaded into running albus daemon (SIGHUP)");
@@ -98,9 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             service::handle_service_command(service_args.command)
         }
         // interactive curses-style terminal monitor
-        Some(Commands::Monitor) => {
-            monitor::run_monitor()
-        }
+        Some(Commands::Monitor) => monitor::run_monitor(),
         // crash recovery: restore system resolv.conf and iptables state
         Some(Commands::Cleanup) => {
             if !is_root() {
@@ -126,12 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
         // start packet fragmentation and desync engine
-        Some(Commands::Run(args)) => {
-            run_engine(args).await
-        }
-        None => {
-            run_engine(cli.run_args).await
-        }
+        Some(Commands::Run(args)) => run_engine(args).await,
+        None => run_engine(cli.run_args).await,
     }
 }
 
@@ -153,10 +150,11 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
 
     // load persistent configuration from json path or default hierarchy
     let cfg = if let Some(ref path) = args.config {
-        Config::load_from_file(path)?
+        Config::load_from_file_root_checked(path)?
     } else {
         Config::load_or_default()
     };
+    cfg.validate()?;
 
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;

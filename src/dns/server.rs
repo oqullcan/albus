@@ -91,6 +91,7 @@ impl DnsServer {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut tick_count: u64 = 0;
+            let mut last_heal: Option<std::time::Instant> = None;
 
             loop {
                 tokio::select! {
@@ -107,9 +108,13 @@ impl DnsServer {
 
                             if !has_loopback {
                                 warn!("DNS leak canary: /etc/resolv.conf does not point to 127.0.0.1 (possible DHCP/NetworkManager overwrite). Auto-healing system DNS...");
-                                if let Err(e) = crate::dns::system::set_system_dns() {
+                                let can_heal = last_heal.map(|t| t.elapsed().as_secs() >= 300).unwrap_or(true);
+                                if !can_heal {
+                                    warn!("DNS auto-heal rate-limited (last heal <5min ago) — skipping root write");
+                                } else if let Err(e) = crate::dns::system::set_system_dns() {
                                     warn!("failed to auto-heal /etc/resolv.conf: {}", e);
                                 } else {
+                                    last_heal = Some(std::time::Instant::now());
                                     info!("DNS leak canary: successfully auto-healed /etc/resolv.conf to 127.0.0.1");
                                 }
                             }
@@ -328,11 +333,10 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     if arcount == 0 {
         // opt rr specification: root domain (0x00), type 41 (opt), udp payload size 4096, do-bit (0x8000)
         let opt_rr: [u8; 11] = [
-            0x00,
-            0x00, 0x29, // type: opt (41)
+            0x00, 0x00, 0x29, // type: opt (41)
             0x10, 0x00, // payload size: 4096
-            0x00,       // extended rcode
-            0x00,       // edns version
+            0x00, // extended rcode
+            0x00, // edns version
             0x80, 0x00, // do bit set (0x8000)
             0x00, 0x00, // rdlen: 0
         ];
@@ -446,30 +450,22 @@ async fn run_active_canary_probe() {
         let mut resp_buf = [0u8; 512];
         let (len, _) = sock.recv_from(&mut resp_buf).await?;
         Ok::<Vec<u8>, std::io::Error>(resp_buf[..len].to_vec())
-    }).await;
+    })
+    .await;
 
     match probe_res {
         Ok(Ok(resp)) => {
             if resp.windows(4).any(|w| w == [127, 0, 0, 99]) {
                 debug!("active DNS leak canary probe passed: 127.0.0.99 verified from local proxy");
             } else {
-                warn!("Active DNS Leak Canary TRIPPED: resolver responded without expected canary IP (127.0.0.99). Potential DNS hijacking or poisoned cache detected!");
-                if let Err(e) = crate::dns::system::set_system_dns() {
-                    warn!("failed to auto-heal /etc/resolv.conf: {}", e);
-                }
+                warn!("Active DNS Leak Canary TRIPPED: resolver responded without expected canary IP (127.0.0.99). Potential DNS hijacking or poisoned cache detected! (passive canary will heal with backoff)");
             }
         }
         Ok(Err(e)) => {
-            warn!("Active DNS Leak Canary probe network error ({}). Auto-healing system DNS...", e);
-            if let Err(err) = crate::dns::system::set_system_dns() {
-                warn!("failed to auto-heal /etc/resolv.conf: {}", err);
-            }
+            warn!("Active DNS Leak Canary probe network error ({}). Passive canary will heal with backoff...", e);
         }
         Err(_) => {
-            warn!("Active DNS Leak Canary probe timed out (1.5s): local DNS proxy unresponsive! Auto-healing system DNS...");
-            if let Err(e) = crate::dns::system::set_system_dns() {
-                warn!("failed to auto-heal /etc/resolv.conf: {}", e);
-            }
+            warn!("Active DNS Leak Canary probe timed out (1.5s): local DNS proxy unresponsive! Passive canary will heal with backoff...");
         }
     }
 }
@@ -623,8 +619,14 @@ mod tests {
             q.push_back("second.com".to_string());
         }
 
-        assert_eq!(server.pop_domain(test_ip).await, Some("first.com".to_string()));
-        assert_eq!(server.pop_domain(test_ip).await, Some("second.com".to_string()));
+        assert_eq!(
+            server.pop_domain(test_ip).await,
+            Some("first.com".to_string())
+        );
+        assert_eq!(
+            server.pop_domain(test_ip).await,
+            Some("second.com".to_string())
+        );
         assert_eq!(server.pop_domain(test_ip).await, None);
     }
 
@@ -637,9 +639,8 @@ mod tests {
             0x00, 0x00, // ancount
             0x00, 0x00, // nscount
             0x00, 0x00, // arcount
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,       // end of name
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, // end of name
             0x00, 0x1C, // qtype = 28 (aaaa)
             0x00, 0x01, // qclass = in (1)
         ];
@@ -668,11 +669,8 @@ mod tests {
             0x00, 0x00, // ancount
             0x00, 0x00, // nscount
             0x00, 0x00, // arcount = 0
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,
-            0x00, 0x01,
-            0x00, 0x01,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01,
         ];
 
         let dnssec_query = enable_dnssec_do(&query);
