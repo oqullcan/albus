@@ -16,6 +16,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+hickory-proto = { version = "0.26", default-features = false, features = ["std", "dnssec-aws-lc-rs"] }
 libc = "0.2"
 webpki-roots = "1.0"
 

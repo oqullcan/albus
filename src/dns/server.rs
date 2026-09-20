@@ -8,7 +8,9 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::cache::DnsCache;
+use super::dnssec::{DnssecState, DnssecValidator};
 use super::doh::DoHResolver;
+use super::ech::EchConfigCache;
 
 // local dns server instance wrapping doh client pool and response cache
 pub struct DnsServer {
@@ -18,6 +20,8 @@ pub struct DnsServer {
     dnssec: bool,
     pqc: bool,
     cache: Arc<DnsCache>,
+    validator: Arc<DnssecValidator>,
+    ech_cache: EchConfigCache,
     ip_queue: Arc<Mutex<HashMap<Ipv4Addr, VecDeque<String>>>>,
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -40,6 +44,8 @@ impl DnsServer {
             dnssec,
             pqc,
             cache: Arc::new(DnsCache::new(2048)),
+            validator: Arc::new(DnssecValidator::new()),
+            ech_cache: EchConfigCache::new(),
             ip_queue: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
         })
@@ -79,8 +85,13 @@ impl DnsServer {
         );
 
         let socket = Arc::new(socket);
-        let resolver = self.resolver.clone();
+        // upgrade DoH clients to ECH where the upstream publishes configs
+        // (fetched over plain DoH first; logged per upstream)
+        let resolver = self.resolver.with_ech_upgraded(&self.ech_cache).await;
+        // verify the post-quantum claim in the background (one-shot, non-blocking)
+        resolver.spawn_pq_probe();
         let cache = self.cache.clone();
+        let validator = self.validator.clone();
         let ip_queue = self.ip_queue.clone();
         let block_ipv6 = self.block_ipv6;
         let dnssec = self.dnssec;
@@ -148,6 +159,7 @@ impl DnsServer {
                                 let socket_clone = socket.clone();
                                 let resolver_clone = resolver.clone();
                                 let cache_clone = cache.clone();
+                                let validator_clone = validator.clone();
                                 let ip_queue_clone = ip_queue.clone();
                                 let sem_clone = semaphore.clone();
 
@@ -217,7 +229,44 @@ impl DnsServer {
 
                                     match resolver_clone.resolve(&outgoing_query).await {
                                         Ok((resp_bytes, via)) => {
-                                            // insert response into cache
+                                            // 4. local DNSSEC chain validation (fail-closed on Bogus)
+                                            let dnssec_state = if dnssec {
+                                                match crate::dns::cache::extract_query_key(&query_data) {
+                                                    Some(key) => {
+                                                        match tokio::time::timeout(
+                                                            std::time::Duration::from_secs(10),
+                                                            validator_clone.validate(
+                                                                &key.name,
+                                                                key.qtype,
+                                                                &resp_bytes,
+                                                                &resolver_clone,
+                                                            ),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(s) => Some(s),
+                                                            Err(_) => {
+                                                                warn!("dnssec validation timed out; serving unverified");
+                                                                Some(DnssecState::Indeterminate)
+                                                            }
+                                                        }
+                                                    }
+                                                    None => None,
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            if dnssec_state == Some(DnssecState::Bogus) {
+                                                warn!("dnssec BOGUS response rejected (not cached, SERVFAIL sent)");
+                                                if query_data.len() >= 4 {
+                                                    let mut fail_resp = query_data.clone();
+                                                    fail_resp[2] |= 0x80;
+                                                    fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02;
+                                                    let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
+                                                }
+                                                return;
+                                            }
+                                            // insert response into cache (bogus never cached)
                                             cache_clone.insert(&query_data, &resp_bytes);
 
                                             let is_ad = is_dnssec_authenticated(&resp_bytes);
@@ -228,6 +277,7 @@ impl DnsServer {
                                                         ips = ?ips,
                                                         via = %via,
                                                         dnssec_authenticated = is_ad,
+                                                        dnssec_local = ?dnssec_state,
                                                         "DNS resolved"
                                                     );
                                                     let mut map = ip_queue_clone.lock().await;

@@ -1,6 +1,6 @@
 # albus
 
-> A kernel-level deep packet inspection (DPI) evasion engine and post-quantum DNS-over-HTTPS resolver for Linux.
+> A kernel-level deep packet inspection (DPI) evasion engine and DNS-over-HTTPS resolver for Linux, with ML-KEM post-quantum key exchange verified per upstream at startup.
 
 [![author](https://img.shields.io/badge/author-oqullcan-blue.svg)](https://github.com/oqullcan)
 [![rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
@@ -12,7 +12,7 @@
 
 ## Abstract
 
-**albus** implements transparent transport-layer desynchronization and post-quantum encrypted domain name resolution directly within the Linux network stack. By leveraging BPF CO-RE (`BPF_PROG_TYPE_SOCK_OPS`) attached to the unified cgroup v2 hierarchy, the engine dynamically modulates TCP Maximum Segment Size (MSS) during initial connection establishment to fragment TLS ClientHello records across multiple IP datagrams. Concurrently, a zero-allocation raw socket engine injects synthetic desynchronization payloads with destination-adaptive Time-to-Live (Auto-TTL) values, inducing state desynchronization in stateful middleboxes without disrupting end-to-end transport semantics.
+**albus** implements transparent transport-layer desynchronization and encrypted domain name resolution over DoH directly within the Linux network stack, with ML-KEM post-quantum key exchange where the upstream negotiates it (see §5). By leveraging BPF CO-RE (`BPF_PROG_TYPE_SOCK_OPS`) attached to the unified cgroup v2 hierarchy, the engine dynamically modulates TCP Maximum Segment Size (MSS) during initial connection establishment to fragment TLS ClientHello records across multiple IP datagrams. Concurrently, a zero-allocation raw socket engine injects synthetic desynchronization payloads with destination-adaptive Time-to-Live (Auto-TTL) values, inducing state desynchronization in stateful middleboxes without disrupting end-to-end transport semantics.
 
 ---
 
@@ -27,7 +27,7 @@
 | **Live Map Reload** | Runtime eBPF Reconfiguration | Zero-downtime updates of target ports, exclusion maps, and MSS limits via `SIGHUP` (`albus service reload` / `albus config set`). |
 | **Path Heuristics** | Auto-TTL Estimation | Dynamic hop-distance probing with boundary clamping (3–12 hops) and in-memory TTL caching. |
 | **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
-| **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs` cryptographic provider. |
+| **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs`, offered when `--pqc`; negotiated per upstream and verified at startup (`post-quantum KEM handshake OK` in logs, classical fallback warns). |
 | **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
 | **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` requires admin authentication (`AUTH_ADMIN`) for `wheel`/`sudo` users to manage `albus.service`. |
 
@@ -46,7 +46,7 @@
 │                                          │ │                                          │
 │ ├─ In-Memory Response Cache (0ms)        │ │ 1. eBPF ACTIVE_ESTABLISHED               │
 │ ├─ Post-Quantum ML-KEM-768 Key Exchange  │ │    Clamps initial TCP MSS = 88 bytes     │
-│ ├─ DNSSEC DO-bit & AD Validation         │ │    Notifies userspace via perf event ring│
+│ ├─ DNSSEC Local Chain Validation          │ │    Notifies userspace via perf event ring│
 │ ├─ IPv6 (AAAA) Leak Filtering            │ │                                          │
 │ └─ Upstream Dispatch:                    │ │ 2. Raw Socket Packet Injector            │
 │    • Quad9 / Cloudflare / Mullvad        │ │    Emits fake ClientHello (Optimal TTL)  │
@@ -78,8 +78,8 @@ The eBPF kernel program (`sockops.bpf.c`) natively processes both `AF_INET` and 
 ### 4. Zero-Downtime Live Map Reload (SIGHUP)
 Runtime configurations—including target ports, exclusion IP lists, and MSS bounds—can be updated instantly without restarting `albus.service` or severing active network connections. Dispatching `SIGHUP` (or executing `sudo albus service reload` / `albus config set ...`) synchronizes running eBPF maps atomically in kernel space.
 
-### 5. Post-Quantum DoH Resolution
-To mitigate "Harvest Now, Decrypt Later" surveillance, the DNS subsystem employs hybrid post-quantum key encapsulation (`X25519Kyber768Draft00` / `SecP256r1MLKEM768`). Upstream queries to Quad9, Cloudflare, and Mullvad are protected against future cryptanalytic attacks on elliptic-curve discrete logarithms.
+### 5. Post-Quantum DoH Key Exchange (verified, transport-only)
+To mitigate "Harvest Now, Decrypt Later" surveillance of DNS traffic, the DoH client offers hybrid post-quantum key encapsulation (`X25519Kyber768Draft00` / `SecP256r1MLKEM768`) via `aws-lc-rs`. At startup, each PQC-enabled upstream completes a background TLS handshake offering ONLY PQ KEM groups: success is logged (`DoH upstream <name>: post-quantum KEM handshake OK`), failure warns that connections use classical KEX despite `pqc=true`. Measured 2026-09-20: Cloudflare and `dns.nextdns.io` negotiate PQ; Quad9 and Mullvad do not — re-check your journal, support changes over time. Scope is transport key exchange only: certificate signatures remain classical. ECH is enabled automatically wherever an upstream publishes an ECHConfig (Type 65 fetched over DoH at startup, logged per upstream); measured 2026-09-20, none of the bundled upstreams publish one, so DoH connections carry plain SNI — user browsing SNI remains the browser's ECH job, out of scope here. DNSSEC is validated locally (RRSIG + DNSKEY + DS chain to the embedded root KSK; bogus answers get SERVFAIL and are never cached, unsigned answers are served as insecure); NSEC3 closest-encloser completeness and RFC 5011 rollover are not yet covered. PQ signatures (ML-DSA) are not yet offered by any bundled upstream; when servers deploy them, support arrives with the TLS provider — nothing is hardcoded client-side against it.
 
 ### 6. DNS Leak Protection & Active Canary Watchdog
 - **DNS Kill-Switch (`--kill-switch`)**: Injects kernel-level firewall (`iptables`/`ip6tables`) drop rules on all outbound non-loopback UDP/TCP port 53 traffic. Ensures no misconfigured background processes can leak plaintext DNS queries to the local ISP.
@@ -154,8 +154,8 @@ sudo albus cleanup           # Restore original /etc/resolv.conf and purge firew
 | `--doh` | `bool` | `true` | Spawn local DNS-over-HTTPS resolver on `127.0.0.1:53` |
 | `--doh-upstream` | `String` | `"quad9"` | Upstream resolver (`quad9`, `cloudflare`, `mullvad-*`, URL) |
 | `--doh-bootstrap-ips` | `Vec<IPv4>`| `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
-| `--dnssec` | `bool` | `true` | Enforce EDNS0 DO-bit and Authenticated Data validation |
-| `--pqc` | `bool` | `true` | Enable hybrid ML-KEM-768 post-quantum key exchange |
+| `--dnssec` | `bool` | `true` | Validate RRSIG chain locally (bogus → SERVFAIL, unsigned → served insecure) |
+| `--pqc` | `bool` | `true` | Offer hybrid ML-KEM-768 key exchange (negotiated per upstream; verified in logs) |
 | `--ram-only` | `bool` | `false` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |
 | `--block-quic` | `bool` | `true` | Drop outbound UDP 443 to force TLS/TCP transport |
 | `--block-stun` | `bool` | `true` | Drop outbound STUN (UDP 3478, 5349) to prevent WebRTC IP leaks |

@@ -184,7 +184,7 @@ pub struct RunArgs {
     #[arg(long, default_value = "/sys/fs/cgroup")]
     pub cgroup: String,
 
-    // enable post-quantum cryptography (ml-kem / kyber768 hybrid key exchange)
+    // offer post-quantum cryptography (ml-kem / kyber768 hybrid key exchange) where negotiated
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub pqc: bool,
 

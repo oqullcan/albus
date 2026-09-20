@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use hickory_proto::rr::{Name, Record};
 pub const DNS_TYPE_SVCB: u16 = 64;
 pub const DNS_TYPE_HTTPS: u16 = 65;
 pub const SVC_PARAM_ECH: u16 = 0x0005;
@@ -94,6 +95,96 @@ impl EchConfigCache {
     }
 }
 
+/// Fetches the ECHConfigList for `host` through our own DoH path (Type 65
+/// HTTPS query) and returns the raw config-list bytes ready for
+/// `rustls::client::EchConfig::new`. Follows one alias-mode hop; never
+/// panics; None when unpublished, unparseable, or unreachable.
+pub async fn fetch_echconfig_list(
+    host: &str,
+    resolver: &crate::dns::doh::DoHResolver,
+) -> Option<Vec<u8>> {
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+    use hickory_proto::rr::{RData, RecordType};
+
+    let clean = host.trim().trim_end_matches('.');
+    if clean.is_empty() || clean.len() > 253 {
+        return None;
+    }
+    let fqdn = format!("{}.", clean);
+    let mut name = Name::from_ascii(&fqdn).ok()?;
+    if name.is_root() {
+        return None;
+    }
+    // at most one alias-mode hop, then stop
+    for _ in 0..2 {
+        let mut msg = Message::new(query_id(), MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(name.clone(), RecordType::HTTPS));
+        let wire = msg.to_vec().ok()?;
+        if wire.is_empty() {
+            return None;
+        }
+        let (resp_wire, _) = resolver.resolve(&wire).await.ok()?;
+        let resp = Message::from_vec(&resp_wire).ok()?;
+        let records: Vec<_> = resp.answers.iter().chain(resp.authorities.iter()).collect();
+        if let Some(hit) = echconfig_from_records(&records, &name) {
+            return Some(hit);
+        }
+        // alias mode (priority 0): continue at the target name once
+        let mut alias: Option<Name> = None;
+        for rec in &records {
+            let (priority, target) = match &rec.data {
+                RData::HTTPS(h) => (h.svc_priority, &h.target_name),
+                RData::SVCB(s) => (s.svc_priority, &s.target_name),
+                _ => continue,
+            };
+            if priority == 0 && !target.is_root() {
+                alias = Some(target.clone());
+                break;
+            }
+        }
+        match alias {
+            Some(t) => name = t,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Pure extraction: ECHConfigList from owner-matching HTTPS/SVCB records
+/// only (never a stranger zone's config). Offline-testable.
+fn echconfig_from_records(records: &[&Record], owner: &Name) -> Option<Vec<u8>> {
+    use hickory_proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+    use hickory_proto::rr::RData;
+    for rec in records {
+        if rec.name.to_ascii().to_lowercase() != owner.to_ascii().to_lowercase() {
+            continue;
+        }
+        let params: &[(SvcParamKey, SvcParamValue)] = match &rec.data {
+            RData::HTTPS(h) => &h.svc_params,
+            RData::SVCB(s) => &s.svc_params,
+            _ => continue,
+        };
+        for (k, v) in params {
+            if *k == SvcParamKey::EchConfigList {
+                if let SvcParamValue::EchConfigList(list) = v {
+                    if !list.0.is_empty() && list.0.len() <= 4096 {
+                        return Some(list.0.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+fn query_id() -> u16 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
+        .unwrap_or(0x5678)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +224,94 @@ mod tests {
         cache.insert(domain.to_string(), dummy_ech.clone());
         assert_eq!(cache.get(domain), Some(dummy_ech));
         assert_eq!(cache.get("unknown.com"), None);
+    }
+
+    #[test]
+    fn test_ech_config_rejects_garbage_offline() {
+        // junk bytes must never become an ECH config (deterministic, no network)
+        let junk = vec![0x00u8, 0x01, 0x02, 0x03];
+        let res = rustls::client::EchConfig::new(
+            junk.into(),
+            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+        );
+        assert!(res.is_err(), "garbage must not parse as ECHConfig");
+    }
+
+    #[test]
+    fn test_fetch_rejects_bad_host_offline() {
+        // empty/root hosts short-circuit without network; run inside a
+        // throwaway runtime since fetch is async
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolver = crate::dns::doh::DoHResolver::new("quad9", &[], true).unwrap();
+        assert!(rt.block_on(fetch_echconfig_list("", &resolver)).is_none());
+    }
+
+    #[test]
+    fn test_echconfig_extraction_from_synthetic_https_offline() {
+        use hickory_proto::rr::rdata::svcb::{EchConfigList, SvcParamKey, SvcParamValue};
+        use hickory_proto::rr::rdata::{HTTPS, SVCB};
+        use hickory_proto::rr::{RData, Record};
+        // positive control: synthetic HTTPS record carrying an echconfig
+        let owner = Name::from_ascii("example.com.").unwrap();
+        let blob = vec![0xFE, 0x0D, 0x00, 0x20, 0x01, 0x02, 0x03, 0x04];
+        let svcb = SVCB::new(
+            1,
+            owner.clone(),
+            vec![(
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(EchConfigList(blob.clone())),
+            )],
+        );
+        let rec = Record::from_rdata(owner.clone(), 300, RData::HTTPS(HTTPS(svcb)));
+        let refs = vec![&rec];
+        assert_eq!(echconfig_from_records(&refs, &owner), Some(blob));
+        // another zone's config must never match (no cross-zone fallback)
+        let other = Name::from_ascii("other.example.").unwrap();
+        assert_eq!(echconfig_from_records(&refs, &other), None);
+        // record without ech param yields nothing
+        let bare = SVCB::new(1, owner.clone(), vec![]);
+        let rec2 = Record::from_rdata(owner.clone(), 300, RData::HTTPS(HTTPS(bare)));
+        let refs2 = vec![&rec2];
+        assert_eq!(echconfig_from_records(&refs2, &owner), None);
+    }
+
+    /// Live measurement: which DoH hosts publish ECHConfigs.
+    /// Ignored by default (needs network); run with:
+    /// `cargo test -- --ignored --nocapture live_ech_publishers`
+    #[test]
+    #[ignore]
+    fn live_ech_publishers_print_configs() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolver = crate::dns::doh::DoHResolver::new("quad9", &[], true).unwrap();
+        for host in [
+            "cloudflare-dns.com",
+            "dns.google",
+            "dns.quad9.net",
+            "dns.mullvad.net",
+        ] {
+            let fetched = rt.block_on(fetch_echconfig_list(host, &resolver));
+            match fetched {
+                Some(b) => {
+                    let ok = rustls::client::EchConfig::new(
+                        b.clone().into(),
+                        rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+                    )
+                    .is_ok();
+                    println!(
+                        "ECH-PROBE {}: published len={} rustls_accept={}",
+                        host,
+                        b.len(),
+                        ok
+                    );
+                }
+                None => println!("ECH-PROBE {}: no echconfig published", host),
+            }
+        }
     }
 }

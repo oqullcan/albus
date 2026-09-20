@@ -892,7 +892,7 @@ Panel {
               Text {
                   textFormat: Text.PlainText;
                 width: parent.width
-                text: root.isBusy ? "Applying rules..." : (root.isRunning ? ("eBPF sock_ops • ML-KEM-768 • " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent")) : "Engine is offline")
+                text: root.isBusy ? "Applying rules..." : (root.isRunning ? ("eBPF sock_ops" + (root.pqcEnabled ? " • ML-KEM-768 (offered — see logs)" : "") + " • " + (root.ramOnlyEnabled ? "RAM-Only" : "Persistent")) : "Engine is offline")
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption - 1
                 color: root.dim
@@ -1379,7 +1379,7 @@ Panel {
 
                   CompactToggle {
                     label: "DNSSEC cryptographic validation"
-                    description: "Enforce DO-bit & Authenticated Data verification"
+                    description: "Local RRSIG chain validation; bogus answers get SERVFAIL"
                     checked: root.dnssecEnabled
                     onClicked: {
                       root.dnssecEnabled = !root.dnssecEnabled
@@ -1389,7 +1389,7 @@ Panel {
 
                   CompactToggle {
                     label: "Post-Quantum Kyber768 (PQC)"
-                    description: "Hybrid ML-KEM-768 quantum-safe key exchange"
+                    description: "Hybrid ML-KEM-768 key exchange when negotiated (see logs)"
                     checked: root.pqcEnabled
                     onClicked: {
                       root.pqcEnabled = !root.pqcEnabled

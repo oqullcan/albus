@@ -85,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let _ = std::process::Command::new("/usr/bin/systemctl")
                                 .args(["kill", "-s", "HUP", "albus.service"])
                                 .status();
-                            println!("live configuration reloaded into running albus daemon (SIGHUP)");
+                            println!(
+                                "live configuration reloaded into running albus daemon (SIGHUP)"
+                            );
                         }
                     } else {
                         println!(

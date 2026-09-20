@@ -5,7 +5,7 @@
   "version": "2.1.0",
   "author": "Oğulcan Yetim",
   "license": "GPL-3.0",
-  "description": "Kernel-level deep packet inspection (DPI) evasion engine and post-quantum DNS-over-HTTPS suite with Omarchy integration.",
+  "description": "Kernel-level deep packet inspection (DPI) evasion engine and DNS-over-HTTPS suite with verified ML-KEM post-quantum key exchange and Omarchy integration.",
   "kinds": [
     "bar-widget"
   ],
