@@ -39,10 +39,16 @@ jobs:
           toolchain: stable
       - name: cargo audit (RustSec)
         uses: rustsec/audit-check@v2 # pinned: see .github/pins.md
+        env:
+          # rust-toolchain.toml pins 1.89 for the build; audit tooling
+          # needs a newer rustc, so override just for these steps
+          RUSTUP_TOOLCHAIN: stable
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2 # pinned: see .github/pins.md
+        env:
+          RUSTUP_TOOLCHAIN: stable
         with:
           command: check
 
