@@ -17,6 +17,22 @@ fn clang_binary() -> String {
     "clang".to_string()
 }
 
+/// Locate a sysroot include dir providing `asm/types.h` (needed by
+/// kernel UAPI headers under `-target bpf`). Debian/Ubuntu multiarch
+/// keeps it under `/usr/include/<triplet>/`, not `/usr/include/`.
+fn system_include_dir() -> Option<PathBuf> {
+    for cand in [
+        "/usr/include",
+        "/usr/include/x86_64-linux-gnu",
+        "/usr/include/aarch64-linux-gnu",
+    ] {
+        if PathBuf::from(cand).join("asm/types.h").exists() {
+            return Some(PathBuf::from(cand));
+        }
+    }
+    None
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bpf_src = PathBuf::from("bpf/sockops.bpf.c");
@@ -27,16 +43,15 @@ fn main() {
     println!("cargo:rerun-if-changed=bpf/include/bpf_endian.h");
     println!("cargo:rerun-if-env-changed=CC");
 
-    let status = Command::new(clang_binary())
+    let mut cmd = Command::new(clang_binary());
+    cmd.args([
+        "-target", "bpf", "-O2", "-g", "-Wall", "-Werror", "-I", "bpf",
+    ]);
+    if let Some(dir) = system_include_dir() {
+        cmd.arg("-I").arg(dir);
+    }
+    let status = cmd
         .args([
-            "-target",
-            "bpf",
-            "-O2",
-            "-g",
-            "-Wall",
-            "-Werror",
-            "-I",
-            "bpf",
             "-c",
             bpf_src.to_str().unwrap(),
             "-o",
