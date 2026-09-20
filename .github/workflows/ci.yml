@@ -20,7 +20,7 @@ jobs:
           toolchain: 1.89
           components: rustfmt, clippy
       - name: Install eBPF build deps
-        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
       - name: fmt
         run: cargo fmt --check
       - name: clippy
@@ -53,7 +53,7 @@ jobs:
         with:
           toolchain: 1.89
       - name: Install eBPF build deps
-        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
       - name: real kernel eBPF load test (root)
         run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test ebpf -- --ignored --nocapture
 
@@ -69,7 +69,7 @@ jobs:
         with:
           toolchain: 1.89
       - name: Install eBPF build deps
-        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
       - name: release build
         run: cargo build --release
       - name: checksum
