@@ -65,7 +65,7 @@
 ## Evasion Mechanisms
 
 ### 1. TCP Segmentation & Dynamic MSS Jitter (`--min-mss`)
-Middlebox DPI systems inspect initial TCP payloads for plaintext Server Name Indication (SNI) extensions (RFC 6066). Albus programmatically sets `bpf_setsockopt(skops, SOL_TCP, TCP_BPF_MSS, mss)` on established sockets to split the ClientHello handshake across multiple TCP segments. To prevent DPI statistical fingerprinting based on static segment boundaries, Albus supports MSS Jitter: when `--min-mss` (default: `64`) is configured below `--mss` (default: `88`), the eBPF kernel hook invokes `bpf_get_prandom_u32()` to randomize the initial MSS per connection within the `[min_mss, mss]` range. After the ClientHello phase exceeds `--restore-after-bytes` (default: 600 bytes), native line-rate MSS (1460 bytes) is restored automatically.
+Middlebox DPI systems inspect initial TCP payloads for plaintext Server Name Indication (SNI) extensions (RFC 6066). Albus programmatically sets `bpf_setsockopt(skops, SOL_TCP, TCP_MAXSEG, mss)` on established sockets to split the ClientHello handshake across multiple TCP segments. To prevent DPI statistical fingerprinting based on static segment boundaries, Albus supports MSS Jitter: when `--min-mss` (default: `64`) is configured below `--mss` (default: `88`), the eBPF kernel hook invokes `bpf_get_prandom_u32()` to randomize the initial MSS per connection within the `[min_mss, mss]` range. After the ClientHello phase exceeds `--restore-after-bytes` (default: 600 bytes), native line-rate MSS (1460 bytes) is restored automatically.
 
 ### 2. Decoy SNI Pool Rotation & Auto-TTL Desynchronization
 Albus probes the network path to estimate the router hop distance $H$ to the destination IP and computes an optimal injection TTL:
@@ -84,7 +84,7 @@ To mitigate "Harvest Now, Decrypt Later" surveillance of DNS traffic, the DoH cl
 ### 6. DNS Leak Protection & Active Canary Watchdog
 - **DNS Kill-Switch (`--kill-switch`)**: Injects kernel-level firewall (`iptables`/`ip6tables`) drop rules on all outbound non-loopback UDP/TCP port 53 traffic. Ensures no misconfigured background processes can leak plaintext DNS queries to the local ISP.
 - **Active Leak Canary Watchdog**: An autonomous background prober actively queries `leak-test.albus.internal` every 60 seconds over loopback (`127.0.0.1:53`), verifying the synthetic canary record (`127.0.0.99`). If queries fail or return unexpected data (due to VPN route takeovers, network managers overwriting `/etc/resolv.conf`, or DNS hijacking), it triggers instant autonomous self-healing.
-- **Fail-Closed Network Lockdown (`--network-lockdown`)**: Distinct from the DNS Kill-Switch, Network Lockdown drops all outbound non-loopback web traffic (TCP 80 and 443) if the eBPF subsystem fails to attach. This guarantees that unfragmented, unevaded cleartext traffic is never leaked to the ISP if DPI evasion cannot be sustained.
+- **Fail-Closed Network Lockdown (`--network-lockdown`)**: Distinct from the DNS Kill-Switch, Network Lockdown drops all outbound non-loopback web traffic (TCP 80 and 443) if the eBPF subsystem fails to attach. Already-established flows (including the daemon's own DoH connections) are exempted via conntrack `ESTABLISHED,RELATED` so lockdown cannot kill DNS itself. This guarantees that unfragmented, unevaded cleartext traffic is never leaked to the ISP if DPI evasion cannot be sustained.
 - **WebRTC STUN Blocking (`--block-stun`)**: Drops outbound UDP traffic on standard STUN/TURN ports 3478 and 5349 to eliminate real IPv4/IPv6 exposure through WebRTC peer connection candidates.
 
 ---
@@ -93,8 +93,8 @@ To mitigate "Harvest Now, Decrypt Later" surveillance of DNS traffic, the DoH cl
 
 ### Prerequisites
 - **Kernel**: Linux 5.10+ with `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, and cgroup v2.
-- **Toolchain**: Rust 1.75+ (Cargo). *(Pre-built binary runs standalone via BPF CO-RE without clang or kernel headers).*
-- **Permissions**: `CAP_NET_RAW`, `CAP_BPF`, `CAP_NET_ADMIN` (or `sudo`).
+- **Toolchain**: Rust 1.89 pinned via `rust-toolchain.toml` (matches CI).
+- **Permissions**: `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_BIND_SERVICE`, `CAP_DAC_OVERRIDE` (or `sudo`; see the systemd unit).
 
 ### Compilation
 ```bash
@@ -125,8 +125,14 @@ sudo albus run --ram-only=true --pqc=true
 sudo albus run --doh-upstream mullvad-base
 
 # Custom DoH endpoint with dedicated bootstrap IP addressing
+# (non-global bootstrap/host IPs — loopback, private, link-local incl.
+# cloud metadata — are refused; see SSRF policy below)
 sudo albus run --doh-upstream "https://doh.example.com/dns-query" --doh-bootstrap-ips "93.184.216.34"
 ```
+
+> **SSRF policy:** custom upstreams must be `https://`; loopback, private,
+> link-local (incl. cloud metadata `169.254.169.254`), CGNAT, multicast and
+> unspecified dial targets are refused fail-closed (`src/dns/ssrf.rs`).
 
 ### Daemon & Configuration Management
 ```bash
@@ -153,7 +159,7 @@ sudo albus cleanup           # Restore original /etc/resolv.conf and purge firew
 | `--fake-bad-checksum` | `bool` | `false` | Invalidate TCP checksum (`0xDEAD`) for middlebox corruption |
 | `--doh` | `bool` | `true` | Spawn local DNS-over-HTTPS resolver on `127.0.0.1:53` |
 | `--doh-upstream` | `String` | `"quad9"` | Upstream resolver (`quad9`, `cloudflare`, `mullvad-*`, URL) |
-| `--doh-bootstrap-ips` | `Vec<IPv4>`| `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
+| `--doh-bootstrap-ips` | `Vec<IPv4>` | `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
 | `--dnssec` | `bool` | `true` | Validate RRSIG chain locally (bogus → SERVFAIL, unsigned → served insecure) |
 | `--pqc` | `bool` | `true` | Offer hybrid ML-KEM-768 key exchange (negotiated per upstream; verified in logs) |
 | `--ram-only` | `bool` | `false` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |

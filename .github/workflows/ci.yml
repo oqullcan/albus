@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1' # weekly audit sweep, Monday 06:00 UTC
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: 1.89
+          components: rustfmt, clippy
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: unit + integration tests
+        run: cargo test --workspace
+      - name: robustness fuzz suite
+        run: cargo test --test fuzz
+      - name: docs sync check
+        run: cargo test --test docs
+      - name: cargo audit (RustSec)
+        uses: rustsec/audit-check@v2 # pinned: see .github/pins.md
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2 # pinned: see .github/pins.md
+        with:
+          command: check
+
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true # informational until runner kernels stabilize
+    steps:
+      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: 1.89
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: real kernel eBPF load test (root)
+        run: sudo -E cargo test --release --test ebpf -- --ignored --nocapture
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: 1.89
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: release build
+        run: cargo build --release
+      - name: checksum
+        run: sha256sum target/release/albus | tee albus.sha256
+      - name: upload binary
+        uses: actions/upload-artifact@v4 # pinned: see .github/pins.md
+        with:
+          name: albus-linux-x86_64
+          path: target/release/albus
+      - name: upload checksum
+        uses: actions/upload-artifact@v4 # pinned: see .github/pins.md
+        with:
+          name: albus-sha256
+          path: albus.sha256
