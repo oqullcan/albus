@@ -55,15 +55,20 @@ pub fn show_status_json() {
     let is_active = is_service_active || is_process_running;
     let cfg = crate::app::config::Config::load_or_default();
 
-    // serde_json escaping prevents doh_upstream JSON injection
-    let payload = if is_active {
+    println!("{}", status_payload(is_active, &cfg.doh_upstream));
+}
+
+// pure payload constructor (no I/O): serde_json escaping prevents
+// doh_upstream JSON injection into panel widgets.
+pub fn status_payload(is_active: bool, doh_upstream: &str) -> serde_json::Value {
+    if is_active {
         serde_json::json!({
             "text": "󰞌",
             "alt": "active",
             "tooltip": "albus DPI Bypass: ACTIVE\nEngine: eBPF sock_ops\nDNS: 127.0.0.1 (Encrypted DoH)",
             "class": "active",
             "active": true,
-            "doh_upstream": cfg.doh_upstream,
+            "doh_upstream": doh_upstream,
         })
     } else {
         serde_json::json!({
@@ -72,10 +77,9 @@ pub fn show_status_json() {
             "tooltip": "albus DPI Bypass: INACTIVE\nRun 'sudo albus run' or 'sudo albus service start'",
             "class": "inactive",
             "active": false,
-            "doh_upstream": cfg.doh_upstream,
+            "doh_upstream": doh_upstream,
         })
-    };
-    println!("{}", payload);
+    }
 }
 
 fn format_bool(ok: bool) -> &'static str {
@@ -83,5 +87,34 @@ fn format_bool(ok: bool) -> &'static str {
         "supported"
     } else {
         "NOT supported"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_payload_is_valid_json() {
+        for active in [true, false] {
+            let v = status_payload(active, "quad9");
+            assert_eq!(v["active"], serde_json::json!(active));
+            assert_eq!(v["doh_upstream"], serde_json::json!("quad9"));
+            // must serialize without error
+            assert!(!v.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_status_payload_escapes_hostile_upstream() {
+        // attacker-controlled upstream must not break panel JSON parsing
+        let evil = "quad9\"}, {\"injected\":true, \"x\":\"";
+        let v = status_payload(true, evil);
+        assert_eq!(v["doh_upstream"], serde_json::json!(evil));
+        // round-trips through the serializer intact
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&v.to_string()).expect("payload must stay valid JSON");
+        assert_eq!(reparsed["doh_upstream"], serde_json::json!(evil));
+        assert!(reparsed.get("injected").is_none());
     }
 }

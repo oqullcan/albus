@@ -31,7 +31,10 @@ import time
 
 # Extend freely: plain hostnames, SNI is set explicitly by the client.
 TARGETS = ["roblox.com", "discord.com"]
-STUB_PORT = 9443
+# Port 443 (not a high port): the eBPF sock_ops hook only tracks target
+# ports (default [443]). A 9443 stub would bypass shaping entirely and
+# every run would RST even with albus on — a false negative.
+STUB_PORT = 443
 FLOW_TIMEOUT = 4.0
 
 # --------------------------------------------------------------------------
@@ -50,6 +53,14 @@ def tcp_checksum(src: bytes, dst: bytes, segment: bytes) -> int:
     if len(data) % 2:
         data += b"\x00"
     s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def ip_checksum(header: bytes) -> int:
+    """Ones-complement checksum over a header with a zeroed checksum field."""
+    s = sum(struct.unpack("!%dH" % (len(header) // 2), header))
     while s >> 16:
         s = (s & 0xFFFF) + (s >> 16)
     return (~s) & 0xFFFF
@@ -111,7 +122,8 @@ def parse_sni(stream: bytes) -> str | None:
 
 
 def parse_frame(frame: bytes):
-    """Return (src_ip, dst_ip, src_port, dst_port, seq, payload, tcp_csum_ok).
+    """Return (src_ip, dst_ip, src_port, dst_port, seq, payload, tcp_csum_ok,
+    csum_field_zero).
     Handles raw IP (loopback AF_PACKET) and Ethernet-prefixed frames."""
     if len(frame) < 1:
         return None
@@ -142,7 +154,7 @@ def parse_frame(frame: bytes):
     recv_sum = struct.unpack("!H", frame[t + 16 : t + 18])[0]
     zeroed = seg[:16] + b"\x00\x00" + seg[18:]
     ok = tcp_checksum(src, dst, zeroed) == recv_sum
-    return (src, dst, src_port, dst_port, seq, payload, ok)
+    return (src, dst, src_port, dst_port, seq, payload, ok, recv_sum == 0)
 
 
 def send_rst(src_ip: bytes, dst_ip: bytes, src_port: int, dst_port: int, seq: int) -> None:
@@ -151,14 +163,13 @@ def send_rst(src_ip: bytes, dst_ip: bytes, src_port: int, dst_port: int, seq: in
     try:
         s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         ip = struct.pack(
-            "!BBHHHBBH4s4s", 0x45, 0, 0, 40, 0x1234, 0, 64, 6, 0, src_ip, dst_ip
+            "!BBHHHBBH4s4s", 0x45, 0, 40, 0x1234, 0x4000, 64, 6, 0, src_ip, dst_ip
         )
         tcp = struct.pack("!HHIIHHHH", src_port, dst_port, seq, 0, 0x50, 0x04, 0, 0)
         seg_sum = tcp_checksum(src_ip, dst_ip, tcp)
         tcp = tcp[:16] + struct.pack("!H", seg_sum) + tcp[18:]
         pkt = ip + tcp
-        ip_sum = tcp_checksum(b"", b"", ip[:20])
-        pkt = pkt[:10] + struct.pack("!H", ip_sum) + pkt[12:]
+        pkt = pkt[:10] + struct.pack("!H", ip_checksum(pkt[:20])) + pkt[12:]
         s.sendto(pkt, (socket.inet_ntoa(dst_ip), 0))
     finally:
         s.close()
@@ -234,8 +245,17 @@ class Sim:
     def __init__(self, iface: str, blocklist: list[str]) -> None:
         self.iface = iface
         self.block = {b.lower() for b in blocklist}
+        # Loopback captures carry partial (offloaded) checksums, so a
+        # "wrong" checksum there proves nothing; only real interfaces get
+        # the bad-checksum confusion signal. Overlap detection works
+        # everywhere.
+        self.check_csum = iface != "lo"
         self.flows: dict[tuple, dict] = {}
         self.decisions: dict[str, str] = {}
+        # monotonic timestamps of desync evidence (overlap / bad checksum);
+        # plus last-seen data segment time toward the stub (any SNI).
+        self.confused: list[float] = []
+        self.last_data_at: float = 0.0
 
     def run(self, stop: threading.Event) -> None:
         try:
@@ -269,9 +289,10 @@ class Sim:
         parsed = parse_frame(frame)
         if not parsed:
             return
-        src, dst, sport, dport, seq, payload, csum_ok = parsed
+        src, dst, sport, dport, seq, payload, csum_ok, csum_zero = parsed
         if dport != STUB_PORT or not payload:
             return
+        self.last_data_at = time.monotonic()
         key = (src, sport, dst, dport)
         flow = self.flows.setdefault(
             key, {"segs": [], "seen": time.monotonic(), "done": False}
@@ -283,11 +304,14 @@ class Sim:
         for (oseq, opay) in flow["segs"]:
             if oseq == seq and opay != payload and payload:
                 flow["done"] = True
+                self.confused.append(time.monotonic())
                 log("sim_confused_overlap", sni="unknown")
                 return
-        # bad checksum => likely injected fake
-        if not csum_ok and payload:
+        # bad checksum => likely injected fake. Zero checksum fields are
+        # checksum-offload artifacts (loopback), not confusion signals.
+        if not csum_ok and not csum_zero and self.check_csum and payload:
             flow["done"] = True
+            self.confused.append(time.monotonic())
             log("sim_confused_badsum", sni="unknown")
             return
         flow["segs"].append((seq, payload))
@@ -363,11 +387,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     time.sleep(0.5)
     results = []
     for target in targets:
-        # one handshake per target: the sim observes passively and decides
+        # one handshake per target: the sim observes passively and decides.
+        # Verdict follows SIM observations, not the handshake: on loopback
+        # our own decoys poison the stub, so handshake_ok is meaningless.
+        # rst => DPI won. Otherwise bypassed IFF the sim actually observed
+        # data in this target's window (else inconclusive, not a pass).
+        sim.last_data_at = 0.0
+        window_start = time.monotonic()
         r = run_client(target, port=args.port)
         time.sleep(0.5)  # let the observer finish classifying
         decision = sim.decisions.get(target, "no-observation")
-        bypassed = r["handshake_ok"]
+        observed = sim.last_data_at >= window_start
+        if decision == "rst":
+            bypassed: bool = False
+        elif decision in ("pass-fragmented", "pass-allowlist") or (
+            observed and len(sim.confused) > 0
+        ):
+            bypassed = True
+        elif observed and decision == "no-observation":
+            # traffic seen but never classifiable and never RST'd:
+            # DPI observed yet could not act => defeated
+            bypassed = True
+        else:
+            bypassed = False
         results.append(
             {
                 "target": target,

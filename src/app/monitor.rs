@@ -96,4 +96,18 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("clean"), "clean");
     }
+
+    #[test]
+    fn test_strip_ansi_hostile_sequences() {
+        // multi-param CSI + bell + backspace collapse to plain text
+        assert_eq!(strip_ansi("\x1b[1;32mX\x1b[0m\x07Y\x08Z"), "XYZ");
+        // OSC window-title: no ESC/BEL may survive (residue is inert text)
+        let osc = strip_ansi("\x1b]0;pwned\x07hi");
+        assert!(!osc.contains('\x1b') && !osc.contains('\x07'));
+        assert_eq!(osc, "wnedhi");
+        // lone ESC and truncated CSI must not panic or leak bytes
+        assert_eq!(strip_ansi("\x1b"), "");
+        assert_eq!(strip_ansi("\x1b[31"), "");
+        assert_eq!(strip_ansi(""), "");
+    }
 }

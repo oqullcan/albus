@@ -67,4 +67,68 @@ impl ConnInfo {
     pub fn is_ipv6(&self) -> bool {
         self.src_ip.is_ipv6()
     }
+
+    /// Both endpoints must share one address family; `is_ipv6` alone only
+    /// inspects src, so mixed V4/V6 values must be rejected explicitly.
+    pub fn validate_families(&self) -> Result<(), &'static str> {
+        match (self.src_ip.is_ipv6(), self.dst_ip.is_ipv6()) {
+            (true, true) | (false, false) => Ok(()),
+            _ => Err("mismatched IP families in ConnInfo"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_conn_info_v4_fields() {
+        let c = ConnInfo::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(93, 184, 216, 34),
+            12345,
+            443,
+            1000,
+            2000,
+        );
+        assert!(!c.is_ipv6());
+        assert_eq!(c.src_port, 12345);
+        assert_eq!(c.dst_port, 443);
+        assert_eq!(c.seq, 1000);
+        assert_eq!(c.ack, 2000);
+    }
+
+    #[test]
+    fn test_conn_info_v6_flag() {
+        let c = ConnInfo::new_v6(
+            Ipv6Addr::LOCALHOST,
+            Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+            5000,
+            443,
+            7,
+            8,
+        );
+        assert!(c.is_ipv6());
+        assert_eq!(c.dst_port, 443);
+    }
+
+    #[test]
+    fn test_validate_families_rejects_mixed() {
+        use std::net::IpAddr;
+        let mut mixed = ConnInfo::new_v4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            443,
+            0,
+            0,
+        );
+        assert!(mixed.validate_families().is_ok());
+        // is_ipv6 alone would still say false here — the mismatch is the point
+        mixed.dst_ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(!mixed.is_ipv6());
+        assert!(mixed.validate_families().is_err());
+    }
 }

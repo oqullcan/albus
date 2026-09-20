@@ -68,6 +68,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
       - name: real kernel eBPF load test (root)
         run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test ebpf -- --ignored --nocapture
+      - name: privileged firewall symmetry test (root)
+        run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test root -- --ignored --nocapture
 
   build:
     runs-on: ubuntu-latest

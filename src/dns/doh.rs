@@ -793,3 +793,65 @@ mod tests {
         assert!(response_wire.len() > 12);
     }
 }
+
+#[cfg(test)]
+mod ssrf_matrix_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_bootstrap_ips_blocked_matrix() {
+        // every non-global family member must be refused as bootstrap
+        for s in [
+            "10.0.0.5",
+            "172.16.9.9",
+            "172.31.0.1",
+            "192.168.0.1",
+            "0.0.0.0",
+            "169.254.10.20",
+            "224.0.0.251",
+        ] {
+            let ip = Ipv4Addr::from_str(s).unwrap();
+            assert!(
+                SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[ip], true)
+                    .is_err(),
+                "bootstrap {} must be refused",
+                s
+            );
+        }
+        // global addresses pass (construction succeeds)
+        let ok = [Ipv4Addr::new(45, 90, 28, 188), Ipv4Addr::new(1, 1, 1, 1)];
+        assert!(
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &ok, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_extract_filters_and_dedups() {
+        // blocked + duplicate + invalid entries collapse to clean globals
+        let custom = [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ];
+        let ips = extract_upstream_ips("quad9, quad9, not-a-url@@@, ,", &custom);
+        assert!(!ips.contains(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            ips.iter()
+                .filter(|ip| **ip == Ipv4Addr::new(9, 9, 9, 9))
+                .count(),
+            1
+        );
+        assert!(extract_upstream_ips("", &[]).is_empty());
+        // v6: loopback/link-local stripped, globals kept
+        let v6: Vec<Ipv6Addr> = vec!["::1", "fe80::1"]
+            .iter()
+            .map(|s| Ipv6Addr::from_str(s).unwrap())
+            .collect();
+        let out = extract_upstream_ips_v6("cloudflare", &v6);
+        assert!(!out.iter().any(|ip| ip.is_loopback()));
+        assert!(out.contains(&Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)));
+        let _ = IpAddr::from([127, 0, 0, 1]);
+    }
+}

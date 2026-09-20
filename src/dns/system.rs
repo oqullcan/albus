@@ -219,7 +219,10 @@ pub fn cleanup_system_dns() -> Result<bool> {
 }
 
 pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
-    if let Ok(content) = fs::read_to_string(&path) {
+    // resolve through the same symlink policy as writes: never scan
+    // through an attacker-planted link, even for a read-only decision.
+    let target = resolve_write_target(path.as_ref())?;
+    if let Ok(content) = fs::read_to_string(&target) {
         if content.contains("# albus-saved:")
             || content.contains("# albus:")
             || content.contains("nameserver 127.0.0.1")

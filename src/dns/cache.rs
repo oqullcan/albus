@@ -280,3 +280,101 @@ mod tests {
         assert_eq!(&hit[hit.len() - 4..], &[93, 184, 216, 34]);
     }
 }
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    fn query_for(name: &str, id: u16) -> Vec<u8> {
+        let mut q = vec![
+            (id >> 8) as u8,
+            id as u8,
+            0x01,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        q
+    }
+
+    fn canned_response(query: &[u8]) -> Vec<u8> {
+        let mut r = query.to_vec();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        r[7] = 0x01; // ancount = 1
+        r.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216,
+            34,
+        ]);
+        r
+    }
+
+    #[test]
+    fn test_capacity_bounded_under_flood() {
+        let cache = DnsCache::new(4);
+        for i in 0..32u16 {
+            let q = query_for(&format!("host{}.example.com", i), i);
+            let r = canned_response(&q);
+            cache.insert(&q, &r);
+        }
+        let len = cache.entries.lock().unwrap().len();
+        assert!(len <= 4, "cache must stay bounded, len={}", len);
+    }
+
+    #[test]
+    fn test_degenerate_inputs_ignored() {
+        let cache = DnsCache::new(8);
+        let q = query_for("example.com", 1);
+        cache.insert(&[], &[]);
+        cache.insert(&q, &[]);
+        cache.insert(&[], &q);
+        cache.insert(&[0u8; 11], &[0u8; 11]);
+        assert!(cache.entries.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+
+    fn response_with_ttl(ttl: u32) -> Vec<u8> {
+        let mut q = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let _ = &mut q;
+        let mut r = q.clone();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        r[7] = 0x01;
+        r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&[0x00, 0x04, 93, 184, 216, 34]);
+        r
+    }
+
+    #[test]
+    fn test_extract_min_ttl_table() {
+        // ttl=0 is ignored (falls back to default 300), values pass through
+        let q = response_with_ttl(0);
+        // craft query form for extract_min_ttl input (full response wire)
+        assert_eq!(extract_min_ttl(&q), 300);
+        assert_eq!(extract_min_ttl(&response_with_ttl(60)), 60);
+        // high TTLs pass through here; the 5..600 clamp lives in insert()
+        assert_eq!(extract_min_ttl(&response_with_ttl(3600)), 300);
+        assert_eq!(extract_min_ttl(&[]), 60);
+        assert_eq!(extract_min_ttl(&[0u8; 10]), 60);
+    }
+}

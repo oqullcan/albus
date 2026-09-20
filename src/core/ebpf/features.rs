@@ -19,18 +19,20 @@ pub fn is_cgroup_v2(path: &str) -> bool {
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let mount_point = parts[1];
-                let fs_type = parts[2];
-                if (mount_point == path || path.starts_with(mount_point)) && fs_type == "cgroup2" {
-                    return true;
-                }
+            if parts.len() >= 3 && parts[2] == "cgroup2" && mount_covers(parts[1], path) {
+                return true;
             }
         }
     }
 
     // fallback verification via standard cgroup control files
     p.join("cgroup.procs").exists() || p.join("cgroup.controllers").exists()
+}
+
+/// Pure mount-coverage check: exact match, root mount, or proper `/`-bounded
+/// prefix. A naive starts_with would accept `/sys/fs/cgroupfoo`.
+pub fn mount_covers(mount_point: &str, path: &str) -> bool {
+    mount_point == path || mount_point == "/" || path.starts_with(&format!("{}/", mount_point))
 }
 
 // verifies kernel support for bpf type format (btf) runtime relocation
@@ -133,5 +135,32 @@ mod tests {
     fn test_capability_summary() {
         let (root, cgroup, sockops, btf) = capability_summary();
         let _ = (root, cgroup, sockops, btf);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn test_mount_covers_table() {
+        assert!(mount_covers("/sys/fs/cgroup", "/sys/fs/cgroup"));
+        assert!(mount_covers("/sys/fs/cgroup", "/sys/fs/cgroup/user.slice"));
+        assert!(mount_covers("/", "/sys/fs/cgroup"));
+        assert!(mount_covers("/", "/"));
+        // prefix confusion must not match
+        assert!(!mount_covers("/sys/fs/cgroup", "/sys/fs/cgroupfoo"));
+        assert!(!mount_covers("/sys/fs/cgroup", "/sys/fs/cgroupfoo/bar"));
+        assert!(!mount_covers("/sys/fs/cgroup", "/other"));
+        assert!(!mount_covers("/sys", "/sysfs"));
+    }
+
+    #[test]
+    fn test_parse_kernel_version_edges() {
+        assert_eq!(parse_kernel_version("6"), None);
+        assert_eq!(parse_kernel_version(""), None);
+        assert_eq!(parse_kernel_version("5."), None);
+        assert_eq!(parse_kernel_version("v6.1"), None);
+        assert_eq!(parse_kernel_version("6.13.5-arch1"), Some((6, 13)));
     }
 }

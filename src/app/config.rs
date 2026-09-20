@@ -660,4 +660,80 @@ mod tests {
         let _ = fs::remove_file(&real_file);
         let _ = fs::remove_dir(&temp_dir);
     }
+
+    fn valid_cfg() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn test_validate_accepts_default() {
+        assert!(valid_cfg().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_ranges() {
+        // (mutator, reason)
+        let cases: Vec<(Box<dyn Fn(&mut Config)>, &str)> = vec![
+            (Box::new(|c: &mut Config| c.mss = 0), "mss zero"),
+            (Box::new(|c: &mut Config| c.mss = 1500), "mss over 1460"),
+            (Box::new(|c: &mut Config| c.min_mss = 200), "min_mss > mss"),
+            (Box::new(|c: &mut Config| c.min_mss = 0), "min_mss under 32"),
+            (Box::new(|c: &mut Config| c.ports = vec![]), "empty ports"),
+            (
+                Box::new(|c: &mut Config| c.ports = vec![443, 443]),
+                "duplicate ports",
+            ),
+            (Box::new(|c: &mut Config| c.ports = vec![0]), "port zero"),
+            (
+                Box::new(|c: &mut Config| c.ports = vec![0u16; 65]),
+                "too many ports",
+            ),
+            (
+                Box::new(|c: &mut Config| {
+                    c.min_ttl = 10;
+                    c.max_ttl = 5;
+                }),
+                "min_ttl > max_ttl",
+            ),
+            (
+                Box::new(|c: &mut Config| c.max_ttl = 65),
+                "max_ttl too large",
+            ),
+            (
+                Box::new(|c: &mut Config| c.fake_sni = Some("a;b".into())),
+                "sni metachar",
+            ),
+            (
+                Box::new(|c: &mut Config| c.fake_sni = Some("x".repeat(300))),
+                "sni too long",
+            ),
+            (
+                Box::new(|c: &mut Config| c.cgroup_path = "relative/path".into()),
+                "relative cgroup",
+            ),
+            (
+                Box::new(|c: &mut Config| c.cgroup_path = "/x/../y".into()),
+                "cgroup traversal",
+            ),
+            (
+                Box::new(|c: &mut Config| c.doh_upstream = "x".repeat(2000)),
+                "upstream too long",
+            ),
+        ];
+        for (mutate, reason) in cases {
+            let mut cfg = valid_cfg();
+            mutate(&mut cfg);
+            assert!(cfg.validate().is_err(), "must reject: {}", reason);
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_boundary_values() {
+        let mut cfg = valid_cfg();
+        cfg.mss = 1460;
+        cfg.min_mss = 1460;
+        cfg.max_ttl = 64;
+        cfg.fake_sni = Some("valid-host.example".into());
+        assert!(cfg.validate().is_ok());
+    }
 }

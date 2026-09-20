@@ -269,3 +269,69 @@ impl Drop for BpfManager {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
+
+    fn test_cfg() -> BpfManagerConfig {
+        BpfManagerConfig {
+            mss: 88,
+            min_mss: 64,
+            restore_mss: 0,
+            restore_after_bytes: 600,
+            ports: vec![443],
+            exclude_ips: vec![],
+            exclude_ips_v6: vec![],
+            cgroup_path: "/sys/fs/cgroup".to_string(),
+            fake_ttl: 8,
+            fake_sni: None,
+            fake_bad_checksum: false,
+            pqc: true,
+            auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+        }
+    }
+
+    #[test]
+    fn test_manager_new_is_stopped() {
+        let mgr = BpfManager::new(test_cfg());
+        assert!(!mgr.running.load(Ordering::SeqCst));
+        assert_eq!(mgr.cfg.mss, 88);
+        assert_eq!(mgr.cfg.ports, vec![443]);
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
+
+    fn cfg_with_ports(ports: Vec<u16>) -> BpfManagerConfig {
+        BpfManagerConfig {
+            mss: 88,
+            min_mss: 64,
+            restore_mss: 0,
+            restore_after_bytes: 600,
+            ports,
+            exclude_ips: vec![],
+            exclude_ips_v6: vec![],
+            cgroup_path: "/sys/fs/cgroup".to_string(),
+            fake_ttl: 8,
+            fake_sni: None,
+            fake_bad_checksum: false,
+            pqc: true,
+            auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+        }
+    }
+
+    #[test]
+    fn test_reload_maps_without_handles_updates_cfg_only() {
+        // no kernel maps attached: pure config swap, must not error
+        let mut mgr = BpfManager::new(cfg_with_ports(vec![443]));
+        let next = cfg_with_ports(vec![80, 443]);
+        mgr.reload_maps(&next)
+            .expect("cfg-only reload must succeed");
+        assert_eq!(mgr.cfg.ports, vec![80, 443]);
+    }
+}

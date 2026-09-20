@@ -84,20 +84,25 @@ impl AutoTtlEstimator {
 
 // parses /proc/net/route to determine the primary outbound interface and gateway
 pub fn resolve_default_network_interface() -> Option<(String, Ipv4Addr)> {
-    if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 3 {
-                let iface = fields[0];
-                let dest_hex = fields[1];
-                let gw_hex = fields[2];
+    let content = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_route_table(&content)
+}
 
-                // destination 00000000 signifies default gateway route (0.0.0.0/0)
-                if dest_hex == "00000000" {
-                    if let Ok(gw_val) = u32::from_str_radix(gw_hex, 16) {
-                        let gw_ip = Ipv4Addr::from(gw_val.to_be());
-                        return Some((iface.to_string(), gw_ip));
-                    }
+// pure route-table parser: first 00000000-destination row wins; hex gateway
+// is little-endian on the wire, hence to_be for the octet order.
+pub fn parse_route_table(content: &str) -> Option<(String, Ipv4Addr)> {
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 3 {
+            let iface = fields[0];
+            let dest_hex = fields[1];
+            let gw_hex = fields[2];
+
+            // destination 00000000 signifies default gateway route (0.0.0.0/0)
+            if dest_hex == "00000000" {
+                if let Ok(gw_val) = u32::from_str_radix(gw_hex, 16) {
+                    let gw_ip = Ipv4Addr::from(gw_val.to_be());
+                    return Some((iface.to_string(), gw_ip));
                 }
             }
         }
@@ -179,5 +184,54 @@ mod tests {
     fn test_resolve_default_network_interface_execution() {
         let route = resolve_default_network_interface();
         let _ = route;
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+
+    fn estimator() -> AutoTtlEstimator {
+        AutoTtlEstimator::new(AutoTtlConfig {
+            enabled: true,
+            default_ttl: 8,
+            min_ttl: 4,
+            max_ttl: 10,
+        })
+    }
+
+    #[test]
+    fn test_calculate_optimal_ttl_full_branch_table() {
+        let e = estimator();
+        // <=3 -> min
+        assert_eq!(e.calculate_optimal_ttl(0), 4);
+        assert_eq!(e.calculate_optimal_ttl(3), 4);
+        // 4..=6 -> hops-2 clamped
+        assert_eq!(e.calculate_optimal_ttl(4), 4);
+        assert_eq!(e.calculate_optimal_ttl(6), 4);
+        // 7..=12 -> hops/2+1 clamped
+        assert_eq!(e.calculate_optimal_ttl(7), 4);
+        assert_eq!(e.calculate_optimal_ttl(12), 7);
+        // >12 -> default clamped
+        assert_eq!(e.calculate_optimal_ttl(13), 8);
+        assert_eq!(e.calculate_optimal_ttl(255), 8);
+    }
+
+    #[test]
+    fn test_parse_route_table_shapes() {
+        let table = "Iface\tDestination\tGateway\tFlags\neth0\t00000000\t0101A8C0\t0003\neth0\t000101A8\t00000000\t0001\n";
+        let (iface, gw) = parse_route_table(table).expect("default route parses");
+        assert_eq!(iface, "eth0");
+        assert_eq!(gw, Ipv4Addr::new(192, 168, 1, 1));
+        // no default route
+        assert!(
+            parse_route_table("Iface\tDestination\tGateway\neth0\t000101A8\t00000000\n").is_none()
+        );
+        // bad hex skipped, short lines skipped, empty missing
+        assert!(parse_route_table("Iface\neth0\t00000000\tZZZZ\n").is_none());
+        assert!(parse_route_table("").is_none());
+        // first default wins
+        let two = "Iface\tD\tG\neth0\t00000000\t0101010A\neth1\t00000000\t0202020A\n";
+        assert_eq!(parse_route_table(two).unwrap().0, "eth0");
     }
 }

@@ -91,6 +91,10 @@ pub fn build_packet_stack_opts(
 ) -> StackPacket {
     let mut pkt = StackPacket::new();
 
+    if conn.validate_families().is_err() {
+        return pkt;
+    }
+
     match (conn.src_ip, conn.dst_ip) {
         (std::net::IpAddr::V6(src6), std::net::IpAddr::V6(dst6)) => {
             let tcp_hdr_len = 20;

@@ -207,13 +207,16 @@ impl Engine {
             warn!("firewall/DNS-affecting options changed — restart albus to apply (hot-reload skipped for those)");
         }
 
-        let exclude_ips = if self.cfg.doh_enabled {
-            extract_upstream_ips(&self.cfg.doh_upstream, &self.cfg.doh_bootstrap_ips)
+        // exclusion maps are hot-reloadable eBPF content (not firewall/DNS
+        // identity), so they must follow the NEW upstream; using the old one
+        // would fragment the new DoH traffic and skip the stale entries.
+        let exclude_ips = if new_cfg.doh_enabled {
+            extract_upstream_ips(&new_cfg.doh_upstream, &new_cfg.doh_bootstrap_ips)
         } else {
             Vec::new()
         };
-        let exclude_ips_v6 = if self.cfg.doh_enabled {
-            extract_upstream_ips_v6(&self.cfg.doh_upstream, &[])
+        let exclude_ips_v6 = if new_cfg.doh_enabled {
+            extract_upstream_ips_v6(&new_cfg.doh_upstream, &[])
         } else {
             Vec::new()
         };

@@ -355,3 +355,84 @@ fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .status()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_exec_path_accepts_system_binary() {
+        assert!(validate_exec_path("/usr/local/bin/albus").is_ok());
+    }
+
+    #[test]
+    fn test_validate_exec_path_rejects_injection() {
+        for bad in [
+            "/tmp/my albus",
+            "/tmp/x;reboot",
+            "/tmp/$(id)",
+            "/tmp/`id`",
+            "/tmp/a|b",
+            "/tmp/a&b",
+            "/tmp/a>b",
+            "/tmp/a#b",
+            "/tmp/x\\y",
+            "/tmp/../bin/albus",
+            "relative/path",
+            "",
+        ] {
+            assert!(validate_exec_path(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_fs_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "albus_svc_{}_{}_{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn test_secure_remove_regular_file() {
+        let dir = tmpdir("reg");
+        let f = dir.join("unit");
+        fs::write(&f, "x").unwrap();
+        assert!(secure_remove_file(f.to_str().unwrap()).unwrap());
+        assert!(!f.exists());
+        // second call: idempotent NotFound -> false
+        assert!(!secure_remove_file(f.to_str().unwrap()).unwrap());
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_secure_remove_refuses_symlink() {
+        let dir = tmpdir("link");
+        let target = dir.join("target");
+        let link = dir.join("link");
+        fs::write(&target, "precious").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(unix)]
+        {
+            assert!(secure_remove_file(link.to_str().unwrap()).is_err());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+        }
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir(&dir);
+    }
+}

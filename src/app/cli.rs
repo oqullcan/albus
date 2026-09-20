@@ -205,3 +205,46 @@ fn parse_optional_ipv4(s: &str) -> Result<std::net::Ipv4Addr, String> {
     }
     trimmed.parse().map_err(|e| format!("{}", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_parse_optional_ipv4_shapes() {
+        assert!(parse_optional_ipv4("1.1.1.1").is_ok());
+        assert!(parse_optional_ipv4("  9.9.9.9  ").is_ok());
+        for bad in ["", "   ", "999.1.1.1", "1.1.1", "abc", "1::1", "1.1.1.1.1"] {
+            assert!(parse_optional_ipv4(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn test_cli_defaults_and_parsing() {
+        let cli = Cli::try_parse_from(["albus", "run"]).expect("run parses");
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.fake_ttl, 8);
+                assert!(args.auto_ttl);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+        let cli = Cli::try_parse_from([
+            "albus",
+            "run",
+            "--ports",
+            "443,80",
+            "--fake-sni",
+            "x.example",
+        ])
+        .expect("flags parse");
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.ports, vec![443, 80]);
+                assert_eq!(args.fake_sni.as_deref(), Some("x.example"));
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+}

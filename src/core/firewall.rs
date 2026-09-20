@@ -120,43 +120,70 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
     }
 }
 
+// pure rule-spec constructors below: every iptables invocation in this
+// module goes through these, so ordering/content is unit-testable
+// without root. Comment strings namespace each feature for safe deletion.
+
+fn quic_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
+    vec![(
+        vec!["-p", "udp", "--dport", "443", "-j", "REJECT"],
+        "albus-quic",
+    )]
+}
+
+fn stun_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
+    ["3478", "5349"]
+        .iter()
+        .map(|port| {
+            (
+                vec!["-p", "udp", "--dport", port, "-j", "REJECT"],
+                "albus-stun",
+            )
+        })
+        .collect()
+}
+
+fn kill_switch_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
+    let mut specs = Vec::new();
+    for proto in ["udp", "tcp"] {
+        specs.push((
+            vec!["!", "-o", "lo", "-p", proto, "--dport", "53", "-j", "DROP"],
+            "albus-kill",
+        ));
+    }
+    // DoT 853 also blocked to prevent plaintext-adjacent leak
+    specs.push((
+        vec!["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", "DROP"],
+        "albus-kill",
+    ));
+    specs
+}
+
 // injects icmp port unreachable / tcp reset via iptables reject on udp 443
 pub fn block_quic() {
-    ensure_rule(
-        false,
-        &["-p", "udp", "--dport", "443", "-j", "REJECT"],
-        "albus-quic",
-    );
-    ensure_rule(
-        true,
-        &["-p", "udp", "--dport", "443", "-j", "REJECT"],
-        "albus-quic",
-    );
+    for (spec, comment) in quic_rule_specs() {
+        ensure_rule(false, &spec, comment);
+        ensure_rule(true, &spec, comment);
+    }
 
     info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
 }
 
 // purges injected reject rules for udp 443
 pub fn unblock_quic() {
-    delete_rule_bounded(false, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
-    delete_rule_bounded(true, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
+    for (spec, _) in quic_rule_specs() {
+        delete_rule_bounded(false, &spec);
+        delete_rule_bounded(true, &spec);
+    }
 
     debug!("QUIC firewall rules cleaned up");
 }
 
 // blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks
 pub fn block_stun() {
-    for port in &["3478", "5349"] {
-        ensure_rule(
-            false,
-            &["-p", "udp", "--dport", port, "-j", "REJECT"],
-            "albus-stun",
-        );
-        ensure_rule(
-            true,
-            &["-p", "udp", "--dport", port, "-j", "REJECT"],
-            "albus-stun",
-        );
+    for (spec, comment) in stun_rule_specs() {
+        ensure_rule(false, &spec, comment);
+        ensure_rule(true, &spec, comment);
     }
 
     info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
@@ -164,9 +191,9 @@ pub fn block_stun() {
 
 // purges stun packet filtering rules
 pub fn unblock_stun() {
-    for port in &["3478", "5349"] {
-        delete_rule_bounded(false, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
-        delete_rule_bounded(true, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
+    for (spec, _) in stun_rule_specs() {
+        delete_rule_bounded(false, &spec);
+        delete_rule_bounded(true, &spec);
     }
 
     debug!("STUN firewall rules cleaned up");
@@ -176,16 +203,10 @@ pub fn unblock_stun() {
 // guarantees no application or rogue dhcp server can leak plaintext dns to the isp
 // NOTE: uses DROP (stealth) instead of REJECT to avoid signaling DPI/middleboxes.
 pub fn enable_kill_switch() {
-    let udp = ["!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "DROP"];
-    let tcp = ["!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "DROP"];
-    // DoT 853 also blocked to prevent plaintext-adjacent leak
-    let dot = ["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", "DROP"];
-    ensure_rule(false, &udp, "albus-kill");
-    ensure_rule(false, &tcp, "albus-kill");
-    ensure_rule(false, &dot, "albus-kill");
-    ensure_rule(true, &udp, "albus-kill");
-    ensure_rule(true, &tcp, "albus-kill");
-    ensure_rule(true, &dot, "albus-kill");
+    for (spec, comment) in kill_switch_rule_specs() {
+        ensure_rule(false, &spec, comment);
+        ensure_rule(true, &spec, comment);
+    }
 
     info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
 }
@@ -297,6 +318,52 @@ mod tests {
             assert!(accept.contains(port) && drop.contains(port));
             assert_eq!(specs[0].1, "albus-lockdown");
             assert_eq!(specs[1].1, "albus-lockdown");
+        }
+    }
+
+    fn spec_strs(specs: &[(Vec<&str>, &str)]) -> Vec<String> {
+        specs
+            .iter()
+            .map(|(args, comment)| format!("{} #{}", args.join(" "), comment))
+            .collect()
+    }
+
+    #[test]
+    fn test_quic_specs_shape() {
+        let specs = quic_rule_specs();
+        assert_eq!(specs.len(), 1);
+        let s = spec_strs(&specs);
+        assert!(s[0].contains("--dport 443"), "{}", s[0]);
+        assert!(s[0].ends_with("REJECT #albus-quic"), "{}", s[0]);
+        assert!(!s[0].contains("-o lo"), "quic rule is not loopback-scoped");
+    }
+
+    #[test]
+    fn test_stun_specs_cover_both_ports() {
+        let specs = stun_rule_specs();
+        assert_eq!(specs.len(), 2);
+        let joined = spec_strs(&specs).join("\n");
+        assert!(joined.contains("--dport 3478"), "{}", joined);
+        assert!(joined.contains("--dport 5349"), "{}", joined);
+        for (args, comment) in &specs {
+            assert_eq!(*comment, "albus-stun");
+            assert!(args.contains(&"-j") && args.contains(&"REJECT"));
+        }
+    }
+
+    #[test]
+    fn test_kill_switch_specs_shape() {
+        let specs = kill_switch_rule_specs();
+        assert_eq!(specs.len(), 3);
+        let joined = spec_strs(&specs).join("\n");
+        // udp/53 + tcp/53 + tcp/853, all non-loopback DROP
+        assert!(joined.contains("-p udp --dport 53"), "{}", joined);
+        assert!(joined.contains("-p tcp --dport 53"), "{}", joined);
+        assert!(joined.contains("--dport 853"), "{}", joined);
+        for (args, comment) in &specs {
+            assert_eq!(*comment, "albus-kill");
+            assert!(args.contains(&"!") && args.contains(&"lo"));
+            assert!(args.last() == Some(&"DROP"));
         }
     }
 }

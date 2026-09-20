@@ -315,3 +315,52 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+    use hickory_proto::rr::rdata::svcb::{EchConfigList, SvcParamKey, SvcParamValue};
+    use hickory_proto::rr::rdata::{HTTPS, SVCB};
+    use hickory_proto::rr::{Name, RData, Record};
+
+    fn https_rec(owner: &str, priority: u16, target: &str, ech: Option<Vec<u8>>) -> Record {
+        let mut params = Vec::new();
+        if let Some(b) = ech {
+            params.push((
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(EchConfigList(b)),
+            ));
+        }
+        let svcb = SVCB::new(priority, Name::from_ascii(target).unwrap(), params);
+        Record::from_rdata(
+            Name::from_ascii(owner).unwrap(),
+            300,
+            RData::HTTPS(HTTPS(svcb)),
+        )
+    }
+
+    #[test]
+    fn test_alias_mode_ignored_without_chase() {
+        // alias (priority 0) record alone yields nothing from pure extraction
+        let rec = https_rec("a.example.", 0, "b.example.", None);
+        let refs = vec![&rec];
+        let owner = Name::from_ascii("a.example.").unwrap();
+        assert_eq!(echconfig_from_records(&refs, &owner), None);
+    }
+
+    #[test]
+    fn test_oversize_ech_dropped() {
+        let rec = https_rec("a.example.", 1, ".", Some(vec![0xAA; 5000]));
+        let refs = vec![&rec];
+        let owner = Name::from_ascii("a.example.").unwrap();
+        assert_eq!(echconfig_from_records(&refs, &owner), None);
+    }
+
+    #[test]
+    fn test_empty_ech_dropped() {
+        let rec = https_rec("a.example.", 1, ".", Some(vec![]));
+        let refs = vec![&rec];
+        let owner = Name::from_ascii("a.example.").unwrap();
+        assert_eq!(echconfig_from_records(&refs, &owner), None);
+    }
+}

@@ -818,3 +818,58 @@ mod tests {
         assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
     }
 }
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+
+    fn query_with_qtype(qtype: u16) -> Vec<u8> {
+        let mut q = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        q.extend_from_slice(&[(qtype >> 8) as u8, qtype as u8, 0x00, 0x01]);
+        q
+    }
+
+    #[test]
+    fn test_pointer_chain_terminates() {
+        // 6-jump compression chain must not hang the parser (max_jumps=5)
+        let mut msg = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        // answer: pointer to offset 40, which points back to 12 (loop)
+        msg.extend_from_slice(&[0xC0, 0x28, 0x00, 0x01, 0x00, 0x01]);
+        // offset 40: pointer to 12
+        while msg.len() < 40 {
+            msg.push(0x00);
+        }
+        msg.extend_from_slice(&[0xC0, 0x0C]);
+        let _ = parse_dns_response(&msg);
+    }
+
+    #[test]
+    fn test_enable_dnssec_do_idempotent() {
+        let q = query_with_qtype(1);
+        let once = enable_dnssec_do(&q);
+        let twice = enable_dnssec_do(&once);
+        // second call must not append another OPT record
+        assert_eq!(once.len(), twice.len());
+        assert_eq!(twice[11], 1, "exactly one OPT");
+    }
+
+    #[test]
+    fn test_aaaa_matrix() {
+        assert!(is_aaaa_query(&query_with_qtype(28)));
+        assert!(!is_aaaa_query(&query_with_qtype(1)));
+        assert!(!is_aaaa_query(&[]));
+        assert!(!is_aaaa_query(&[0u8; 10]));
+        // qdcount = 0
+        let mut q = query_with_qtype(28);
+        q[4] = 0;
+        q[5] = 0;
+        assert!(!is_aaaa_query(&q));
+    }
+}
