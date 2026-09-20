@@ -684,18 +684,26 @@ pub fn parse_elf_sockops(
         ));
     }
 
-    let shstrtab_hdr_offset = e_shoff + (e_shstrndx * e_shentsize);
-    let shstrtab_offset = u64::from_le_bytes(
-        elf_bytes[shstrtab_hdr_offset + 24..shstrtab_hdr_offset + 32]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let shstrtab_size = u64::from_le_bytes(
-        elf_bytes[shstrtab_hdr_offset + 32..shstrtab_hdr_offset + 40]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let shstrtab = &elf_bytes[shstrtab_offset..shstrtab_offset + shstrtab_size];
+    let shstrtab_hdr_offset = e_shoff
+        .checked_add(
+            (e_shstrndx as usize)
+                .checked_mul(e_shentsize)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
+        )
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?;
+    let shstrtab_offset = le_u64_at(
+        elf_bytes,
+        shstrtab_hdr_offset
+            .checked_add(24)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
+    )? as usize;
+    let shstrtab_size = le_u64_at(
+        elf_bytes,
+        shstrtab_hdr_offset
+            .checked_add(32)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
+    )? as usize;
+    let shstrtab = elf_slice(elf_bytes, shstrtab_offset, shstrtab_size)?;
 
     let get_sh_name = |name_offset: usize| -> String {
         if name_offset < shstrtab.len() {
@@ -713,31 +721,53 @@ pub fn parse_elf_sockops(
     let mut rel_section = None;
 
     for i in 0..e_shnum {
-        let sh_offset = e_shoff + (i * e_shentsize);
-        let sh_name_off =
-            u32::from_le_bytes(elf_bytes[sh_offset..sh_offset + 4].try_into().unwrap()) as usize;
-        let sh_type =
-            u32::from_le_bytes(elf_bytes[sh_offset + 4..sh_offset + 8].try_into().unwrap());
-        let sh_offset_val = u64::from_le_bytes(
-            elf_bytes[sh_offset + 24..sh_offset + 32]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let sh_size = u64::from_le_bytes(
-            elf_bytes[sh_offset + 32..sh_offset + 40]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let sh_link = u32::from_le_bytes(
-            elf_bytes[sh_offset + 40..sh_offset + 44]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let sh_entsize_val = u64::from_le_bytes(
-            elf_bytes[sh_offset + 56..sh_offset + 64]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let sh_offset = e_shoff
+            .checked_add(
+                (i as usize)
+                    .checked_mul(e_shentsize)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+            )
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
+        let end = sh_offset
+            .checked_add(64)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
+        if end > elf_bytes.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "section header out of bounds",
+            ));
+        }
+        let sh_name_off = le_u32_at(elf_bytes, sh_offset)? as usize;
+        let sh_type = le_u32_at(
+            elf_bytes,
+            sh_offset
+                .checked_add(4)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+        )?;
+        let sh_offset_val = le_u64_at(
+            elf_bytes,
+            sh_offset
+                .checked_add(24)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+        )? as usize;
+        let sh_size = le_u64_at(
+            elf_bytes,
+            sh_offset
+                .checked_add(32)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+        )? as usize;
+        let sh_link = le_u32_at(
+            elf_bytes,
+            sh_offset
+                .checked_add(40)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+        )? as usize;
+        let sh_entsize_val = le_u64_at(
+            elf_bytes,
+            sh_offset
+                .checked_add(56)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+        )? as usize;
 
         let name = get_sh_name(sh_name_off);
 
@@ -797,20 +827,28 @@ pub fn parse_elf_sockops(
         (symtab_section, rel_section)
     {
         let strtab = if sym_link < e_shnum {
-            let str_hdr = e_shoff + (sym_link * e_shentsize);
-            let s_off =
-                u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap())
-                    as usize;
-            let s_size =
-                u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap())
-                    as usize;
-            if s_off + s_size <= elf_bytes.len() {
-                &elf_bytes[s_off..s_off + s_size]
-            } else {
-                &[]
-            }
+            let str_hdr = e_shoff
+                .checked_add(
+                    sym_link
+                        .checked_mul(e_shentsize)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+                )
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
+            let s_off = le_u64_at(
+                elf_bytes,
+                str_hdr
+                    .checked_add(24)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+            )? as usize;
+            let s_size = le_u64_at(
+                elf_bytes,
+                str_hdr
+                    .checked_add(32)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
+            )? as usize;
+            elf_slice(elf_bytes, s_off, s_size).unwrap_or(&[])
         } else if let Some((str_off, str_size)) = strtab_section {
-            &elf_bytes[str_off..str_off + str_size]
+            elf_slice(elf_bytes, str_off, str_size).unwrap_or(&[])
         } else {
             &[]
         };
@@ -825,22 +863,41 @@ pub fn parse_elf_sockops(
             }
         };
 
-        let num_syms = sym_size / 24;
+        let num_syms = (sym_size / 24).min(MAX_SYMBOLS);
         let mut symbols = Vec::with_capacity(num_syms);
         for i in 0..num_syms {
-            let s_off = sym_off + (i * 24);
-            let st_name =
-                u32::from_le_bytes(elf_bytes[s_off..s_off + 4].try_into().unwrap()) as usize;
+            let s_off = sym_off
+                .checked_add(
+                    i.checked_mul(24)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sym overflow"))?,
+                )
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sym overflow"))?;
+            let st_name = le_u32_at(elf_bytes, s_off)? as usize;
             symbols.push(get_sym_name(st_name));
         }
 
-        let num_rels = rel_size / entry_size;
+        if entry_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "zero relocation entry size",
+            ));
+        }
+        let num_rels = (rel_size / entry_size).min(MAX_RELOCS);
 
         for i in 0..num_rels {
-            let r_off = rel_off + (i * entry_size);
-            let r_offset =
-                u64::from_le_bytes(elf_bytes[r_off..r_off + 8].try_into().unwrap()) as usize;
-            let r_info = u64::from_le_bytes(elf_bytes[r_off + 8..r_off + 16].try_into().unwrap());
+            let r_off = rel_off
+                .checked_add(
+                    i.checked_mul(entry_size)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?,
+                )
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?;
+            let r_offset = le_u64_at(elf_bytes, r_off)? as usize;
+            let r_info = le_u64_at(
+                elf_bytes,
+                r_off
+                    .checked_add(8)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?,
+            )?;
             let sym_idx = (r_info >> 32) as usize;
 
             let insn_idx = r_offset / 8;
@@ -857,6 +914,42 @@ pub fn parse_elf_sockops(
 
     Ok(insns)
 }
+
+// bounded slice read: overflow and out-of-bounds become Err, never panic
+// (the daemon runs with panic=abort, so any panic here is a hard crash).
+fn elf_slice(elf_bytes: &[u8], off: usize, len: usize) -> Result<&[u8]> {
+    let end = off
+        .checked_add(len)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "elf offset overflow"))?;
+    elf_bytes
+        .get(off..end)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "elf section out of bounds"))
+}
+
+fn le_u16_at(elf_bytes: &[u8], off: usize) -> Result<u16> {
+    let b: [u8; 2] = elf_slice(elf_bytes, off, 2)?
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
+    Ok(u16::from_le_bytes(b))
+}
+
+fn le_u32_at(elf_bytes: &[u8], off: usize) -> Result<u32> {
+    let b: [u8; 4] = elf_slice(elf_bytes, off, 4)?
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn le_u64_at(elf_bytes: &[u8], off: usize) -> Result<u64> {
+    let b: [u8; 8] = elf_slice(elf_bytes, off, 8)?
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
+    Ok(u64::from_le_bytes(b))
+}
+
+// hard caps so a corrupt symbol/relocation count cannot force GB allocations
+const MAX_SYMBOLS: usize = 4096;
+const MAX_RELOCS: usize = 4096;
 
 // reads possible cpu cores configured in sysfs
 fn get_possible_cpus() -> usize {
@@ -1036,8 +1129,11 @@ impl PerfReader {
                 if raw_size >= std::mem::size_of::<RawConnEvent>() {
                     let mut evt_bytes = [0u8; std::mem::size_of::<RawConnEvent>()];
                     read_ring_bytes((record_offset + 12) & data_mask, &mut evt_bytes);
-                    let event =
-                        unsafe { std::ptr::read(evt_bytes.as_ptr() as *const RawConnEvent) };
+                    // unaligned: evt_bytes is a u8 stack array (align 1), so a
+                    // plain ptr::read would be UB on stricter targets
+                    let event = unsafe {
+                        std::ptr::read_unaligned(evt_bytes.as_ptr() as *const RawConnEvent)
+                    };
                     callback(event);
                 }
             }
@@ -1069,6 +1165,34 @@ impl Drop for PerfReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_elf_parser_overflow_header_is_err_not_panic() {
+        // corrupt header: section table offset near u64::MAX so that
+        // offset+size arithmetic overflows; parser must return Err.
+        let mut hdr = vec![0u8; 64];
+        hdr[0..4].copy_from_slice(b"\x7FELF");
+        hdr[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        hdr[58..60].copy_from_slice(&64u16.to_le_bytes());
+        hdr[60..62].copy_from_slice(&1u16.to_le_bytes());
+        hdr[62..64].copy_from_slice(&0u16.to_le_bytes());
+        let map_fds = HashMap::new();
+        let res = parse_elf_sockops(&hdr, &map_fds);
+        assert!(
+            res.is_err(),
+            "overflowing ELF header must be Err, not panic"
+        );
+    }
+
+    #[test]
+    fn test_elf_parser_truncated_is_err_not_panic() {
+        // truncated garbage with valid magic
+        let mut tiny = vec![0u8; 40];
+        tiny[0..4].copy_from_slice(b"\x7FELF");
+        let map_fds = HashMap::new();
+        assert!(parse_elf_sockops(&tiny, &map_fds).is_err());
+        assert!(parse_elf_sockops(&[], &map_fds).is_err());
+    }
 
     #[test]
     fn test_elf_parser_relocation_integrity() {

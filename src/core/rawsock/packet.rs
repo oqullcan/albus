@@ -2,7 +2,7 @@
 
 use super::types::ConnInfo;
 
-pub const MAX_PACKET_LEN: usize = 512;
+pub const MAX_PACKET_LEN: usize = 1500;
 
 // fixed-size stack buffer eliminating heap allocation overhead during packet synthesis
 #[derive(Clone, Copy)]
@@ -290,6 +290,28 @@ mod tests {
 
         // payload verification
         assert_eq!(&pkt[40..], payload);
+    }
+
+    #[test]
+    fn test_pq_sized_decoy_payload_not_truncated() {
+        // post-quantum ClientHello decoys (Kyber768/ML-KEM shares) run ~1KB+;
+        // the old 512-byte cap silently dropped them to empty packets.
+        let conn = ConnInfo::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(93, 184, 216, 34),
+            12345,
+            443,
+            1000,
+            2000,
+        );
+        let payload = vec![0x42u8; 1200];
+        let pkt = build_packet_stack_opts(&conn, &payload, 8, false);
+        assert!(!pkt.is_empty(), "1200-byte PQ decoy must not be dropped");
+        assert_eq!(pkt.len(), 20 + 20 + payload.len());
+        assert_eq!(&pkt[40..], payload.as_slice());
+        // over-MTU still refused (fail-closed, empty — never truncated)
+        let huge = vec![0x42u8; 1500];
+        assert!(build_packet_stack_opts(&conn, &huge, 8, false).is_empty());
     }
 
     #[test]

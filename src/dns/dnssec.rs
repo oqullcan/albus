@@ -197,7 +197,7 @@ impl DnssecValidator {
     fn rrsig_records(records: &[Record], covered: RecordType) -> Vec<RRSIG> {
         let mut sigs = Vec::new();
         for rec in records {
-            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = (&rec.data) {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &rec.data {
                 if sig.input().type_covered == covered {
                     sigs.push(sig.clone());
                 }
@@ -209,7 +209,7 @@ impl DnssecValidator {
     fn dnskey_records(records: &[Record]) -> Vec<DNSKEY> {
         let mut keys = Vec::new();
         for rec in records {
-            if let RData::DNSSEC(DNSSECRData::DNSKEY(key)) = (&rec.data) {
+            if let RData::DNSSEC(DNSSECRData::DNSKEY(key)) = &rec.data {
                 keys.push(key.clone());
             }
         }
@@ -291,7 +291,7 @@ impl DnssecValidator {
         // DS must digest a SEP (flag 257) key; the DS RRset itself must be
         // signed by the parent keys, whose chain we then recurse into.
         for rec in &ds_records {
-            let RData::DNSSEC(DNSSECRData::DS(ds)) = (&rec.data) else {
+            let RData::DNSSEC(DNSSECRData::DS(ds)) = &rec.data else {
                 continue;
             };
             if ds.digest_type() != hickory_proto::dnssec::DigestType::SHA256

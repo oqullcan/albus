@@ -210,12 +210,46 @@ pub fn disable_kill_switch() {
 }
 
 // enables fail-closed network lockdown: blocks outbound non-loopback tcp traffic on ports 80 and 443
-// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails
+// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails.
+//
+// Ordered specs (ACCEPT first): already-established flows — including the
+// daemon's own upstream DoH connections — are exempted via conntrack state,
+// so lockdown drops only NEW unprotected flows instead of killing DNS too.
+fn lockdown_rule_specs<'a>(port: &'a str) -> Vec<(Vec<&'a str>, &'static str)> {
+    vec![
+        (
+            vec![
+                "!",
+                "-o",
+                "lo",
+                "-p",
+                "tcp",
+                "--dport",
+                port,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+            "albus-lockdown",
+        ),
+        (
+            vec!["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "DROP"],
+            "albus-lockdown",
+        ),
+    ]
+}
+
 pub fn enable_network_lockdown() {
     for port in &["80", "443"] {
-        let rule = ["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "DROP"];
-        ensure_rule(false, &rule, "albus-lockdown");
-        ensure_rule(true, &rule, "albus-lockdown");
+        // insert in reverse: `ensure_rule` prepends (`-I OUTPUT`), so the
+        // ACCEPT fast-path must be inserted last to land on top.
+        for (spec, comment) in lockdown_rule_specs(port).iter().rev() {
+            ensure_rule(false, spec, comment);
+            ensure_rule(true, spec, comment);
+        }
     }
 
     info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
@@ -224,6 +258,11 @@ pub fn enable_network_lockdown() {
 // purges fail-closed network lockdown rules
 pub fn disable_network_lockdown() {
     for port in &["80", "443"] {
+        for (spec, _) in lockdown_rule_specs(port) {
+            delete_rule_bounded(false, &spec);
+            delete_rule_bounded(true, &spec);
+        }
+        // legacy DROP/REJECT shapes without comments (pre-hardening installs)
         for target in ["DROP", "REJECT"] {
             let rule = ["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", target];
             delete_rule_bounded(false, &rule);
@@ -232,4 +271,32 @@ pub fn disable_network_lockdown() {
     }
 
     debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lockdown_accept_precedes_drop() {
+        // the conntrack fast-path must sort before the DROP, otherwise the
+        // daemon's own established DoH connections die with lockdown on.
+        for port in ["80", "443"] {
+            let specs = lockdown_rule_specs(port);
+            assert_eq!(specs.len(), 2);
+            let accept = specs[0].0.join(" ");
+            let drop = specs[1].0.join(" ");
+            assert!(
+                accept.contains("conntrack")
+                    && accept.contains("ESTABLISHED,RELATED")
+                    && accept.ends_with("ACCEPT"),
+                "first spec must be the established fast-path: {}",
+                accept
+            );
+            assert!(drop.ends_with("DROP"), "second spec must drop: {}", drop);
+            assert!(accept.contains(port) && drop.contains(port));
+            assert_eq!(specs[0].1, "albus-lockdown");
+            assert_eq!(specs[1].1, "albus-lockdown");
+        }
+    }
 }

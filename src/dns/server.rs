@@ -26,6 +26,30 @@ pub struct DnsServer {
     shutdown_tx: broadcast::Sender<()>,
 }
 
+// Redacts custom DoH URLs to scheme://host for logs: full URLs may embed
+// account identifiers (e.g. NextDNS profile IDs) that must not land in the
+// persistent journal. Presets pass through unchanged.
+fn redact_upstream_desc(desc: &str) -> String {
+    let mut out = Vec::new();
+    for part in desc.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match url::Url::parse(p) {
+            Ok(u) => {
+                let host = u.host_str().unwrap_or("?");
+                out.push(format!("{}://{}", u.scheme(), host));
+            }
+            Err(_) => out.push(p.to_string()),
+        }
+    }
+    if out.is_empty() {
+        return desc.to_string();
+    }
+    out.join(",")
+}
+
 impl DnsServer {
     pub fn new(
         upstreams_csv: &str,
@@ -65,6 +89,12 @@ impl DnsServer {
         }
     }
 
+    // Redacts custom DoH URLs to scheme://host for logs: full URLs may embed
+    // account identifiers (e.g. NextDNS profile IDs). Presets pass through.
+    fn upstream_desc_for_log(desc: &str) -> String {
+        redact_upstream_desc(desc)
+    }
+
     // spawns background asynchronous udp receive loop on loopback interface 127.0.0.1:53
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let socket = match UdpSocket::bind("127.0.0.1:53").await {
@@ -74,9 +104,12 @@ impl DnsServer {
             }
         };
 
+        // Log scheme+host only: custom URLs embed account profile IDs
+        // (e.g. NextDNS) that must not land in the persistent journal.
+        let upstream_log = Self::upstream_desc_for_log(&self.upstream_desc);
         info!(
             addr = "127.0.0.1:53",
-            upstream = %self.upstream_desc,
+            upstream = %upstream_log,
             block_ipv6 = self.block_ipv6,
             dnssec = self.dnssec,
             pqc = self.pqc,
@@ -656,6 +689,19 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_upstream_log_redacts_profile_ids() {
+        assert_eq!(
+            redact_upstream_desc("https://dns.nextdns.io/795926"),
+            "https://dns.nextdns.io"
+        );
+        assert_eq!(redact_upstream_desc("quad9"), "quad9");
+        assert_eq!(
+            redact_upstream_desc("quad9, https://dns.nextdns.io/795926"),
+            "quad9,https://dns.nextdns.io"
+        );
+    }
 
     #[tokio::test]
     async fn test_dns_server_queue_fifo() {

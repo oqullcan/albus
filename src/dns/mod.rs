@@ -5,6 +5,7 @@ pub mod dnssec;
 pub mod doh;
 pub mod ech;
 pub mod server;
+pub mod ssrf;
 pub mod system;
 
 pub use dnssec::{DnssecState, DnssecValidator};

@@ -113,27 +113,7 @@ fn is_pq_kx_group(name: &str) -> bool {
 }
 
 fn is_blocked_bootstrap_ip(ip: &Ipv4Addr) -> bool {
-    let o = ip.octets();
-    // loopback, unspecified, multicast, link-local, metadata, private
-    if o[0] == 127 || o[0] == 0 || o[0] >= 224 {
-        return true;
-    }
-    if o[0] == 169 && o[1] == 254 {
-        return true; // link-local + cloud metadata 169.254.169.254
-    }
-    if o[0] == 10 {
-        return true;
-    }
-    if o[0] == 172 && (16..32).contains(&o[1]) {
-        return true;
-    }
-    if o[0] == 192 && o[1] == 168 {
-        return true;
-    }
-    if o[0] == 100 && (64..128).contains(&o[1]) {
-        return true; // CGNAT
-    }
-    false
+    super::ssrf::blocked_ipv4(ip)
 }
 
 // individual http/2 client targeting an encrypted dns endpoint
@@ -222,15 +202,41 @@ impl SingleDoHClient {
                     bootstrap_addrs.push(SocketAddr::from((*ip, port)));
                 }
 
-                // 3. handle raw ipv4 host literal
+                // 3. handle raw ip host literals — fail closed on SSRF targets
                 if bootstrap_addrs.is_empty() {
                     if let Ok(ip) = host_str.parse::<Ipv4Addr>() {
+                        if super::ssrf::blocked_ipv4(&ip) {
+                            return Err(format!(
+                                "blocked DoH host literal {} (non-global address)",
+                                ip
+                            )
+                            .into());
+                        }
                         bootstrap_addrs.push(SocketAddr::from((ip, port)));
+                    } else if let Ok(ip6) = host_str
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<Ipv6Addr>()
+                    {
+                        if super::ssrf::blocked_ipv6(&ip6) {
+                            return Err(format!(
+                                "blocked DoH host literal {} (non-global address)",
+                                ip6
+                            )
+                            .into());
+                        }
+                        bootstrap_addrs.push(SocketAddr::from((ip6, port)));
                     } else {
-                        // 4. resolve fqdn via system resolver prior to resolv.conf modification
+                        // 4. resolve fqdn via system resolver prior to resolv.conf modification.
+                        // Screen results: a poisoned/malicious resolver must not pin us
+                        // to loopback- or metadata-range dial targets (TLS cert check
+                        // remains the backstop for anything that passes the screen).
                         let host_with_port = format!("{}:{}", host_str, port);
                         if let Ok(resolved) = host_with_port.to_socket_addrs() {
                             for addr in resolved {
+                                if super::ssrf::blocked_socket(&addr) {
+                                    continue;
+                                }
                                 bootstrap_addrs.push(addr);
                             }
                         }
@@ -563,13 +569,17 @@ pub fn extract_upstream_ips(
         if let Ok(parsed) = Url::parse(u) {
             if let Some(host_str) = parsed.host_str() {
                 if let Ok(ip) = host_str.parse::<Ipv4Addr>() {
-                    ips.push(ip);
+                    if !super::ssrf::blocked_ipv4(&ip) {
+                        ips.push(ip);
+                    }
                 } else {
                     let host_with_port = format!("{}:{}", host_str, parsed.port().unwrap_or(443));
                     if let Ok(resolved) = host_with_port.to_socket_addrs() {
                         for addr in resolved {
                             if let std::net::SocketAddr::V4(v4) = addr {
-                                ips.push(*v4.ip());
+                                if !super::ssrf::blocked_ipv4(v4.ip()) {
+                                    ips.push(*v4.ip());
+                                }
                             }
                         }
                     }
@@ -590,8 +600,12 @@ pub fn extract_upstream_ips_v6(
 ) -> Vec<Ipv6Addr> {
     let mut ips = Vec::new();
 
-    // append all user-specified bootstrap endpoints
-    ips.extend_from_slice(custom_bootstrap_ips);
+    // append user-specified bootstrap endpoints (minus blocked ranges)
+    for ip in custom_bootstrap_ips {
+        if !super::ssrf::blocked_ipv6(ip) {
+            ips.push(*ip);
+        }
+    }
 
     for raw in upstreams_csv.split(',') {
         let u = raw.trim();
@@ -608,13 +622,17 @@ pub fn extract_upstream_ips_v6(
             if let Some(host_str) = parsed.host_str() {
                 let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
                 if let Ok(ip) = clean_host.parse::<Ipv6Addr>() {
-                    ips.push(ip);
+                    if !super::ssrf::blocked_ipv6(&ip) {
+                        ips.push(ip);
+                    }
                 } else {
                     let host_with_port = format!("{}:{}", host_str, parsed.port().unwrap_or(443));
                     if let Ok(resolved) = host_with_port.to_socket_addrs() {
                         for addr in resolved {
                             if let std::net::SocketAddr::V6(v6) = addr {
-                                ips.push(*v6.ip());
+                                if !super::ssrf::blocked_ipv6(v6.ip()) {
+                                    ips.push(*v6.ip());
+                                }
                             }
                         }
                     }
@@ -687,6 +705,31 @@ mod tests {
         let client =
             SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], false).unwrap();
         assert!(!client.probe_pq_support(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn test_ssrf_custom_urls_rejected() {
+        // plaintext is refused outright
+        assert!(
+            SingleDoHClient::new("http://127.0.0.1:1234/dns-query", "custom", &[], true).is_err()
+        );
+        assert!(SingleDoHClient::new(
+            "http://169.254.169.254/latest/meta-data/",
+            "custom",
+            &[],
+            true
+        )
+        .is_err());
+        // https does not save non-global literals (new host-literal screen)
+        assert!(SingleDoHClient::new("https://127.0.0.1/dns-query", "custom", &[], true).is_err());
+        assert!(SingleDoHClient::new("https://[::1]/dns-query", "custom", &[], true).is_err());
+        assert!(
+            SingleDoHClient::new("https://169.254.169.254/dns-query", "custom", &[], true).is_err()
+        );
+        // sane inputs still pass
+        assert!(
+            SingleDoHClient::new("https://dns.quad9.net/dns-query", "quad9", &[], true).is_ok()
+        );
     }
 
     /// Live measurement: which upstreams truly negotiate PQ KEM.
