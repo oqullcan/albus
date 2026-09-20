@@ -217,6 +217,14 @@ WantedBy=multi-user.target
     secure_write_root_file(POLKIT_RULE_PATH, POLKIT_RULE_CONTENT, 0o644)?;
     println!("Created polkit authorization rule: {}", POLKIT_RULE_PATH);
 
+    // managed-install marker: proves albus lived here so firewall cleanup
+    // may sweep legacy uncommented rules without risking admin rules
+    secure_write_root_file(
+        crate::core::firewall::MANAGED_MARKER_PATH,
+        "managed\n",
+        0o600,
+    )?;
+
     // reload daemon manager and enable unit (absolute path, checked)
     let reload = systemctl().arg("daemon-reload").status()?;
     if !reload.success() {
@@ -277,6 +285,11 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match secure_remove_file(POLKIT_RULE_PATH) {
         Ok(true) => println!("Removed {}", POLKIT_RULE_PATH),
+        Ok(false) => {}
+        Err(e) => return Err(e),
+    }
+    match secure_remove_file(crate::core::firewall::MANAGED_MARKER_PATH) {
+        Ok(true) => println!("Removed {}", crate::core::firewall::MANAGED_MARKER_PATH),
         Ok(false) => {}
         Err(e) => return Err(e),
     }

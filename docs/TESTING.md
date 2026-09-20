@@ -63,6 +63,14 @@ Config hot-path: as normal user, change a panel toggle and save — toast
 only, **no** polkit dialog. Then "Restart Service" — exactly **one**
 polkit dialog is expected.
 
+Migration note (managed-install marker): installs by the new binary
+write `/etc/albus/.managed` (root-only, `O_NOFOLLOW`). Rule cleanup
+deletes legacy `albus-*` rules **only** when the marker is absent
+(first stop after upgrade); once the marker exists, teardown removes
+only rules the daemon knows it applied. Verify with:
+`sudo ls -l /etc/albus/.managed` (present after fresh install,
+absent on pre-marker installs until next stop/start cycle).
+
 ## Results log (append-only; never invent results)
 
 ### 2026-09-20 — logic self-tests (no root)
@@ -84,3 +92,17 @@ polkit dialog is expected.
   sim never sees a clean blocked SNI.
 - Loopback caveat (documented in code): our own decoys poison the local
   stub, so verdicts rest on sim observations, never on handshake success.
+
+### 2026-09-20 — wave-2 unit + privileged suites (develop, uncommitted)
+- `cargo test --lib`: **104 passed**, 0 failed, 2 ignored. New: firewall
+  marker-gating test (`managed_install_present_at`: absent/file/symlink/dir)
+  and NSEC3 closest-encloser test (parent/grandparent/self match,
+  unrelated miss, non-NSEC3 ignored). `cargo clippy --lib`: clean.
+- `cargo test --test root -- --ignored` as root via pkexec: **3 passed**
+  (QUIC block/unblock symmetry; "Bad rule" lines are the test's own
+  idempotent-cleanup noise on absent rules).
+- Live daemon untouched by the suite: `albus.service` still `active`,
+  6×`albus` rules in v4 + 6× in v6 OUTPUT; `/etc/albus/.managed` absent
+  (live install predates the marker — first stop/start with the new
+  binary will take the one-shot legacy-cleanup path, then behave as
+  managed).

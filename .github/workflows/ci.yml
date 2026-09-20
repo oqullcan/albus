@@ -98,3 +98,26 @@ jobs:
         with:
           name: albus-sha256
           path: albus.sha256
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+        with:
+          persist-credentials: false
+      - name: Install stable toolchain with llvm-tools
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+        env:
+          RUSTUP_TOOLCHAIN: stable
+      - name: coverage gate (workspace, min 55% lines)
+        run: cargo llvm-cov --workspace --fail-under-lines 55 --summary-only
+        env:
+          RUSTUP_TOOLCHAIN: stable

@@ -128,6 +128,24 @@ impl DnsServer {
         let ip_queue = self.ip_queue.clone();
         let block_ipv6 = self.block_ipv6;
         let dnssec = self.dnssec;
+        // trust-anchor rollover early warning (one-shot, bounded, non-blocking)
+        if dnssec {
+            let health_validator = validator.clone();
+            let health_resolver = resolver.clone();
+            tokio::spawn(async move {
+                let ok = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    health_validator.anchor_health(&health_resolver),
+                )
+                .await
+                .unwrap_or(true);
+                if !ok {
+                    warn!("root DNSKEY set differs from compiled-in trust anchors — possible KSK rollover: update albus, DNSSEC validation may start failing");
+                } else {
+                    info!("root trust anchors match live root DNSKEY set");
+                }
+            });
+        }
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
@@ -290,7 +308,11 @@ impl DnsServer {
                                                 None
                                             };
                                             if dnssec_state == Some(DnssecState::Bogus) {
-                                                warn!("dnssec BOGUS response rejected (not cached, SERVFAIL sent)");
+                                                let qlabel =
+                                                    crate::dns::cache::extract_query_key(&query_data)
+                                                        .map(|k| format!("{}/{}", k.name, k.qtype))
+                                                        .unwrap_or_else(|| "?/?".to_string());
+                                                warn!("dnssec BOGUS response rejected for {} (not cached, SERVFAIL sent)", qlabel);
                                                 if query_data.len() >= 4 {
                                                     let mut fail_resp = query_data.clone();
                                                     fail_resp[2] |= 0x80;

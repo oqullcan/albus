@@ -76,8 +76,30 @@ fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
     }
 }
 
+/// Marker proving albus was installed on this machine (written on successful
+/// install, removed on uninstall). Gates the legacy uncommented-rule sweep
+/// below: without it, a textually identical administrator rule could be
+/// removed by mistake.
+pub const MANAGED_MARKER_PATH: &str = "/etc/albus/.managed";
+
+fn managed_install_present() -> bool {
+    managed_install_present_at(MANAGED_MARKER_PATH)
+}
+
+fn managed_install_present_at(path: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_file(),
+        Err(_) => false,
+    }
+}
+
 /// Bounded delete: avoids infinite loop if binary is shimmed.
-fn delete_rule_bounded(v6: bool, args: &[&str]) {
+/// Returns true when at least one commented (ours, namespaced) rule was
+/// removed; the legacy uncommented sweep only runs then, or when the
+/// managed-install marker proves albus lived here — otherwise an
+/// administrator rule identical to ours would be indistinguishable.
+fn delete_rule_bounded(v6: bool, args: &[&str]) -> bool {
+    let mut removed_any = false;
     // 1. new-style rules (with per-feature comments)
     for comment in [
         "albus-quic",
@@ -96,28 +118,31 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
                 iptables_base().args(&del_args).status()
             };
             match status {
-                Ok(s) if s.success() => continue,
+                Ok(s) if s.success() => {
+                    removed_any = true;
+                    continue;
+                }
                 _ => break,
             }
         }
     }
     // 2. legacy rules without comment match (pre-hardening installs).
-    // Residual risk: an administrator rule textually identical to ours is
-    // indistinguishable and one instance may be removed; tolerated because
-    // upgrade cleanup must handle uncommented rules from older releases.
-    for _ in 0..MAX_RULE_DELETE_ITER {
-        let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
-        del_args.extend_from_slice(args);
-        let status = if v6 {
-            ip6tables_base().args(&del_args).status()
-        } else {
-            iptables_base().args(&del_args).status()
-        };
-        match status {
-            Ok(s) if s.success() => continue,
-            _ => break,
+    if removed_any || managed_install_present() {
+        for _ in 0..MAX_RULE_DELETE_ITER {
+            let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
+            del_args.extend_from_slice(args);
+            let status = if v6 {
+                ip6tables_base().args(&del_args).status()
+            } else {
+                iptables_base().args(&del_args).status()
+            };
+            match status {
+                Ok(s) if s.success() => continue,
+                _ => break,
+            }
         }
     }
+    removed_any
 }
 
 // pure rule-spec constructors below: every iptables invocation in this
@@ -365,5 +390,32 @@ mod tests {
             assert!(args.contains(&"!") && args.contains(&"lo"));
             assert!(args.last() == Some(&"DROP"));
         }
+    }
+
+    #[test]
+    fn test_managed_marker_gating() {
+        let dir = std::env::temp_dir().join(format!(
+            "albus_fw_marker_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let marker = dir.join(".managed");
+        let missing = dir.join("absent");
+        // absent -> false
+        assert!(!managed_install_present_at(missing.to_str().unwrap()));
+        // regular file -> true
+        std::fs::write(&marker, "managed\n").unwrap();
+        assert!(managed_install_present_at(marker.to_str().unwrap()));
+        // symlink (even to a file) -> false, never follow
+        let link = dir.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&marker, &link).unwrap();
+        #[cfg(unix)]
+        assert!(!managed_install_present_at(link.to_str().unwrap()));
+        // directory -> false
+        assert!(!managed_install_present_at(dir.to_str().unwrap()));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
