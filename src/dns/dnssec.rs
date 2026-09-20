@@ -601,33 +601,114 @@ mod tests {
         assert_eq!(state, DnssecState::Indeterminate);
     }
 
-    // builds a DO-bit query with hickory (never hand-rolled wire bytes)
-    fn doh_query_with_do(name: &str, qtype: RecordType) -> Vec<u8> {
-        use hickory_proto::op::Edns;
-        let mut msg = Message::new(rand_id(), MessageType::Query, OpCode::Query);
-        msg.metadata.recursion_desired = true;
-        let fqdn = format!("{}.", name.trim_end_matches('.'));
-        let owner = Name::from_ascii(&fqdn).unwrap();
-        msg.add_query(Query::query(owner, qtype));
-        let mut edns = Edns::new();
-        edns.set_dnssec_ok(true);
-        edns.set_max_payload(1232);
-        msg.set_edns(edns);
-        msg.to_vec().unwrap()
+    // Offline self-signed root zone: generates a fresh P-256 key, anchors it,
+    // signs a root A RRset, and pre-seeds the DNSKEY cache. Fully
+    // deterministic apart from key material (which never affects verdicts).
+    // No network, no clock beyond validity windows.
+    struct SignedRootFixture {
+        validator: DnssecValidator,
+        wire: Vec<u8>,
+    }
+
+    fn signed_root_fixture() -> SignedRootFixture {
+        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_proto::dnssec::rdata::SigInput;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
+        use hickory_proto::rr::SerialNumber;
+
+        let root = Name::from_ascii(".").unwrap();
+        let der =
+            EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("keygen works");
+        let signing_key = EcdsaSigningKey::from_key_der(&der.into(), Algorithm::ECDSAP256SHA256)
+            .expect("key parses");
+        let pubkey = signing_key.to_public_key().expect("pubkey derives");
+        let dnskey = DNSKEY::new(true, true, false, pubkey.clone());
+        let key_tag = dnskey.calculate_key_tag().expect("tag computes");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock works")
+            .as_secs() as u32;
+        let mut validator = DnssecValidator::new();
+        validator.anchors.insert(&pubkey);
+
+        // signed root A RRset
+        let a_rec = Record::from_rdata(root.clone(), 300, RData::A(A::new(93, 184, 216, 34)));
+        let input = SigInput {
+            type_covered: RecordType::A,
+            algorithm: Algorithm::ECDSAP256SHA256,
+            num_labels: 0,
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(now + 3600),
+            sig_inception: SerialNumber::new(now - 100),
+            key_tag,
+            signer_name: root.clone(),
+        };
+        let tbs = TBS::from_input(&root, DNSClass::IN, &input, std::iter::once(&a_rec))
+            .expect("tbs builds");
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(signing_key),
+            root.clone(),
+            Duration::from_secs(3600),
+        );
+        let sig_bytes = signer.sign(&tbs).expect("signing works");
+        let sig_rec = Record::from_rdata(
+            root.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig_bytes))),
+        );
+
+        // seed the DNSKEY cache so no network is touched
+        let dnskey_rec = Record::from_rdata(
+            root.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        );
+        validator.cache_store(&root, RecordType::DNSKEY, vec![dnskey_rec]);
+
+        let mut msg = Message::new(0x4242, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        msg.add_query(Query::query(root, RecordType::A));
+        msg.answers.push(a_rec);
+        msg.answers.push(sig_rec);
+        SignedRootFixture {
+            validator,
+            wire: msg.to_vec().unwrap(),
+        }
+    }
+
+    fn dummy_resolver() -> DoHResolver {
+        DoHResolver::new("quad9", &[], true).expect("resolver init should succeed")
     }
 
     #[tokio::test]
-    async fn test_signed_zone_validates_secure_live() {
-        let v = DnssecValidator::new();
-        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
-        // ietf.org is DNSSEC-signed (independently confirmed via AD flag)
-        let q = doh_query_with_do("ietf.org", RecordType::A);
-        let (resp, _) = resolver
-            .resolve(&q)
-            .await
-            .expect("live DoH query should succeed");
-        let state = v.validate("ietf.org", 1, &resp, &resolver).await;
+    async fn test_self_signed_root_validates_secure_offline() {
+        let fx = signed_root_fixture();
+        let resolver = dummy_resolver();
+        let state = fx.validator.validate(".", 1, &fx.wire, &resolver).await;
         assert_eq!(state, DnssecState::Secure);
+    }
+
+    #[tokio::test]
+    async fn test_tampered_signed_response_is_bogus_offline() {
+        let fx = signed_root_fixture();
+        let resolver = dummy_resolver();
+        // flip a byte inside the A rdata: signature must fail closed
+        let mut msg = Message::from_vec(&fx.wire).expect("fixture parses");
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::A {
+                if let RData::A(addr) = &mut rec.data {
+                    let mut octets = addr.octets();
+                    octets[3] ^= 0x01;
+                    *addr = A::new(octets[0], octets[1], octets[2], octets[3]);
+                    break;
+                }
+            }
+        }
+        let wire = msg.to_vec().unwrap();
+        let state = fx.validator.validate(".", 1, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Bogus);
     }
 
     #[tokio::test]
@@ -654,36 +735,5 @@ mod tests {
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let state = v.validate("www.example.com", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
-    }
-
-    #[tokio::test]
-    async fn test_tampered_signed_response_is_bogus_live() {
-        let v = DnssecValidator::new();
-        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
-        let q = doh_query_with_do("ietf.org", RecordType::A);
-        let (resp, _) = resolver
-            .resolve(&q)
-            .await
-            .expect("live DoH query should succeed");
-        // flip a byte inside the first A-record rdata via parsed message
-        let mut msg = Message::from_vec(&resp).expect("response must parse");
-        let mut tampered = false;
-        for rec in msg.answers.iter_mut() {
-            if rec.record_type() == RecordType::A {
-                if let RData::A(addr) = &mut rec.data {
-                    let mut octets = addr.octets();
-                    octets[3] ^= 0x01;
-                    *addr = hickory_proto::rr::rdata::A::new(
-                        octets[0], octets[1], octets[2], octets[3],
-                    );
-                    tampered = true;
-                    break;
-                }
-            }
-        }
-        assert!(tampered, "live response must contain an A record");
-        let wire = msg.to_vec().unwrap();
-        let state = v.validate("ietf.org", 1, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
     }
 }
