@@ -1119,11 +1119,17 @@ mod tests {
         // owner == hash(parent suffix "missing.example.com.") -> encloser found
         let parent = Name::from_ascii("missing.example.com.").unwrap();
         let rec = mk_rec(&hash_of(&parent));
-        assert!(any_nsec3_matches_encloser(std::slice::from_ref(&rec), &qname));
+        assert!(any_nsec3_matches_encloser(
+            std::slice::from_ref(&rec),
+            &qname
+        ));
         // owner == hash(grandparent "example.com.") also counts
         let gp = Name::from_ascii("example.com.").unwrap();
         let rec2 = mk_rec(&hash_of(&gp));
-        assert!(any_nsec3_matches_encloser(std::slice::from_ref(&rec2), &qname));
+        assert!(any_nsec3_matches_encloser(
+            std::slice::from_ref(&rec2),
+            &qname
+        ));
         // owner == hash(qname) itself counts (exact-match record)
         let rec3 = mk_rec(&hash_of(&qname));
         assert!(any_nsec3_matches_encloser(

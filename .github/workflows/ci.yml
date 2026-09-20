@@ -71,6 +71,61 @@ jobs:
       - name: privileged firewall symmetry test (root)
         run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test root -- --ignored --nocapture
 
+  # Live DPI evasion proof: a real RST-injection simulator (scripts/dpi_sim.py)
+  # must RST handshakes with albus OFF (proves the simulator is live — a test
+  # that passes without any RST proves nothing) and stay silent with albus ON
+  # (proves MSS-clamp/fake-injection evasion). Deliberately NOT
+  # continue-on-error: either direction failing is a real regression signal.
+  # NOTE: this job lives apart from `kernel` (which is informational until
+  # runner kernels stabilize) precisely so a failure here turns CI red.
+  dpi-evasion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: 1.89
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+      - name: release build (evasion daemon)
+        run: cargo build --release
+      - name: Phase A — simulator validity (albus OFF must RST)
+        run: |
+          set +e
+          sudo -E python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_off.log
+          SIM_RC=${PIPESTATUS[0]}
+          set -e
+          echo "sim exit code (albus OFF): ${SIM_RC} (non-zero expected: nothing bypassed)"
+          python3 scripts/dpi_evasion_check.py off /tmp/dpi_off.log
+          test "${SIM_RC}" -ne 0
+      - name: Phase B — evasion (albus ON must establish)
+        run: |
+          # Minimal daemon: no DoH listener, no firewall rules — only the eBPF
+          # sock_ops clamp + raw-socket injector under test. Foreground process,
+          # SIGTERM shuts it down gracefully (restores anything it applied).
+          sudo -E ./target/release/albus run --doh=false --kill-switch=false --block-quic=false --block-stun=false --block-ipv6=false --dnssec=false --pqc=false > /tmp/albus.log 2>&1 &
+          echo $! > /tmp/albus_sudo.pid
+          cleanup() { sudo pkill -TERM -f 'target/release/albus run' 2>/dev/null || true; }
+          trap cleanup EXIT
+          sleep 10
+          if ! sudo kill -0 "$(cat /tmp/albus_sudo.pid)" 2>/dev/null; then
+            echo "albus daemon failed to start:"
+            cat /tmp/albus.log
+            exit 1
+          fi
+          echo "albus daemon alive, running evasion lab..."
+          set +e
+          sudo -E python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_on.log
+          SIM_RC=${PIPESTATUS[0]}
+          set -e
+          echo "sim exit code (albus ON): ${SIM_RC} (zero expected: all bypassed)"
+          python3 scripts/dpi_evasion_check.py on /tmp/dpi_on.log
+          test "${SIM_RC}" -eq 0
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15

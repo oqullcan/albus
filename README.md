@@ -109,6 +109,9 @@ cargo build --release
 sudo cp target/release/albus /usr/local/bin/albus
 ```
 
+### Verification
+DPI evasion is verified against a live RST-injection simulator on every CI run — see docs/TEST_RESULTS.md for the latest recorded proof.
+
 ---
 
 ## Command-Line Interface

@@ -394,10 +394,7 @@ mod tests {
 
     #[test]
     fn test_managed_marker_gating() {
-        let dir = std::env::temp_dir().join(format!(
-            "albus_fw_marker_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("albus_fw_marker_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let marker = dir.join(".managed");
         let missing = dir.join("absent");
