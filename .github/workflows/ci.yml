@@ -31,6 +31,12 @@ jobs:
         run: cargo test --test fuzz
       - name: docs sync check
         run: cargo test --test docs
+      # audit tools release faster than our pinned toolchain (1.89 cannot
+      # compile current cargo-audit); run them on stable, code stays pinned.
+      - name: Install stable toolchain for audit tools
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
+        with:
+          toolchain: stable
       - name: cargo audit (RustSec)
         uses: rustsec/audit-check@v2 # pinned: see .github/pins.md
         with:
