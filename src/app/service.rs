@@ -342,14 +342,15 @@ fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn show_service_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new(SYSTEMCTL_BIN)
-        .args(["status", "albus.service"])
-        .status()?;
+    let _ = systemctl().args(["status", "albus.service"]).status()?;
     Ok(())
 }
 
 fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new(JOURNALCTL_BIN)
+    let mut logs = Command::new(JOURNALCTL_BIN);
+    logs.env_clear();
+    logs.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    let _ = logs
         .args(["-u", "albus.service", "-f", "-n", "50"])
         .status()?;
     Ok(())

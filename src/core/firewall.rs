@@ -61,13 +61,18 @@ fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
     }
     let mut insert_args: Vec<&str> = vec!["-I", "OUTPUT"];
     insert_args.extend_from_slice(&spec);
-    let res = if v6 {
+    match if v6 {
         ip6tables_base().args(&insert_args).status()
     } else {
         iptables_base().args(&insert_args).status()
-    };
-    if let Err(e) = res {
-        warn!("failed to insert firewall rule {:?}: {}", args, e);
+    } {
+        Err(e) => warn!("failed to spawn firewall binary for {:?}: {}", args, e),
+        Ok(s) if !s.success() => warn!(
+            "firewall insert exited {} for {:?} (rule not applied)",
+            s.code().unwrap_or(-1),
+            args
+        ),
+        _ => {}
     }
 }
 
@@ -96,7 +101,10 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
             }
         }
     }
-    // 2. legacy rules without comment match (pre-hardening installs)
+    // 2. legacy rules without comment match (pre-hardening installs).
+    // Residual risk: an administrator rule textually identical to ours is
+    // indistinguishable and one instance may be removed; tolerated because
+    // upgrade cleanup must handle uncommented rules from older releases.
     for _ in 0..MAX_RULE_DELETE_ITER {
         let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
         del_args.extend_from_slice(args);
