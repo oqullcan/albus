@@ -1,5 +1,11 @@
 # cargo-deny configuration: licenses, advisories, bans, sources.
 # See CONTRIBUTING.md ("Dependency Maintenance") for the update discipline.
+#
+# Known benign warnings (do not "fix" without reading this):
+# - warning[parse-error] on OUR OWN license field: Cargo.toml declares the
+#   deprecated SPDX spelling "GPL-3.0" deliberately (see allow-list NOTE).
+# - warning[duplicate] on getrandom/syn/untrusted: multiple versions are
+#   policy "warn", not "deny" (see [bans] below).
 
 [graph]
 targets = [

@@ -205,4 +205,16 @@ mod tests {
         assert!(!should_signal_daemon(true, false));
         assert!(!should_signal_daemon(false, false));
     }
+
+    #[tokio::test]
+    async fn test_run_engine_refuses_unprivileged() {
+        // L-guard: without root the engine must refuse before touching
+        // firewall, DNS, or eBPF. Skipped as root (it would really start).
+        if albus::core::ebpf::is_root() {
+            return;
+        }
+        let args = set_args();
+        let res = run_engine(args).await;
+        assert!(res.is_err(), "unprivileged run_engine must refuse");
+    }
 }

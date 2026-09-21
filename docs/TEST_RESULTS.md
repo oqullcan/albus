@@ -203,6 +203,23 @@ docs/TESTING.md; new signed DPI records go at the top of this file.
   unrun (nothing pushed — inherent).
 - QML: `qml6` cannot load the panel (missing Quickshell imports, no
   `qmllint`); runtime verification remains unavailable, limitation stands.
+
+### Coverage gaps + deny warnings closed out (local, 2026-09-21)
+
+- `tests/cli.rs` (new): `--help`/`--version`/parse-rejection/`config get`
+  smoke via `CARGO_BIN_EXE_albus` (verified the var is integration-only;
+  an attempt inside `src/main.rs` unit tests fails to compile — recorded
+  so nobody retries it).
+- `run_engine` unprivileged-refusal unit test (root-gated skip).
+- `rawsock` root send tests (v4/v6/mixed-families): 3/3 PASS in root lab.
+- Deny `warning[parse-error]` root-caused: it is OUR OWN deprecated
+  `GPL-3.0` SPDX spelling (already a deliberate decision), not a
+  third-party fail-open; `warning[duplicate]` matches the deliberate
+  `multiple-versions = "warn"` policy. Both documented in `deny.toml`.
+  CI and local deny are the same version (0.20.2) — no skew.
+- Watchdog soak: daemon up 1 h+ with flag ON and real traffic, 0 trips,
+  0 lockdown (the 4 historic SHAPING LOST lines are all accounted for:
+  3× v1 false positives + 1× overrun-era trip).
 - M1 consistency grep: no remaining dynamic-probing claims (3 stale code
   comments fixed in this gate: `cli.rs` flag docs, `manager.rs` comment).
 - Security suites re-run individually: ssrf 7, system 7, dnssec 16, cache
@@ -305,3 +322,21 @@ docs/TESTING.md; new signed DPI records go at the top of this file.
   future false trip. Fixed + verified green.)
 - Caveat recorded: unit tests cannot force a kernel ring overrun; the
   freeze path is integration-proven (this burst run), not unit-proven.
+
+### CI#40 DPI flap RCA + deterministic lab (local + CI, 2026-09-21)
+
+- CI run on `6f50d09` failed Phase B on ONE target (`discord` RST,
+  `roblox` bypassed, same daemon seconds apart) — race signature, not
+  regression (no commit content touches the shaping path).
+- Root cause, measured locally: loopback GSO delivers whole ClientHellos
+  (~1526 B first segment) past the MSS clamp; with GSO off, first segment
+  is ~127 B (fragmented) and decoys overlap. Previous green runs rested
+  on decoy-timing luck.
+- Fix (`ci.yml` + `dpi_sim.py`): `ethtool -K lo gso/gro/tso off` with
+  loud verification before the lab (real middleboxes sit behind
+  segmenting NICs, so this is the faithful setup), plus per-flow
+  `sim_first_seg` length logging for future forensics. Validated locally
+  (3/3 clean bypass, GSO restored after) and in CI run on `9d76e02`:
+  **5/5 green** — Phase A first-seg 517 B (whole, RST as designed),
+  Phase B first-seg 127/130 B (fragmented, bypass as designed). The
+  mechanism is now visible in CI logs, not inferred.
