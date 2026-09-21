@@ -173,23 +173,26 @@ jobs:
         run: sha256sum target/release/albus | tee albus.sha256
       # R7 provenance: keyless Sigstore signature (Fulcio + Rekor) so
       # downstream users can verify the binary came from this workflow.
-      # Anyone can verify offline: cosign verify-blob --cert albus.pem
-      # --signature albus.sig target/release/albus --certificate-identity
+      # cosign v3 uses the bundle format (separate --output-signature /
+      # --output-certificate flags were removed). Anyone can verify offline:
+      # cosign verify-blob --bundle albus.bundle --certificate-identity
       # "https://github.com/oqullcan/albus/.github/workflows/ci.yml@refs/heads/develop"
       # --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      # target/release/albus
+      # NOTE: signing gates artifact upload deliberately — an unsigned
+      # binary artifact with a silently skipped signature would be worse
+      # than no artifact (false provenance confidence).
       - name: Install cosign
         uses: sigstore/cosign-installer@828df1e55de306ba29db814d6057ddae71883cda # pinned: see .github/pins.md
         with:
           cosign-release: v3.1.3
       - name: sign release binary (Sigstore keyless)
-        run: cosign sign-blob --yes --output-signature albus.sig --output-certificate albus.pem target/release/albus
+        run: cosign sign-blob --yes --bundle albus.bundle target/release/albus
       - name: upload signature bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
         with:
           name: albus-sigstore
-          path: |
-            albus.sig
-            albus.pem
+          path: albus.bundle
       - name: upload binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
         with:
