@@ -112,7 +112,18 @@ jobs:
         with:
           toolchain: 1.89
       - name: Install eBPF build deps
-        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev ethtool
+      # Deterministic lab: loopback GSO/GRO lets the kernel deliver a whole
+      # ClientHello in one segment, bypassing the MSS clamp below TCP and
+      # turning the verdict into a decoy-timing race (CI #38 lost one target
+      # exactly this way). Real middleboxes sit behind segmenting NICs, so
+      # GSO-off on lo is the faithful setup: fragmented arrival is then
+      # guaranteed iff the clamp applies. Fails loudly if offloads stay on.
+      - name: Disable loopback GSO/GRO for deterministic segments
+        run: |
+          sudo ethtool -K lo gso off gro off tso off
+          sudo ethtool -k lo | grep -E "tcp-segmentation-offload: off" || (echo "GSO still on, lab would race"; exit 1)
+          sudo ethtool -k lo | grep -E "generic-segmentation-offload: off" || (echo "GSO still on, lab would race"; exit 1)
       - name: release build (evasion daemon)
         run: cargo build --release
       - name: Phase A — simulator validity (albus OFF must RST)

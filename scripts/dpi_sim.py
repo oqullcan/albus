@@ -294,6 +294,10 @@ class Sim:
             return
         self.last_data_at = time.monotonic()
         key = (src, sport, dst, dport)
+        if key not in self.flows:
+            # forensic: first-segment length determines everything downstream
+            # (whole hello => instant RST race; fragments => reassembly path)
+            log("sim_first_seg", len=len(payload), sport=sport)
         flow = self.flows.setdefault(
             key, {"segs": [], "seen": time.monotonic(), "done": False}
         )
