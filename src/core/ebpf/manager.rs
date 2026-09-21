@@ -1,18 +1,23 @@
 //! high-level ebpf manager coordinating kernel hooks, raw packet injection, and ring buffer polling.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::loader::{BpfConfig, BpfEngine, RawConnEvent};
 use crate::core::autottl::AutoTtlEstimator;
 use crate::core::fake::clienthello::build_fake_client_hello_opts;
 use crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL;
+use crate::core::firewall::enable_network_lockdown;
 use crate::core::rawsock::{ConnInfo, RawSocket};
 use crate::dns::server::DnsServer;
+
+/// Watchdog re-check interval: displacement is rare and fail-closed is
+/// drastic, so slow polling beats hot polling (no per-packet cost).
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct BpfManagerConfig {
@@ -29,6 +34,9 @@ pub struct BpfManagerConfig {
     pub fake_bad_checksum: bool,
     pub pqc: bool,
     pub auto_ttl_estimator: AutoTtlEstimator,
+    /// shaping watchdog (displacement detection + fail-closed lockdown).
+    /// Default on; --shaping-watchdog=false disables the periodic check.
+    pub shaping_watchdog: bool,
 }
 
 // manager coordinating the ebpf filter engine and raw-socket injector
@@ -38,6 +46,10 @@ pub struct BpfManager {
     map_handles: Option<super::loader::BpfMapHandles>,
     running: Arc<AtomicBool>,
     worker_handle: Option<JoinHandle<()>>,
+    /// latched on confirmed shaping loss (consecutive Unhealthy probes);
+    /// drives the one-shot fail-closed lockdown below. Never auto-cleared:
+    /// only a restart re-arms shaping.
+    pub shaping_lost: Arc<AtomicBool>,
 }
 
 impl BpfManager {
@@ -48,6 +60,7 @@ impl BpfManager {
             map_handles: None,
             running: Arc::new(AtomicBool::new(false)),
             worker_handle: None,
+            shaping_lost: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -144,98 +157,168 @@ impl BpfManager {
                 .collect()
         };
 
+        // watchdog inputs, snapshotted for the worker thread
+        let watchdog_enabled = self.cfg.shaping_watchdog;
+        let watch_ports = self.cfg.ports.clone();
+        let watch_exclude_v4 = self.cfg.exclude_ips.clone();
+        let watch_exclude_v6 = self.cfg.exclude_ips_v6.clone();
+        let tripped_clone = self.shaping_lost.clone();
+        let events_seen = Arc::new(AtomicU64::new(0));
+        let events_probe = events_seen.clone();
+        // fresh start re-arms (a restart means a fresh attach)
+        self.shaping_lost.store(false, Ordering::SeqCst);
+
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok();
             let mut decoy_idx: usize = 0;
+            // watchdog snapshot: read once, the worker owns the rest
+            let mut last_watchdog_check = Instant::now();
+            let mut watch_state = super::watch::WatchState::default();
+            // latched per watchdog window: any perf-ring overrun inside the
+            // window makes its event count untrustworthy (see poll_events)
+            let mut watch_overrun = false;
 
             while running_clone.load(Ordering::Relaxed) {
                 let mut received = false;
-                engine_poll.poll_events(|raw_evt: RawConnEvent| {
-                    received = true;
-                    // NOTE: RawConnEvent is #[repr(packed)] — never take references to its
-                    // fields (unaligned). Copy out via read_unaligned first.
-                    let (src_ip, dst_ip, src_port, dst_port, seq, ack, family, src_ip6, dst_ip6) = unsafe {
-                        let p = &raw_evt as *const RawConnEvent;
-                        (
-                            std::ptr::addr_of!((*p).src_ip).read_unaligned(),
-                            std::ptr::addr_of!((*p).dst_ip).read_unaligned(),
-                            std::ptr::addr_of!((*p).src_port).read_unaligned(),
-                            std::ptr::addr_of!((*p).dst_port).read_unaligned(),
-                            std::ptr::addr_of!((*p).seq).read_unaligned(),
-                            std::ptr::addr_of!((*p).ack).read_unaligned(),
-                            std::ptr::addr_of!((*p).family).read_unaligned(),
-                            std::ptr::addr_of!((*p).src_ip6).read_unaligned(),
-                            std::ptr::addr_of!((*p).dst_ip6).read_unaligned(),
-                        )
-                    };
-                    let conn = if family == 10 {
-                        let mut src_octets = [0u8; 16];
-                        let mut dst_octets = [0u8; 16];
-                        for i in 0..4 {
-                            src_octets[i * 4..(i + 1) * 4].copy_from_slice(&src_ip6[i].to_ne_bytes());
-                            dst_octets[i * 4..(i + 1) * 4].copy_from_slice(&dst_ip6[i].to_ne_bytes());
-                        }
-                        ConnInfo::new_v6(
-                            Ipv6Addr::from(src_octets),
-                            Ipv6Addr::from(dst_octets),
+                watch_overrun |=
+                    engine_poll.poll_events(|raw_evt: RawConnEvent| {
+                        received = true;
+                        // every perf event is evidence the program is firing
+                        events_probe.fetch_add(1, Ordering::Relaxed);
+                        // NOTE: RawConnEvent is #[repr(packed)] — never take references to its
+                        // fields (unaligned). Copy out via read_unaligned first.
+                        let (
+                            src_ip,
+                            dst_ip,
                             src_port,
                             dst_port,
                             seq,
                             ack,
-                        )
-                    } else {
-                        ConnInfo::new_v4(
-                            Ipv4Addr::from(src_ip.to_ne_bytes()),
-                            Ipv4Addr::from(dst_ip.to_ne_bytes()),
-                            src_port,
-                            dst_port,
-                            seq,
-                            ack,
-                        )
-                    };
+                            family,
+                            src_ip6,
+                            dst_ip6,
+                        ) = unsafe {
+                            let p = &raw_evt as *const RawConnEvent;
+                            (
+                                std::ptr::addr_of!((*p).src_ip).read_unaligned(),
+                                std::ptr::addr_of!((*p).dst_ip).read_unaligned(),
+                                std::ptr::addr_of!((*p).src_port).read_unaligned(),
+                                std::ptr::addr_of!((*p).dst_port).read_unaligned(),
+                                std::ptr::addr_of!((*p).seq).read_unaligned(),
+                                std::ptr::addr_of!((*p).ack).read_unaligned(),
+                                std::ptr::addr_of!((*p).family).read_unaligned(),
+                                std::ptr::addr_of!((*p).src_ip6).read_unaligned(),
+                                std::ptr::addr_of!((*p).dst_ip6).read_unaligned(),
+                            )
+                        };
+                        let conn = if family == 10 {
+                            let mut src_octets = [0u8; 16];
+                            let mut dst_octets = [0u8; 16];
+                            for i in 0..4 {
+                                src_octets[i * 4..(i + 1) * 4]
+                                    .copy_from_slice(&src_ip6[i].to_ne_bytes());
+                                dst_octets[i * 4..(i + 1) * 4]
+                                    .copy_from_slice(&dst_ip6[i].to_ne_bytes());
+                            }
+                            ConnInfo::new_v6(
+                                Ipv6Addr::from(src_octets),
+                                Ipv6Addr::from(dst_octets),
+                                src_port,
+                                dst_port,
+                                seq,
+                                ack,
+                            )
+                        } else {
+                            ConnInfo::new_v4(
+                                Ipv4Addr::from(src_ip.to_ne_bytes()),
+                                Ipv4Addr::from(dst_ip.to_ne_bytes()),
+                                src_port,
+                                dst_port,
+                                seq,
+                                ack,
+                            )
+                        };
 
-                    // static TTL lookup for this destination (no probing)
-                    let optimal_ttl = match conn.dst_ip {
-                        IpAddr::V4(v4) => estimator.get_ttl(v4),
-                        IpAddr::V6(_) => fake_ttl_fallback,
-                    };
+                        // static TTL lookup for this destination (no probing)
+                        let optimal_ttl = match conn.dst_ip {
+                            IpAddr::V4(v4) => estimator.get_ttl(v4),
+                            IpAddr::V6(_) => fake_ttl_fallback,
+                        };
 
-                    let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
-                    decoy_idx = decoy_idx.wrapping_add(1);
+                        let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
+                        decoy_idx = decoy_idx.wrapping_add(1);
 
-                    if let Err(e) = raw_socket.send_fake_opts(&conn, payload, optimal_ttl, fake_bad_checksum) {
-                        warn!("Failed to inject fake ClientHello: {}", e);
-                    } else {
-                        let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
+                        if let Err(e) = raw_socket.send_fake_opts(
+                            &conn,
+                            payload,
+                            optimal_ttl,
+                            fake_bad_checksum,
+                        ) {
+                            warn!("Failed to inject fake ClientHello: {}", e);
+                        } else {
+                            let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
 
-                        if let (Some(server), Some(runtime)) = (&dns_server, &rt) {
-                            if let IpAddr::V4(v4) = conn.dst_ip {
-                                if let Some(domain) = runtime.block_on(server.pop_domain(v4)) {
-                                    // domain originates from upstream DNS answers:
-                                    // sanitize before it reaches the journal (L7/L8)
-                                    let clean =
-                                        crate::dns::server::sanitize_log_token(&domain);
-                                    dst_desc = format!("{}:{}", clean, conn.dst_port);
+                            if let (Some(server), Some(runtime)) = (&dns_server, &rt) {
+                                if let IpAddr::V4(v4) = conn.dst_ip {
+                                    if let Some(domain) = runtime.block_on(server.pop_domain(v4)) {
+                                        // domain originates from upstream DNS answers:
+                                        // sanitize before it reaches the journal (L7/L8)
+                                        let clean = crate::dns::server::sanitize_log_token(&domain);
+                                        dst_desc = format!("{}:{}", clean, conn.dst_port);
+                                    }
                                 }
                             }
-                        }
 
-                        debug!(
-                            dst = %dst_desc,
-                            seq = conn.seq,
-                            ack = conn.ack,
-                            ttl = optimal_ttl,
-                            bad_cs = fake_bad_checksum,
-                            "fake ClientHello injected"
-                        );
-                    }
-                });
+                            debug!(
+                                dst = %dst_desc,
+                                seq = conn.seq,
+                                ack = conn.ack,
+                                ttl = optimal_ttl,
+                                bad_cs = fake_bad_checksum,
+                                "fake ClientHello injected"
+                            );
+                        }
+                    });
 
                 if !received {
                     thread::sleep(Duration::from_micros(200));
+                }
+
+                // shaping watchdog (v2 reconciliation): every interval,
+                // compare fresh ESTABLISHED target-port connections against
+                // fresh perf events. Unexplained newcomers across two
+                // consecutive quiet windows trip the one-shot fail-closed
+                // lockdown (see watch::WatchState for the exact rules).
+                if watchdog_enabled && last_watchdog_check.elapsed() >= WATCHDOG_INTERVAL {
+                    last_watchdog_check = Instant::now();
+                    // overrun inside the window: event count untrustworthy,
+                    // freeze this round (neither trip nor reset)
+                    if watch_overrun {
+                        debug!("shaping watchdog: perf ring overran, round frozen");
+                        watch_overrun = false;
+                    } else {
+                        let tcp4 = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+                        let tcp6 = std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
+                        if !(tcp4.is_empty() && tcp6.is_empty()) {
+                            let trip = watch_state.observe(
+                                &tcp4,
+                                &tcp6,
+                                &watch_ports,
+                                &watch_exclude_v4,
+                                &watch_exclude_v6,
+                                events_seen.load(Ordering::Relaxed),
+                            );
+                            if trip && !tripped_clone.swap(true, Ordering::SeqCst) {
+                                warn!(
+                                    "SHAPING LOST: fresh target-port connections produced no perf events across consecutive windows — engaging fail-closed network lockdown (restart albus to re-arm)"
+                                );
+                                enable_network_lockdown();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -286,6 +369,7 @@ mod tests {
             fake_bad_checksum: false,
             pqc: true,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+            shaping_watchdog: true,
         }
     }
 
@@ -318,6 +402,7 @@ mod reload_tests {
             fake_bad_checksum: false,
             pqc: true,
             auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
+            shaping_watchdog: true,
         }
     }
 

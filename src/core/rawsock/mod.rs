@@ -156,3 +156,85 @@ impl Drop for RawSocket {
 
 unsafe impl Send for RawSocket {}
 unsafe impl Sync for RawSocket {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn require_root() -> bool {
+        if !crate::core::ebpf::is_root() {
+            eprintln!("SKIP: raw socket tests need root");
+            return false;
+        }
+        true
+    }
+
+    /// Root-only send-path coverage (run with:
+    /// `sudo -E cargo test --lib rawsock -- --ignored --nocapture`).
+    /// Complements tests/root.rs (which owns the CI root story); these live
+    /// with the code and also cover v6 + fd validity.
+    #[test]
+    #[ignore]
+    fn root_raw_socket_create_and_v4_send() {
+        if !require_root() {
+            return;
+        }
+        let sock = RawSocket::new().expect("raw socket creates as root");
+        assert!(sock.fd >= 0, "valid v4 fd");
+        let conn = types::ConnInfo::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 1),
+            40001,
+            9,
+            1000,
+            0,
+        );
+        let n = sock
+            .send_fake(&conn, b"hello", 64)
+            .expect("loopback v4 send succeeds");
+        assert!(n > 0, "must report bytes sent");
+    }
+
+    #[test]
+    #[ignore]
+    fn root_raw_socket_v6_send_or_skip() {
+        if !require_root() {
+            return;
+        }
+        let sock = RawSocket::new().expect("raw socket creates as root");
+        let Some(fd6) = sock.fd_v6 else {
+            eprintln!("SKIP: no IPv6 raw socket on this host");
+            return;
+        };
+        assert!(fd6 >= 0, "valid v6 fd");
+        let conn =
+            types::ConnInfo::new_v6(Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST, 40002, 9, 2000, 0);
+        let n = sock
+            .send_fake(&conn, b"hello", 64)
+            .expect("loopback v6 send succeeds");
+        assert!(n > 0, "must report bytes sent");
+    }
+
+    #[test]
+    #[ignore]
+    fn root_raw_socket_rejects_mixed_families() {
+        if !require_root() {
+            return;
+        }
+        let sock = RawSocket::new().expect("raw socket creates as root");
+        let mut conn = types::ConnInfo::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 1),
+            40003,
+            9,
+            0,
+            0,
+        );
+        conn.dst_ip = std::net::IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(
+            sock.send_fake(&conn, b"hello", 64).is_err(),
+            "mixed families must fail closed even as root"
+        );
+    }
+}

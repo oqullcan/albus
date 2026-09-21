@@ -474,12 +474,21 @@ impl DnssecValidator {
         }
 
         // Per-RRset semantics (RFC 4035 style):
-        // - signed but unverifiable -> Bogus immediately (fail closed);
+        // - signatures that fail cryptography -> Bogus immediately (fail closed);
         // - unsigned -> insecure link (served, never Secure);
         // - Secure requires every link verified: a signed CNAME to unsigned
-        //   data is Insecure, not Bogus (no stripping proven).
+        //   data is Insecure, not Bogus (no stripping proven);
+        // - signatures that VERIFY but whose chain cannot be built (island of
+        //   security: validly signed zone with no DS link to the parent, or
+        //   unresolvable chain) -> insecure link (served, never Secure).
+        //   Rationale: unsigned data is already served as Insecure, so an
+        //   unanchorable-but-authentic RRset cannot downgrade anything; only
+        //   proven-crypto-failure stays Bogus. Denial records (NSEC/NSEC3)
+        //   keep the strict rule below: a verifiable-but-useless denial is
+        //   ignored, an unverifiable one stays Bogus (forgery direction).
         let mut secure_links = 0u32;
         let mut insecure_links = 0u32;
+        let mut island_links = 0u32;
         let mut nsec3_seen = false;
         let mut nsec3_covers = false;
         let mut nsec3_encloser = false;
@@ -501,6 +510,7 @@ impl DnssecValidator {
                 continue;
             }
             let mut rrset_secure = false;
+            let mut rrset_crypto_ok = false;
             for sig in &sigs {
                 let signer = sig.input().signer_name.clone();
                 // fetch the signer's DNSKEY set and try it
@@ -517,6 +527,8 @@ impl DnssecValidator {
                 {
                     continue;
                 }
+                // signature is authentic under this key; chain decides Secure
+                rrset_crypto_ok = true;
                 if Box::pin(self.chain_to_root(&signer, &dnskey_recs, resolver, 0)).await {
                     rrset_secure = true;
                     break;
@@ -550,7 +562,27 @@ impl DnssecValidator {
                 secure_links += 1;
                 continue;
             }
-            // RRSIGs present but none chain-verify: cryptographic failure
+            if is_nsec3 || is_nsec {
+                // denial records stay strict: an unverifiable denial could
+                // hide records (forgery direction), so it stays Bogus even
+                // when the cryptography alone checked out
+                debug!(
+                    "dnssec: denial RRSIGs present but unverifiable for {}",
+                    name.to_ascii()
+                );
+                return DnssecState::Bogus;
+            }
+            if rrset_crypto_ok {
+                // island of security (or unresolvable chain): authentic but
+                // unanchored — serve as insecure, never Secure, never Bogus
+                debug!(
+                    "dnssec: authentic but unanchored RRset for {} (island), serving insecure",
+                    name.to_ascii()
+                );
+                island_links += 1;
+                continue;
+            }
+            // RRSIGs present but none verify: cryptographic failure
             debug!(
                 "dnssec: RRSIGs present but chain failed for {}",
                 name.to_ascii()
@@ -577,10 +609,10 @@ impl DnssecValidator {
         if nsec_seen && nsec_covered {
             secure_links += 1;
         }
-        if secure_links > 0 && insecure_links == 0 {
+        if secure_links > 0 && insecure_links == 0 && island_links == 0 {
             return DnssecState::Secure;
         }
-        if insecure_links > 0 {
+        if insecure_links + island_links > 0 {
             DnssecState::Insecure
         } else {
             DnssecState::Indeterminate
@@ -926,6 +958,13 @@ mod tests {
     }
 
     fn signed_root_fixture() -> SignedRootFixture {
+        signed_root_fixture_anchored(true)
+    }
+
+    /// anchor=false builds an island of security: cryptographically valid
+    /// signatures under a key the validator does NOT trust (no DS link
+    /// possible). Must validate Insecure (served), never Bogus.
+    fn signed_root_fixture_anchored(anchor: bool) -> SignedRootFixture {
         use hickory_proto::dnssec::crypto::EcdsaSigningKey;
         use hickory_proto::dnssec::rdata::SigInput;
         use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
@@ -945,7 +984,9 @@ mod tests {
             .expect("clock works")
             .as_secs() as u32;
         let mut validator = DnssecValidator::new();
-        validator.anchors.insert(&pubkey);
+        if anchor {
+            validator.anchors.insert(&pubkey);
+        }
 
         // signed root A RRset
         let a_rec = Record::from_rdata(root.clone(), 300, RData::A(A::new(93, 184, 216, 34)));
@@ -1024,6 +1065,19 @@ mod tests {
         let wire = msg.to_vec().unwrap();
         let state = fx.validator.validate(".", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Bogus);
+    }
+
+    #[tokio::test]
+    async fn test_island_of_security_is_insecure_offline() {
+        // cryptographically VALID signatures under an untrusted key (no DS
+        // link possible, e.g. chatgpt.com-style unsigned delegation serving
+        // signed answers): authentic but unanchored -> Insecure (served),
+        // never Bogus. Fully offline: signer DNSKEY is cache-seeded and the
+        // root zone needs no fetch for the anchor check.
+        let fx = signed_root_fixture_anchored(false);
+        let resolver = dummy_resolver();
+        let state = fx.validator.validate(".", 1, &fx.wire, &resolver).await;
+        assert_eq!(state, DnssecState::Insecure);
     }
 
     #[tokio::test]

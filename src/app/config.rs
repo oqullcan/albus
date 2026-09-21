@@ -49,6 +49,8 @@ pub struct Config {
     pub network_lockdown: bool,
     #[serde(default = "default_true")]
     pub block_ipv6: bool,
+    #[serde(default)]
+    pub shaping_watchdog: bool,
     #[serde(default = "default_true")]
     pub dnssec: bool,
     #[serde(default = "default_true")]
@@ -122,6 +124,7 @@ impl Default for Config {
             kill_switch: true,
             network_lockdown: false,
             block_ipv6: true,
+            shaping_watchdog: false,
             dnssec: true,
             pqc: true,
             ram_only: false,
@@ -648,6 +651,7 @@ pub fn apply_run_args(
     cfg.kill_switch = args.kill_switch;
     cfg.network_lockdown = args.network_lockdown;
     cfg.block_ipv6 = args.block_ipv6;
+    cfg.shaping_watchdog = args.shaping_watchdog;
     cfg.dnssec = args.dnssec;
     cfg.pqc = args.pqc;
     cfg.ram_only = args.ram_only;

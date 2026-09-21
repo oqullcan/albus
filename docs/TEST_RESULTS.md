@@ -210,3 +210,98 @@ docs/TESTING.md; new signed DPI records go at the top of this file.
   all green.
 - Diff integrity: no secrets (scan clean), no artifacts, no `Cargo.lock`
   changes, `/tmp` worktree + instrumented copies removed.
+
+### Island-of-security false-BOGUS fix (user-reported outage, 2026-09-21)
+
+- Symptoms with albus active: `chatgpt.com` → `DNS_PROBE_POSSIBLE`
+  (SERVFAIL), Instagram stories/media failing. Two stacked causes found:
+  1. Watchdog false-positive lockdown (separate incident above) killed
+     new :443 — explained the Instagram media failures and most SERVFAILs.
+  2. Genuine validator bug for `chatgpt.com`/`quad9.net`: signed answers
+     under an **unsigned delegation** (no DS in parent — verified: DS
+     query returns NSEC3 denial) were judged Bogus. Root cause: chain-walk
+     failure (missing DS) was indistinguishable from crypto failure.
+- Fix (`src/dns/dnssec.rs`): split the verdict — signatures that VERIFY
+  but cannot chain serve as Insecure (island; no downgrade vs unsigned
+  baseline, which is already served); only proven crypto failure stays
+  Bogus; denial records keep the strict rule (forgery direction).
+- Regression test `test_island_of_security_is_insecure_offline`
+  (self-signed fixture without anchor — fully offline): Insecure, was
+  Bogus before the fix. Existing tampered-data test still Bogus.
+- Live verification after reinstall: `chatgpt.com` NOERROR an=3,
+  `quad9.net` NOERROR an=2, all instagram/fbcdn hosts resolve; journal
+  shows zero BOGUS after restart. Instagram app itself may need a restart
+  (it cached lockdown-era failures); QUIC→TCP fallback is normal.
+- Install note: a stray `albus monitor` TUI holds the binary busy
+  (`Text file busy` on cp) — remove-then-copy (`rm -f` + `cp`) replaces
+  it safely; the running monitor keeps its old pages.
+
+### Shaping watchdog validation (local root lab, 2026-09-21)
+
+- Choice: BPF query-first + fail-closed + flagged (default on).
+- Design pivot (honest): `BPF_PROG_QUERY` proved **non-functional on this
+  kernel — raw syscall returns EINVAL for every attach type, flag set, and
+  attr size (both 32 B and 64 B), verified down to hand-packed bytes via
+  ctypes as root. Watchdog therefore measures effectiveness directly
+  (loopback MSS probe on a target port) instead of asking the kernel; the
+  query code was deleted, not left to rot. Streak policy (2× Unhealthy
+  trips; Healthy resets; Inconclusive freezes) replaces double-confirmation.
+- Quiet on healthy daemon: 75 s+ uptime, 0 lockdown rules, 0 SHAPING LOST
+  lines, service active (no false trip).
+- Live trip test: dummy no-op program attached at the hierarchy root via
+  ctypes (displacing the daemon's program, same hazard class as the Phase
+  2.5 incident) → within ~2 watchdog intervals: **4 `albus-lockdown`
+  rules + exactly 1 SHAPING LOST journal line**, daemon alive (fail-closed
+  as designed, no log spam).
+- Recovery: `service restart` → `active`, 0 lockdown, 6 albus rules,
+  `curl → 200` (re-armed cleanly).
+- DPI ON after restart: **bypassed 2/2** (no-observation profile).
+- Root loader roundtrip test (attach/detach at child cgroup): PASS.
+- Coverage with watchdog code: **66.44%** lines, gate PASS.
+
+### Watchdog v2 — reconciliation detector (local root lab, 2026-09-21)
+
+- v1 MSS probe abandoned with cause: on GSO/loopback paths the kernel
+  reports huge MSS even with the clamp attached (observed `mss:32741`
+  on a shaping daemon), so the probe read Unhealthy on healthy daemons
+  and triple-bricked the machine (3 lockdowns, one per restart). The
+  probe code was deleted outright — a misleading instrument is worse
+  than none.
+- v2 model (`src/core/ebpf/watch.rs`): every NEW ESTABLISHED target-port
+  connection must be accompanied by fresh perf events in the same window;
+  unexplained newcomers across 2 consecutive windows trip. Baseline
+  snapshot (pre-existing conns never count), DoH exclusions honored,
+  idle/event windows reset, dead inodes pruned. 6 unit tests (fixtures,
+  exclusion, trip/reset lifecycle, malformed input).
+- v6 parsing cross-checked live: `/proc/net/tcp6` remote
+  `00470626000078009000000042010000` decodes (per-word reversal) to a
+  `2606:4700:...` address matching `ss` output family.
+- Quiet with v2 armed + real browser traffic: 0 lockdown, 0 warnings.
+- Live trip (ctypes displacement + curl traffic): **4 lockdown rules +
+  exactly 1 SHAPING LOST**, daemon alive; restart recovered fully
+  (`active`, 0 lockdown, 6 rules, `curl → 200`).
+- DPI ON after recovery: **bypassed 2/2**. Machine left with watchdog
+  ENABLED (validated); code default stays `false` until v2 soaks.
+- Root loader test hardened: Drop-guard cgroup cleanup + EPERM-skip when
+  the daemon holds the root slot (kernel design, not a bug).
+
+### Watchdog overrun fix (root-caused false trip, local root lab, 2026-09-21)
+
+- A daemon tripped with **zero external interference**: fresh :443 conns,
+  zero new events, 2 consecutive windows. Root cause, code-reading +
+  elimination: the perf ring silently drops events on overrun (8 pages;
+  media-burst connection storms), and the worker counted only what it
+  read — a burst that overruns the ring looks exactly like a dead
+  program. eBPF attach was healthy throughout (verified at boot).
+- Fix: (a) `read_events`/`poll_events` now report overrun
+  (`head - tail > capacity` → resync + `true`); (b) watchdog rounds with
+  an overrun **freeze** (neither trip nor reset); (c) ring 8 → 32 data
+  pages/CPU. Rationale documented in code: overrun implies events WERE
+  flowing, so skipping is the safe direction.
+- Validation: 300-connection burst (25 parallel) against a live stub with
+  watchdog armed → 0 lockdown, 0 warnings, service active. DPI ON after:
+  **bypassed 2/2**. (Incidental catch while fixing: the event counter had
+  been glued onto a comment line by a bad edit — zero counting, guaranteed
+  future false trip. Fixed + verified green.)
+- Caveat recorded: unit tests cannot force a kernel ring overrun; the
+  freeze path is integration-proven (this burst run), not unit-proven.

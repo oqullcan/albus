@@ -339,14 +339,21 @@ impl BpfEngine {
         self.map_handles().push_exclude_ips_v6(ips)
     }
 
-    // polls ring buffer pages across all active per-core perf readers
-    pub fn poll_events<F>(&mut self, mut callback: F)
+    // polls ring buffer pages across all active per-core perf readers.
+    // Returns true if any reader overran (head advanced past tail + capacity:
+    // events were silently lost). Callers must treat an overrun window as
+    // INCONCLUSIVE — absent events prove nothing when the ring itself
+    // dropped them (burst traffic). Found live 2026-09-21: media bursts
+    // overran the 8-page ring and starved the watchdog counter.
+    pub fn poll_events<F>(&mut self, mut callback: F) -> bool
     where
         F: FnMut(RawConnEvent),
     {
+        let mut overrun = false;
         for reader in &mut self.perf_readers {
-            reader.read_events(&mut callback);
+            overrun |= reader.read_events(&mut callback);
         }
+        overrun
     }
 
     // detaches sock_ops program from cgroup v2 tree
@@ -602,6 +609,12 @@ fn bpf_prog_detach(target_fd: RawFd, attach_type: u32) -> Result<()> {
     }
 }
 
+/// NOTE (watchdog redesign): BPF_PROG_QUERY proved non-functional on the
+/// reference kernel (Omarchy 7.2.5): the raw syscall returns EINVAL for every
+/// attach type, flag set, and attr size, verified down to hand-packed bytes
+/// via ctypes as root. The watchdog therefore measures effectiveness
+/// directly (MSS probe in manager.rs) instead of asking the kernel. If a
+/// future kernel answers QUERY, this is where the fast path would live.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BpfInsn {
@@ -967,7 +980,10 @@ unsafe impl Sync for PerfReader {}
 impl PerfReader {
     pub fn new(cpu: i32) -> Result<Self> {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-        let num_pages: usize = 8;
+        // 32 data pages (was 8): media-burst connection storms overran the
+        // small ring and starved event consumers — 128 KiB per CPU is cheap
+        // insurance on top of the overrun detection above.
+        let num_pages: usize = 32;
         debug_assert!(
             num_pages.is_power_of_two(),
             "perf ring pages must be power-of-two"
@@ -1061,8 +1077,10 @@ impl PerfReader {
         })
     }
 
-    // decodes sample records from volatile data_head to data_tail ring boundary
-    pub fn read_events<F>(&mut self, callback: &mut F)
+    // decodes sample records from volatile data_head to data_tail ring boundary.
+    // Returns true on ring overrun (unprocessed backlog exceeded capacity):
+    // some events were lost before we read them.
+    pub fn read_events<F>(&mut self, callback: &mut F) -> bool
     where
         F: FnMut(RawConnEvent),
     {
@@ -1080,7 +1098,7 @@ impl PerfReader {
         let mut tail = unsafe { std::ptr::read_volatile(&header.data_tail) };
 
         if head == tail {
-            return;
+            return false;
         }
 
         // smp_rmb: synchronize with kernel's perf ring write before reading data section
@@ -1089,6 +1107,16 @@ impl PerfReader {
         let data_ptr = unsafe { (self.mmap_ptr as *const u8).add(self.page_size) };
         let data_len = self.mmap_size - self.page_size;
         let data_mask = data_len - 1;
+
+        // overrun check FIRST: if the backlog exceeds capacity, the oldest
+        // events are already gone and every size field below is suspect —
+        // report it and resync tail to head (drop the window, keep liveness)
+        if head.wrapping_sub(tail) > data_len as u64 {
+            unsafe {
+                std::ptr::write_volatile(&mut header.data_tail, head);
+            }
+            return true;
+        }
 
         let read_ring_bytes = |offset: usize, dst: &mut [u8]| {
             for (i, b) in dst.iter_mut().enumerate() {
@@ -1136,6 +1164,7 @@ impl PerfReader {
         unsafe {
             std::ptr::write_volatile(&mut header.data_tail, tail);
         }
+        false
     }
 }
 
@@ -1242,5 +1271,45 @@ mod tests {
             });
             assert_eq!(count, 0);
         }
+    }
+
+    /// Root-only attach/detach round-trip through an isolated child cgroup
+    /// (never the live hierarchy root): proves load/attach/map-write/detach
+    /// work on the running kernel. Skips (does not fail) when the live
+    /// daemon holds the root attach slot — child attach then gets EPERM by
+    /// kernel design, which is environmental, not a bug. For the full
+    /// check, stop the daemon first. Run with:
+    /// `sudo -E cargo test --lib loader -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn root_attach_detach_roundtrip() {
+        use crate::core::ebpf::features::is_root;
+        if !is_root() {
+            return;
+        }
+        struct RmDir(String);
+        impl Drop for RmDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let child = format!("/sys/fs/cgroup/albus-qtest-{}", std::process::id());
+        let _guard = RmDir(child.clone());
+        std::fs::create_dir(&child).expect("test cgroup creatable as root");
+        let mut engine = match BpfEngine::load_and_attach(&child) {
+            Ok(e) => e,
+            Err(e) if format!("{e}").contains("Operation not permitted") => {
+                eprintln!(
+                    "SKIP: root cgroup slot held (daemon running?) — stop it for the full check"
+                );
+                return;
+            }
+            Err(e) => panic!("attach at free child cgroup must work: {e}"),
+        };
+        assert!(engine.prog_fd >= 0, "real prog fd expected");
+        engine
+            .push_config(BpfConfig::new(88, 0, 600, 64, true))
+            .expect("config map writable");
+        engine.detach().expect("detach works");
     }
 }

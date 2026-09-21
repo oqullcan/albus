@@ -65,6 +65,7 @@ impl Engine {
             fake_bad_checksum: cfg.fake_bad_checksum,
             pqc: cfg.pqc,
             auto_ttl_estimator,
+            shaping_watchdog: cfg.shaping_watchdog,
         };
 
         // instantiate local doh proxy server on 127.0.0.1:53
@@ -269,6 +270,7 @@ impl Engine {
             fake_bad_checksum: new_cfg.fake_bad_checksum,
             pqc: new_cfg.pqc,
             auto_ttl_estimator,
+            shaping_watchdog: new_cfg.shaping_watchdog,
         };
 
         if let Err(e) = self.bpf_manager.reload_maps(&bpf_cfg) {
