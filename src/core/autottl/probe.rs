@@ -1,9 +1,20 @@
-//! hop distance heuristic measurement and optimal time-to-live middlebox desynchronization calculation.
+//! Hop-distance TTL selection for middlebox desynchronization.
+//!
+//! CONTRACT (static model, honest by design — see M1 remediation):
+//! albus does NOT perform active hop-distance probing. There is deliberately
+//! no traceroute/ICMP machinery here: every new destination would otherwise
+//! receive unsolicited probe traffic (fingerprintable noise), and a raw ICMP
+//! listener would widen the daemon's attack surface for a heuristic gain.
+//! Instead the effective TTL is derived from operator configuration:
+//! auto mode clamps `default_ttl` into `[min_ttl, max_ttl]`; manual mode
+//! (`enabled = false`) honors `default_ttl` exactly.
+//! `calculate_optimal_ttl` below is the RESERVED mapping for a future active
+//! prober (kept with its branch-table tests as specification); nothing in
+//! production consults it today. If probing is ever reintroduced, the T7
+//! contract tests in this file must be updated deliberately — they pin the
+//! static behavior so fake "dynamics" cannot slip back in silently.
 
 use std::net::Ipv4Addr;
-use tracing::debug;
-
-use super::cache::TtlCache;
 
 #[derive(Debug, Clone)]
 pub struct AutoTtlConfig {
@@ -27,39 +38,27 @@ impl Default for AutoTtlConfig {
 #[derive(Debug, Clone)]
 pub struct AutoTtlEstimator {
     config: AutoTtlConfig,
-    cache: TtlCache,
 }
 
 impl AutoTtlEstimator {
     pub fn new(config: AutoTtlConfig) -> Self {
-        Self {
-            config,
-            cache: TtlCache::new(),
-        }
+        Self { config }
     }
 
-    // calculates optimal ttl for destination endpoint or schedules asynchronous background estimation
-    pub fn get_ttl(&self, dst_ip: Ipv4Addr) -> u8 {
+    // Static TTL contract: no measurement, no spawned tasks, no network I/O.
+    // Auto mode clamps the default into the safe bounds; manual mode honors
+    // the operator's exact value. Deterministic per configuration.
+    pub fn get_ttl(&self, _dst_ip: Ipv4Addr) -> u8 {
         if !self.config.enabled {
             return self.config.default_ttl;
         }
-
-        if let Some(ttl) = self.cache.get(&dst_ip) {
-            return ttl;
-        }
-
-        // spawn non-blocking hop measurement task within runtime context
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let this = self.clone();
-            handle.spawn(async move {
-                this.estimate_and_cache(dst_ip).await;
-            });
-        }
-
-        self.config.default_ttl
+        self.config
+            .default_ttl
+            .clamp(self.config.min_ttl, self.config.max_ttl)
     }
 
-    // derives middlebox drop ttl based on estimated path length
+    // RESERVED mapping for a future active prober (see module docs): kept
+    // with its branch-table tests as specification, not consulted today.
     pub fn calculate_optimal_ttl(&self, total_hops: u8) -> u8 {
         if total_hops <= 3 {
             self.config.min_ttl
@@ -72,13 +71,6 @@ impl AutoTtlEstimator {
                 .default_ttl
                 .clamp(self.config.min_ttl, self.config.max_ttl)
         }
-    }
-
-    async fn estimate_and_cache(&self, dst_ip: Ipv4Addr) {
-        let estimated_hops = measure_hop_distance(dst_ip).await;
-        let optimal_ttl = self.calculate_optimal_ttl(estimated_hops);
-        debug!(ip = %dst_ip, total_hops = estimated_hops, optimal_ttl = optimal_ttl, "Auto-TTL estimated");
-        self.cache.insert(dst_ip, optimal_ttl);
     }
 }
 
@@ -110,20 +102,6 @@ pub fn parse_route_table(content: &str) -> Option<(String, Ipv4Addr)> {
     None
 }
 
-// sends synthetic traceroute probe to estimate network layer router hop count
-pub async fn measure_hop_distance(dst_ip: Ipv4Addr) -> u8 {
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return 12,
-    };
-
-    let target = format!("{}:33434", dst_ip);
-    let probe_payload = [0u8; 24];
-
-    let _ = socket.send_to(&probe_payload, &target).await;
-    12
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +117,8 @@ mod tests {
 
     #[test]
     fn test_autottl_cached_retrieval() {
+        // static contract: first call already returns the default — no
+        // spawned task, no network I/O, nothing to "warm up"
         let config = AutoTtlConfig {
             enabled: true,
             default_ttl: 8,
@@ -150,6 +130,49 @@ mod tests {
 
         let ttl1 = estimator.get_ttl(ip);
         assert_eq!(ttl1, 8);
+    }
+
+    #[test]
+    fn test_static_contract_pins_no_dynamics() {
+        // T7/M1 regression: the estimator must be destination-independent.
+        // If genuine probing is ever reintroduced, this test must be
+        // updated deliberately — it pins the static contract.
+        let estimator = AutoTtlEstimator::new(AutoTtlConfig::default());
+        let a = Ipv4Addr::new(1, 1, 1, 1);
+        let b = Ipv4Addr::new(203, 0, 113, 7);
+        let c = Ipv4Addr::new(192, 0, 2, 99);
+        assert_eq!(estimator.get_ttl(a), 8);
+        assert_eq!(estimator.get_ttl(b), 8);
+        assert_eq!(estimator.get_ttl(c), 8);
+        // repeated calls are stable (no background mutation)
+        assert_eq!(estimator.get_ttl(a), estimator.get_ttl(a));
+    }
+
+    #[test]
+    fn test_static_contract_clamp_and_manual() {
+        // auto mode clamps an out-of-range default into [min, max] ...
+        let clamped = AutoTtlEstimator::new(AutoTtlConfig {
+            enabled: true,
+            default_ttl: 200,
+            min_ttl: 4,
+            max_ttl: 10,
+        });
+        assert_eq!(clamped.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 10);
+        let clamped_lo = AutoTtlEstimator::new(AutoTtlConfig {
+            enabled: true,
+            default_ttl: 1,
+            min_ttl: 4,
+            max_ttl: 10,
+        });
+        assert_eq!(clamped_lo.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 4);
+        // ... while manual mode honors the operator's exact value
+        let manual = AutoTtlEstimator::new(AutoTtlConfig {
+            enabled: false,
+            default_ttl: 200,
+            min_ttl: 4,
+            max_ttl: 10,
+        });
+        assert_eq!(manual.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 200);
     }
 
     #[test]

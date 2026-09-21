@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::loader::{BpfConfig, BpfEngine, RawConnEvent};
 use crate::core::autottl::AutoTtlEstimator;
-use crate::core::fake::clienthello::{build_fake_client_hello, FAKE_TLS_CLIENT_HELLO};
+use crate::core::fake::clienthello::build_fake_client_hello_opts;
+use crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL;
 use crate::core::rawsock::{ConnInfo, RawSocket};
 use crate::dns::server::DnsServer;
 
@@ -129,26 +130,17 @@ impl BpfManager {
         // assemble decoy clienthello payloads: rotate across pool if no custom sni is forced
         let fake_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
             if sni != "www.google.com" && !sni.is_empty() {
-                vec![
-                    crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc),
-                ]
+                vec![build_fake_client_hello_opts(sni, self.cfg.pqc)]
             } else {
-                crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
+                DEFAULT_DECOY_SNI_POOL
                     .iter()
-                    .map(|&s| {
-                        crate::core::fake::clienthello::build_fake_client_hello_opts(
-                            s,
-                            self.cfg.pqc,
-                        )
-                    })
+                    .map(|&s| build_fake_client_hello_opts(s, self.cfg.pqc))
                     .collect()
             }
         } else {
-            crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
+            DEFAULT_DECOY_SNI_POOL
                 .iter()
-                .map(|&s| {
-                    crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc)
-                })
+                .map(|&s| build_fake_client_hello_opts(s, self.cfg.pqc))
                 .collect()
         };
 
@@ -205,7 +197,7 @@ impl BpfManager {
                         )
                     };
 
-                    // dynamically resolve optimal ttl for destination
+                    // static TTL lookup for this destination (no probing)
                     let optimal_ttl = match conn.dst_ip {
                         IpAddr::V4(v4) => estimator.get_ttl(v4),
                         IpAddr::V6(_) => fake_ttl_fallback,
@@ -222,12 +214,16 @@ impl BpfManager {
                         if let (Some(server), Some(runtime)) = (&dns_server, &rt) {
                             if let IpAddr::V4(v4) = conn.dst_ip {
                                 if let Some(domain) = runtime.block_on(server.pop_domain(v4)) {
-                                    dst_desc = format!("{}:{}", domain, conn.dst_port);
+                                    // domain originates from upstream DNS answers:
+                                    // sanitize before it reaches the journal (L7/L8)
+                                    let clean =
+                                        crate::dns::server::sanitize_log_token(&domain);
+                                    dst_desc = format!("{}:{}", clean, conn.dst_port);
                                 }
                             }
                         }
 
-                        info!(
+                        debug!(
                             dst = %dst_desc,
                             seq = conn.seq,
                             ack = conn.ack,

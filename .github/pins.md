@@ -1,6 +1,10 @@
 # Pinned CI action SHAs (supply-chain discipline: tags move, SHAs don't).
 # Refresh procedure: `git ls-remote <repo> refs/tags/<tag>`, verify the
-# commit on GitHub, update the full SHA below and in ci.yml comments.
+# commit on GitHub, update the full SHA below and in ci.yml (form:
+# `uses: <action>@<sha> # <tag>` — never a bare tag).
+#
+# ci.yml also pins cargo-llvm-cov to a crates.io version:
+# cargo-llvm-cov 0.9.1 (locally validated; bump deliberately).
 
 - actions/checkout@v4
   sha: 11d5960a326750d5838078e36cf38b85af677262

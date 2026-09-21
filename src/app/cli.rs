@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "albus",
     author = "oqullcan",
-    version = "2.1.0",
+    version,
     about = "ebpf sock_ops tcp mss fragmentation and doh proxy engine",
     long_about = "albus is a kernel-level network utility utilizing ebpf sock_ops and encrypted doh to bypass deep packet inspection."
 )]
@@ -112,15 +112,16 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fake_bad_checksum: bool,
 
-    // dynamic hop distance estimation and ttl optimization
+    // static TTL selection (no probing — see autottl docs): true clamps
+    // the default into [min_ttl, max_ttl], false honors --fake-ttl exactly
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub auto_ttl: bool,
 
-    // minimum ttl boundary clamp for auto-ttl estimation
+    // minimum ttl boundary clamp for the static default
     #[arg(long, default_value_t = 3)]
     pub min_ttl: u8,
 
-    // maximum ttl boundary clamp for auto-ttl estimation
+    // maximum ttl boundary clamp for the static default
     #[arg(long, default_value_t = 12)]
     pub max_ttl: u8,
 

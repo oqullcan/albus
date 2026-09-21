@@ -104,7 +104,6 @@ pub async fn fetch_echconfig_list(
     resolver: &crate::dns::doh::DoHResolver,
 ) -> Option<Vec<u8>> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
     use hickory_proto::rr::{RData, RecordType};
 
     let clean = host.trim().trim_end_matches('.');
@@ -179,10 +178,7 @@ fn echconfig_from_records(records: &[&Record], owner: &Name) -> Option<Vec<u8>> 
     None
 }
 fn query_id() -> u16 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
-        .unwrap_or(0x5678)
+    crate::dns::secure_rand_u16()
 }
 
 #[cfg(test)]

@@ -1,5 +1,8 @@
 //! ebpf sock_ops kernel instrumentation and doh resolver library.
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
+//!
+//! NOTE: no crate-wide lint allows — dead code and warnings must be fixed
+//! or suppressed narrowly with justification at the item level, so CI's
+//! `clippy --workspace -- -D warnings` stays meaningful.
 
 pub mod app;
 pub mod core;

@@ -770,7 +770,12 @@ mod tests {
         assert!(ips.contains(&Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0009)));
     }
 
+    /// Live measurement: real Quad9 resolution over the network.
+    /// Explicitly opt-in (needs internet); run with:
+    /// `cargo test -- --ignored --nocapture test_doh_quad9_live_query`.
+    /// Must stay #[ignore]: the default suite is deterministic and offline.
     #[tokio::test]
+    #[ignore]
     async fn test_doh_quad9_live_query() {
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let query_wire = [

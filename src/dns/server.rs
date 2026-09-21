@@ -50,6 +50,25 @@ fn redact_upstream_desc(desc: &str) -> String {
     out.join(",")
 }
 
+/// Sanitizes upstream-influenced tokens (QNAMEs) before logging: strips ANSI
+/// escapes, then drops ASCII controls/newlines that enable journal log
+/// forgery, and caps length. Diagnostics survive (readable domain stays);
+/// only control smuggling is removed. (L7/L8)
+pub(crate) fn sanitize_log_token(s: &str) -> String {
+    let stripped = crate::app::monitor::strip_ansi(s);
+    let mut out = String::with_capacity(stripped.len().min(200));
+    for c in stripped.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if out.len() >= 200 {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl DnsServer {
     pub fn new(
         upstreams_csv: &str,
@@ -247,8 +266,9 @@ impl DnsServer {
                                     if let Some(cached_resp) = cache_clone.get(&query_data) {
                                         if let Some((domain, ips)) = parse_dns_response(&cached_resp) {
                                             if !ips.is_empty() {
+                                                // domain mirrors upstream data: sanitize (L8)
                                                 debug!(
-                                                    domain = %domain,
+                                                    domain = %sanitize_log_token(&domain),
                                                     ips = ?ips,
                                                     source = "cache_0ms",
                                                     "DNS cache hit"
@@ -321,14 +341,18 @@ impl DnsServer {
                                                 }
                                                 return;
                                             }
-                                            // insert response into cache (bogus never cached)
-                                            cache_clone.insert(&query_data, &resp_bytes);
+                                            // insert response into cache (bogus never cached;
+                                            // indeterminate never cached either, see cacheable_state)
+                                            if cacheable_state(dnssec_state) {
+                                                cache_clone.insert(&query_data, &resp_bytes);
+                                            }
 
                                             let is_ad = is_dnssec_authenticated(&resp_bytes);
                                             if let Some((domain, ips)) = parse_dns_response(&resp_bytes) {
                                                 if !ips.is_empty() {
+                                                    // domain mirrors upstream data: sanitize (L8)
                                                     debug!(
-                                                        domain = %domain,
+                                                        domain = %sanitize_log_token(&domain),
                                                         ips = ?ips,
                                                         via = %via,
                                                         dnssec_authenticated = is_ad,
@@ -451,6 +475,16 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     }
 
     out
+}
+/// L10 cache policy: Indeterminate (validation timed out) must never be
+/// cached — an unverified answer must not linger for the full TTL; the next
+/// query revalidates from scratch. Bogus never reaches here (early SERVFAIL
+/// return); Secure/Insecure/unsigned(None) cache as before.
+pub(crate) fn cacheable_state(state: Option<DnssecState>) -> bool {
+    matches!(
+        state,
+        None | Some(DnssecState::Secure) | Some(DnssecState::Insecure)
+    )
 }
 
 // inspects header flags to verify presence of authenticated data (ad) bit
@@ -713,6 +747,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_sanitize_log_token_kills_forgery() {
+        // L7/L8 regression: hostile upstream QNAME content must come out as
+        // a single inert line — no ANSI escapes, no newlines, bounded length
+        let evil = "evil.com\nINJECTED journal line\x1b[31mred\x1b[0m\x07";
+        let clean = sanitize_log_token(evil);
+        assert!(!clean.contains('\n'), "newline must go");
+        assert!(!clean.contains('\r'), "CR must go");
+        assert!(!clean.contains('\x1b'), "ESC must go");
+        assert!(!clean.contains('\x07'), "BEL must go");
+        assert!(clean.contains("evil.com"), "diagnostic content survives");
+        assert!(clean.contains("INJECTED journal line"), "words survive");
+        // length cap
+        let long = "a".repeat(500);
+        assert_eq!(sanitize_log_token(&long).len(), 200);
+        // benign domains pass through untouched
+        assert_eq!(sanitize_log_token("example.com"), "example.com");
+        assert_eq!(sanitize_log_token(""), "");
+    }
+
+    #[test]
     fn test_upstream_log_redacts_profile_ids() {
         assert_eq!(
             redact_upstream_desc("https://dns.nextdns.io/795926"),
@@ -723,6 +777,17 @@ mod tests {
             redact_upstream_desc("quad9, https://dns.nextdns.io/795926"),
             "quad9,https://dns.nextdns.io"
         );
+    }
+
+    #[test]
+    fn test_cacheable_state_policy() {
+        // L10: only verified-or-unsigned answers may be cached; a timed-out
+        // validation (Indeterminate) must force revalidation next query
+        assert!(cacheable_state(None));
+        assert!(cacheable_state(Some(DnssecState::Secure)));
+        assert!(cacheable_state(Some(DnssecState::Insecure)));
+        assert!(!cacheable_state(Some(DnssecState::Indeterminate)));
+        assert!(!cacheable_state(Some(DnssecState::Bogus)));
     }
 
     #[tokio::test]

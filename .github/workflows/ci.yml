@@ -1,5 +1,11 @@
 name: ci
 
+# Least privilege: every job gets read-only contents by default; the `build`
+# job additionally grants actions:write for artifact upload (nothing else
+# writes). Do not broaden without a documented reason.
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -11,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
           persist-credentials: false
       - name: Install Rust toolchain
@@ -38,7 +44,7 @@ jobs:
         with:
           toolchain: stable
       - name: cargo audit (RustSec)
-        uses: rustsec/audit-check@v2 # pinned: see .github/pins.md
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2, pinned: see .github/pins.md
         env:
           # rust-toolchain.toml pins 1.89 for the build; audit tooling
           # needs a newer rustc, so override just for these steps
@@ -46,7 +52,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2 # pinned: see .github/pins.md
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, pinned: see .github/pins.md
         env:
           RUSTUP_TOOLCHAIN: stable
         with:
@@ -57,7 +63,7 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true # informational until runner kernels stabilize
     steps:
-      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
           persist-credentials: false
       - name: Install Rust toolchain
@@ -82,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
           persist-credentials: false
       - name: Install Rust toolchain
@@ -129,8 +135,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # artifact upload needs actions:write on top of the read-only default
+    permissions:
+      contents: read
+      actions: write
     steps:
-      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
           persist-credentials: false
       - name: Install Rust toolchain
@@ -144,12 +154,12 @@ jobs:
       - name: checksum
         run: sha256sum target/release/albus | tee albus.sha256
       - name: upload binary
-        uses: actions/upload-artifact@v4 # pinned: see .github/pins.md
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
         with:
           name: albus-linux-x86_64
           path: target/release/albus
       - name: upload checksum
-        uses: actions/upload-artifact@v4 # pinned: see .github/pins.md
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
         with:
           name: albus-sha256
           path: albus.sha256
@@ -158,7 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4 # pinned: see .github/pins.md
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
           persist-credentials: false
       - name: Install stable toolchain with llvm-tools
@@ -169,7 +179,8 @@ jobs:
       - name: Install eBPF build deps
         run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
+        # pinned to the locally validated version; bump deliberately (see pins.md)
+        run: cargo install cargo-llvm-cov --locked --version 0.9.1
         env:
           RUSTUP_TOOLCHAIN: stable
       - name: coverage gate (workspace, min 55% lines)

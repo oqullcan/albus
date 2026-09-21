@@ -155,8 +155,29 @@ fn verify_installed_binary() -> Result<String, Box<dyn std::error::Error + Send 
     Ok(canon_str)
 }
 
+/// Persists `service install` CLI tuning through the same load/apply/
+/// validate/save path as `config set`. Semantics match `config set`
+/// exactly: flags fully specify the config, so a bare reinstall resets
+/// prior tuning to defaults — explicit and visible, unlike the old silent
+/// drop. Split into `_at` for testability: production passes the standard
+/// config path, tests pass a temp file.
+fn persist_install_config(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    persist_install_config_at(args, &crate::app::config::Config::default_config_path())
+}
+
+fn persist_install_config_at(
+    args: &RunArgs,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cfg =
+        crate::app::config::apply_run_args(crate::app::config::Config::load_or_default(), args)?;
+    cfg.validate()?;
+    cfg.save_to_file(path)?;
+    Ok(())
+}
+
 // generates systemd unit file with AmbientCapabilities, installs polkit rule, and enables auto-start
-fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service install requires root privileges — run with sudo".into());
     }
@@ -175,6 +196,10 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
     // verify installed copy is root-owned, non-symlink, canonical
     let exe_str = verify_installed_binary()?;
 
+    // L5: persist CLI tuning (previously silently dropped) so the bare
+    // `ExecStart={exe} run` below picks it up via the standard config path
+    persist_install_config(args)?;
+
     let exec_start = format!("{} run", exe_str);
     let exec_stop = format!("{} cleanup", exe_str);
 
@@ -190,10 +215,23 @@ Wants=network-online.target
 Type=simple
 ExecStart={exec_start}
 ExecReload=/bin/kill -s HUP $MAINPID
+# NOTE (L4, deliberate tradeoff): ExecStopPost runs `cleanup` on EVERY stop,
+# including crashes — so a crash briefly lifts kill-switch/lockdown until
+# `Restart=always` (3 s) brings the daemon back. Fail-open-for-seconds beats
+# fail-closed-forever here: a persistent lockdown without a daemon would
+# brick outbound web/DNS with no self-recovery. Crash loops are visible in
+# the journal; protections re-apply on each restart.
 ExecStopPost={exec_stop}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+# Privilege model (L1, deliberate): the daemon runs as uid 0 — no User= line.
+# The AmbientCapabilities below are not theater for the future: they document
+# the exact set a User=albus migration needs (raw sockets, iptables, eBPF,
+# :53 bind, resolv.conf writes). Until file ownership (/etc/resolv.conf,
+# /etc/albus), cgroup access, and iptables-restore paths are migrated AND
+# soak-tested as non-root, uid 0 stays: startup needs all of them at once,
+# and a half-migrated daemon would fail in ways that look like DPI breakage.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 NoNewPrivileges=true
@@ -446,6 +484,39 @@ mod service_fs_tests {
         }
         let _ = fs::remove_file(&link);
         let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_persist_install_config_applies_args() {
+        // L5 regression: `service install --mss 100` must persist tuning
+        // (previously dropped). Uses a temp path — never the live config.
+        use clap::Parser;
+        let args = match crate::app::cli::Cli::try_parse_from([
+            "albus",
+            "service",
+            "install",
+            "--mss",
+            "100",
+            "--doh-upstream",
+            "cloudflare",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(crate::app::cli::Commands::Service(svc)) => match svc.command {
+                crate::app::cli::ServiceCommands::Install(a) => a,
+                _ => panic!("expected install subcommand"),
+            },
+            _ => panic!("expected service command"),
+        };
+        let dir = tmpdir("persist");
+        let path = dir.join("config.json");
+        persist_install_config_at(&args, &path).expect("persist must succeed");
+        let loaded = crate::app::config::Config::load_from_file(&path).expect("reload must work");
+        assert_eq!(loaded.mss, 100);
+        assert_eq!(loaded.doh_upstream, "cloudflare");
+        let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }
 }

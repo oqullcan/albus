@@ -1,4 +1,5 @@
-//! automated hop distance estimation and optimal time-to-live calculation for middlebox desynchronization.
+//! TTL selection for middlebox desynchronization (static contract — see
+//! probe.rs docs): operator-configured default with bounds, no probing.
 
 pub mod cache;
 pub mod probe;

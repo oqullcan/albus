@@ -76,7 +76,7 @@ impl RawSocket {
         ttl: u8,
         bad_checksum: bool,
     ) -> Result<usize> {
-        conn.validate_families().map_err(|e| Error::other(e))?;
+        conn.validate_families().map_err(Error::other)?;
         let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
 
         match (conn.src_ip, conn.dst_ip) {

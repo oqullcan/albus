@@ -4,10 +4,13 @@
 
 use albus::core::ebpf::loader::parse_elf_sockops;
 use albus::core::fake::clienthello::build_fake_client_hello;
+use albus::core::fake::ech::has_ech_extension;
 use albus::core::fake::sni::parse_sni;
 use albus::core::rawsock::packet::build_packet;
 use albus::core::rawsock::types::ConnInfo;
 use albus::dns::cache::extract_query_key;
+use albus::dns::ech::parse_https_ech_config;
+use albus::dns::server::{build_canary_query, build_canary_response, is_canary_query};
 use albus::dns::server::{is_aaaa_query, parse_dns_response};
 use albus::dns::ssrf::{blocked_ipv4, blocked_ipv6};
 use std::collections::HashMap;
@@ -185,24 +188,149 @@ fn fuzz_sni_roundtrip() {
 }
 
 #[test]
+fn fuzz_ech_detector_positive_and_mutated() {
+    // T1: positive control — a hello carrying an ECH extension (0xfe0d)
+    // must be detected; the stock decoy (no ECH) must not.
+    let plain = build_fake_client_hello("example.com");
+    assert!(!has_ech_extension(&plain));
+    // splice an empty ECH extension (type 0xfe0d, len 0) at the end of the
+    // extensions block: patch ext-len (+=4) and rebuild lengths by reusing
+    // the builder output layout (record[3..5], hs[6..9], body ext-len)
+    let mut with_ech = plain.clone();
+    // locate extensions-length field: record(5) + hs-hdr(4) + fixed(34+1+0+2+2+1+1) = 45
+    const EXT_LEN_OFF: usize = 5 + 4 + 34 + 1 + 2 + 2 + 1 + 1;
+    let old_ext_len = ((with_ech[EXT_LEN_OFF] as usize) << 8) | with_ech[EXT_LEN_OFF + 1] as usize;
+    let new_ext_len = old_ext_len + 4;
+    with_ech[EXT_LEN_OFF] = (new_ext_len >> 8) as u8;
+    with_ech[EXT_LEN_OFF + 1] = new_ext_len as u8;
+    let insert_at = EXT_LEN_OFF + 2 + old_ext_len;
+    with_ech.splice(insert_at..insert_at, [0xFE, 0x0D, 0x00, 0x00]);
+    // fix up hs length (+4) and record length (+4)
+    let hs_len =
+        ((with_ech[6] as usize) << 16) | ((with_ech[7] as usize) << 8) | with_ech[8] as usize;
+    let hs_len = hs_len + 4;
+    with_ech[6] = (hs_len >> 16) as u8;
+    with_ech[7] = (hs_len >> 8) as u8;
+    with_ech[8] = hs_len as u8;
+    let rec_len = ((with_ech[3] as usize) << 8) | with_ech[4] as usize;
+    let rec_len = rec_len + 4;
+    with_ech[3] = (rec_len >> 8) as u8;
+    with_ech[4] = rec_len as u8;
+    assert!(
+        has_ech_extension(&with_ech),
+        "crafted ECH hello must be detected"
+    );
+    // mutated ECH hellos must not panic the detector
+    let mut rng = XorShift64(0xE0C4E37A55AA55AA);
+    for _ in 0..256 {
+        let mut m = with_ech.clone();
+        for _ in 0..rng.below(10) {
+            let i = rng.below(m.len());
+            m[i] = rng.byte();
+        }
+        let _ = has_ech_extension(&m);
+    }
+}
+
+#[test]
+fn fuzz_echconfig_and_canary_builders() {
+    // T3: raw SVCB parser — valid fixture parses, garbage never panics and
+    // only yields bytes when an ech key is actually present
+    let mut rdata = vec![0x00, 0x01, 0x00];
+    rdata.extend_from_slice(&[0x00, 0x05, 0x00, 0x02, 0xDE, 0xAD]);
+    assert_eq!(
+        parse_https_ech_config(&rdata),
+        Some(vec![0xDE, 0xAD]),
+        "ech key must extract"
+    );
+    let mut rng = XorShift64(0xCA4E4E37A11CE7A1);
+    for _ in 0..512 {
+        let len = rng.below(48);
+        let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let out = parse_https_ech_config(&buf);
+        // invariant: output is always a sub-slice of input (no synthesis)
+        if let Some(b) = out {
+            assert!(b.len() <= buf.len());
+            assert!(
+                buf.windows(b.len()).any(|w| w == b.as_slice()),
+                "extracted bytes must come from input"
+            );
+        }
+    }
+    // canary builders round-trip: built query is recognized, response
+    // carries the canary IP; mutated queries never panic either path
+    let q = build_canary_query();
+    assert!(is_canary_query(&q));
+    let resp = build_canary_response(&q, std::net::Ipv4Addr::new(127, 0, 0, 99));
+    assert!(resp.windows(4).any(|w| w == [127, 0, 0, 99]));
+    for _ in 0..256 {
+        let mut m = q.clone();
+        for _ in 0..rng.below(6) {
+            let i = rng.below(m.len());
+            m[i] = rng.byte();
+        }
+        let _ = is_canary_query(&m);
+        let _ = build_canary_response(&m, std::net::Ipv4Addr::new(127, 0, 0, 99));
+    }
+}
+
+#[test]
 fn fuzz_ssrf_consistency() {
-    // same input must always give the same verdict (no hidden state/time)
+    // input-space partitions: every address in a blocked range must be
+    // refused, sampled globals must pass. Deterministic, no hidden state.
     let mut rng = XorShift64(0x1745F51422D7AEEF);
-    for _ in 0..2048 {
-        let v4 = Ipv4Addr::new(rng.byte(), rng.byte(), rng.byte(), rng.byte());
-        assert_eq!(blocked_ipv4(&v4), blocked_ipv4(&v4));
-        let segs = [
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-            rng.next() as u16,
-        ];
-        let v6 = Ipv6Addr::from(segs);
-        assert_eq!(blocked_ipv6(&v6), blocked_ipv6(&v6));
+    // full /8 sweeps for the small sensitive ranges (loopback, link-local
+    // second octet, CGNAT samples) + random sampling of the large ones
+    for b in 0..=255u8 {
+        assert!(blocked_ipv4(&Ipv4Addr::new(127, b, rng.byte(), rng.byte())));
+        assert!(blocked_ipv4(&Ipv4Addr::new(169, 254, b, rng.byte())));
+    }
+    for _ in 0..512 {
+        let b = rng.byte();
+        assert!(blocked_ipv4(&Ipv4Addr::new(10, b, rng.byte(), rng.byte())));
+        assert!(blocked_ipv4(&Ipv4Addr::new(
+            192,
+            168,
+            rng.byte(),
+            rng.byte()
+        )));
+        assert!(blocked_ipv4(&Ipv4Addr::new(
+            172,
+            16 + rng.below(16) as u8,
+            rng.byte(),
+            rng.byte()
+        )));
+        assert!(blocked_ipv4(&Ipv4Addr::new(
+            100,
+            64 + rng.below(64) as u8,
+            rng.byte(),
+            rng.byte()
+        )));
+    }
+    // boundary octets: 172.15/172.32 and 100.63/100.128 are public
+    assert!(!blocked_ipv4(&Ipv4Addr::new(172, 15, 0, 1)));
+    assert!(!blocked_ipv4(&Ipv4Addr::new(172, 32, 0, 1)));
+    assert!(!blocked_ipv4(&Ipv4Addr::new(100, 63, 0, 1)));
+    assert!(!blocked_ipv4(&Ipv4Addr::new(100, 128, 0, 1)));
+    // mapped loopback/private must be refused (normalization, see L6)
+    assert!(blocked_ipv6(&Ipv6Addr::from([
+        0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001
+    ])));
+    assert!(blocked_ipv6(&Ipv6Addr::from([
+        0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001
+    ])));
+    assert!(!blocked_ipv6(&Ipv6Addr::from([
+        0, 0, 0, 0, 0, 0xffff, 0x0101, 0x0101
+    ])));
+    // v6 special ranges: full fe80::/10 second-group sweep (top 6 bits)
+    for hi in 0xfe80..=0xfebf {
+        let lo = rng.next() as u16;
+        assert!(blocked_ipv6(&Ipv6Addr::new(hi, lo, lo, lo, lo, lo, lo, lo)));
+    }
+    // fc00::/7 sweep (top 7 bits: fc00-fdff)
+    for _ in 0..64 {
+        let hi = 0xfc00 | rng.below(0x200) as u16;
+        assert!(blocked_ipv6(&Ipv6Addr::new(hi, 1, 2, 3, 4, 5, 6, 7)));
     }
     // spot checks anchor the policy
     assert!(blocked_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));

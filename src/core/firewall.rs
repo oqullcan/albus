@@ -35,7 +35,11 @@ fn ip6tables_base() -> Command {
 }
 
 /// Idempotent insert: `iptables -C OUTPUT ... || iptables -I OUTPUT ...`
-fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
+/// Returns true only when the rule is present afterwards (verified with
+/// -C). Callers must not log protections as ACTIVE on false — an xtables
+/// lock failure or missing binary would otherwise claim cover that does
+/// not exist (L2).
+fn ensure_rule(v6: bool, args: &[&str], comment: &str) -> bool {
     let mut spec: Vec<&str> = Vec::with_capacity(args.len() + 4);
     spec.extend_from_slice(args);
     spec.extend_from_slice(&["-m", "comment", "--comment", comment]);
@@ -57,23 +61,56 @@ fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
             .unwrap_or(false)
     };
     if check_ok {
-        return;
+        return true;
     }
     let mut insert_args: Vec<&str> = vec!["-I", "OUTPUT"];
     insert_args.extend_from_slice(&spec);
-    match if v6 {
+    let inserted = match if v6 {
         ip6tables_base().args(&insert_args).status()
     } else {
         iptables_base().args(&insert_args).status()
     } {
-        Err(e) => warn!("failed to spawn firewall binary for {:?}: {}", args, e),
-        Ok(s) if !s.success() => warn!(
-            "firewall insert exited {} for {:?} (rule not applied)",
-            s.code().unwrap_or(-1),
-            args
-        ),
-        _ => {}
+        Err(e) => {
+            warn!("failed to spawn firewall binary for {:?}: {}", args, e);
+            false
+        }
+        Ok(s) if !s.success() => {
+            warn!(
+                "firewall insert exited {} for {:?} (rule not applied)",
+                s.code().unwrap_or(-1),
+                args
+            );
+            false
+        }
+        _ => true,
+    };
+    if !inserted {
+        return false;
     }
+    // verify presence afterwards: -I can report success while a concurrent
+    // flush removed the rule; never claim cover without proof
+    let mut verify_args: Vec<&str> = vec!["-C", "OUTPUT"];
+    verify_args.extend_from_slice(&spec);
+    let verified = if v6 {
+        ip6tables_base()
+            .args(&verify_args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        iptables_base()
+            .args(&verify_args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !verified {
+        warn!(
+            "firewall rule insert unverified for {:?} (rule not applied)",
+            args
+        );
+    }
+    verified
 }
 
 /// Marker proving albus was installed on this machine (written on successful
@@ -150,6 +187,12 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) -> bool {
 // without root. Comment strings namespace each feature for safe deletion.
 
 fn quic_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
+    // NOTE (L17, deliberate): no `! -o lo` scoping here, unlike kill-switch
+    // and lockdown. QUIC bypasses the TCP-only evasion engine entirely, so
+    // the block is uniform by policy — no carve-outs that behave differently
+    // per interface. Collateral: local services binding UDP 443/3478/5349 on
+    // loopback are also rejected. Accepted tradeoff, asserted by
+    // test_quic_specs_shape.
     vec![(
         vec!["-p", "udp", "--dport", "443", "-j", "REJECT"],
         "albus-quic",
@@ -184,14 +227,21 @@ fn kill_switch_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
     specs
 }
 
-// injects icmp port unreachable / tcp reset via iptables reject on udp 443
-pub fn block_quic() {
+// injects icmp port unreachable / tcp reset via iptables reject on udp 443.
+// Returns true only when every rule verified present (see ensure_rule).
+pub fn block_quic() -> bool {
+    let mut ok = true;
     for (spec, comment) in quic_rule_specs() {
-        ensure_rule(false, &spec, comment);
-        ensure_rule(true, &spec, comment);
+        ok &= ensure_rule(false, &spec, comment);
+        ok &= ensure_rule(true, &spec, comment);
     }
 
-    info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
+    if ok {
+        info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
+    } else {
+        warn!("QUIC block INCOMPLETE — some reject rules missing, UDP 443 may leak");
+    }
+    ok
 }
 
 // purges injected reject rules for udp 443
@@ -204,14 +254,21 @@ pub fn unblock_quic() {
     debug!("QUIC firewall rules cleaned up");
 }
 
-// blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks
-pub fn block_stun() {
+// blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks.
+// Returns true only when every rule verified present (see ensure_rule).
+pub fn block_stun() -> bool {
+    let mut ok = true;
     for (spec, comment) in stun_rule_specs() {
-        ensure_rule(false, &spec, comment);
-        ensure_rule(true, &spec, comment);
+        ok &= ensure_rule(false, &spec, comment);
+        ok &= ensure_rule(true, &spec, comment);
     }
 
-    info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
+    if ok {
+        info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
+    } else {
+        warn!("STUN block INCOMPLETE — some reject rules missing, STUN may leak");
+    }
+    ok
 }
 
 // purges stun packet filtering rules
@@ -227,13 +284,20 @@ pub fn unblock_stun() {
 // enables strict dns kill-switch: drops all non-loopback outbound port 53 traffic
 // guarantees no application or rogue dhcp server can leak plaintext dns to the isp
 // NOTE: uses DROP (stealth) instead of REJECT to avoid signaling DPI/middleboxes.
-pub fn enable_kill_switch() {
+// Returns true only when every rule verified present (see ensure_rule).
+pub fn enable_kill_switch() -> bool {
+    let mut ok = true;
     for (spec, comment) in kill_switch_rule_specs() {
-        ensure_rule(false, &spec, comment);
-        ensure_rule(true, &spec, comment);
+        ok &= ensure_rule(false, &spec, comment);
+        ok &= ensure_rule(true, &spec, comment);
     }
 
-    info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
+    if ok {
+        info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
+    } else {
+        warn!("DNS Kill-Switch INCOMPLETE — some DROP rules missing, plaintext DNS may leak");
+    }
+    ok
 }
 
 // removes dns kill-switch filtering rules
@@ -261,7 +325,7 @@ pub fn disable_kill_switch() {
 // Ordered specs (ACCEPT first): already-established flows — including the
 // daemon's own upstream DoH connections — are exempted via conntrack state,
 // so lockdown drops only NEW unprotected flows instead of killing DNS too.
-fn lockdown_rule_specs<'a>(port: &'a str) -> Vec<(Vec<&'a str>, &'static str)> {
+fn lockdown_rule_specs(port: &str) -> Vec<(Vec<&str>, &'static str)> {
     vec![
         (
             vec![
@@ -288,17 +352,25 @@ fn lockdown_rule_specs<'a>(port: &'a str) -> Vec<(Vec<&'a str>, &'static str)> {
     ]
 }
 
-pub fn enable_network_lockdown() {
+pub fn enable_network_lockdown() -> bool {
+    let mut ok = true;
     for port in &["80", "443"] {
         // insert in reverse: `ensure_rule` prepends (`-I OUTPUT`), so the
         // ACCEPT fast-path must be inserted last to land on top.
         for (spec, comment) in lockdown_rule_specs(port).iter().rev() {
-            ensure_rule(false, spec, comment);
-            ensure_rule(true, spec, comment);
+            ok &= ensure_rule(false, spec, comment);
+            ok &= ensure_rule(true, spec, comment);
         }
     }
 
-    info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
+    if ok {
+        info!(
+            "Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked"
+        );
+    } else {
+        warn!("Network Lockdown INCOMPLETE — some rules missing, traffic may flow unprotected");
+    }
+    ok
 }
 
 // purges fail-closed network lockdown rules
@@ -414,5 +486,26 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_enable_fns_report_failure_without_root() {
+        // L2 regression: without privileges no rule can be applied, so every
+        // enable fn must return false (never claim ACTIVE cover). Skipped as
+        // root: applying real rules is the privileged suite's job, and unit
+        // tests must never mutate host firewall state.
+        if crate::core::ebpf::is_root() {
+            return;
+        }
+        assert!(!block_quic(), "block_quic must report failure unprivileged");
+        assert!(!block_stun(), "block_stun must report failure unprivileged");
+        assert!(
+            !enable_kill_switch(),
+            "enable_kill_switch must report failure unprivileged"
+        );
+        assert!(
+            !enable_network_lockdown(),
+            "enable_network_lockdown must report failure unprivileged"
+        );
     }
 }

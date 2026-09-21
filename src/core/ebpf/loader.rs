@@ -145,7 +145,7 @@ impl BpfEngine {
         map_fds.insert("connections".to_string(), connections_fd);
 
         // 2. parse elf section headers and relocate pseudo map file descriptors
-        let insns = parse_elf_sockops(elf_bytes, &map_fds).map_err(|e| {
+        let insns = parse_elf_sockops(elf_bytes, &map_fds).inspect_err(|_| {
             for fd in [
                 config_map_fd,
                 target_ports_fd,
@@ -156,12 +156,11 @@ impl BpfEngine {
             ] {
                 close_fd(fd);
             }
-            e
         })?;
 
         // 3. submit instructions to in-kernel bpf verifier
-        let prog_fd =
-            bpf_load_program(BPF_PROG_TYPE_SOCK_OPS, &insns, "albus_sockops").map_err(|e| {
+        let prog_fd = bpf_load_program(BPF_PROG_TYPE_SOCK_OPS, &insns, "albus_sockops")
+            .inspect_err(|_| {
                 for fd in [
                     config_map_fd,
                     target_ports_fd,
@@ -172,7 +171,6 @@ impl BpfEngine {
                 ] {
                     close_fd(fd);
                 }
-                e
             })?;
 
         // 4. open cgroup hierarchy directory handle and attach program
@@ -671,7 +669,7 @@ pub fn parse_elf_sockops(
             "invalid section header count/size",
         ));
     }
-    let table_len = (e_shnum as usize)
+    let table_len = e_shnum
         .checked_mul(e_shentsize)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
     let table_end = e_shoff
@@ -686,7 +684,7 @@ pub fn parse_elf_sockops(
 
     let shstrtab_hdr_offset = e_shoff
         .checked_add(
-            (e_shstrndx as usize)
+            e_shstrndx
                 .checked_mul(e_shentsize)
                 .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
         )
@@ -723,8 +721,7 @@ pub fn parse_elf_sockops(
     for i in 0..e_shnum {
         let sh_offset = e_shoff
             .checked_add(
-                (i as usize)
-                    .checked_mul(e_shentsize)
+                i.checked_mul(e_shentsize)
                     .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
             )
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
@@ -924,13 +921,6 @@ fn elf_slice(elf_bytes: &[u8], off: usize, len: usize) -> Result<&[u8]> {
     elf_bytes
         .get(off..end)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "elf section out of bounds"))
-}
-
-fn le_u16_at(elf_bytes: &[u8], off: usize) -> Result<u16> {
-    let b: [u8; 2] = elf_slice(elf_bytes, off, 2)?
-        .try_into()
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
-    Ok(u16::from_le_bytes(b))
 }
 
 fn le_u32_at(elf_bytes: &[u8], off: usize) -> Result<u32> {

@@ -29,7 +29,7 @@ use hickory_proto::dnssec::rdata::{DNSKEY, NSEC3, RRSIG};
 use hickory_proto::dnssec::{Algorithm, PublicKey, SupportedAlgorithms, TrustAnchors, Verifier};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::dns::doh::DoHResolver;
 
@@ -73,10 +73,14 @@ pub struct DnssecValidator {
     anchors: TrustAnchors,
     supported: SupportedAlgorithms,
     // (zone-name, type) -> (records, fetched-at)
-    key_cache: Mutex<HashMap<(String, u16), (Vec<Record>, Instant)>>,
+    key_cache: Mutex<KeyCacheMap>,
     // (qname, qtype) -> (verdict, decided-at); Secure/Insecure live in DnsCache
-    neg_cache: Mutex<HashMap<(String, u16), (DnssecState, Instant)>>,
+    neg_cache: Mutex<NegCacheMap>,
 }
+
+// factored so clippy::type_complexity stays quiet and the shapes are named
+type KeyCacheMap = HashMap<(String, u16), (Vec<Record>, Instant)>;
+type NegCacheMap = HashMap<(String, u16), (DnssecState, Instant)>;
 
 impl DnssecValidator {
     pub fn new() -> Self {
@@ -195,9 +199,9 @@ impl DnssecValidator {
         {
             // keep the requested RRset plus any accompanying RRSIGs (needed to
             // authenticate it); dropping RRSIGs here silently breaks the chain
-            if rec.record_type() == RecordType::RRSIG {
-                out.push(rec.clone());
-            } else if name_eq(&rec.name, name) && rec.record_type() == rtype {
+            if rec.record_type() == RecordType::RRSIG
+                || (name_eq(&rec.name, name) && rec.record_type() == rtype)
+            {
                 out.push(rec.clone());
             }
         }
@@ -450,8 +454,8 @@ impl DnssecValidator {
                 let t = rec.record_type();
                 if t == RecordType::NSEC || t == RecordType::NSEC3 || t == RecordType::RRSIG {
                     let entry = denial
-                        .entry((&rec.name).to_ascii().to_lowercase())
-                        .or_insert_with(|| ((&rec.name).clone(), Vec::new(), t));
+                        .entry(rec.name.to_ascii().to_lowercase())
+                        .or_insert_with(|| (rec.name.clone(), Vec::new(), t));
                     entry.1.push(rec.clone());
                     if t != RecordType::RRSIG {
                         entry.2 = t;
@@ -479,11 +483,17 @@ impl DnssecValidator {
         let mut nsec3_seen = false;
         let mut nsec3_covers = false;
         let mut nsec3_encloser = false;
+        let mut nsec_seen = false;
+        let mut nsec_covered = false;
         let nxdomain = msg.response_code == ResponseCode::NXDomain;
         for (name, recs, t) in &candidates {
             let is_nsec3 = *t == RecordType::NSEC3;
+            let is_nsec = *t == RecordType::NSEC;
             if is_nsec3 {
                 nsec3_seen = true;
+            }
+            if is_nsec {
+                nsec_seen = true;
             }
             let sigs = Self::rrsig_records(recs, *t);
             if sigs.is_empty() {
@@ -526,6 +536,17 @@ impl DnssecValidator {
                     }
                     continue;
                 }
+                // L11: same rule for NSEC — a verified NSEC counts toward
+                // Secure only when its span actually denies qname. Verified
+                // but non-covering groups are ignored (never Bogus: only
+                // cryptographic failure is Bogus; the answer is still
+                // served, as Indeterminate, and revalidated next query).
+                if is_nsec {
+                    if any_nsec_covers(recs, name, &owner) {
+                        nsec_covered = true;
+                    }
+                    continue;
+                }
                 secure_links += 1;
                 continue;
             }
@@ -552,6 +573,10 @@ impl DnssecValidator {
             }
             return DnssecState::Secure;
         }
+        // L11: verified NSEC coverage promotes the denial to a secure link
+        if nsec_seen && nsec_covered {
+            secure_links += 1;
+        }
         if secure_links > 0 && insecure_links == 0 {
             return DnssecState::Secure;
         }
@@ -567,27 +592,10 @@ fn name_eq(a: &Name, b: &Name) -> bool {
     a.to_ascii().to_lowercase() == b.to_ascii().to_lowercase()
 }
 
-/// True when any NSEC3 record in `recs` cryptographically covers `qname`:
-/// hash(qname) falls in (owner_hash, next_hash]. Owner-match alone proves
-/// nothing — the hash span is the denial.
-fn any_nsec3_covers(recs: &[Record], qname: &Name) -> bool {
-    use hickory_proto::dnssec::rdata::NSEC3;
-    for rec in recs {
-        let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &rec.data else {
-            continue;
-        };
-        if nsec3_covers(nsec3, &rec.name, qname) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Lineage-scoped variant: the covering record must additionally live under
 /// qname's own zone cut (parent zone == qname or an ancestor). Stops an
 /// attacker replaying a genuine signed NSEC3 from an unrelated zone.
 fn any_nsec3_covers_in_scope(recs: &[Record], qname: &Name) -> bool {
-    use hickory_proto::dnssec::rdata::NSEC3;
     for rec in recs {
         let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &rec.data else {
             continue;
@@ -654,8 +662,68 @@ fn zone_in_scope(rec_name: &Name, qname: &Name) -> bool {
     !p.is_empty() && q.len() > p.len() && q.ends_with(&format!(".{}", p))
 }
 
+/// Canonical DNS name ordering (RFC 4034 s6.1): labels compared right to
+/// left, case-insensitive octet-wise; an ancestor sorts before its
+/// descendants. Used for NSEC denial coverage.
+fn cmp_dns_name(a: &Name, b: &Name) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut al: Vec<Vec<u8>> = a.iter().map(|l| l.to_ascii_lowercase()).collect();
+    let mut bl: Vec<Vec<u8>> = b.iter().map(|l| l.to_ascii_lowercase()).collect();
+    // drop the root empty label when present so "x." and "x" compare equal
+    if al.last().is_some_and(|l| l.is_empty()) {
+        al.pop();
+    }
+    if bl.last().is_some_and(|l| l.is_empty()) {
+        bl.pop();
+    }
+    al.reverse();
+    bl.reverse();
+    for (x, y) in al.iter().zip(bl.iter()) {
+        match x.cmp(y) {
+            Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    al.len().cmp(&bl.len())
+}
+
+/// NSEC denial coverage (L11): qname is denied iff owner < qname <= next in
+/// canonical order, wrap-aware. A verified-but-not-covering NSEC proves
+/// someone else's denial, not ours.
+fn nsec_covers(owner: &Name, next: &Name, qname: &Name) -> bool {
+    use std::cmp::Ordering;
+    let owner_next = cmp_dns_name(owner, next);
+    if owner_next == Ordering::Equal {
+        return true; // degenerate single-name span
+    }
+    let owner_q = cmp_dns_name(owner, qname);
+    let q_next = cmp_dns_name(qname, next);
+    if owner_next == Ordering::Less {
+        // normal interval: owner < qname <= next
+        owner_q == Ordering::Less && q_next != Ordering::Greater
+    } else {
+        // wrap-around: qname past owner, or at/before next
+        owner_q == Ordering::Less || q_next != Ordering::Greater
+    }
+}
+
+/// True when any NSEC record in `recs` (owned by `owner`) covers `qname`.
+fn any_nsec_covers(recs: &[Record], owner: &Name, qname: &Name) -> bool {
+    for rec in recs {
+        let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &rec.data else {
+            continue;
+        };
+        if !name_eq(&rec.name, owner) {
+            continue;
+        }
+        if nsec_covers(owner, nsec.next_domain_name(), qname) {
+            return true;
+        }
+    }
+    false
+}
+
 fn nsec3_covers(nsec3: &NSEC3, owner: &Name, qname: &Name) -> bool {
-    use hickory_proto::dnssec::Nsec3HashAlgorithm;
     let owner_hash = match owner_hash_bytes(owner) {
         Some(h) => h,
         None => return false,
@@ -779,10 +847,7 @@ fn cname_chain(
 }
 
 fn rand_id() -> u16 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
-        .unwrap_or(0x1234)
+    crate::dns::secure_rand_u16()
 }
 
 fn is_sep(key: &DNSKEY) -> bool {
@@ -798,6 +863,7 @@ impl Default for DnssecValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::dnssec::rdata::NSEC;
     use hickory_proto::rr::rdata::A;
 
     // tiny local base32hex encoder for building deterministic fixtures
@@ -1003,6 +1069,50 @@ mod tests {
     }
 
     #[test]
+    fn test_base32hex_roundtrip_and_adversarial() {
+        // encode(decode) roundtrip over representative lengths incl. NSEC3
+        // SHA1 (20 bytes -> 32 chars): decode must invert the encoder exactly.
+        // (len 0 excluded: empty input is rejected by design — an empty
+        // owner label never hashes, see owner_hash_bytes.)
+        let mut lens = vec![1usize, 2, 3, 4, 5, 19, 20, 21, 32, 64];
+        lens.extend([7, 13, 31]);
+        for len in lens {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let enc = b32hex_enc(&bytes);
+            assert_eq!(
+                base32hex_decode(enc.as_bytes()),
+                Some(bytes),
+                "roundtrip failed for len {}",
+                len
+            );
+        }
+        // adversarial: uppercase/lowercase mix, padding chars, whitespace,
+        // overlong runs, all-zero and all-max inputs never panic and reject
+        // anything outside the strict unpadded alphabet
+        for bad in [
+            "CPNMUOJ1=".as_bytes(),
+            "CP NMUOJ1".as_bytes(),
+            "cpnmuoj1\n".as_bytes(),
+            "=========".as_bytes(),
+            "CC1".as_bytes(),
+            "~~~~~~~~~~~~~~~~".as_bytes(),
+            b"\xff\xfe\x00\x01".as_slice(),
+        ] {
+            assert_eq!(base32hex_decode(bad), None, "must reject {:?}", bad);
+        }
+        // all-max input is valid (decodes to 0xFF bytes, zero pad bits)
+        assert_eq!(
+            base32hex_decode(b"vvvvvvvv"),
+            Some(vec![0xFF; 5]),
+            "max-value input must decode"
+        );
+        // single chars: trailing zero pad bits accepted, nonzero rejected
+        // ("C0" -> 01100 00000 -> byte 0x60, pad 00; "C1" -> pad 01)
+        assert_eq!(base32hex_decode(b"C0"), Some(vec![0x60]));
+        assert_eq!(base32hex_decode(b"C1"), None);
+    }
+
+    #[test]
     fn test_matches_anchor_positive_and_negative() {
         use hickory_proto::dnssec::crypto::EcdsaSigningKey;
         use hickory_proto::dnssec::{PublicKey, SigningKey};
@@ -1019,6 +1129,93 @@ mod tests {
         assert!(v2.anchors.insert(&pubkey));
         assert!(v2.matches_anchor(std::slice::from_ref(&stranger)));
         let _ = (pubkey.algorithm(), pubkey.public_bytes().len());
+    }
+
+    #[test]
+    fn test_neg_cache_stores_only_negative_verdicts() {
+        let v = DnssecValidator::new();
+        // Bogus + Indeterminate are remembered (anti-amplification bound)
+        v.neg_store("Example.COM", 1, DnssecState::Bogus);
+        assert_eq!(v.neg_lookup("example.com", 1), Some(DnssecState::Bogus));
+        v.neg_store("other.example.", 28, DnssecState::Indeterminate);
+        assert_eq!(
+            v.neg_lookup("other.example.", 28),
+            Some(DnssecState::Indeterminate)
+        );
+        // Secure/Insecure are never stored (live in DnsCache instead)
+        v.neg_store("example.com", 1, DnssecState::Secure);
+        v.neg_store("plain.example.", 1, DnssecState::Insecure);
+        assert_eq!(v.neg_lookup("plain.example.", 1), None);
+        // qtype is part of the key; unknown names miss
+        assert_eq!(v.neg_lookup("example.com", 28), None);
+        assert_eq!(v.neg_lookup("absent.example.", 1), None);
+    }
+
+    #[test]
+    fn test_nsec_span_logic() {
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        // canonical order: ancestors first, case-insensitive, label-wise
+        assert_eq!(
+            cmp_dns_name(&n("example.com."), &n("example.com.")),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            cmp_dns_name(&n("example.com."), &n("a.example.com.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_dns_name(&n("b.example.com."), &n("a.example.com.")),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_dns_name(&n("A.EXAMPLE.com."), &n("a.example.com.")),
+            std::cmp::Ordering::Equal
+        );
+        // owner < qname <= next denies; endpoints: owner itself does not
+        let owner = n("a.example.");
+        let next = n("c.example.");
+        assert!(nsec_covers(&owner, &next, &n("b.example.")));
+        assert!(nsec_covers(&owner, &next, &n("c.example.")));
+        assert!(!nsec_covers(&owner, &next, &n("a.example.")));
+        assert!(!nsec_covers(&owner, &next, &n("d.example.")));
+        // wrap-around: (y.example., b.example.] covers z.* and a.*, not m.*
+        let w_owner = n("y.example.");
+        let w_next = n("b.example.");
+        assert!(nsec_covers(&w_owner, &w_next, &n("z.example.")));
+        assert!(nsec_covers(&w_owner, &w_next, &n("a.example.")));
+        assert!(!nsec_covers(&w_owner, &w_next, &n("m.example.")));
+        assert!(!nsec_covers(&w_owner, &w_next, &n("y.example.")));
+        // degenerate single-name span covers
+        assert!(nsec_covers(&owner, &owner, &n("b.example.")));
+
+        // record-level: covering NSEC counts, foreign one does not
+        let mk_rec = |owner: Name, next: Name| {
+            Record::from_rdata(
+                owner,
+                300,
+                RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(next, [RecordType::A]))),
+            )
+        };
+        let qname = n("b.example.");
+        let rec = mk_rec(n("a.example."), n("c.example."));
+        assert!(any_nsec_covers(
+            std::slice::from_ref(&rec),
+            &n("a.example."),
+            &qname
+        ));
+        let foreign = mk_rec(n("x.other."), n("z.other."));
+        assert!(!any_nsec_covers(
+            std::slice::from_ref(&foreign),
+            &n("x.other."),
+            &qname
+        ));
+        // wrong-owner record in the set is skipped, not trusted
+        let impostor = mk_rec(n("a.example."), n("b.example."));
+        assert!(!any_nsec_covers(
+            std::slice::from_ref(&impostor),
+            &n("zzz.example."),
+            &qname
+        ));
     }
 
     #[test]
@@ -1067,17 +1264,20 @@ mod tests {
             300,
             RData::DNSSEC(DNSSECRData::NSEC3(mk(&h))),
         );
-        assert!(any_nsec3_covers(std::slice::from_ref(&rec), &qname));
+        assert!(any_nsec3_covers_in_scope(
+            std::slice::from_ref(&rec),
+            &qname
+        ));
         // same span math, but the record lives in a foreign zone:
-        // in-scope check must refuse it
+        // the raw span still covers, the in-scope check must refuse it
         let foreign_owner =
             Name::from_ascii(&format!("{}.other-zone.example.", enc(&below))).unwrap();
+        assert!(nsec3_covers(&mk(&h), &foreign_owner, &qname));
         let rec_foreign = Record::from_rdata(
             foreign_owner.clone(),
             300,
             RData::DNSSEC(DNSSECRData::NSEC3(mk(&h))),
         );
-        assert!(any_nsec3_covers(std::slice::from_ref(&rec_foreign), &qname));
         assert!(!any_nsec3_covers_in_scope(
             std::slice::from_ref(&rec_foreign),
             &qname

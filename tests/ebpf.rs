@@ -31,13 +31,38 @@ fn ebpf_load_attach_write_detach() {
         return;
     }
 
-    let mut engine = match BpfEngine::load_and_attach("/sys/fs/cgroup") {
+    // Attach to an isolated child cgroup, NEVER the live hierarchy root:
+    // attaching at /sys/fs/cgroup would silently displace a running
+    // daemon's program (single-attach slot), and our detach would then
+    // leave production unprotected with zero alarm. (Found the hard way:
+    // a test run left the live daemon shapeless until restart.)
+    let child = format!("/sys/fs/cgroup/albus-test-{}", std::process::id());
+    if std::fs::create_dir(&child).is_err() {
+        skip("cannot create isolated test cgroup");
+        return;
+    }
+    struct RmDir<'a>(&'a str);
+    impl Drop for RmDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(self.0);
+        }
+    }
+    let _cleanup = RmDir(&child);
+
+    let mut engine = match BpfEngine::load_and_attach(&child) {
         Ok(e) => e,
         Err(e) => {
-            // Kernel without BPF syscall access (containers/seccomp):
-            // environment limitation, not an albus bug.
-            skip(&format!("load_and_attach refused: {}", e));
-            return;
+            // L28: distinguish environmental refusal from implementation
+            // failure. EPERM/EACCES (containers, seccomp, dropped caps) is an
+            // environment limitation — SKIP. Anything else after passing
+            // preconditions (verifier reject, missing maps, attach failure)
+            // is a genuine albus bug and must FAIL loudly, never SKIP.
+            let msg = format!("{e}");
+            if msg.contains("Permission denied") || msg.contains("Operation not permitted") {
+                skip(&format!("load_and_attach refused (environment): {e}"));
+                return;
+            }
+            panic!("load_and_attach failed despite passing preconditions: {e}");
         }
     };
     assert!(engine.prog_fd >= 0, "real prog fd expected");

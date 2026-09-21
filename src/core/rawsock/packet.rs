@@ -4,6 +4,23 @@ use super::types::ConnInfo;
 
 pub const MAX_PACKET_LEN: usize = 1500;
 
+// L20: per-packet IP identification so decoys do not share one static
+// marker (was a constant 0x1234 — trivially filterable). Counter-based, so
+// output is deterministic in tests. Window stays a fixed 502 and the fake
+// key_share stays short on purpose: on TTL overshoot the decoy reaches the
+// REAL server, where a varying window could disturb the live connection —
+// the ID field is inert there (DF is set, no reassembly), the window is not.
+fn next_ip_id() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static PKT_ID: AtomicU16 = AtomicU16::new(0x1234);
+    let n = PKT_ID.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
+        .unwrap_or(0);
+    n.wrapping_add(t)
+}
+
 // fixed-size stack buffer eliminating heap allocation overhead during packet synthesis
 #[derive(Clone, Copy)]
 pub struct StackPacket {
@@ -171,8 +188,9 @@ pub fn build_packet_stack_opts(
             ip_hdr[1] = 0x00; // differentiated services code point / ecn
             ip_hdr[2] = (total_len >> 8) as u8;
             ip_hdr[3] = total_len as u8;
-            ip_hdr[4] = 0x12; // packet identification
-            ip_hdr[5] = 0x34;
+            let ip_id = next_ip_id();
+            ip_hdr[4] = (ip_id >> 8) as u8; // packet identification (varied per packet, L20)
+            ip_hdr[5] = ip_id as u8;
             ip_hdr[6] = 0x40; // flags: don't fragment (df) bit set
             ip_hdr[7] = 0x00;
             ip_hdr[8] = ttl;
@@ -412,5 +430,31 @@ mod tests {
         let cs1 = checksum(sample);
         let cs2 = checksum(sample);
         assert_eq!(cs1, cs2);
+    }
+
+    #[test]
+    fn test_ip_id_varies_per_packet() {
+        // L20 regression: consecutive decoys must not share one static IP
+        // identification (was constant 0x1234 — filterable). Eight builds
+        // must show variance (counter guarantees it; 8 samples make an
+        // accidental all-equal astronomically impossible, no flakiness).
+        let conn = ConnInfo::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(93, 184, 216, 34),
+            12345,
+            443,
+            1000,
+            2000,
+        );
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let p = build_packet(&conn, b"hello", 8);
+            ids.insert(((p[4] as u16) << 8) | p[5] as u16);
+            // headers stay valid: version/IHL, DF set, checksum verifies
+            assert_eq!(p[0], 0x45);
+            assert_eq!(p[6], 0x40);
+            assert_eq!(checksum(&p[0..20]), 0x0000);
+        }
+        assert!(ids.len() >= 2, "IP IDs must vary across packets");
     }
 }

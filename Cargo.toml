@@ -27,4 +27,8 @@ cc = "1.1"
 opt-level = 3
 lto = true
 strip = true
+# Deliberate (L23): abort on panic — a half-unwound root daemon holding
+# iptables/eBPF/DNS state is worse than a clean crash + systemd restart
+# (which re-applies protections within seconds). Cost: no backtraces from
+# release crashes; diagnose via debug builds + journal context.
 panic = "abort"

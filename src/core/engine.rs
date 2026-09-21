@@ -99,25 +99,30 @@ impl Engine {
             return Err("albus requires root privileges — run with sudo".into());
         }
 
-        // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection)
+        // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection).
+        // applied_* tracks VERIFIED application only (L2): shutdown removes
+        // whatever is present idempotently, but the flags must never claim
+        // cover that was never confirmed.
         if self.cfg.block_quic {
-            block_quic();
-            self.applied_quic = true;
+            self.applied_quic = block_quic();
         }
         if self.cfg.block_stun {
-            block_stun();
-            self.applied_stun = true;
+            self.applied_stun = block_stun();
         }
 
         // 2. kill-switch applies even without DoH (fail-closed for plaintext DNS)
         if self.cfg.kill_switch {
-            enable_kill_switch();
-            self.applied_kill = true;
+            self.applied_kill = enable_kill_switch();
         }
 
-        // 3. bind udp listener on 127.0.0.1:53 and update /etc/resolv.conf
+        // 3. bind udp listener on 127.0.0.1:53 and update /etc/resolv.conf.
+        // L3: every early return below rolls back steps 1-2 first — a failed
+        // start must never leave firewall rules behind without a daemon.
         if let Some(ref dns) = self.dns_server {
-            dns.start().await?;
+            if let Err(e) = dns.start().await {
+                self.cleanup_firewall_only();
+                return Err(format!("failed to bind local DNS resolver: {}", e).into());
+            }
             if let Err(e) = set_system_dns() {
                 // full revert: resolvectl links may already be pointed at loopback
                 crate::dns::system::revert_resolvectl_dns();
@@ -150,10 +155,30 @@ impl Engine {
 
         info!("albus is running — press Ctrl+C to stop");
 
-        // 5. block awaiting asynchronous signal trap (ctrl-c, sigterm, sigusr1 cache flush, or sighup config reload)
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sigusr1 = signal(SignalKind::user_defined1())?;
-        let mut sighup = signal(SignalKind::hangup())?;
+        // 5. block awaiting asynchronous signal trap (ctrl-c, sigterm, sigusr1 cache flush, or sighup config reload).
+        // L3: signal setup happens after subsystems are live, so a setup
+        // failure must roll back before returning.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.shutdown();
+                return Err(format!("failed to trap SIGTERM: {}", e).into());
+            }
+        };
+        let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.shutdown();
+                return Err(format!("failed to trap SIGUSR1: {}", e).into());
+            }
+        };
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.shutdown();
+                return Err(format!("failed to trap SIGHUP: {}", e).into());
+            }
+        };
 
         loop {
             tokio::select! {
@@ -306,6 +331,72 @@ impl Engine {
         self.cleanup_firewall_only();
         if self.cfg.network_lockdown {
             disable_network_lockdown();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_failed_start_applies_nothing() {
+        // L3 regression: a refused start must leave zero applied state. Only
+        // meaningful unprivileged (as root run() would really start); the
+        // privileged path is covered by the manual root lab.
+        if is_root() {
+            return;
+        }
+        let mut engine = Engine::new(Config::default()).expect("default config builds");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        let res = rt.block_on(engine.run());
+        assert!(res.is_err(), "unprivileged run must refuse");
+        assert!(!engine.applied_quic, "no quic rules on refused start");
+        assert!(!engine.applied_stun, "no stun rules on refused start");
+        assert!(!engine.applied_kill, "no kill-switch on refused start");
+        assert!(!engine.applied_dns, "no DNS takeover on refused start");
+    }
+
+    #[test]
+    fn test_cleanup_idempotent_on_fresh_engine() {
+        // fresh engine holds no applied state: cleanup must be a silent
+        // no-op (safe even as root — every branch is flag-gated off).
+        let mut engine = Engine::new(Config::default()).expect("default config builds");
+        engine.cleanup_firewall_only();
+        assert!(!engine.applied_quic);
+        assert!(!engine.applied_stun);
+        assert!(!engine.applied_kill);
+        assert!(!engine.applied_dns);
+    }
+
+    #[test]
+    fn test_reload_merges_hot_fields_keeps_firewall_identity() {
+        // T5: SIGHUP merges eBPF-safe fields from disk but never touches
+        // firewall/DNS identity. Diverge both classes from whatever the
+        // on-disk config says, reload, and assert the split.
+        let file_cfg = Config::load_or_default();
+        let file_valid = file_cfg.validate().is_ok();
+        let mut custom = Config::default();
+        custom.restore_after_bytes = file_cfg.restore_after_bytes.wrapping_add(1);
+        custom.kill_switch = !file_cfg.kill_switch;
+        let mut engine = Engine::new(custom).expect("diverged config builds");
+        engine.reload_config();
+        if !file_valid {
+            // invalid on-disk config: reload refuses everything, engine keeps
+            // its running values (warned, not applied)
+            assert_eq!(
+                engine.cfg.restore_after_bytes,
+                file_cfg.restore_after_bytes.wrapping_add(1)
+            );
+            assert_eq!(engine.cfg.kill_switch, !file_cfg.kill_switch);
+        } else {
+            // hot-reloadable field follows disk ...
+            assert_eq!(engine.cfg.restore_after_bytes, file_cfg.restore_after_bytes);
+            // ... firewall identity stays with the running daemon
+            assert_eq!(engine.cfg.kill_switch, !file_cfg.kill_switch);
         }
     }
 }

@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Strips ANSI escape sequences to prevent terminal injection via log-controlled domains.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -57,9 +57,12 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n\x1b[2m──────────────────────────────────────────────────────────────────────────\x1b[0m\n");
     stdout.flush()?;
 
-    // stream journalctl log entries (sanitized note: journal output may contain attacker
-    // domains — terminal emulator should filter ANSI; we document strip_ansi for consumers)
+    // stream journalctl log entries through the ANSI sanitizer (L7): journal
+    // output may contain attacker-influenced domains, and this terminal is
+    // interactive — raw escapes would execute in the emulator. Persistent
+    // journald content itself is untouched; only rendering is filtered.
     if is_active {
+        use std::io::BufRead;
         let mut child = Command::new("/usr/bin/journalctl")
             .args([
                 "-u",
@@ -71,8 +74,16 @@ pub fn run_monitor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "-o",
                 "cat",
             ])
+            .stdout(std::process::Stdio::piped())
             .spawn()?;
-
+        if let Some(out) = child.stdout.take() {
+            for line in std::io::BufReader::new(out).lines() {
+                match line {
+                    Ok(l) => println!("{}", strip_ansi(&l)),
+                    Err(_) => break,
+                }
+            }
+        }
         let _ = child.wait();
     } else {
         println!(

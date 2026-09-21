@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::io::Result;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -107,27 +109,64 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 
 fn atomic_write_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // resolve the symlink policy FIRST on the final path, then write a temp
+    // file in the same directory and rename(2) it into place. rename never
+    // follows the destination's final component, so even a symlink swapped
+    // in between check and rename is replaced itself, never traversed — and
+    // a mid-write crash leaves either the old or the new file, never a
+    // truncated resolv.conf (L15).
+    let target = resolve_write_target(path)?;
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write path without parent directory",
+        )
+    })?;
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let uniq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".albus.tmp.{}.{}", std::process::id(), uniq));
+
+    let write_tmp = || -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        // create_new (O_EXCL): never open, follow, or clobber anything
+        // pre-existing — not a symlink, fifo, or another writer's temp
+        options.write(true).create_new(true);
         options
             .mode(0o644)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options.open(&tmp)?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: refusing to write non-regular file at {}",
+                    tmp.display()
+                ),
+            ));
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // chmod explicitly: mode() at create is masked by umask, and a 600
+        // resolv.conf would break DNS for unprivileged users
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+        Ok(())
+    };
+    if let Err(e) = write_tmp() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    let mut file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "security violation: refusing to write non-regular file at {}",
-                path.display()
-            ),
-        ));
+    if let Err(e) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
+    // durability of the rename itself; best-effort on exotic filesystems
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -164,7 +203,12 @@ pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
             continue;
         }
 
-        // comment out preexisting nameserver declarations
+        // comment out preexisting nameserver declarations — INCLUDING a
+        // preexisting `nameserver 127.0.0.1` (L16): it is administrator
+        // configuration we must restore later, not our own marker. Our
+        // freshly added loopback line is already at the top, so saving the
+        // old one as `# albus-saved:` loses nothing and restore() brings
+        // exactly one loopback line back.
         if trimmed.starts_with("nameserver") {
             new_lines.push(format!("# albus-saved: {}", trimmed));
         } else {
@@ -223,10 +267,11 @@ pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
     // through an attacker-planted link, even for a read-only decision.
     let target = resolve_write_target(path.as_ref())?;
     if let Ok(content) = fs::read_to_string(&target) {
-        if content.contains("# albus-saved:")
-            || content.contains("# albus:")
-            || content.contains("nameserver 127.0.0.1")
-        {
+        // L16: trigger on OUR ownership markers only — never on a bare
+        // `nameserver 127.0.0.1`. An administrator running their own
+        // loopback resolver (no albus markers present) must not have their
+        // line eaten by cleanup's restore path.
+        if content.contains("# albus-saved:") || content.contains("# albus:") {
             restore_system_dns_at(path)?;
             return Ok(true);
         }
@@ -272,6 +317,19 @@ mod tests {
     }
 
     #[test]
+    fn test_iface_validation() {
+        assert!(is_valid_iface("eth0"));
+        assert!(is_valid_iface("wlan0"));
+        assert!(!is_valid_iface("lo"));
+        assert!(!is_valid_iface("docker0"));
+        assert!(!is_valid_iface("vethabc"));
+        assert!(!is_valid_iface("tun0"));
+        assert!(!is_valid_iface("wg0"));
+        assert!(!is_valid_iface("../evil"));
+        assert!(!is_valid_iface(""));
+    }
+
+    #[test]
     fn test_restore_empty_refuses_fallback() {
         let temp_dir = std::env::temp_dir();
         let temp_file = temp_dir.join(format!("test_resolv_empty_{}", std::process::id()));
@@ -286,15 +344,73 @@ mod tests {
     }
 
     #[test]
-    fn test_iface_validation() {
-        assert!(is_valid_iface("eth0"));
-        assert!(is_valid_iface("wlan0"));
-        assert!(!is_valid_iface("lo"));
-        assert!(!is_valid_iface("docker0"));
-        assert!(!is_valid_iface("vethabc"));
-        assert!(!is_valid_iface("tun0"));
-        assert!(!is_valid_iface("wg0"));
-        assert!(!is_valid_iface("../evil"));
-        assert!(!is_valid_iface(""));
+    fn test_cleanup_ignores_unowned_loopback() {
+        // L16 regression: an administrator's own loopback resolver with NO
+        // albus markers must be left completely untouched by cleanup.
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_resolv_unowned_{}", std::process::id()));
+        let original = "nameserver 127.0.0.1\nnameserver 1.1.1.1\n";
+        fs::write(&temp_file, original).unwrap();
+        let touched = cleanup_system_dns_at(&temp_file).expect("cleanup must not error");
+        assert!(!touched, "unowned file must not trigger restore");
+        assert_eq!(
+            fs::read_to_string(&temp_file).unwrap(),
+            original,
+            "admin loopback line must survive cleanup byte-for-byte"
+        );
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_set_restore_preserves_admin_loopback() {
+        // L16 companion: a pre-existing admin loopback line is saved as
+        // `# albus-saved:` on set() and restored exactly on restore().
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_resolv_adminlo_{}", std::process::id()));
+        let original = "nameserver 127.0.0.1\nnameserver 1.1.1.1\n";
+        fs::write(&temp_file, original).unwrap();
+        set_system_dns_at(&temp_file).expect("set must succeed");
+        let modified = fs::read_to_string(&temp_file).unwrap();
+        assert!(modified.contains("# albus-saved: nameserver 127.0.0.1"));
+        restore_system_dns_at(&temp_file).expect("restore must succeed");
+        assert_eq!(
+            fs::read_to_string(&temp_file).unwrap(),
+            original,
+            "admin loopback must round-trip exactly"
+        );
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_atomic_write_perms_and_no_temp_leftovers() {
+        // L15: tmp+rename writes land with 0644 regardless of umask and
+        // leave no temp files behind. Dedicated subdir: sibling tests share
+        // the process temp dir in parallel, so leftovers are scoped here.
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_resolv_atomic_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let temp_file = temp_dir.join("resolv.conf");
+        fs::write(&temp_file, "nameserver 9.9.9.9\n").unwrap();
+        set_system_dns_at(&temp_file).expect("set must succeed");
+        restore_system_dns_at(&temp_file).expect("restore must succeed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&temp_file).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o644, "resolv.conf replacement must stay 0644");
+        }
+        let leftovers: Vec<_> = fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".albus.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files may remain: {:?}",
+            leftovers
+        );
+        let _ = fs::remove_file(&temp_file);
+        let _ = fs::remove_dir(&temp_dir);
     }
 }

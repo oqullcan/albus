@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// lookup key derived from queried fqdn labels and resource record type
+// lookup key derived from queried fqdn labels, resource record type and
+// class. Class is part of the key (L12): IN and non-IN queries for the same
+// name/type must never share an entry.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct DnsCacheKey {
     pub name: String,
     pub qtype: u16,
+    pub qclass: u16,
     pub do_bit: bool,
 }
 
@@ -157,6 +160,14 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     }
 
     let qtype = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
+    // class follows type; missing class bytes (truncated query) default to
+    // IN (1) rather than rejecting — the entry simply never matches a real
+    // query carrying an explicit class.
+    let qclass = if pos + 4 <= data.len() {
+        ((data[pos + 2] as u16) << 8) | (data[pos + 3] as u16)
+    } else {
+        1
+    };
     // include DO-bit in cache key so dnssec on/off responses are not cross-served
     let do_bit = data.len() >= 12 && {
         let arcount = ((data[10] as u16) << 8) | (data[11] as u16);
@@ -165,6 +176,7 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     Some(DnsCacheKey {
         name: labels.join("."),
         qtype,
+        qclass,
         do_bit,
     })
 }
@@ -278,6 +290,39 @@ mod tests {
         assert_eq!(hit[0], 0xAB);
         assert_eq!(hit[1], 0xCD);
         assert_eq!(&hit[hit.len() - 4..], &[93, 184, 216, 34]);
+    }
+
+    #[test]
+    fn test_cache_key_splits_by_class() {
+        // L12 regression: qclass is part of the key — a CHAOS-class query
+        // for the same name/type must not receive the IN-class entry.
+        let cache = DnsCache::new(100);
+        let mut q_in = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let mut resp = q_in.clone();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp[7] = 0x01;
+        resp.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216,
+            34,
+        ]);
+        cache.insert(&q_in, &resp);
+        // same bytes, class CH (3) instead of IN (1): must miss
+        let mut q_ch = q_in.clone();
+        let n = q_ch.len();
+        q_ch[n - 2] = 0x00;
+        q_ch[n - 1] = 0x03;
+        assert!(
+            cache.get(&q_ch).is_none(),
+            "different class must not hit IN entry"
+        );
+        // truncated class bytes default to IN and hit
+        q_in.truncate(q_in.len() - 2);
+        assert!(cache.get(&q_in).is_some(), "missing class defaults to IN");
     }
 }
 

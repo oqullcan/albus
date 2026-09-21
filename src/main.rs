@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
                 Some(ConfigCommands::Set(args)) => {
-                    let cfg = apply_run_args_to_config(Config::load_or_default(), &args)?;
+                    let cfg = albus::app::config::apply_run_args(Config::load_or_default(), &args)?;
                     cfg.validate()?;
 
                     let path = Config::default_config_path();
@@ -142,39 +142,6 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     engine.run().await
 }
 
-// maps CLI run arguments onto a config (pure; validation stays with caller)
-fn apply_run_args_to_config(
-    mut cfg: Config,
-    args: &RunArgs,
-) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // update runtime tuning parameters
-    cfg.mss = args.mss;
-    cfg.min_mss = args.min_mss;
-    cfg.restore_mss = args.restore_mss;
-    cfg.restore_after_bytes = args.restore_after_bytes;
-    cfg.ports = args.ports.clone();
-    cfg.cgroup_path = args.cgroup.clone();
-    cfg.fake_ttl = args.fake_ttl;
-    cfg.fake_sni = args.fake_sni.clone();
-    cfg.fake_bad_checksum = args.fake_bad_checksum;
-    cfg.auto_ttl = args.auto_ttl;
-    cfg.min_ttl = args.min_ttl;
-    cfg.max_ttl = args.max_ttl;
-    cfg.doh_enabled = args.doh;
-    cfg.doh_upstream = args.doh_upstream.clone();
-    cfg.doh_bootstrap_ips = args.doh_bootstrap_ips.clone();
-    cfg.block_quic = args.block_quic;
-    cfg.block_stun = args.block_stun;
-    cfg.kill_switch = args.kill_switch;
-    cfg.network_lockdown = args.network_lockdown;
-    cfg.block_ipv6 = args.block_ipv6;
-    cfg.dnssec = args.dnssec;
-    cfg.pqc = args.pqc;
-    cfg.ram_only = args.ram_only;
-    cfg.verbose = args.verbose;
-    Ok(cfg)
-}
-
 fn resolve_log_level(verbose: bool) -> Level {
     if verbose {
         Level::DEBUG
@@ -215,8 +182,9 @@ mod tests {
 
     #[test]
     fn test_apply_run_args_maps_fields() {
+        use albus::app::config::apply_run_args;
         let args = set_args();
-        let cfg = apply_run_args_to_config(Config::default(), &args).unwrap();
+        let cfg = apply_run_args(Config::default(), &args).unwrap();
         assert_eq!(cfg.mss, 100);
         assert_eq!(cfg.doh_upstream, "cloudflare");
         assert!(!cfg.kill_switch);

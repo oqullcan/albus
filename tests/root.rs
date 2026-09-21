@@ -48,6 +48,19 @@ fn root_quic_block_unblock_symmetry() {
         skip("not root");
         return;
     }
+    // L27: Drop guard restores the daemon's QUIC rule even if an assertion
+    // below panics — a failed test must never leave the host less protected
+    // than it found it. (block_quic covers both families, no per-v6 state.)
+    struct RestoreGuard {
+        had_quic: bool,
+    }
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            if self.had_quic {
+                block_quic();
+            }
+        }
+    }
     for v6 in [false, true] {
         let before = match albus_rules(v6) {
             Some(r) => r,
@@ -58,6 +71,7 @@ fn root_quic_block_unblock_symmetry() {
         };
         // daemon may already hold the rule: assert convergence, not growth
         let had_quic = before.iter().any(|r| r.contains("albus-quic"));
+        let _guard = RestoreGuard { had_quic };
         block_quic();
         let during = albus_rules(v6).unwrap_or_default();
         assert!(

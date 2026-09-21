@@ -5,6 +5,8 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use crate::app::cli::RunArgs;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_mss")]
@@ -436,6 +438,13 @@ impl Config {
         if self.min_mss < 32 || self.min_mss > 1460 {
             return Err(format!("invalid min_mss {}", self.min_mss).into());
         }
+        if self.restore_mss != 0 && (self.restore_mss < 64 || self.restore_mss > 1460) {
+            return Err(format!(
+                "invalid restore_mss {} (expected 0=auto or 64..=1460)",
+                self.restore_mss
+            )
+            .into());
+        }
         if self.ports.is_empty() || self.ports.len() > 64 {
             return Err(format!("invalid ports len {} (expected 1..=64)", self.ports.len()).into());
         }
@@ -611,6 +620,41 @@ impl Config {
     }
 }
 
+/// Maps CLI run arguments onto a config (pure; validation stays with the
+/// caller). Shared by `albus config set` and `albus service install` so both
+/// persist identical semantics.
+pub fn apply_run_args(
+    mut cfg: Config,
+    args: &RunArgs,
+) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    // update runtime tuning parameters
+    cfg.mss = args.mss;
+    cfg.min_mss = args.min_mss;
+    cfg.restore_mss = args.restore_mss;
+    cfg.restore_after_bytes = args.restore_after_bytes;
+    cfg.ports = args.ports.clone();
+    cfg.cgroup_path = args.cgroup.clone();
+    cfg.fake_ttl = args.fake_ttl;
+    cfg.fake_sni = args.fake_sni.clone();
+    cfg.fake_bad_checksum = args.fake_bad_checksum;
+    cfg.auto_ttl = args.auto_ttl;
+    cfg.min_ttl = args.min_ttl;
+    cfg.max_ttl = args.max_ttl;
+    cfg.doh_enabled = args.doh;
+    cfg.doh_upstream = args.doh_upstream.clone();
+    cfg.doh_bootstrap_ips = args.doh_bootstrap_ips.clone();
+    cfg.block_quic = args.block_quic;
+    cfg.block_stun = args.block_stun;
+    cfg.kill_switch = args.kill_switch;
+    cfg.network_lockdown = args.network_lockdown;
+    cfg.block_ipv6 = args.block_ipv6;
+    cfg.dnssec = args.dnssec;
+    cfg.pqc = args.pqc;
+    cfg.ram_only = args.ram_only;
+    cfg.verbose = args.verbose;
+    Ok(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +722,14 @@ mod tests {
             (Box::new(|c: &mut Config| c.mss = 1500), "mss over 1460"),
             (Box::new(|c: &mut Config| c.min_mss = 200), "min_mss > mss"),
             (Box::new(|c: &mut Config| c.min_mss = 0), "min_mss under 32"),
+            (
+                Box::new(|c: &mut Config| c.restore_mss = 1),
+                "restore_mss under 64",
+            ),
+            (
+                Box::new(|c: &mut Config| c.restore_mss = 1500),
+                "restore_mss over 1460",
+            ),
             (Box::new(|c: &mut Config| c.ports = vec![]), "empty ports"),
             (
                 Box::new(|c: &mut Config| c.ports = vec![443, 443]),
@@ -733,7 +785,11 @@ mod tests {
         cfg.mss = 1460;
         cfg.min_mss = 1460;
         cfg.max_ttl = 64;
+        cfg.restore_mss = 1460;
         cfg.fake_sni = Some("valid-host.example".into());
+        assert!(cfg.validate().is_ok());
+        // 0 = auto line-rate is the default and must stay valid
+        cfg.restore_mss = 0;
         assert!(cfg.validate().is_ok());
     }
 }

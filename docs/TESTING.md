@@ -9,7 +9,13 @@ Everything runs on one machine; no VPS, no external hardware.
 cargo fmt --check && cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo test --test fuzz --test docs --test net
+cargo llvm-cov --workspace --fail-under-lines 55 --summary-only  # needs stable + llvm-tools
 ```
+
+QML (`BarWidget.qml`, `Panel.qml`) has no automated tests: no Quickshell
+runtime exists in CI or here — reviewed by reading (process spawning uses
+absolute paths + arg arrays, all text is `PlainText`, inputs validated).
+If Qt tooling ever becomes available, add at least a parse smoke test.
 
 Privileged suites need interactive root and never fail spuriously
 (they SKIP when preconditions are missing):
@@ -71,38 +77,8 @@ only rules the daemon knows it applied. Verify with:
 `sudo ls -l /etc/albus/.managed` (present after fresh install,
 absent on pre-marker installs until next stop/start cycle).
 
-## Results log (append-only; never invent results)
+## Results
 
-### 2026-09-20 — logic self-tests (no root)
-- Env: `Linux 7.2.5-3-omarchy`, Python 3.14.7, albus @ `develop`.
-- SNI parser (`roblox.com`/`discord.com`, empty + 32-byte session id,
-  garbage rejection) — PASS.
-- Frame parse + TCP checksum round-trip (valid passes, 1-bit flip
-  fails) — PASS.
-- TLS stub + client handshake on 127.0.0.1:19443 (`discord.com`) —
-  `handshake_ok=true` — PASS.
-
-### 2026-09-20 — full root lab run (interactive root via pkexec)
-- Env: `Linux 7.2.5-3-omarchy`, albus `2.1.0` (develop), targets
-  `roblox.com`, `discord.com`, iface `lo`.
-- Service stopped: `sim_rst clean-sni-first-segment` on both targets,
-  `bypassed=false` — sim correctly blocks unprotected handshakes.
-- Service running: no RST on either target, `bypassed=true` — MSS clamp
-  fragments the hello and decoy injection confuses reassembly, so the
-  sim never sees a clean blocked SNI.
-- Loopback caveat (documented in code): our own decoys poison the local
-  stub, so verdicts rest on sim observations, never on handshake success.
-
-### 2026-09-20 — wave-2 unit + privileged suites (develop, uncommitted)
-- `cargo test --lib`: **104 passed**, 0 failed, 2 ignored. New: firewall
-  marker-gating test (`managed_install_present_at`: absent/file/symlink/dir)
-  and NSEC3 closest-encloser test (parent/grandparent/self match,
-  unrelated miss, non-NSEC3 ignored). `cargo clippy --lib`: clean.
-- `cargo test --test root -- --ignored` as root via pkexec: **3 passed**
-  (QUIC block/unblock symmetry; "Bad rule" lines are the test's own
-  idempotent-cleanup noise on absent rules).
-- Live daemon untouched by the suite: `albus.service` still `active`,
-  6×`albus` rules in v4 + 6× in v6 OUTPUT; `/etc/albus/.managed` absent
-  (live install predates the marker — first stop/start with the new
-  binary will take the one-shot legacy-cleanup path, then behave as
-  managed).
+This file is procedures only. Recorded evidence lives in
+docs/TEST_RESULTS.md (signed DPI records + history of earlier runs) and in
+the CI logs of the `dpi-evasion` job. Never invent results.
