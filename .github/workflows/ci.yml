@@ -12,9 +12,16 @@ on:
   schedule:
     - cron: '0 6 * * 1' # weekly audit sweep, Monday 06:00 UTC
 
+# R6: pin the runner image (ubuntu-latest migrates Oct 2026 — kernel/header
+# drift would silently change eBPF/DPI behavior) and avoid duplicate runs
+# stacking on rapid pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
@@ -42,7 +49,9 @@ jobs:
       - name: Install stable toolchain for audit tools
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
         with:
-          toolchain: stable
+          # pinned exact version (R4): floating `stable` made audit/cov
+          # non-reproducible over time; bump deliberately with pins.md
+          toolchain: 1.98.0
       - name: cargo audit (RustSec)
         uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2, pinned: see .github/pins.md
         env:
@@ -53,15 +62,18 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, pinned: see .github/pins.md
-        env:
-          RUSTUP_TOOLCHAIN: stable
+        # NOTE: no RUSTUP_TOOLCHAIN here — the action is a self-contained
+        # docker image; leaking the override in caused a visible rustup
+        # error inside the container (CI #37 forensics).
         with:
           command: check
 
   kernel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    continue-on-error: true # informational until runner kernels stabilize
+    # No continue-on-error: CI #37 proved the hosted kernel loads our eBPF
+    # program for real, so a kernel-job failure is a genuine regression
+    # signal and must turn CI red.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
@@ -72,6 +84,10 @@ jobs:
           toolchain: 1.89
       - name: Install eBPF build deps
         run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+      # R9 forensic record: eBPF/DPI behavior is kernel-sensitive, so the
+      # exact kernel stays in the log even when everything passes.
+      - name: record kernel version
+        run: uname -r && test -e /sys/kernel/btf/vmlinux && echo "BTF present" || echo "BTF MISSING"
       - name: real kernel eBPF load test (root)
         run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test ebpf -- --ignored --nocapture
       - name: privileged firewall symmetry test (root)
@@ -85,7 +101,7 @@ jobs:
   # NOTE: this job lives apart from `kernel` (which is informational until
   # runner kernels stabilize) precisely so a failure here turns CI red.
   dpi-evasion:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
@@ -133,12 +149,14 @@ jobs:
           test "${SIM_RC}" -eq 0
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # artifact upload needs actions:write on top of the read-only default
+    # artifact upload needs actions:write on top of the read-only default;
+    # keyless Sigstore signing needs id-token:write (OIDC to Fulcio).
     permissions:
       contents: read
       actions: write
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
         with:
@@ -153,6 +171,25 @@ jobs:
         run: cargo build --release
       - name: checksum
         run: sha256sum target/release/albus | tee albus.sha256
+      # R7 provenance: keyless Sigstore signature (Fulcio + Rekor) so
+      # downstream users can verify the binary came from this workflow.
+      # Anyone can verify offline: cosign verify-blob --cert albus.pem
+      # --signature albus.sig target/release/albus --certificate-identity
+      # "https://github.com/oqullcan/albus/.github/workflows/ci.yml@refs/heads/develop"
+      # --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Install cosign
+        uses: sigstore/cosign-installer@828df1e55de306ba29db814d6057ddae71883cda # pinned: see .github/pins.md
+        with:
+          cosign-release: v3.1.3
+      - name: sign release binary (Sigstore keyless)
+        run: cosign sign-blob --yes --output-signature albus.sig --output-certificate albus.pem target/release/albus
+      - name: upload signature bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
+        with:
+          name: albus-sigstore
+          path: |
+            albus.sig
+            albus.pem
       - name: upload binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned: see .github/pins.md
         with:
@@ -165,7 +202,7 @@ jobs:
           path: albus.sha256
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: see .github/pins.md
@@ -174,7 +211,8 @@ jobs:
       - name: Install stable toolchain with llvm-tools
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned: see .github/pins.md
         with:
-          toolchain: stable
+          # pinned exact version, see above
+          toolchain: 1.98.0
           components: llvm-tools-preview
       - name: Install eBPF build deps
         run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev

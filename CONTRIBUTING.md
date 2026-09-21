@@ -47,7 +47,9 @@
 
 ## Dependency Maintenance
 
-- Every new dependency must pass `cargo deny check` against `deny.toml`.
+- Every new dependency must pass `cargo deny --all-features check`
+  against `deny.toml` (CI checks all features — plain `check` is not
+  equivalent).
   If it needs a license outside the allow-list, update `deny.toml`
   **and** explain why in the PR — new licenses are a deliberate decision,
   never an accident.
