@@ -8,7 +8,7 @@ Kernel-level DPI evasion engine and DNS-over-HTTPS resolver for Linux. Fragments
 2. Raw-socket injector sends TTL-limited decoy hellos → DPI state desync.
    (Decoy TTL is a static operator-set value, not probed — see `src/core/autottl`.)
 3. Local DoH resolver on 127.0.0.1:53 answers DNS (DNSSEC-validated, kill-switched).
-4. Shaping watchdog (opt-in, off by default) reconciles fresh connections against perf events; unexplained connections across consecutive windows engage fail-closed network lockdown until restart.
+4. Shaping watchdog reconciles fresh connections against perf events; unexplained connections across consecutive windows engage fail-closed network lockdown until restart (`--shaping-watchdog=false` opts out).
 
 ## Requirements
 
@@ -66,7 +66,7 @@ Full flag list: `albus run --help`. Defaults (kept in sync with `Config::default
 | `--kill-switch` | `bool` | `true` |
 | `--network-lockdown` | `bool` | `false` |
 | `--block-ipv6` | `bool` | `true` |
-| `--shaping-watchdog` | `bool` | `false` |
+| `--shaping-watchdog` | `bool` | `true` |
 
 ### Verification
 DPI evasion is verified against a live RST-injection simulator on every CI run — see docs/TEST_RESULTS.md for the latest recorded proof. To verify your own setup: see docs/TESTING.md.

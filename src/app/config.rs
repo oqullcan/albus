@@ -49,7 +49,7 @@ pub struct Config {
     pub network_lockdown: bool,
     #[serde(default = "default_true")]
     pub block_ipv6: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub shaping_watchdog: bool,
     #[serde(default = "default_true")]
     pub dnssec: bool,
@@ -124,7 +124,7 @@ impl Default for Config {
             kill_switch: true,
             network_lockdown: false,
             block_ipv6: true,
-            shaping_watchdog: false,
+            shaping_watchdog: true,
             dnssec: true,
             pqc: true,
             ram_only: false,
@@ -135,6 +135,21 @@ impl Default for Config {
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Resolves the dedicated service user (`albus`, created by
+/// `service install`) to its uid, if the account exists. The rootless
+/// daemon runs as this user, so root-owned-only checks below must also
+/// accept it for daemon-managed paths. None when the account is absent
+/// (pre-migration installs behave exactly as before).
+#[cfg(unix)]
+fn service_uid() -> Option<libc::uid_t> {
+    let name = std::ffi::CString::new("albus").ok()?;
+    let pwd = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pwd.is_null() {
+        return None;
+    }
+    Some(unsafe { (*pwd).pw_uid })
+}
 
 // validates username against Linux / POSIX rules (1..=32 chars, [a-zA-Z_][a-zA-Z0-9_-]*)
 fn is_valid_username(username: &str) -> bool {
@@ -366,7 +381,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
         if current_uid == 0 {
             if is_system_path {
-                if file_uid != 0 {
+                // rootless migration: daemon-managed paths may be owned by
+                // the service user instead of root (both are trusted here;
+                // anything else is still refused)
+                if file_uid != 0 && Some(file_uid) != service_uid() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(

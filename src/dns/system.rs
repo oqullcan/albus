@@ -49,8 +49,10 @@ fn is_valid_iface(name: &str) -> bool {
     true
 }
 
-// enumerates physical and virtual network interfaces excluding loopback and container bridges
-fn get_network_interfaces() -> Vec<String> {
+// enumerates physical and virtual network interfaces excluding loopback and container bridges.
+// pub(crate): the DNS canary (server.rs) reuses the exact same set for
+// per-link verification, so daemon and watchdog can never disagree on scope.
+pub(crate) fn get_network_interfaces() -> Vec<String> {
     let mut ifaces = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
@@ -63,24 +65,108 @@ fn get_network_interfaces() -> Vec<String> {
     ifaces
 }
 
-// updates systemd-resolved link-specific nameservers via resolvectl dbus interface
-fn configure_resolvectl_dns(dns_ip: &str) {
+// updates systemd-resolved link-specific nameservers via resolvectl dbus interface.
+// Returns Err on ANY link failure (callers log loudly — the pre-2026-09-22
+// code swallowed these with `let _`, which once left per-link DNS empty and
+// made every NSS lookup hang behind the kill-switch with zero diagnostics).
+fn configure_resolvectl_dns(dns_ip: &str) -> std::io::Result<()> {
+    let mut failed = Vec::new();
     for iface in get_network_interfaces() {
-        let _ = resolvectl().args(["dns", &iface, dns_ip]).output();
-        let _ = resolvectl().args(["domain", &iface, "~."]).output();
-        let _ = resolvectl()
+        let dns_ok = resolvectl()
+            .args(["dns", &iface, dns_ip])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let domain_ok = resolvectl()
+            .args(["domain", &iface, "~."])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let route_ok = resolvectl()
             .args(["default-route", &iface, "true"])
-            .output();
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !(dns_ok && domain_ok && route_ok) {
+            failed.push(iface);
+        }
     }
     let _ = resolvectl().arg("flush-caches").output();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "resolvectl link configuration failed for interface(s): {}",
+            failed.join(", ")
+        )))
+    }
 }
 
-// restores link-specific dns configuration in systemd-resolved
-pub(crate) fn revert_resolvectl_dns() {
+// restores link-specific dns configuration in systemd-resolved.
+// Best-effort by contract (uninstall/cleanup must not fail hard on it),
+// but failures are RETURNED now (were silently swallowed): callers that
+// can heal (canary) must log + retry instead of assuming success.
+pub(crate) fn revert_resolvectl_dns() -> std::io::Result<()> {
+    let mut failed = Vec::new();
     for iface in get_network_interfaces() {
-        let _ = resolvectl().args(["revert", &iface]).output();
+        let ok = resolvectl()
+            .args(["revert", &iface])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            failed.push(iface);
+        }
     }
     let _ = resolvectl().arg("flush-caches").output();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "resolvectl revert failed for interface(s): {}",
+            failed.join(", ")
+        )))
+    }
+}
+
+/// Reads back per-link DNS servers (`resolvectl dns <iface>`). Pure-parse
+/// split out for unit tests. Header looks like `Link 2 (enp3s0):` followed
+/// by server tokens (possibly across continuation lines); everything after
+/// the `...):` header token is a server. Empty output means no servers.
+pub(crate) fn parse_link_dns_output(text: &str) -> Vec<String> {
+    let mut it = text.split_whitespace();
+    for token in &mut it {
+        if token.ends_with("):") {
+            return it.map(|s| s.to_string()).collect();
+        }
+    }
+    Vec::new()
+}
+
+fn link_dns_servers(iface: &str) -> std::io::Result<Vec<String>> {
+    let out = resolvectl().args(["dns", iface]).output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "resolvectl dns {} failed",
+            iface
+        )));
+    }
+    Ok(parse_link_dns_output(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Interfaces whose per-link DNS does NOT include 127.0.0.1. Unreadable
+/// links count as healthy (not missing): on systems without a working
+/// resolvectl every query would error, and a warning storm every 60 s is
+/// worse than useless — startup already fails loudly if configuration is
+/// impossible, and the /etc/resolv.conf canary still guards the file path.
+pub(crate) fn links_missing_loopback() -> Vec<String> {
+    get_network_interfaces()
+        .into_iter()
+        .filter(|iface| match link_dns_servers(iface) {
+            Ok(servers) => !servers.iter().any(|s| s == "127.0.0.1"),
+            Err(_) => false,
+        })
+        .collect()
 }
 
 /// Resolves write target safely: if `path` is a symlink (e.g. /etc/resolv.conf ->
@@ -172,7 +258,10 @@ fn atomic_write_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
 
 // modifies system resolver configuration to target 127.0.0.1 while preserving original upstream entries
 pub fn set_system_dns() -> Result<()> {
-    configure_resolvectl_dns("127.0.0.1");
+    // resolvectl failures are fatal here (not best-effort): without per-link
+    // DNS the systemd NSS path (`resolve` first in nsswitch) hangs behind
+    // the kill-switch instead of reaching us. Loud error, no silent half-state.
+    configure_resolvectl_dns("127.0.0.1")?;
     set_system_dns_at(RESOLV_CONF_PATH)
 }
 
@@ -223,7 +312,9 @@ pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
 
 // restores original nameserver entries in /etc/resolv.conf and flushes resolver caches
 pub fn restore_system_dns() -> Result<()> {
-    revert_resolvectl_dns();
+    // revert is best-effort (a missing link must not fail the restore),
+    // but a failed revert is no longer silent at the call sites that matter
+    let _ = revert_resolvectl_dns();
     restore_system_dns_at(RESOLV_CONF_PATH)
 }
 
@@ -258,7 +349,7 @@ pub fn restore_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
 
 // detects un-restored albus configuration tags and recovers original system state
 pub fn cleanup_system_dns() -> Result<bool> {
-    revert_resolvectl_dns();
+    let _ = revert_resolvectl_dns();
     cleanup_system_dns_at(RESOLV_CONF_PATH)
 }
 
@@ -412,5 +503,27 @@ mod tests {
         );
         let _ = fs::remove_file(&temp_file);
         let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_parse_link_dns_output() {
+        // standard single + multi-server outputs
+        assert_eq!(
+            parse_link_dns_output("Link 2 (enp3s0): 127.0.0.1"),
+            vec!["127.0.0.1".to_string()]
+        );
+        assert_eq!(
+            parse_link_dns_output("Link 2 (enp3s0): 1.1.1.1 1.0.0.1"),
+            vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+        );
+        // empty (no servers configured) parses to empty, not garbage
+        assert!(parse_link_dns_output("Link 2 (enp3s0):").is_empty());
+        assert!(parse_link_dns_output("").is_empty());
+        assert!(parse_link_dns_output("garbage without header").is_empty());
+        // continuation lines join the same list
+        assert_eq!(
+            parse_link_dns_output("Link 2 (enp3s0): 127.0.0.1\n  1.1.1.1"),
+            vec!["127.0.0.1".to_string(), "1.1.1.1".to_string()]
+        );
     }
 }

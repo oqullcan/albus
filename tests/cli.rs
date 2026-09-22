@@ -58,3 +58,82 @@ fn cli_config_get_prints_json() {
         &text[..text.len().min(120)]
     );
 }
+
+#[test]
+fn cli_status_without_privilege() {
+    // `albus status` is read-only diagnostics: must exit 0 unprivileged
+    // (it degrades to a capability hint instead of probing the kernel)
+    let out = std::process::Command::new(bin())
+        .arg("status")
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("albus status"), "status header present");
+}
+
+#[test]
+fn cli_status_json_is_parseable() {
+    // panel widgets consume this: must always be valid JSON with the
+    // documented shape, even unprivileged (mirrors the unit test in
+    // app::status, end-to-end through the real binary)
+    let out = std::process::Command::new(bin())
+        .args(["status", "--json"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(text.trim()).expect("status --json prints JSON");
+    assert!(v.get("active").is_some(), "payload carries active flag");
+    assert!(v.get("class").is_some(), "payload carries class");
+}
+
+#[test]
+fn cli_cleanup_refuses_unprivileged() {
+    // `albus cleanup` rewrites resolv.conf + iptables: must refuse
+    // without root (fail-closed) and touch nothing. Skipped as root —
+    // that path belongs to the manual root lab, not unit CI.
+    if std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let before = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let out = std::process::Command::new(bin())
+        .arg("cleanup")
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success(), "refusal is Ok, not a crash");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("root"),
+        "must say why it refused: {}",
+        stderr.trim()
+    );
+    let after = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    assert_eq!(before, after, "refused cleanup must not touch resolv.conf");
+}
+
+#[test]
+fn cli_service_status_passthrough() {
+    // `service status` shells to systemctl (read-only): must terminate
+    // promptly with some output, unprivileged. Exit code is systemctl's
+    // business (polkit may deny); survival + output is ours.
+    let out = std::process::Command::new(bin())
+        .args(["service", "status"])
+        .output()
+        .expect("binary runs");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.trim().is_empty(),
+        "systemctl passthrough must produce output, not hang or crash silent"
+    );
+}

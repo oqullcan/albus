@@ -2,6 +2,8 @@
 # Refresh procedure: `git ls-remote <repo> refs/tags/<tag>`, verify the
 # commit on GitHub, update the full SHA below and in ci.yml (form:
 # `uses: <action>@<sha> # <tag>` — never a bare tag).
+# Last currency check 2026-09-21: v4 tags unmoved, stable==1.98.0 matches
+# the ci.yml pin, `cargo audit` clean (196 crates).
 #
 # ci.yml also pins cargo-llvm-cov to a crates.io version:
 # cargo-llvm-cov 0.9.1 (locally validated; bump deliberately).

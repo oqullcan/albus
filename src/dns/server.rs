@@ -173,6 +173,7 @@ impl DnsServer {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut tick_count: u64 = 0;
             let mut last_heal: Option<std::time::Instant> = None;
+            let mut last_link_heal: Option<std::time::Instant> = None;
 
             loop {
                 tokio::select! {
@@ -204,6 +205,30 @@ impl DnsServer {
                         // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
                         if tick_count % 4 == 0 {
                             run_active_canary_probe().await;
+                            // 3. Per-link DNS verification (same cadence): the
+                            // systemd NSS path (`resolve` first in nsswitch)
+                            // hangs behind the kill-switch unless every link
+                            // points at loopback. External reverts (DHCP,
+                            // manual `resolvectl revert`, operator error) are
+                            // healed here, rate-limited like the file path.
+                            let missing =
+                                crate::dns::system::links_missing_loopback();
+                            if !missing.is_empty() {
+                                warn!("DNS leak canary: link(s) {:?} not pointed at 127.0.0.1 (external revert?) — re-applying...", missing);
+                                let can_heal = last_link_heal
+                                    .map(|t| t.elapsed().as_secs() >= 300)
+                                    .unwrap_or(true);
+                                if !can_heal {
+                                    warn!("DNS link auto-heal rate-limited (last heal <5min ago) — skipping");
+                                } else if let Err(e) =
+                                    crate::dns::system::set_system_dns()
+                                {
+                                    warn!("failed to auto-heal link DNS: {}", e);
+                                } else {
+                                    last_link_heal = Some(std::time::Instant::now());
+                                    info!("DNS leak canary: per-link DNS re-applied to 127.0.0.1");
+                                }
+                            }
                         }
                     }
                     _ = canary_shutdown_rx.recv() => {

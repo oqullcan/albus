@@ -597,8 +597,13 @@ impl DnssecValidator {
             }
             // NXDOMAIN additionally needs a closest-encloser proof: a verified
             // NSEC3 whose owner hashes to qname itself or one of its ancestors.
-            // (NODATA keeps covering-only; wildcard-cover completeness for the
-            // wildcard step remains documented future work.)
+            // NODATA keeps covering-only. Deliberately no separate wildcard
+            // correspondence requirement (analyzed 2026-09-21): verdicts only
+            // gate SERVFAIL-vs-serve, so a missing wildcard component cannot
+            // upgrade anything — stripping records can only move Secure
+            // toward Bogus (fail closed), never the reverse. Wildcard-form
+            // groups are still sig+chain verified like all denial records
+            // (see the wildcard regression tests below).
             if nxdomain && !nsec3_encloser {
                 debug!("dnssec: NXDOMAIN lacks closest-encloser proof");
                 return DnssecState::Bogus;
@@ -675,8 +680,15 @@ fn any_nsec3_matches_encloser(recs: &[Record], qname: &Name) -> bool {
 }
 
 /// Parent zone of an NSEC3 owner must equal qname or strictly contain it
-/// (label-boundary suffix match, case-insensitive).
+/// (label-boundary suffix match, case-insensitive). The root parent always
+/// qualifies: root is an ancestor of every name, and root-owned records can
+/// only verify under root keys (chain-checked separately) — without this,
+/// TLD-level denials could never be in scope.
 fn zone_in_scope(rec_name: &Name, qname: &Name) -> bool {
+    let parent = rec_name.base_name();
+    if parent.is_root() {
+        return true;
+    }
     let parent = rec_name.base_name();
     if name_eq(&parent, qname) {
         return true;
@@ -1430,6 +1442,10 @@ mod tests {
         ));
         // case-insensitive
         assert!(zone_in_scope(&n("ABC.EXAMPLE.COM."), &n("example.com.")));
+        // root parent always qualifies (root is every name's ancestor):
+        // without this, TLD-level denials could never be in scope
+        assert!(zone_in_scope(&n("a1b2c3."), &n("missing.")));
+        assert!(zone_in_scope(&n("a1b2c3."), &n(".")));
     }
 
     #[tokio::test]
@@ -1504,5 +1520,183 @@ mod tests {
         // signed CNAME, unsigned terminal: Insecure (served), NOT Bogus
         let state = validator.validate("alias", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
+    }
+
+    /// Builds a self-signed root zone + validator with the key anchored and
+    /// the DNSKEY set cache-seeded: fully offline validation harness for
+    /// denial tests (root short-circuits the chain walk, no fetches).
+    struct DenialFixture {
+        validator: DnssecValidator,
+        root: Name,
+        key_tag: u16,
+        signer: hickory_proto::dnssec::DnssecSigner,
+        now: u32,
+    }
+
+    impl DenialFixture {
+        fn new() -> Self {
+            use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+            use hickory_proto::dnssec::SigningKey;
+            let root = Name::from_ascii(".").unwrap();
+            let der =
+                EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("keygen works");
+            let signing_key =
+                EcdsaSigningKey::from_key_der(&der.into(), Algorithm::ECDSAP256SHA256)
+                    .expect("key parses");
+            let pubkey = signing_key.to_public_key().expect("pubkey derives");
+            let dnskey = DNSKEY::new(true, true, false, pubkey.clone());
+            let key_tag = dnskey.calculate_key_tag().expect("tag computes");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock works")
+                .as_secs() as u32;
+            let mut validator = DnssecValidator::new();
+            validator.anchors.insert(&pubkey);
+            let dnskey_rec = Record::from_rdata(
+                root.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            );
+            validator.cache_store(&root, RecordType::DNSKEY, vec![dnskey_rec]);
+            let signer = hickory_proto::dnssec::DnssecSigner::new(
+                dnskey.clone(),
+                Box::new(signing_key),
+                root.clone(),
+                Duration::from_secs(3600),
+            );
+            DenialFixture {
+                validator,
+                root,
+                key_tag,
+                signer,
+                now,
+            }
+        }
+
+        fn hash(&self, name: &Name) -> Vec<u8> {
+            use hickory_proto::dnssec::Nsec3HashAlgorithm;
+            Nsec3HashAlgorithm::SHA1
+                .hash(&[], name, 0)
+                .expect("hash works")
+                .as_ref()
+                .to_vec()
+        }
+
+        /// Signed NSEC3 group (owner label + next hash + RRSIG), ready for
+        /// the authority section.
+        fn group(&self, owner_hash: &[u8], next_hash: &[u8]) -> Vec<Record> {
+            use hickory_proto::dnssec::rdata::SigInput;
+            use hickory_proto::dnssec::TBS;
+            use hickory_proto::rr::SerialNumber;
+            let owner = Name::from_ascii(&format!("{}.", b32hex_enc(owner_hash))).unwrap();
+            let nsec3 = NSEC3::new(
+                hickory_proto::dnssec::Nsec3HashAlgorithm::SHA1,
+                false,
+                0,
+                vec![],
+                next_hash.to_vec(),
+                [RecordType::A],
+            );
+            let rec =
+                Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+            let input = SigInput {
+                type_covered: RecordType::NSEC3,
+                algorithm: Algorithm::ECDSAP256SHA256,
+                num_labels: 1,
+                original_ttl: 300,
+                sig_expiration: SerialNumber::new(self.now + 3600),
+                sig_inception: SerialNumber::new(self.now - 100),
+                key_tag: self.key_tag,
+                signer_name: self.root.clone(),
+            };
+            let tbs = TBS::from_input(&owner, DNSClass::IN, &input, std::iter::once(&rec))
+                .expect("tbs builds");
+            let sig_bytes = self.signer.sign(&tbs).expect("signing works");
+            let sig_rec = Record::from_rdata(
+                owner,
+                300,
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig_bytes))),
+            );
+            vec![rec, sig_rec]
+        }
+
+        fn nx_message(&self, qname: &str, groups: Vec<Vec<Record>>) -> Vec<u8> {
+            let name = Name::from_ascii(qname).unwrap();
+            let mut msg = Message::new(0x4242, MessageType::Response, OpCode::Query);
+            msg.metadata.response_code = ResponseCode::NXDomain;
+            msg.add_query(Query::query(name, RecordType::A));
+            for g in groups {
+                for rec in g {
+                    msg.authorities.push(rec);
+                }
+            }
+            msg.to_vec().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nxdomain_denial_forged_group_is_bogus_offline() {
+        // Forgery direction stays fail-closed: a tampered NSEC3 group kills
+        // the whole denial even next to a fully valid covering group.
+        let fx = DenialFixture::new();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+        let h = fx.hash(&qname);
+        // covering group: (h-1, h]
+        let mut below = h.clone();
+        below[19] = below[19].wrapping_sub(1);
+        let cover = fx.group(&below, &h);
+        // encloser group: owner == hash(example.)
+        let enc = fx.hash(&Name::from_ascii("example.").unwrap());
+        let encloser = fx.group(&enc, &enc);
+        // forged group: valid shape, but the next-hash is flipped so the
+        // signature over the RRset no longer verifies (same effect as a
+        // corrupted RRSIG, without depending on signature codecs)
+        let mut forged_group = fx.group(&h, &h);
+        for rec in forged_group.iter_mut() {
+            if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &mut rec.data {
+                let mut next = nsec3.next_hashed_owner_name().to_vec();
+                next[0] ^= 0x01;
+                *nsec3 = NSEC3::new(
+                    nsec3.hash_algorithm(),
+                    nsec3.opt_out(),
+                    nsec3.iterations(),
+                    nsec3.salt().to_vec(),
+                    next,
+                    nsec3.type_bit_maps(),
+                );
+            }
+        }
+        let wire = fx.nx_message("missing.example.", vec![cover, encloser, forged_group]);
+        let resolver = dummy_resolver();
+        let state = fx
+            .validator
+            .validate("missing.example", 1, &wire, &resolver)
+            .await;
+        assert_eq!(state, DnssecState::Bogus);
+    }
+
+    #[tokio::test]
+    async fn test_nxdomain_wildcard_form_group_does_not_break_offline() {
+        // A present, valid wildcard-form NSEC3 (owner == hash(*.example.))
+        // neither proves nor breaks the denial: verdict still Secure via
+        // the covering + encloser groups. Locks the analyzed semantic that
+        // wildcard correspondence is not a Bogus trigger.
+        let fx = DenialFixture::new();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+        let h = fx.hash(&qname);
+        let mut below = h.clone();
+        below[19] = below[19].wrapping_sub(1);
+        let cover = fx.group(&below, &h);
+        let enc = fx.hash(&Name::from_ascii("example.").unwrap());
+        let encloser = fx.group(&enc, &enc);
+        let wild = fx.hash(&Name::from_ascii("*.example.").unwrap());
+        let wildcard = fx.group(&wild, &wild);
+        let wire = fx.nx_message("missing.example.", vec![cover, encloser, wildcard]);
+        let resolver = dummy_resolver();
+        let state = fx
+            .validator
+            .validate("missing.example", 1, &wire, &resolver)
+            .await;
+        assert_eq!(state, DnssecState::Secure);
     }
 }

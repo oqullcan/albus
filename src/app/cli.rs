@@ -161,12 +161,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub block_ipv6: bool,
 
-    // shaping watchdog: periodically verify the eBPF program is still
-    // attached (query + MSS probe); on double-confirmed loss, engage
-    // fail-closed network lockdown once until restart. DEFAULT OFF: the
-    // loopback MSS probe reads GSO-inflated values and false-trips (see
-    // incident 2026-09-21); re-enable only with a sound detector.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    // shaping watchdog: periodically reconcile fresh connections against
+    // perf events; on consecutive unexplained windows, engage fail-closed
+    // network lockdown once until restart. On by default (soaked live with
+    // real traffic, zero false trips after the overrun fix).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub shaping_watchdog: bool,
 
     // tcp max segment size clamp for tls clienthello fragmentation

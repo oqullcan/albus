@@ -252,6 +252,84 @@ docs/TESTING.md; new signed DPI records go at the top of this file.
 - Install note: a stray `albus monitor` TUI holds the binary busy
   (`Text file busy` on cp) — remove-then-copy (`rm -f` + `cp`) replaces
   it safely; the running monitor keeps its old pages.
+- Rootless install caveat: `service install` run from the INSTALLED
+  binary always fails self-copy (`current_exe == SYSTEM_BIN_PATH` →
+  ETXTBSY fail-closed). Always install from the build tree
+  (`./target/release/albus service install`).
+
+### "Internet dies with albus on" triage, part 2: PQ-intolerance (2026-09-22)
+
+- After the island fix, remaining failures narrowed per-destination:
+  packet capture showed the server (or on-path box) answering curl's
+  ClientHello with fatal `15 03 01 00 02 02 28` (alert 40).
+- Hello forensics (curl `--trace` parse): 1546-byte hello offering
+  `SecP256r1MLKEM768 (0x11ec)` FIRST with a 1216-byte share. Deterministic
+  repro: `openssl s_client -groups SecP256r1MLKEM768` → alert 40;
+  `-groups X25519MLKEM768` → negotiates fine; `-groups X25519` → fine.
+  Conclusion: something on that path kills 0x11ec hellos specifically —
+  external to albus (reproduced with shaping fully off, DNS+firewall only;
+  albus never touches hello bytes).
+- Our own DoH (aws-lc-rs defaults) still completes — different edges
+  tolerate; no albus change made (would fix nothing user-side).
+- Fastly (93.184.216.34) and Meta (157.240.1.1) paths dead even with
+  daemon stopped and zero rules loaded (ICMP-proven) — upstream/ISP-side.
+### "Internet dies with albus on" triage, part 3: polkit-locked NSS (2026-09-22)
+
+- Symptom: total outage with daemon active, instant recovery when off —
+  but ICMP/TCP matrices showed selective path failures, masking the real
+  mechanism: `nsswitch.conf` puts systemd `resolve` FIRST, and resolved's
+  upstreams (:53/:853) are kill-switch-dropped, so EVERY glibc lookup
+  hung (not failed) whenever resolved had no per-link DNS to loopback.
+- Root cause, two layers: (a) `configure_resolvectl_dns` swallowed ALL
+  errors (`let _`), so missing per-link DNS was invisible — and my own
+  spike-test `revert` had wiped it; (b) under the rootless unit
+  (`User=albus` + `NoNewPrivileges`), SetLinkDNS et al. fail with
+  "requires interactive authentication" — reproduced exactly via
+  `systemd-run` with the unit's sandbox flags (plain setpriv worked,
+  sandboxed failed).
+- Fix: explicit polkit allowlist for the `albus` user
+  (`set-dns-servers`, `set-domains`, `set-default-route`, `revert`,
+  `flush-caches` → YES; nothing beyond what the daemon already controls
+  via `/etc/resolv.conf`) + `configure`/`revert` return `Result` with
+  loud errors + startup treats configure failure as fatal + canary
+  re-verifies per-link DNS every 60 s and self-heals (own 5-min gate).
+- Regression tests: polkit content asserts, `parse_link_dns_output`
+  fixtures. Live validation after reinstall: per-link `127.0.0.1` applied
+  by the daemon itself, `getent` instant, chatgpt 403 in 0.02 s, github
+  200 in 0.5 s, eBPF attached, 0 lockdown, 0 BOGUS.
+- Suite: 138 lib green, clippy/fmt clean.
+
+### Round-up: CLI surface, QML evidence, ExecStopPost+, unit render test
+
+- `tests/cli.rs` extended to 7 (status, status --json shape, cleanup
+  refusal with resolv.conf untouched, service status passthrough).
+- QML best-available evidence: installed copy byte-identical; live
+  shell journal zero QML errors. Recorded in TESTING.md.
+- `ExecStopPost=+albus cleanup` (rootless made the old line a no-op):
+  unit template extracted to pure `build_unit_content()` + regression
+  test asserting the `+` prefix, User=albus, caps, memlock lines; rendered
+  output passes `systemd-analyze verify` clean (checker sanity-checked
+  against a broken fixture).
+- Live install test of the new unit: BLOCKED (pkexec agent dead this
+  session); will run on next root window before any release.
+
+### "Internet dies with albus on" triage (live, 2026-09-21)
+
+- Method: ICMP matrix (albus has NO code path affecting ICMP — any ping
+  failure is definitionally external) + DNS matrix + IP-literal TCP
+  matrix + iptables counters, daemon on vs off.
+- Proven albus-independent: `93.184.216.34` (Fastly/example.com) and
+  `157.240.1.1` (Meta) ping-fail with daemon STOPPED and zero albus
+  rules loaded; 1.1.1.1/8.8.8.8/9.9.9.9 fine throughout. Traceroute-by-TTL
+  dies after hop 4 (81.212.211.204) with no further replies — upstream
+  path issue toward those networks, not on-host.
+- Proven albus-healthy at the same time: TCP:443 to 1.1.1.1 in 0.02 s
+  and to 8.8.8.8 in 0.08 s with daemon active; no lockdown rules;
+  validator BOGUS-quiet post-restart; all instagram/fbcdn hostnames
+  resolve.
+- Earlier "off=works" correlation was flapping paths + the two real
+  albus bugs already fixed above (lockdown incident, island SERVFAIL).
+  UFW is active with default policies throughout (coexists, not involved).
 
 ### Shaping watchdog validation (local root lab, 2026-09-21)
 
@@ -340,3 +418,19 @@ docs/TESTING.md; new signed DPI records go at the top of this file.
   **5/5 green** — Phase A first-seg 517 B (whole, RST as designed),
   Phase B first-seg 127/130 B (fragmented, bypass as designed). The
   mechanism is now visible in CI logs, not inferred.
+
+### Round-up: CLI surface, QML evidence, watchdog default-on (2026-09-21)
+
+- `tests/cli.rs` extended: `status`, `status --json` (shape-asserted),
+  `cleanup` refusal (asserts the root message + `resolv.conf` untouched),
+  `service status` passthrough (asserts output, not hang). 7/7 green.
+  (One authored test asserted nothing — caught in review, replaced with
+  a real output assertion before commit.)
+- QML best-available evidence: installed plugin copy byte-identical to
+  repo; live Omarchy shell journal shows zero QML errors for it (only an
+  unrelated bluetooth DBus warning + my own `qml6` probe failure, which
+  cannot resolve Quickshell imports by design). Recorded in TESTING.md.
+- Watchdog default flipped to **on** (code + README table): 1 h+ soak
+  with flag on and real traffic, 0 trips, 0 lockdown; trip-on-demand and
+  burst-proof proven earlier. Machine config already had it on; fresh
+  installs now get it too. QML untouched (it never sends the flag).

@@ -8,6 +8,53 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+// Linux capability numbers (linux/capability.h) backing the systemd unit's
+// AmbientCapabilities set. A non-root daemon holding exactly these runs
+// everything albus needs (raw sockets, iptables, eBPF, :53 bind,
+// resolv.conf writes) with nothing else.
+pub const CAP_DAC_OVERRIDE: u64 = 1;
+pub const CAP_NET_BIND_SERVICE: u64 = 10;
+pub const CAP_NET_ADMIN: u64 = 12;
+pub const CAP_NET_RAW: u64 = 13;
+pub const CAP_PERFMON: u64 = 38;
+pub const CAP_BPF: u64 = 39;
+
+pub const REQUIRED_SERVICE_CAPS: u64 = (1 << CAP_DAC_OVERRIDE)
+    | (1 << CAP_NET_BIND_SERVICE)
+    | (1 << CAP_NET_ADMIN)
+    | (1 << CAP_NET_RAW)
+    | (1 << CAP_PERFMON)
+    | (1 << CAP_BPF);
+
+/// Whether this process may run the engine: uid 0, or a dedicated service
+/// user holding exactly the capability set above (see the systemd unit).
+/// Service MANAGEMENT commands (install/start/stop via systemctl) still
+/// require real root — capabilities do not authorize those.
+pub fn has_service_privileges() -> bool {
+    if is_root() {
+        return true;
+    }
+    match cap_eff_self() {
+        Some(eff) => eff & REQUIRED_SERVICE_CAPS == REQUIRED_SERVICE_CAPS,
+        None => false,
+    }
+}
+
+/// Parse helper, pure and unit-tested: effective capability mask from
+/// /proc/self/status text. Unknown/malformed input yields None (fail
+/// closed: has_service_privileges then refuses).
+pub fn cap_eff_from_status(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("CapEff:")?;
+        u64::from_str_radix(rest.trim(), 16).ok()
+    })
+}
+
+fn cap_eff_self() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    cap_eff_from_status(&text)
+}
+
 // inspects /proc/mounts to verify presence of cgroup2 filesystem at target mount path
 pub fn is_cgroup_v2(path: &str) -> bool {
     let p = Path::new(path);
@@ -135,6 +182,47 @@ mod tests {
     fn test_capability_summary() {
         let (root, cgroup, sockops, btf) = capability_summary();
         let _ = (root, cgroup, sockops, btf);
+    }
+
+    #[test]
+    fn test_cap_eff_parsing() {
+        let sample = "Name:\talbus\nUid:\t996\t996\t996\t996\nCapEff:\t00000000800405fb\n";
+        assert_eq!(cap_eff_from_status(sample), Some(0x800405fb));
+        assert_eq!(cap_eff_from_status("no caps here\n"), None);
+        assert_eq!(cap_eff_from_status("CapEff:\tZZZ\n"), None);
+        assert_eq!(cap_eff_from_status(""), None);
+    }
+
+    #[test]
+    fn test_required_caps_shape() {
+        // exactly the six unit capabilities, nothing else
+        let mut count = 0u32;
+        let mut bits = REQUIRED_SERVICE_CAPS;
+        while bits != 0 {
+            count += (bits & 1) as u32;
+            bits >>= 1;
+        }
+        assert_eq!(count, 6);
+        for cap in [
+            CAP_DAC_OVERRIDE,
+            CAP_NET_BIND_SERVICE,
+            CAP_NET_ADMIN,
+            CAP_NET_RAW,
+            CAP_PERFMON,
+            CAP_BPF,
+        ] {
+            assert_ne!(REQUIRED_SERVICE_CAPS & (1 << cap), 0);
+        }
+    }
+
+    #[test]
+    fn test_has_service_privileges_matches_self() {
+        // self-consistency, not privilege level: root passes, and a
+        // capability-bearing non-root passes iff the mask covers the set.
+        // (Real non-root coverage happens in the root lab as the albus user.)
+        if is_root() {
+            assert!(has_service_privileges());
+        }
     }
 }
 

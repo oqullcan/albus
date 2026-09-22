@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::app::config::Config;
 use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
-use crate::core::ebpf::{is_root, BpfManager, BpfManagerConfig};
+use crate::core::ebpf::{has_service_privileges, BpfManager, BpfManagerConfig};
 use crate::core::firewall::{
     block_quic, block_stun, disable_kill_switch, disable_network_lockdown, enable_kill_switch,
     enable_network_lockdown, unblock_quic, unblock_stun,
@@ -96,8 +96,13 @@ impl Engine {
 
     // starts all subsystems and blocks awaiting sigint or sigterm termination signals
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !is_root() {
-            return Err("albus requires root privileges — run with sudo".into());
+        // rootless-ready gate: uid 0 OR the dedicated service user holding
+        // the unit's capability set (see has_service_privileges). Plain
+        // unprivileged users are still refused before anything is touched.
+        if !has_service_privileges() {
+            return Err(
+                "albus requires root or the albus service user (see User= in albus.service) — run with sudo".into(),
+            );
         }
 
         // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection).
@@ -126,7 +131,12 @@ impl Engine {
             }
             if let Err(e) = set_system_dns() {
                 // full revert: resolvectl links may already be pointed at loopback
-                crate::dns::system::revert_resolvectl_dns();
+                if let Err(re) = crate::dns::system::revert_resolvectl_dns() {
+                    warn!(
+                        "failed to revert resolvectl links during startup rollback: {}",
+                        re
+                    );
+                }
                 let _ = restore_system_dns();
                 dns.stop();
                 self.cleanup_firewall_only();
@@ -340,6 +350,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ebpf::is_root;
 
     #[test]
     fn test_failed_start_applies_nothing() {

@@ -22,6 +22,24 @@ const POLKIT_RULE_CONTENT: &str = r#"polkit.addRule(function(action, subject) {
             }
         }
     }
+    // Rootless daemon support: the albus service user must drive per-link
+    // DNS without interactive auth (NoNewPrivileges + no agent in daemon
+    // context). Without this, SetLinkDNS et al. fail with "requires
+    // interactive authentication", set_system_dns aborts startup, and every
+    // NSS lookup hangs behind the kill-switch with zero diagnostics (seen
+    // live 2026-09-22). Explicit action list on purpose: nothing here
+    // exceeds what the daemon already controls (it writes /etc/resolv.conf
+    // directly), so this grants no new capability — it only unbreaks the
+    // D-Bus path for the dedicated account.
+    if (subject.user == "albus") {
+        if (action.id == "org.freedesktop.resolve1.set-dns-servers" ||
+            action.id == "org.freedesktop.resolve1.set-domains" ||
+            action.id == "org.freedesktop.resolve1.set-default-route" ||
+            action.id == "org.freedesktop.resolve1.revert" ||
+            action.id == "org.freedesktop.resolve1.flush-caches") {
+            return polkit.Result.YES;
+        }
+    }
 });
 "#;
 
@@ -176,11 +194,154 @@ fn persist_install_config_at(
     Ok(())
 }
 
+/// Ensures the `albus` system user/group exist for rootless runtime.
+/// Idempotent: existing accounts (any uid, locked password, nologin shell
+/// or otherwise) are accepted as-is — install never mutates an existing
+/// account, it only creates a missing one with safe defaults.
+fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let check = std::process::Command::new("/usr/sbin/useradd")
+        .arg("--help")
+        .output();
+    if check.is_err() {
+        // no useradd (minimal container?): rootless is unavailable;
+        // install continues — the unit will fail loudly at startup
+        // instead of here, and has_service_privileges documents why.
+        eprintln!("warning: /usr/sbin/useradd missing, skipping service-user creation");
+        return Ok(());
+    }
+    // `id albus` decides: present -> accept untouched, absent -> create.
+    // Absolute paths, no shell, fixed argv (no user input reaches exec).
+    let id_status = std::process::Command::new("/usr/bin/id")
+        .arg("albus")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if id_status.success() {
+        return Ok(());
+    }
+    let create = std::process::Command::new("/usr/sbin/useradd")
+        .args([
+            "--system",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--comment",
+            "albus DPI evasion daemon",
+            "albus",
+        ])
+        .status()?;
+    if !create.success() {
+        return Err("failed to create albus system user (see useradd output)".into());
+    }
+    Ok(())
+}
+
+/// Ensures daemon-managed directories exist with service-user ownership.
+/// Pre-existing content is never deleted or re-permissioned file-by-file:
+/// only the top directory ownership is converged (root-owned leftovers
+/// from pre-migration installs become daemon-writable this way).
+fn ensure_service_dirs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+    let etc_albus = Path::new("/etc/albus");
+    if !etc_albus.exists() {
+        fs::create_dir_all(etc_albus)?;
+        fs::set_permissions(etc_albus, fs::Permissions::from_mode(0o755))?;
+    }
+    // converge top-dir ownership to the service user when the account exists
+    if let Ok(c_user) = std::ffi::CString::new("albus") {
+        unsafe {
+            let pwd = libc::getpwnam(c_user.as_ptr());
+            if !pwd.is_null() {
+                let (uid, gid) = ((*pwd).pw_uid, (*pwd).pw_gid);
+                // chown the DIRECTORY (not recursive): files keep their
+                // owners; the daemon only needs traversal + its own files
+                if let Ok(c_dir) = std::ffi::CString::new("/etc/albus") {
+                    if libc::chown(c_dir.as_ptr(), uid, gid) != 0 {
+                        return Err("failed to chown /etc/albus to the albus user".into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Renders the systemd unit template (pure; unit-tested). Keeping
+/// rendering separate from install I/O means CI validates the exact bytes
+/// systemd will receive, including the load-bearing `+` on ExecStopPost.
+fn build_unit_content(exec_start: &str, exec_stop: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=albus — High-Performance eBPF DPI Bypass & DoH DNS Service
+Documentation=https://github.com/oqullcan/albus
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Rootless operation (L1 migration): the daemon runs as the dedicated
+# `albus` system user with exactly the capabilities below — full root is
+# no longer required at runtime. Service MANAGEMENT (this install/uninstall
+# path) still runs as real root.
+User=albus
+Group=albus
+# Volatile + persistent state owned by the service user (created here and
+# by StateDirectory); /etc/resolv.conf stays root-owned (CAP_DAC_OVERRIDE
+# covers the daemon's rewrite) and is guarded by ReadWritePaths.
+RuntimeDirectory=albus
+RuntimeDirectoryMode=0750
+StateDirectory=albus
+Environment=HOME=/var/lib/albus
+# BPF maps + perf rings charge memlock: the default 64 KiB process limit
+# would fail map creation for a non-root daemon. Unlimited here (the maps
+# are small and bounded in code: 64-entry hashes, 32-page rings).
+LimitMEMLOCK=infinity
+ExecStart={exec_start}
+ExecReload=/bin/kill -s HUP $MAINPID
+# NOTE (L4, deliberate tradeoff): ExecStopPost runs `cleanup` on EVERY stop,
+# including crashes — so a crash briefly lifts kill-switch/lockdown until
+# `Restart=always` (3 s) brings the daemon back. Fail-open-for-seconds beats
+# fail-closed-forever here: a persistent lockdown without a daemon would
+# brick outbound web/DNS with no self-recovery. Crash loops are visible in
+# the journal; protections re-apply on each restart.
+# The `+` prefix is load-bearing: with User=albus below, an unprefixed
+# ExecStopPost would run unprivileged and `cleanup` would refuse (it needs
+# root for resolv.conf/iptables) — leaving stale DNS/rules behind exactly
+# when they matter most (post-crash). `+` forces full privileges.
+ExecStopPost=+{exec_stop}
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+# Privilege model (L1 migration complete): the daemon runs as User=albus
+# with exactly these capabilities — full root is no longer required at
+# runtime. has_service_privileges() enforces the same set in-process.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run /etc/resolv.conf /etc/albus
+
+[Install]
+WantedBy=multi-user.target
+"#,
+    )
+}
+
 // generates systemd unit file with AmbientCapabilities, installs polkit rule, and enables auto-start
 fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
         return Err("albus service install requires root privileges — run with sudo".into());
     }
+
+    // 0. dedicated service user for rootless runtime (idempotent: existing
+    // installs, custom uids, and re-runs all converge here without damage)
+    ensure_service_user()?;
+    // daemon-managed paths owned by the service user (config, marker dir);
+    // /etc/resolv.conf itself stays root-owned (daemon rewrites it via
+    // CAP_DAC_OVERRIDE under ReadWritePaths)
+    ensure_service_dirs()?;
 
     // copy binary to standard system execution path — FAIL CLOSED, no fallback
     let exe_path = std::env::current_exe()?;
@@ -204,48 +365,10 @@ fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     let exec_stop = format!("{} cleanup", exe_str);
 
     // format systemd service specification (least-privilege capabilities + hardening)
-    let unit_content = format!(
-        r#"[Unit]
-Description=albus — High-Performance eBPF DPI Bypass & DoH DNS Service
-Documentation=https://github.com/oqullcan/albus
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart={exec_start}
-ExecReload=/bin/kill -s HUP $MAINPID
-# NOTE (L4, deliberate tradeoff): ExecStopPost runs `cleanup` on EVERY stop,
-# including crashes — so a crash briefly lifts kill-switch/lockdown until
-# `Restart=always` (3 s) brings the daemon back. Fail-open-for-seconds beats
-# fail-closed-forever here: a persistent lockdown without a daemon would
-# brick outbound web/DNS with no self-recovery. Crash loops are visible in
-# the journal; protections re-apply on each restart.
-ExecStopPost={exec_stop}
-Restart=always
-RestartSec=3
-LimitNOFILE=65536
-# Privilege model (L1, deliberate): the daemon runs as uid 0 — no User= line.
-# The AmbientCapabilities below are not theater for the future: they document
-# the exact set a User=albus migration needs (raw sockets, iptables, eBPF,
-# :53 bind, resolv.conf writes). Until file ownership (/etc/resolv.conf,
-# /etc/albus), cgroup access, and iptables-restore paths are migrated AND
-# soak-tested as non-root, uid 0 stays: startup needs all of them at once,
-# and a half-migrated daemon would fail in ways that look like DPI breakage.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/run /etc/resolv.conf
-
-[Install]
-WantedBy=multi-user.target
-"#,
-    );
+    let unit_content = build_unit_content(&exec_start, &exec_stop);
 
     secure_write_root_file(SERVICE_FILE_PATH, &unit_content, 0o600)?;
+
     println!("Created systemd service unit: {}", SERVICE_FILE_PATH);
 
     // install polkit authorization rule (fail closed — no silent half-install)
@@ -417,6 +540,32 @@ mod tests {
     }
 
     #[test]
+    fn test_unit_content_carries_load_bearing_lines() {
+        // the template is what systemd will execute: assert the exact
+        // security-critical lines render (unsubstituted placeholders or a
+        // lost `+` prefix would silently weaken stop-cleanup or privileges)
+        let unit = build_unit_content("/usr/local/bin/albus run", "/usr/local/bin/albus cleanup");
+        assert!(
+            unit.contains("ExecStopPost=+/usr/local/bin/albus cleanup"),
+            "cleanup must run privileged (+ prefix)"
+        );
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/albus run"),
+            "daemon entrypoint must render"
+        );
+        assert!(unit.contains("User=albus"), "rootless user must render");
+        assert!(
+            unit.contains("AmbientCapabilities=CAP_NET_ADMIN"),
+            "capability set must render"
+        );
+        assert!(
+            unit.contains("LimitMEMLOCK=infinity"),
+            "memlock limit must render (else maps fail as non-root)"
+        );
+        assert!(!unit.contains("{exec_"), "no unsubstituted placeholders");
+    }
+
+    #[test]
     fn test_validate_exec_path_rejects_injection() {
         for bad in [
             "/tmp/my albus",
@@ -518,5 +667,53 @@ mod service_fs_tests {
         assert_eq!(loaded.doh_upstream, "cloudflare");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_service_mgmt_requires_root() {
+        // install/uninstall touch system state: unprivileged callers must
+        // be refused before anything happens. Skipped as root (that path
+        // belongs to the manual root lab, never unit CI).
+        if is_root() {
+            return;
+        }
+        use clap::Parser;
+        let args = match crate::app::cli::Cli::try_parse_from(["albus", "service", "install"])
+            .unwrap()
+            .command
+        {
+            Some(crate::app::cli::Commands::Service(svc)) => match svc.command {
+                crate::app::cli::ServiceCommands::Install(a) => a,
+                _ => panic!("expected install subcommand"),
+            },
+            _ => panic!("expected service command"),
+        };
+        assert!(install_service(&args).is_err());
+        assert!(uninstall_service().is_err());
+    }
+
+    #[test]
+    fn test_polkit_rule_covers_service_user_resolve1() {
+        // the rootless daemon's SetLinkDNS calls die with "requires
+        // interactive authentication" without this (seen live): assert the
+        // exact action IDs + account + YES verdict are present, and that the
+        // unit-management gate is unchanged.
+        for action in [
+            "org.freedesktop.resolve1.set-dns-servers",
+            "org.freedesktop.resolve1.set-domains",
+            "org.freedesktop.resolve1.set-default-route",
+            "org.freedesktop.resolve1.revert",
+            "org.freedesktop.resolve1.flush-caches",
+        ] {
+            assert!(
+                POLKIT_RULE_CONTENT.contains(action),
+                "rule must authorize {}",
+                action
+            );
+        }
+        assert!(POLKIT_RULE_CONTENT.contains("subject.user == \"albus\""));
+        assert!(POLKIT_RULE_CONTENT.contains("polkit.Result.YES"));
+        assert!(POLKIT_RULE_CONTENT.contains("org.freedesktop.systemd1.manage-units"));
+        assert!(POLKIT_RULE_CONTENT.contains("polkit.Result.AUTH_ADMIN"));
     }
 }
