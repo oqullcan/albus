@@ -51,32 +51,36 @@ impl BpfManager {
     }
 
     // reloads ebpf maps live at runtime without stopping or detaching the program
+    // FP-17: push first, swap cfg only on success; absent handles (pre-start)
+    // is an explicit error, never a silent Ok.
     pub fn reload_maps(
         &mut self,
         new_cfg: &BpfManagerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(handles) = self.map_handles else {
+            return Err("eBPF maps not loaded yet — start the engine before reload".into());
+        };
+        let bpf_cfg = BpfConfig::new(
+            new_cfg.mss,
+            new_cfg.restore_mss,
+            new_cfg.restore_after_bytes,
+            new_cfg.min_mss,
+            true,
+        );
+        handles.push_config(bpf_cfg)?;
+        handles.push_target_ports(&new_cfg.ports)?;
+        handles.push_exclude_ips(&new_cfg.exclude_ips)?;
+        handles.push_exclude_ips_v6(&new_cfg.exclude_ips_v6)?;
+        // all pushes succeeded: now adopt the new config (no cfg/map divergence)
         self.cfg = new_cfg.clone();
-        if let Some(handles) = self.map_handles {
-            let bpf_cfg = BpfConfig::new(
-                new_cfg.mss,
-                new_cfg.restore_mss,
-                new_cfg.restore_after_bytes,
-                new_cfg.min_mss,
-                true,
-            );
-            handles.push_config(bpf_cfg)?;
-            handles.push_target_ports(&new_cfg.ports)?;
-            handles.push_exclude_ips(&new_cfg.exclude_ips)?;
-            handles.push_exclude_ips_v6(&new_cfg.exclude_ips_v6)?;
-            info!(
-                mss = new_cfg.mss,
-                min_mss = new_cfg.min_mss,
-                ports = ?new_cfg.ports,
-                exclude_count = new_cfg.exclude_ips.len(),
-                exclude_v6_count = new_cfg.exclude_ips_v6.len(),
-                "eBPF runtime maps reloaded dynamically"
-            );
-        }
+        info!(
+            mss = new_cfg.mss,
+            min_mss = new_cfg.min_mss,
+            ports = ?new_cfg.ports,
+            exclude_count = new_cfg.exclude_ips.len(),
+            exclude_v6_count = new_cfg.exclude_ips_v6.len(),
+            "eBPF runtime maps reloaded dynamically"
+        );
         Ok(())
     }
 
@@ -157,6 +161,9 @@ impl BpfManager {
                 .enable_all()
                 .build()
                 .ok();
+            // FP-13: enter the runtime so estimator.get_ttl's try_current
+            // finds a context and background estimation actually runs.
+            let _enter_guard = rt.as_ref().map(|r| r.enter());
             let mut decoy_idx: usize = 0;
 
             while running_clone.load(Ordering::Relaxed) {

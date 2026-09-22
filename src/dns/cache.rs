@@ -182,7 +182,7 @@ pub(crate) fn scan_opt(data: &[u8]) -> OptScan {
             return OptScan::Malformed;
         }
         let rr_type = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
-        let rdlen = ((((data[pos + 8] as u16) << 8) | (data[pos + 9] as u16)) as usize);
+        let rdlen = (((data[pos + 8] as u16) << 8) | data[pos + 9] as u16) as usize;
         if rr_type == 41 {
             return OptScan::Present {
                 ttl_offset: pos + 4,

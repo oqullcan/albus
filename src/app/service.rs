@@ -323,6 +323,33 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(s) => eprintln!("warning: systemctl disable exited {}", s),
         Err(e) => eprintln!("warning: systemctl disable failed to spawn ({})", e),
     }
+
+    // FP-09: revert persistent network state FIRST, before any fallible file
+    // or daemon housekeeping that could abort with `return Err` and strand it.
+    // FP-10: report revert outcomes instead of assuming success.
+    let fw_removed = crate::core::firewall::unblock_quic()
+        + crate::core::firewall::unblock_stun()
+        + crate::core::firewall::disable_kill_switch()
+        + crate::core::firewall::disable_network_lockdown();
+    println!("Removed {} firewall rule(s).", fw_removed);
+    let dns_reverted = match crate::dns::cleanup_system_dns() {
+        Ok(true) => {
+            println!("Restored original system DNS.");
+            true
+        }
+        Ok(false) => {
+            println!("No albus DNS markers found; resolver left untouched.");
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: DNS restore failed: {} — check /etc/resolv.conf manually",
+                e
+            );
+            false
+        }
+    };
+
     match secure_remove_file(SERVICE_FILE_PATH) {
         Ok(true) => println!("Removed {}", SERVICE_FILE_PATH),
         Ok(false) => println!("No albus.service file found at {}", SERVICE_FILE_PATH),
@@ -339,14 +366,14 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => return Err(e),
     }
 
-    // FP-03: mirror Cleanup — revert all four families unconditionally so no
-    // fail-closed rules outlive the daemon regardless of stop outcome.
-    crate::core::firewall::unblock_quic();
-    crate::core::firewall::unblock_stun();
-    crate::core::firewall::disable_kill_switch();
-    crate::core::firewall::disable_network_lockdown();
-    let _ = crate::dns::cleanup_system_dns();
-    println!("albus service uninstalled and system settings cleaned up.");
+    // FP-10: qualify the final message on the revert outcomes above.
+    if dns_reverted {
+        println!("albus service uninstalled and system settings cleaned up.");
+    } else {
+        println!(
+            "albus service uninstalled BUT DNS restore failed — run `sudo albus cleanup` and verify /etc/resolv.conf."
+        );
+    }
     // FP-04: the system binary is intentionally retained (lets the admin run
     // `sudo albus cleanup` afterwards); say so instead of implying full removal.
     println!(

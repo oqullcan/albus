@@ -72,7 +72,9 @@ fn ensure_rule(v6: bool, args: &[&str], comment: &str) {
 }
 
 /// Bounded delete: avoids infinite loop if binary is shimmed.
-fn delete_rule_bounded(v6: bool, args: &[&str]) {
+/// FP-10: returns the number of rules actually deleted so callers can report.
+fn delete_rule_bounded(v6: bool, args: &[&str]) -> usize {
+    let mut removed = 0;
     // 1. new-style rules (with per-feature comments)
     for comment in [
         "albus-quic",
@@ -91,7 +93,10 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
                 iptables_base().args(&del_args).status()
             };
             match status {
-                Ok(s) if s.success() => continue,
+                Ok(s) if s.success() => {
+                    removed += 1;
+                    continue;
+                }
                 _ => break,
             }
         }
@@ -101,6 +106,7 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
     // comment-less rules sharing the tuple. Pre-hardening residue (comment-less
     // albus rules) is fail-closed and stays until removed manually — documented
     // instead of blindly deleted. See REPORT run-1 FP-07.
+    removed
 }
 
 // injects icmp port unreachable / tcp reset via iptables reject on udp 443
@@ -119,12 +125,14 @@ pub fn block_quic() {
     info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
 }
 
-// purges injected reject rules for udp 443
-pub fn unblock_quic() {
-    delete_rule_bounded(false, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
-    delete_rule_bounded(true, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
+// purges injected reject rules for udp 443. Returns rules deleted (FP-10).
+pub fn unblock_quic() -> usize {
+    let mut n = 0;
+    n += delete_rule_bounded(false, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
+    n += delete_rule_bounded(true, &["-p", "udp", "--dport", "443", "-j", "REJECT"]);
 
     debug!("QUIC firewall rules cleaned up");
+    n
 }
 
 // blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks
@@ -145,14 +153,16 @@ pub fn block_stun() {
     info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
 }
 
-// purges stun packet filtering rules
-pub fn unblock_stun() {
+// purges stun packet filtering rules. Returns rules deleted (FP-10).
+pub fn unblock_stun() -> usize {
+    let mut n = 0;
     for port in &["3478", "5349"] {
-        delete_rule_bounded(false, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
-        delete_rule_bounded(true, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
+        n += delete_rule_bounded(false, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
+        n += delete_rule_bounded(true, &["-p", "udp", "--dport", port, "-j", "REJECT"]);
     }
 
     debug!("STUN firewall rules cleaned up");
+    n
 }
 
 // enables strict dns kill-switch: drops all non-loopback outbound port 53 traffic
@@ -173,23 +183,25 @@ pub fn enable_kill_switch() {
     info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
 }
 
-// removes dns kill-switch filtering rules
-pub fn disable_kill_switch() {
-    // remove both DROP (new) and REJECT (legacy) variants to clean old installs
+// removes dns kill-switch filtering rules. Returns rules deleted (FP-10).
+pub fn disable_kill_switch() -> usize {
+    // remove both DROP (new) and REJECT (legacy) variants to clean old installs.
+    // FP-07: only comment-scoped deletes; pre-hardening comment-less residue stays.
+    let mut n = 0;
     for target in ["DROP", "REJECT"] {
         let udp = ["!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", target];
         let tcp = ["!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", target];
         let dot = ["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", target];
-        // legacy rules had no comment; bounded delete handles both
-        delete_rule_bounded(false, &udp);
-        delete_rule_bounded(false, &tcp);
-        delete_rule_bounded(false, &dot);
-        delete_rule_bounded(true, &udp);
-        delete_rule_bounded(true, &tcp);
-        delete_rule_bounded(true, &dot);
+        n += delete_rule_bounded(false, &udp);
+        n += delete_rule_bounded(false, &tcp);
+        n += delete_rule_bounded(false, &dot);
+        n += delete_rule_bounded(true, &udp);
+        n += delete_rule_bounded(true, &tcp);
+        n += delete_rule_bounded(true, &dot);
     }
 
     debug!("DNS Kill-Switch deactivated");
+    n
 }
 
 // enables fail-closed network lockdown: blocks outbound non-loopback tcp traffic on ports 80 and 443
@@ -204,15 +216,17 @@ pub fn enable_network_lockdown() {
     info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
 }
 
-// purges fail-closed network lockdown rules
-pub fn disable_network_lockdown() {
+// purges fail-closed network lockdown rules. Returns rules deleted (FP-10).
+pub fn disable_network_lockdown() -> usize {
+    let mut n = 0;
     for port in &["80", "443"] {
         for target in ["DROP", "REJECT"] {
             let rule = ["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", target];
-            delete_rule_bounded(false, &rule);
-            delete_rule_bounded(true, &rule);
+            n += delete_rule_bounded(false, &rule);
+            n += delete_rule_bounded(true, &rule);
         }
     }
 
     debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");
+    n
 }

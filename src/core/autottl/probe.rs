@@ -1,6 +1,8 @@
 //! hop distance heuristic measurement and optimal time-to-live middlebox desynchronization calculation.
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use super::cache::TtlCache;
@@ -28,6 +30,8 @@ impl Default for AutoTtlConfig {
 pub struct AutoTtlEstimator {
     config: AutoTtlConfig,
     cache: TtlCache,
+    // FP-13: in-flight destinations so one miss spawns exactly one task.
+    inflight: Arc<Mutex<HashSet<Ipv4Addr>>>,
 }
 
 impl AutoTtlEstimator {
@@ -35,6 +39,7 @@ impl AutoTtlEstimator {
         Self {
             config,
             cache: TtlCache::new(),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -48,12 +53,20 @@ impl AutoTtlEstimator {
             return ttl;
         }
 
-        // spawn non-blocking hop measurement task within runtime context
+        // spawn non-blocking hop measurement task within runtime context.
+        // FP-13: dedup via the in-flight set — no task storms on hot misses.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let this = self.clone();
-            handle.spawn(async move {
-                this.estimate_and_cache(dst_ip).await;
-            });
+            let fresh = self
+                .inflight
+                .lock()
+                .map(|mut set| set.insert(dst_ip))
+                .unwrap_or(false);
+            if fresh {
+                let this = self.clone();
+                handle.spawn(async move {
+                    this.estimate_and_cache(dst_ip).await;
+                });
+            }
         }
 
         self.config.default_ttl
@@ -79,6 +92,9 @@ impl AutoTtlEstimator {
         let optimal_ttl = self.calculate_optimal_ttl(estimated_hops);
         debug!(ip = %dst_ip, total_hops = estimated_hops, optimal_ttl = optimal_ttl, "Auto-TTL estimated");
         self.cache.insert(dst_ip, optimal_ttl);
+        if let Ok(mut set) = self.inflight.lock() {
+            set.remove(&dst_ip);
+        }
     }
 }
 
@@ -92,7 +108,10 @@ pub fn resolve_default_network_interface() -> Option<(String, Ipv4Addr)> {
                 let dest_hex = fields[1];
                 let gw_hex = fields[2];
 
-                // destination 00000000 signifies default gateway route (0.0.0.0/0)
+                // destination 00000000 signifies default gateway route (0.0.0.0/0).
+                // /proc/net/route hex is little-endian: parse then to_be() so
+                // Ipv4Addr::from (network-order u32) yields the right octets
+                // on little-endian hosts (all supported targets).
                 if dest_hex == "00000000" {
                     if let Ok(gw_val) = u32::from_str_radix(gw_hex, 16) {
                         let gw_ip = Ipv4Addr::from(gw_val.to_be());
@@ -105,7 +124,11 @@ pub fn resolve_default_network_interface() -> Option<(String, Ipv4Addr)> {
     None
 }
 
-// sends synthetic traceroute probe to estimate network layer router hop count
+// sends synthetic traceroute probe to estimate network layer router hop count.
+// FP-13 honesty note: no ICMP listener exists, so the reply cannot be read and
+// this returns a conservative constant. The estimator pipeline (runtime spawn,
+// dedup, expiring cache) around it is real; a true TTL-sweep measurement would
+// need raw ICMP sockets and is explicitly out of scope here.
 pub async fn measure_hop_distance(dst_ip: Ipv4Addr) -> u8 {
     let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
