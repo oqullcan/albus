@@ -96,20 +96,11 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) {
             }
         }
     }
-    // 2. legacy rules without comment match (pre-hardening installs)
-    for _ in 0..MAX_RULE_DELETE_ITER {
-        let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
-        del_args.extend_from_slice(args);
-        let status = if v6 {
-            ip6tables_base().args(&del_args).status()
-        } else {
-            iptables_base().args(&del_args).status()
-        };
-        match status {
-            Ok(s) if s.success() => continue,
-            _ => break,
-        }
-    }
+    // FP-07: legacy unscoped phase REMOVED. It built `-D OUTPUT <args>` with no
+    // `-m comment` match and ran unconditionally, stripping third-party
+    // comment-less rules sharing the tuple. Pre-hardening residue (comment-less
+    // albus rules) is fail-closed and stays until removed manually — documented
+    // instead of blindly deleted. See REPORT run-1 FP-07.
 }
 
 // injects icmp port unreachable / tcp reset via iptables reject on udp 443

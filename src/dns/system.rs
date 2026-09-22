@@ -131,6 +131,30 @@ fn atomic_write_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn read_nofollow(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: refusing to read non-regular file at {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
 // modifies system resolver configuration to target 127.0.0.1 while preserving original upstream entries
 pub fn set_system_dns() -> Result<()> {
     configure_resolvectl_dns("127.0.0.1");
@@ -139,7 +163,7 @@ pub fn set_system_dns() -> Result<()> {
 
 pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
     let target = resolve_write_target(path.as_ref())?;
-    let content = fs::read_to_string(&target)?;
+    let content = read_nofollow(&target)?;
     // idempotency: already active and no unsaved nameservers -> no-op
     let has_marker = content.contains("# albus:");
     let has_loopback = content.lines().any(|l| l.trim() == "nameserver 127.0.0.1");
@@ -185,7 +209,7 @@ pub fn restore_system_dns() -> Result<()> {
 
 pub fn restore_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
     let target = resolve_write_target(path.as_ref())?;
-    let content = fs::read_to_string(&target)?;
+    let content = read_nofollow(&target)?;
     let mut new_lines = Vec::new();
 
     for line in content.lines() {
@@ -219,7 +243,9 @@ pub fn cleanup_system_dns() -> Result<bool> {
 }
 
 pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
-    if let Ok(content) = fs::read_to_string(&path) {
+    let target =
+        resolve_write_target(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    if let Ok(content) = read_nofollow(&target) {
         if content.contains("# albus-saved:")
             || content.contains("# albus:")
             || content.contains("nameserver 127.0.0.1")

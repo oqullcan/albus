@@ -2,6 +2,34 @@
 
 use clap::{Args, Parser, Subcommand};
 
+// FP-08: fail fast at the CLI boundary too (Config::validate remains the
+// single source of truth; these mirror its restore_* bounds).
+fn parse_restore_after_bytes(s: &str) -> Result<u32, String> {
+    let v: u32 = s
+        .parse()
+        .map_err(|_| format!("invalid restore_after_bytes {}", s))?;
+    if v < 64 {
+        return Err(format!(
+            "invalid restore_after_bytes {} (expected >= 64)",
+            v
+        ));
+    }
+    Ok(v)
+}
+
+fn parse_restore_mss(s: &str) -> Result<u16, String> {
+    let v: u16 = s
+        .parse()
+        .map_err(|_| format!("invalid restore_mss {}", s))?;
+    if v != 0 && (v < 64 || v > 1460) {
+        return Err(format!(
+            "invalid restore_mss {} (expected 0 or 64..=1460)",
+            v
+        ));
+    }
+    Ok(v)
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "albus",
@@ -169,11 +197,11 @@ pub struct RunArgs {
     pub min_mss: u16,
 
     // transmitted byte threshold before restoring native line-rate mss
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 600, value_parser = parse_restore_after_bytes)]
     pub restore_after_bytes: u32,
 
     // target mss value upon restoration (0 = 1460 auto)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = parse_restore_mss)]
     pub restore_mss: u16,
 
     // target destination ports for ebpf sock_ops attachment

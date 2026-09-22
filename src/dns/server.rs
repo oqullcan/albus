@@ -371,7 +371,9 @@ pub fn is_aaaa_query(data: &[u8]) -> bool {
     false
 }
 
-// appends rfc 6891 edns0 opt pseudo-rr with dnssec ok (do) bit enabled
+// appends rfc 6891 edns0 opt pseudo-rr with dnssec ok (do) bit enabled.
+// FP-06: DO is forced even when the client sent additional records — an
+// attacker OPT-without-DO must never suppress upstream DNSSEC.
 pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     if query.len() < 12 {
         return query.to_vec();
@@ -380,22 +382,49 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     let mut out = query.to_vec();
     let arcount = ((query[10] as u16) << 8) | (query[11] as u16);
 
+    // shared OPT RR template: root(0x00), type 41, payload 4096, DO set.
+    let opt_rr: [u8; 11] = [
+        0x00, 0x00, 0x29, // type: opt (41)
+        0x10, 0x00, // payload size: 4096
+        0x00, // extended rcode
+        0x00, // edns version
+        0x80, 0x00, // do bit set (0x8000)
+        0x00, 0x00, // rdlen: 0
+    ];
+
     if arcount == 0 {
-        // opt rr specification: root domain (0x00), type 41 (opt), udp payload size 4096, do-bit (0x8000)
-        let opt_rr: [u8; 11] = [
-            0x00, 0x00, 0x29, // type: opt (41)
-            0x10, 0x00, // payload size: 4096
-            0x00, // extended rcode
-            0x00, // edns version
-            0x80, 0x00, // do bit set (0x8000)
-            0x00, 0x00, // rdlen: 0
-        ];
         out.extend_from_slice(&opt_rr);
         out[10] = 0x00;
         out[11] = 0x01;
+        return out;
     }
 
-    out
+    match crate::dns::cache::scan_opt(&out) {
+        crate::dns::cache::OptScan::Present { ttl_offset } => {
+            // patch the DO bit in place — length and ARCOUNT unchanged.
+            let ttl = u32::from_be_bytes([
+                out[ttl_offset],
+                out[ttl_offset + 1],
+                out[ttl_offset + 2],
+                out[ttl_offset + 3],
+            ]);
+            let patched = (ttl | 0x8000).to_be_bytes();
+            out[ttl_offset..ttl_offset + 4].copy_from_slice(&patched);
+            out
+        }
+        crate::dns::cache::OptScan::Absent => {
+            // additional records but no OPT: append one if ARCOUNT allows.
+            if arcount < 0xFFFF {
+                out.extend_from_slice(&opt_rr);
+                let bumped = arcount + 1;
+                out[10] = (bumped >> 8) as u8;
+                out[11] = (bumped & 0xFF) as u8;
+            }
+            out
+        }
+        // malformed additionals: forward unchanged rather than corrupt.
+        crate::dns::cache::OptScan::Malformed => out,
+    }
 }
 
 // inspects header flags to verify presence of authenticated data (ad) bit
@@ -729,6 +758,28 @@ mod tests {
 
         let fake_response = vec![0xAB, 0xCD, 0x81, 0xA0]; // ad bit set (0x20)
         assert!(is_dnssec_authenticated(&fake_response));
+    }
+
+    // FP-06: attacker OPT-without-DO must get DO patched, same length/arcount.
+    #[test]
+    fn test_enable_dnssec_do_forces_do_on_arcount() {
+        let mut query = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(crate::dns::cache::extract_do_bit(&query), Some(false));
+        let forced = enable_dnssec_do(&query);
+        // patched in place: same length, same arcount, DO set
+        assert_eq!(forced.len(), query.len());
+        assert_eq!(forced[11], 1);
+        assert_eq!(crate::dns::cache::extract_do_bit(&forced), Some(true));
+        // idempotent on already-DO queries
+        let do_pos = query.len() - 4;
+        query[do_pos] = 0x80;
+        let again = enable_dnssec_do(&query);
+        assert_eq!(again.len(), query.len());
+        assert_eq!(crate::dns::cache::extract_do_bit(&again), Some(true));
     }
 
     #[test]

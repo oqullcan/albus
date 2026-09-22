@@ -3,7 +3,7 @@
 use crate::app::cli::{RunArgs, ServiceCommands};
 use crate::core::ebpf::is_root;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -49,22 +49,56 @@ fn systemctl() -> Command {
 }
 
 /// Fail-closed atomic write for root-owned files: rejects symlinks, enforces mode.
+fn reject_symlink_chain(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "security violation: symlink in path chain at {}",
+                    ancestor.display()
+                )
+                .into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+            _ => {}
+        }
+        if ancestor == Path::new("/") {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn secure_write_root_file(
     path: &str,
     content: &str,
     mode: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let p = Path::new(path);
-    // 1. reject symlink at final component (TOCTOU-safe open follows)
-    if let Ok(meta) = fs::symlink_metadata(p) {
-        if meta.file_type().is_symlink() {
-            return Err(
-                format!("security violation: refusing to write symlink at {}", path).into(),
-            );
-        }
-    }
+    reject_symlink_chain(p)?;
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
+        // post-mkdir revalidation: parent must be a root-owned real dir
+        let pmeta = fs::symlink_metadata(parent)?;
+        if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+            return Err(format!(
+                "security violation: unsafe parent dir at {}",
+                parent.display()
+            )
+            .into());
+        }
+        if pmeta.uid() != 0 {
+            return Err(format!(
+                "security violation: parent {} owned by uid {} (expected root)",
+                parent.display(),
+                pmeta.uid()
+            )
+            .into());
+        }
     }
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
@@ -89,7 +123,17 @@ fn secure_write_root_file(
     }
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
-    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    // enforce mode via fd (no path re-open race)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::fchmod(file.as_raw_fd(), mode) };
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    }
     Ok(())
 }
 
@@ -260,11 +304,25 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err("albus service uninstall requires root privileges — run with sudo".into());
     }
 
-    // stop/disable/remove unit without exists() TOCTOU
-    let stop = systemctl().args(["stop", "albus.service"]).status();
-    let _ = stop;
-    let disable = systemctl().args(["disable", "albus.service"]).status();
-    let _ = disable;
+    // stop/disable/remove unit without exists() TOCTOU.
+    // FP-03: surface stop/disable failures — they gate the ExecStopPost
+    // mitigation, and silent success here used to mask persistent rules.
+    match systemctl().args(["stop", "albus.service"]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: systemctl stop albus.service exited {} — continuing with explicit revert",
+            s
+        ),
+        Err(e) => eprintln!(
+            "warning: systemctl stop albus.service failed to spawn ({}) — continuing with explicit revert",
+            e
+        ),
+    }
+    match systemctl().args(["disable", "albus.service"]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("warning: systemctl disable exited {}", s),
+        Err(e) => eprintln!("warning: systemctl disable failed to spawn ({})", e),
+    }
     match secure_remove_file(SERVICE_FILE_PATH) {
         Ok(true) => println!("Removed {}", SERVICE_FILE_PATH),
         Ok(false) => println!("No albus.service file found at {}", SERVICE_FILE_PATH),
@@ -281,9 +339,20 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => return Err(e),
     }
 
+    // FP-03: mirror Cleanup — revert all four families unconditionally so no
+    // fail-closed rules outlive the daemon regardless of stop outcome.
     crate::core::firewall::unblock_quic();
+    crate::core::firewall::unblock_stun();
+    crate::core::firewall::disable_kill_switch();
+    crate::core::firewall::disable_network_lockdown();
     let _ = crate::dns::cleanup_system_dns();
     println!("albus service uninstalled and system settings cleaned up.");
+    // FP-04: the system binary is intentionally retained (lets the admin run
+    // `sudo albus cleanup` afterwards); say so instead of implying full removal.
+    println!(
+        "note: system binary retained at {} (run `sudo albus cleanup` if needed, then remove it manually)",
+        SYSTEM_BIN_PATH
+    );
     Ok(())
 }
 

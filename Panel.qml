@@ -536,12 +536,16 @@ Panel {
     args.push("--pqc", root.pqcEnabled ? "true" : "false")
     args.push("--ram-only", root.ramOnlyEnabled ? "true" : "false")
 
-    // preserve backend tuning parameters
+    // preserve backend tuning parameters (FP-08: mirror Config::validate bounds)
     if (root.storedPorts && root.storedPorts.length > 0) {
       args.push("--ports", root.storedPorts.join(","))
     }
-    args.push("--restore-after-bytes", String(root.storedRestoreAfterBytes))
-    args.push("--restore-mss", String(root.storedRestoreMss))
+    var _rab = parseInt(String(root.storedRestoreAfterBytes), 10)
+    if (isNaN(_rab) || _rab < 64) return { ok: false, reason: "Invalid restore window (expected >= 64)" }
+    var _rms = parseInt(String(root.storedRestoreMss), 10)
+    if (isNaN(_rms) || _rms < 0 || _rms > 1460 || (_rms !== 0 && _rms < 64)) return { ok: false, reason: "Invalid restore MSS (expected 0 or 64..1460)" }
+    args.push("--restore-after-bytes", String(_rab))
+    args.push("--restore-mss", String(_rms))
     if (root.storedCgroup) {
       args.push("--cgroup", root.storedCgroup)
     }
