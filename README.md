@@ -1,224 +1,107 @@
 # albus
 
-> A kernel-level deep packet inspection (DPI) evasion engine and DNS-over-HTTPS resolver for Linux, with ML-KEM post-quantum key exchange verified per upstream at startup.
+DPI bypass and encrypted DNS for Linux: eBPF packet
+desynchronization plus a local validating DoH resolver.
 
-[![author](https://img.shields.io/badge/author-oqullcan-blue.svg)](https://github.com/oqullcan)
-[![rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![ebpf](https://img.shields.io/badge/kernel-eBPF%20CO--RE-success.svg)](https://docs.kernel.org/bpf/)
-[![crypto](https://img.shields.io/badge/pqc-ML--KEM--768-purple.svg)](https://csrc.nist.gov/pubs/fips/203/final)
-[![license](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+Evade — fragment TLS ClientHello across packets (eBPF MSS clamp + jitter, raw-socket
+decoys) so middleboxes can't read SNI. Encrypt — resolve DNS locally over DoH with
+DNSSEC validation, kill-switch, and leak canary. Enforce — fail-closed firewall rules
+and a rootless daemon that refuses to run unprivileged.
 
----
+## Requirements
 
-## Abstract
+Linux 5.10+, cgroup v2, Rust 1.75+. Source builds need clang + kernel headers
+(CI installs them); the release binary runs standalone.
 
-**albus** implements transparent transport-layer desynchronization and encrypted domain name resolution over DoH directly within the Linux network stack, with ML-KEM post-quantum key exchange where the upstream negotiates it (see §5). By leveraging BPF CO-RE (`BPF_PROG_TYPE_SOCK_OPS`) attached to the unified cgroup v2 hierarchy, the engine dynamically modulates TCP Maximum Segment Size (MSS) during initial connection establishment to fragment TLS ClientHello records across multiple IP datagrams. Concurrently, a zero-allocation raw socket engine injects synthetic desynchronization payloads with destination-adaptive Time-to-Live (Auto-TTL) values (conservative hop heuristic until true TTL-sweep measurement lands), inducing state desynchronization in stateful middleboxes without disrupting end-to-end transport semantics.
+## Quickstart
 
----
-
-## Technical Specifications
-
-| Component | Standard / Mechanism | Implementation Details |
-| :--- | :--- | :--- |
-| **Transport Modulation** | RFC 793, eBPF `sock_ops` | `BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB` clamps MSS (88 bytes or jittered 64–88 bytes via `bpf_get_prandom_u32`); restored to line-rate (1460 bytes) via `BPF_SOCK_OPS_HDR_OPT_LEN_CB` after 600 bytes. |
-| **Packet Injection** | RFC 791, RFC 8200, RFC 1071, `SOCK_RAW` | Stack-allocated dual-stack IPv4/IPv6 L3/L4 serialization with `IP_HDRINCL`/`IPV6_HDRINCL`, rotating decoy SNI pool, and optional `0xDEAD` checksum corruption. |
-| **Kernel Portability** | BPF CO-RE & BTF | Ahead-of-time bytecode compilation with runtime BTF (`/sys/kernel/btf/vmlinux`) struct relocation across Linux 5.10–6.x+ kernels. |
-| **Interface Roaming** | Dynamic Route Resolver | `/proc/net/route` gateway tracking seamlessly preserves state across Wi-Fi (`wlan0`), Ethernet (`eth0`), and VPN (`tailscale0`, `wg0`) transitions. |
-| **Live Map Reload** | Runtime eBPF Reconfiguration | Zero-downtime updates of target ports, exclusion maps, and MSS limits via `SIGHUP` (`albus service reload` / `albus config set`). |
-| **Path Heuristics** | Auto-TTL Estimation | Conservative hop heuristic with boundary clamping (3–12 hops) and expiring in-memory TTL cache (true path probing is future work). |
-| **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
-| **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs`, offered when `--pqc`; negotiated per upstream and verified at startup (`post-quantum KEM handshake OK` in logs, classical fallback warns). |
-| **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
-| **Access Control** | Polkit Rules | Scoped `/etc/polkit-1/rules.d/albus.rules` requires admin authentication (`AUTH_ADMIN`) for `wheel`/`sudo` users to manage `albus.service`. |
-
----
-
-## Architecture
-
-```
-                  ┌──────────────────────────────────────────────────┐
-                  │          Application (Browser / Client)          │
-                  └──────────────┬────────────────────┬──────────────┘
-                    DNS (UDP 53) │                    │ TCP SYN (:443)
-                                 ▼                    ▼
-┌──────────────────────────────────────────┐ ┌──────────────────────────────────────────┐
-│         Local Encrypted Resolver         │ │        Kernel eBPF & Packet Stack        │
-│                                          │ │                                          │
-│ ├─ In-Memory Response Cache (0ms)        │ │ 1. eBPF ACTIVE_ESTABLISHED               │
-│ ├─ Post-Quantum ML-KEM-768 Key Exchange  │ │    Clamps initial TCP MSS = 88 bytes     │
-│ ├─ DNSSEC Local Chain Validation          │ │    Notifies userspace via perf event ring│
-│ ├─ IPv6 (AAAA) Leak Filtering            │ │                                          │
-│ └─ Upstream Dispatch:                    │ │ 2. Raw Socket Packet Injector            │
-│    • Quad9 / Cloudflare / Mullvad        │ │    Emits fake ClientHello (Optimal TTL)  │
-│    • Custom Bootstrap IP Resolution      │ │    Middlebox state table desynchronizes  │
-│                                          │ │                                          │
-│                                          │ │ 3. ClientHello Transmission              │
-│                                          │ │    Segmented records bypass DPI filter   │
-│                                          │ │                                          │
-│                                          │ │ 4. eBPF WRITE_HDR_OPT                    │
-│                                          │ │    Restores native MSS (1460 bytes)      │
-└──────────────────────────────────────────┘ └──────────────────────────────────────────┘
-```
-
----
-
-## Evasion Mechanisms
-
-### 1. TCP Segmentation & Dynamic MSS Jitter (`--min-mss`)
-Middlebox DPI systems inspect initial TCP payloads for plaintext Server Name Indication (SNI) extensions (RFC 6066). Albus programmatically sets `bpf_setsockopt(skops, SOL_TCP, TCP_BPF_MSS, mss)` on established sockets to split the ClientHello handshake across multiple TCP segments. To prevent DPI statistical fingerprinting based on static segment boundaries, Albus supports MSS Jitter: when `--min-mss` (default: `64`) is configured below `--mss` (default: `88`), the eBPF kernel hook invokes `bpf_get_prandom_u32()` to randomize the initial MSS per connection within the `[min_mss, mss]` range. After the ClientHello phase exceeds `--restore-after-bytes` (default: 600 bytes), native line-rate MSS (1460 bytes) is restored automatically.
-
-### 2. Decoy SNI Pool Rotation & Auto-TTL Desynchronization
-Albus probes the network path to estimate the router hop distance $H$ to the destination IP and computes an optimal injection TTL:
-$$TTL_{opt} = \text{clamp}\left(H_{estimated} - \delta, TTL_{min}, TTL_{max}\right)$$
-The zero-allocation raw socket engine synthesizes and injects a fake ClientHello matching the socket 4-tuple. To defeat middlebox heuristics that filter static fake payloads, Albus rotates across a pre-compiled pool of high-reputation decoy SNIs (Google, Cloudflare, Microsoft, AWS, Apple) unless a specific `--fake-sni` override is provided. The fake segment expires at or just past the DPI middlebox, poisoning its state table, while the authentic segmented payload reaches the destination intact.
-
-### 3. Dual-Stack IPv6 & IPv4 eBPF Evasion
-The eBPF kernel program (`sockops.bpf.c`) natively processes both `AF_INET` and `AF_INET6` socket families. For IPv6 connections, it extracts 128-bit IPv6 endpoints (`remote_ip6` / `local_ip6`), checks the dedicated `exclude_ips_v6` 16-byte BPF hash map, modulates MSS, and emits 128-bit connection events. The userspace injector synthesizes valid RFC 8200 IPv6 raw packets with full TCP pseudo-header checksum computation transmitted via `IPV6_HDRINCL`.
-
-### 4. Zero-Downtime Live Map Reload (SIGHUP)
-Runtime configurations—including target ports, exclusion IP lists, and MSS bounds—can be updated instantly without restarting `albus.service` or severing active network connections. Dispatching `SIGHUP` (or executing `sudo albus service reload` / `albus config set ...`) synchronizes running eBPF maps atomically in kernel space.
-
-### 5. Post-Quantum DoH Key Exchange (verified, transport-only)
-To mitigate "Harvest Now, Decrypt Later" surveillance of DNS traffic, the DoH client offers hybrid post-quantum key encapsulation (`X25519Kyber768Draft00` / `SecP256r1MLKEM768`) via `aws-lc-rs`. At startup, each PQC-enabled upstream completes a background TLS handshake offering ONLY PQ KEM groups: success is logged (`DoH upstream <name>: post-quantum KEM handshake OK`), failure warns that connections use classical KEX despite `pqc=true`. Measured 2026-09-20: Cloudflare and `dns.nextdns.io` negotiate PQ; Quad9 and Mullvad do not — re-check your journal, support changes over time. Scope is transport key exchange only: certificate signatures remain classical. ECH is enabled automatically wherever an upstream publishes an ECHConfig (Type 65 fetched over DoH at startup, logged per upstream); measured 2026-09-20, none of the bundled upstreams publish one, so DoH connections carry plain SNI — user browsing SNI remains the browser's ECH job, out of scope here. DNSSEC is validated locally (RRSIG + DNSKEY + DS chain to the embedded root KSK; bogus answers get SERVFAIL and are never cached, unsigned answers are served as insecure); NSEC3 closest-encloser completeness and RFC 5011 rollover are not yet covered. PQ signatures (ML-DSA) are not yet offered by any bundled upstream; when servers deploy them, support arrives with the TLS provider — nothing is hardcoded client-side against it.
-
-### 6. DNS Leak Protection & Active Canary Watchdog
-- **DNS Kill-Switch (`--kill-switch`)**: Injects kernel-level firewall (`iptables`/`ip6tables`) drop rules on all outbound non-loopback UDP/TCP port 53 traffic. Ensures no misconfigured background processes can leak plaintext DNS queries to the local ISP.
-- **Active Leak Canary Watchdog**: An autonomous background prober actively queries `leak-test.albus.internal` every 60 seconds over loopback (`127.0.0.1:53`), verifying the synthetic canary record (`127.0.0.99`). If queries fail or return unexpected data (due to VPN route takeovers, network managers overwriting `/etc/resolv.conf`, or DNS hijacking), it triggers instant autonomous self-healing.
-- **Fail-Closed Network Lockdown (`--network-lockdown`)**: Distinct from the DNS Kill-Switch, Network Lockdown drops all outbound non-loopback web traffic (TCP 80 and 443) if the eBPF subsystem fails to attach. This guarantees that unfragmented, unevaded cleartext traffic is never leaked to the ISP if DPI evasion cannot be sustained.
-- **WebRTC STUN Blocking (`--block-stun`)**: Drops outbound UDP traffic on standard STUN/TURN ports 3478 and 5349 to eliminate real IPv4/IPv6 exposure through WebRTC peer connection candidates.
-
----
-
-## Installation & Build
-
-### Prerequisites
-- **Kernel**: Linux 5.10+ with `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, and cgroup v2.
-- **Toolchain**: Rust 1.75+ (Cargo). *(Pre-built binary runs standalone via BPF CO-RE without clang or kernel headers).*
-- **Permissions**: `CAP_NET_RAW`, `CAP_BPF`, `CAP_NET_ADMIN` (or `sudo`).
-
-### Compilation
 ```bash
-git clone https://github.com/oqullcan/albus.git
-cd albus
-git checkout v2.1.0
-
-# Compile release profile with LTO and binary stripping
+git clone https://github.com/oqullcan/albus.git && cd albus
 cargo build --release
-
-# Install binary to system path
-sudo cp target/release/albus /usr/local/bin/albus
+sudo ./target/release/albus service install    # binary + unit + polkit, starts daemon
+albus status --json                            # active check for bars and panels
 ```
 
----
-
-## Command-Line Interface
-
-### Core Execution
 ```bash
-# Start engine with default parameters
-sudo albus run
-
-# Enforce volatile Only-RAM execution in /run tmpfs
-sudo albus run --ram-only=true --pqc=true
-
-# Configure Mullvad upstream with malware and tracker blocking
-sudo albus run --doh-upstream mullvad-base
-
-# Custom DoH endpoint with dedicated bootstrap IP addressing
-sudo albus run --doh-upstream "https://doh.example.com/dns-query" --doh-bootstrap-ips "93.184.216.34"
+sudo albus run --doh-upstream mullvad-base       # foreground with options
+sudo albus config set --doh-upstream cloudflare  # persist + live-reload daemon
+sudo albus cleanup                               # restore DNS + firewall
+albus monitor                                    # traffic TUI
 ```
 
-### Daemon & Configuration Management
+## Daemon
+
+Privileged commands (root — install, control, configure, clean up):
+
+- `sudo albus service install` — install binary, systemd unit, polkit rule; creates the `albus` user and starts the daemon
+- `sudo albus service uninstall` — stop, remove unit and rule, revert firewall and DNS (binary is kept by design, with a printed notice)
+- `sudo albus service start` — start the background daemon
+- `sudo albus service stop` — stop the background daemon
+- `sudo albus service restart` — restart (crash-safe: rules re-applied on start)
+- `sudo albus service reload` — SIGHUP, zero-downtime eBPF map reload
+- `sudo albus service status` — systemd unit state
+- `sudo albus service logs` — stream the daemon journal
+- `sudo albus run [--flags]` — run the engine in the foreground with options
+- `sudo albus config set KEY VALUE` — persist a setting and live-reload the daemon
+- `sudo albus cleanup` — restore `/etc/resolv.conf` and purge firewall rules
+
+Unprivileged commands (inspect only):
+
+- `albus status` — kernel capability and privilege summary
+- `albus status --json` — machine-readable status for bars and panels
+- `albus config get` — print the active configuration as JSON
+- `albus monitor` — interactive traffic telemetry TUI
+
+Root runs management; the daemon runs as the dedicated `albus` user with six
+ambient capabilities (`NET_ADMIN`, `NET_RAW`, `BPF`, `PERFMON`, `NET_BIND_SERVICE`,
+`DAC_OVERRIDE`). Uninstall keeps `/usr/local/bin/albus` by design (it says so —
+remove it manually if wanted).
+
+## Options
+
+Evasion:
+
+- `--mss 88` — initial TCP MSS size that fragments the ClientHello
+- `--min-mss 64` — per-connection jitter floor (must stay ≤ mss)
+- `--restore-after-bytes 600` — byte threshold before restoring line-rate MSS (≥ 64)
+- `--restore-mss 0` — MSS restored afterwards (`0` = 1460 auto, else 64–1460)
+- `--ports 443` — target ports for sock_ops interception (up to 64, comma-separated)
+- `--fake-ttl 8` — TTL stamped on injected fake packets
+- `--auto-ttl` — heuristic hop-distance TTL instead of the fallback (conservative constant, not measured probing)
+- `--min-ttl 3`, `--max-ttl 12` — clamps for the auto-TTL heuristic
+- `--fake-sni` — override the rotating high-reputation decoy SNI pool
+- `--fake-bad-checksum` — corrupt TCP checksums with `0xDEAD` to confuse stateful middleboxes
+
+DNS:
+
+- `--doh` — spawn the local DoH proxy listener on 127.0.0.1:53 (on by default)
+- `--doh-upstream quad9` — presets (`quad9`, `cloudflare`, `mullvad-*`) or an `https://` URL (https-only, enforced)
+- `--doh-bootstrap-ips` — static IPv4 endpoints to resolve custom DoH hosts
+- `--dnssec` — validate RRSIG chains locally: Bogus → SERVFAIL (never cached), unsigned → served insecure, unsigned delegations without DS → insecure (never Bogus)
+- `--pqc` — offer hybrid ML-KEM-768 where the upstream negotiates it (transport KEX only, logged per upstream)
+- `--block-ipv6` — filter AAAA queries so IPv6 can't bypass inspection unfragmented
+
+Containment:
+
+- `--block-quic` — drop outbound UDP 443 to force TLS/TCP fallback
+- `--block-stun` — drop outbound STUN (UDP 3478, 5349) against WebRTC IP leaks
+- `--kill-switch` — drop all non-loopback plaintext DNS (UDP/TCP 53, TCP 853)
+- `--network-lockdown` — fail-closed: drop outbound TCP 80/443 if eBPF fails (off by default)
+- `--ram-only` — keep runtime state in `/run` tmpfs only
+- `-c`, `--config PATH` — load an explicit config file (must be root-owned, non-symlink when privileged)
+- `--cgroup /sys/fs/cgroup` — cgroup v2 mount point for BPF attachment
+- `--verbose` — debug logging
+
+## Omarchy panel
+
+Quattro widget (`BarWidget.qml`, `Panel.qml`): status, resolver profiles, toggles,
+live logs (`1/2` tabs, `Space`, `R` reload, `C` flush).
+
 ```bash
-sudo albus service install   # Install systemd unit and provision albus.rules
-sudo albus service start     # Start background daemon
-sudo albus service status    # Inspect operational metrics
-sudo albus service reload    # Send SIGHUP for zero-downtime runtime map reload
-albus config get             # Inspect active persistent configuration (JSON)
-sudo albus config set --doh-upstream cloudflare  # Update settings and reload daemon live
-albus monitor                # Interactive curses-style telemetry TUI
-sudo albus cleanup           # Restore original /etc/resolv.conf and purge firewall rules
-```
-
-Privilege model: install/uninstall/cleanup run as real root, but the daemon
-itself runs as the dedicated `albus` system user (created idempotently at
-install) with exactly six ambient capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`,
-`CAP_BPF`, `CAP_PERFMON`, `CAP_NET_BIND_SERVICE`, `CAP_DAC_OVERRIDE`) —
-`has_service_privileges()` enforces the same set in-process, and the engine
-refuses to run without it. `ExecStopPost` keeps the `+` prefix so crash
-cleanup still runs privileged.
-
-### Options Reference
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--mss` | `u16` | `88` | Initial TCP MSS size for TLS ClientHello fragmentation |
-| `--min-mss` | `u16` | `64` | Minimum TCP MSS for randomized per-connection jitter (`0` disables jitter) |
-| `--restore-after-bytes` | `u32` | `600` | Transmitted byte threshold prior to line-rate MSS restoration |
-| `--ports` | `Vec<u16>` | `[443]` | Target destination ports for eBPF sock_ops interception |
-| `--fake-ttl` | `u8` | `8` | Fallback TTL for raw socket packet injection |
-| `--auto-ttl` | `bool` | `true` | Heuristic hop-distance TTL (conservative constant until true probing lands) |
-| `--fake-sni` | `String` | `None` | Server Name Indication override (defaults to rotating high-reputation pool) |
-| `--fake-bad-checksum` | `bool` | `false` | Invalidate TCP checksum (`0xDEAD`) for middlebox corruption |
-| `--doh` | `bool` | `true` | Spawn local DNS-over-HTTPS resolver on `127.0.0.1:53` |
-| `--doh-upstream` | `String` | `"quad9"` | Upstream resolver (`quad9`, `cloudflare`, `mullvad-*`, URL) |
-| `--doh-bootstrap-ips` | `Vec<IPv4>`| `[]` | Static IPv4 bootstrap endpoints for DoH host resolution |
-| `--dnssec` | `bool` | `true` | Validate RRSIG chain locally (bogus → SERVFAIL, unsigned → served insecure) |
-| `--pqc` | `bool` | `true` | Offer hybrid ML-KEM-768 key exchange (negotiated per upstream; verified in logs) |
-| `--ram-only` | `bool` | `false` | Isolate runtime state in volatile `/run` tmpfs while retaining preferences |
-| `--block-quic` | `bool` | `true` | Drop outbound UDP 443 to force TLS/TCP transport |
-| `--block-stun` | `bool` | `true` | Drop outbound STUN (UDP 3478, 5349) to prevent WebRTC IP leaks |
-| `--kill-switch` | `bool` | `true` | Strict DNS kill-switch dropping non-loopback UDP/TCP 53 |
-| `--network-lockdown` | `bool` | `false` | Fail-closed network kill-switch dropping TCP 80/443 if eBPF fails |
-| `--block-ipv6` | `bool` | `true` | Filter AAAA queries to prevent IPv6 inspection bypass leaks |
-
----
-
-## Desktop Integration (Omarchy Shell)
-
-Albus includes a first-party Omarchy Quattro desktop panel widget (`BarWidget.qml` & `Panel.qml`) providing live packet stream monitoring, one-click resolver switching (Quad9, Cloudflare, Mullvad profiles), security toggles, and keyboard shortcuts (`1-2` tabs, `Space` toggle, `P` pause, `J/K` scroll).
-
-<p align="center">
-  <img src="assets/panel_settings.png" alt="Albus Omarchy Panel Settings" width="48%" />
-  <img src="assets/panel_logs.png" alt="Albus Omarchy Panel Live Logs" width="48%" />
-</p>
-
-```bash
-# Deploy plugin to active user configuration directory
 mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev
 cp manifest.json BarWidget.qml Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
-omarchy-shell shell rescanPlugins
 ```
-
----
-
-## Removal
-
-```bash
-omarchy plugin remove io.github.oqullcan.albus.dev
-```
-
-What persists after plugin removal (plugin directory only is deleted):
-
-| Artifact | Path | Deleted by | Kept? |
-|---|---|---|---|
-| systemd unit | `/etc/systemd/system/albus.service` | `sudo albus service uninstall` | kept (run uninstall first) |
-| polkit rule | `/etc/polkit-1/rules.d/albus.rules` | `sudo albus service uninstall` | kept |
-| installed binary | `/usr/local/bin/albus` | manual (owned by root after install) | kept |
-| user config | `~/.config/albus/config.json`, `/etc/albus/config.json` | manual | kept (preferences) |
-| runtime state | `/run/albus/` | reboot / `sudo albus cleanup` | volatile |
-| DNS / firewall | `/etc/resolv.conf`, iptables rules | `sudo albus cleanup` + uninstall | restored by cleanup |
-| widget state | `~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/` | `omarchy plugin remove` | deleted |
-
-Full teardown:
-
-```bash
-sudo albus service uninstall
-sudo albus cleanup
-omarchy plugin remove io.github.oqullcan.albus.dev
-```
-
----
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE).
+[GPL-3.0](LICENSE)

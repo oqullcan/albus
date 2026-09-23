@@ -193,7 +193,7 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 88)]
     pub mss: u16,
 
-    // minimum tcp mss clamp for jitter randomization (0 = fixed mss)
+    // minimum tcp mss clamp for jitter randomization (must stay within 32..=mss)
     #[arg(long, default_value_t = 64)]
     pub min_mss: u16,
 

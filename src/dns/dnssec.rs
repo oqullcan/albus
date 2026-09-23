@@ -1,6 +1,6 @@
 //! local DNSSEC chain validation (RRSIG + DNSKEY + DS up to the embedded root trust anchor).
 //!
-//! Scope (honest limits, also documented in README §5):
+//! Scope (honest limits, also summarized in the README options table):
 //! - Positive answers (A/AAAA covered here) are fully chain-validated.
 //! - NSEC denial requires interval/bitmap coverage (FP-18); NSEC3 denials are
 //!   capped at Indeterminate (no hash verification without new crypto deps),
@@ -392,6 +392,35 @@ impl DnssecValidator {
         ChainVerdict::Fail
     }
 
+    // FP-19 follow-up (video.twimg.com 2026-09-23): whether an unsigned link
+    // lives in signed space. Checks DS at the owner name and its parent: a DS at
+    // either proves a signed zone covers the name (stripping → Bogus). No DS at
+    // both (e.g. CDN CNAME in an unsigned zone pointing at a signed target) means
+    // the unsigned link is legitimate cross-zone data (Insecure link, never Bogus
+    // by itself). Fetch failures count as NOT-signed here on purpose: when the
+    // network is down the signed links fail closed to Bogus through their own
+    // fetch/verify path, so the end state stays fail-closed regardless.
+    async fn owner_zone_signed(&self, name: &Name, resolver: &DoHResolver) -> bool {
+        let mut current = name.clone();
+        for _ in 0..2 {
+            if let FetchOutcome::Found(recs) =
+                self.fetch_rrset(&current, RecordType::DS, resolver).await
+            {
+                if recs
+                    .iter()
+                    .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))))
+                {
+                    return true;
+                }
+            }
+            if current.is_root() {
+                break;
+            }
+            current = current.base_name();
+        }
+        false
+    }
+
     fn matches_anchor(&self, keys: &[DNSKEY]) -> bool {
         for key in keys {
             for i in 0..self.anchors.len() {
@@ -513,6 +542,12 @@ impl DnssecValidator {
         // Indeterminate — served honestly, never Secure.
         let mut noncovering_signed = false;
         let mut saw_capped = false;
+        // A candidate whose RRSIGs are all present-but-unverifiable is
+        // cryptographic-failure EVIDENCE, not an instant verdict: round-robin
+        // CDN answers mix signature sets, and aborting on the first failing
+        // candidate starves later ones (SERVFAIL roulette). Decided below,
+        // after every candidate had its chance.
+        let mut saw_crypto_failure = false;
         // Strict chain rule: if ANY candidate carries RRSIGs, every link must
         // verify Secure. An unsigned link beside signed links smells like a
         // stripped signature redirecting qname to another valid signed name.
@@ -523,11 +558,20 @@ impl DnssecValidator {
             let sigs = Self::rrsig_records(recs, *t);
             if sigs.is_empty() {
                 if any_signed {
-                    debug!(
-                        "dnssec: unsigned link among signed candidates for {}",
-                        name.to_ascii()
-                    );
-                    return DnssecState::Bogus;
+                    // Unsigned link beside signed candidates: stripping OR
+                    // legitimate cross-zone unsigned data (CDN CNAME in an
+                    // unsigned zone pointing at a signed target). Only Bogus
+                    // when the link's own zone is signed (DS at the owner
+                    // name or its parent); otherwise it is an Insecure link.
+                    if self.owner_zone_signed(name, resolver).await {
+                        debug!(
+                            "dnssec: unsigned link in signed zone among signed candidates for {}",
+                            name.to_ascii()
+                        );
+                        return DnssecState::Bogus;
+                    }
+                    saw_insecure = true;
+                    continue;
                 }
                 saw_insecure = true;
                 continue;
@@ -599,18 +643,31 @@ impl DnssecValidator {
                     continue;
                 }
             }
-            // RRSIGs present but none chain-verify: cryptographic failure
+            // RRSIGs present but none chain-verify: record the cryptographic
+            // failure and keep evaluating — a later candidate may still
+            // authenticate the answer (CDN round-robin shapes). Decided below.
             debug!(
                 "dnssec: RRSIGs present but chain failed for {}",
                 name.to_ascii()
             );
-            return DnssecState::Bogus;
+            saw_crypto_failure = true;
+            continue;
         }
         if noncovering_signed {
             // chain-valid signatures that deny nothing for this query:
             // replayed/forged denial material for a different name.
             debug!(
                 "dnssec: signed but non-covering denial for {}",
+                owner.to_ascii()
+            );
+            return DnssecState::Bogus;
+        }
+        if saw_crypto_failure {
+            // some RRset carried RRSIGs that verified against nothing while
+            // no other candidate authenticated the answer: tampering or
+            // breakage, fail closed.
+            debug!(
+                "dnssec: RRSIGs present but nothing chain-verified for {}",
                 owner.to_ascii()
             );
             return DnssecState::Bogus;
@@ -1013,6 +1070,25 @@ mod tests {
             .expect("live DoH query should succeed");
         let state = v.validate("chatgpt.com", 1, &resp, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
+    }
+
+    // CDN regression (video.twimg.com 2026-09-23): unsigned CNAME in an
+    // unsigned zone pointing at a signed target must be SERVED (Secure when
+    // the target chain verifies, Insecure otherwise) — never Bogus. Round-
+    // robin CDN shapes vary per query, so assert served-ness, not a fixed
+    // state. Live-network — excluded from hermetic gates.
+    #[tokio::test]
+    #[ignore]
+    async fn test_unsigned_cname_to_signed_target_is_secure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("video.twimg.com", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+        let state = v.validate("video.twimg.com", 1, &resp, &resolver).await;
+        assert_ne!(state, DnssecState::Bogus, "CDN answer must be served");
     }
 
     #[tokio::test]

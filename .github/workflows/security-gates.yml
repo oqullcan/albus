@@ -29,8 +29,14 @@ jobs:
       - name: unit tests (hermetic; live-network tests are #[ignore])
         run: cargo test --lib --tests
 
-      - name: Install pinned cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Install pinned cargo-audit (cached)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}
 
-      - name: dependency CVE scan
+      - name: Install pinned cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: dependency CVE scan (audit.toml policy)
         run: cargo audit
