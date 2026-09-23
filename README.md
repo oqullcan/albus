@@ -12,7 +12,7 @@
 
 ## Abstract
 
-**albus** implements transparent transport-layer desynchronization and encrypted domain name resolution over DoH directly within the Linux network stack, with ML-KEM post-quantum key exchange where the upstream negotiates it (see §5). By leveraging BPF CO-RE (`BPF_PROG_TYPE_SOCK_OPS`) attached to the unified cgroup v2 hierarchy, the engine dynamically modulates TCP Maximum Segment Size (MSS) during initial connection establishment to fragment TLS ClientHello records across multiple IP datagrams. Concurrently, a zero-allocation raw socket engine injects synthetic desynchronization payloads with destination-adaptive Time-to-Live (Auto-TTL) values, inducing state desynchronization in stateful middleboxes without disrupting end-to-end transport semantics.
+**albus** implements transparent transport-layer desynchronization and encrypted domain name resolution over DoH directly within the Linux network stack, with ML-KEM post-quantum key exchange where the upstream negotiates it (see §5). By leveraging BPF CO-RE (`BPF_PROG_TYPE_SOCK_OPS`) attached to the unified cgroup v2 hierarchy, the engine dynamically modulates TCP Maximum Segment Size (MSS) during initial connection establishment to fragment TLS ClientHello records across multiple IP datagrams. Concurrently, a zero-allocation raw socket engine injects synthetic desynchronization payloads with destination-adaptive Time-to-Live (Auto-TTL) values (conservative hop heuristic until true TTL-sweep measurement lands), inducing state desynchronization in stateful middleboxes without disrupting end-to-end transport semantics.
 
 ---
 
@@ -25,7 +25,7 @@
 | **Kernel Portability** | BPF CO-RE & BTF | Ahead-of-time bytecode compilation with runtime BTF (`/sys/kernel/btf/vmlinux`) struct relocation across Linux 5.10–6.x+ kernels. |
 | **Interface Roaming** | Dynamic Route Resolver | `/proc/net/route` gateway tracking seamlessly preserves state across Wi-Fi (`wlan0`), Ethernet (`eth0`), and VPN (`tailscale0`, `wg0`) transitions. |
 | **Live Map Reload** | Runtime eBPF Reconfiguration | Zero-downtime updates of target ports, exclusion maps, and MSS limits via `SIGHUP` (`albus service reload` / `albus config set`). |
-| **Path Heuristics** | Auto-TTL Estimation | Dynamic hop-distance probing with boundary clamping (3–12 hops) and in-memory TTL caching. |
+| **Path Heuristics** | Auto-TTL Estimation | Conservative hop heuristic with boundary clamping (3–12 hops) and expiring in-memory TTL cache (true path probing is future work). |
 | **Encrypted Resolver** | RFC 8484 (DoH), RFC 6891 (EDNS0) | Multi-upstream HTTP/2 client pool, EDNS0 DO-bit validation, and optional AAAA record filtering. |
 | **Post-Quantum Security** | NIST FIPS 203 (ML-KEM-768) | Hybrid `X25519 + Kyber768` key exchange via `aws-lc-rs`, offered when `--pqc`; negotiated per upstream and verified at startup (`post-quantum KEM handshake OK` in logs, classical fallback warns). |
 | **Storage & Memory** | Dual-Tier Isolation | Durable master configuration in `~/.config/albus/config.json` with volatile `/run` tmpfs runtime execution and `write_volatile` zeroization. |
@@ -148,7 +148,7 @@ sudo albus cleanup           # Restore original /etc/resolv.conf and purge firew
 | `--restore-after-bytes` | `u32` | `600` | Transmitted byte threshold prior to line-rate MSS restoration |
 | `--ports` | `Vec<u16>` | `[443]` | Target destination ports for eBPF sock_ops interception |
 | `--fake-ttl` | `u8` | `8` | Fallback TTL for raw socket packet injection |
-| `--auto-ttl` | `bool` | `true` | Dynamic hop-distance path measurement |
+| `--auto-ttl` | `bool` | `true` | Heuristic hop-distance TTL (conservative constant until true probing lands) |
 | `--fake-sni` | `String` | `None` | Server Name Indication override (defaults to rotating high-reputation pool) |
 | `--fake-bad-checksum` | `bool` | `false` | Invalidate TCP checksum (`0xDEAD`) for middlebox corruption |
 | `--doh` | `bool` | `true` | Spawn local DNS-over-HTTPS resolver on `127.0.0.1:53` |

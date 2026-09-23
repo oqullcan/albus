@@ -2,8 +2,11 @@
 //!
 //! Scope (honest limits, also documented in README §5):
 //! - Positive answers (A/AAAA covered here) are fully chain-validated.
-//! - NODATA/NXDOMAIN denial is validated only when NSEC/NSEC3 RRsets with
-//!   RRSIGs are present; NSEC3 closest-encloser completeness is NOT checked.
+//! - NSEC denial requires interval/bitmap coverage (FP-18); NSEC3 denials are
+//!   capped at Indeterminate (no hash verification without new crypto deps),
+//!   and NSEC3 closest-encloser completeness is NOT checked.
+//! - Truncated CNAME chains with signed links are Bogus, never silently
+//!   demoted to Insecure (FP-19).
 //! - No RFC 5011 trust-anchor rollover: the compiled-in root KSKs are used.
 //! - DNSSEC signatures themselves are classical (ECDSA/RSA); "post-quantum"
 //!   in albus refers to DoH transport key exchange, not signatures.
@@ -379,8 +382,11 @@ impl DnssecValidator {
         let rtype = RecordType::from(qtype);
         let now = Self::now_epoch();
 
-        // gather candidate RRsets: positive answers, else authority denial records
-        let mut candidates: Vec<(Name, Vec<Record>, RecordType)> = Vec::new();
+        // gather candidate RRsets: positive answers, else authority denial records.
+        // The bool marks denial candidates: ONLY they go through the FP-18
+        // coverage gate. Positive/chain candidates return Secure on chain
+        // success exactly as before.
+        let mut candidates: Vec<(Name, Vec<Record>, RecordType, bool)> = Vec::new();
         let mut answer_recs: Vec<Record> = Vec::new();
         for rec in &msg.answers {
             let t = rec.record_type();
@@ -392,11 +398,23 @@ impl DnssecValidator {
             .iter()
             .any(|r| r.record_type() == rtype && name_eq(&r.name, &owner))
         {
-            candidates.push((owner.clone(), answer_recs, rtype));
+            candidates.push((owner.clone(), answer_recs, rtype, false));
         } else if let Some(chain) = cname_chain(&msg.answers, &owner, rtype) {
             // CNAME chain: every link plus the terminal RRset must verify;
             // a missing link degrades to insecure (served, never Secure).
-            candidates.extend(chain);
+            candidates.extend(chain.into_iter().map(|(n, r, t)| (n, r, t, false)));
+        } else if answer_recs
+            .iter()
+            .any(|rec| matches!((&rec.data), RData::DNSSEC(DNSSECRData::RRSIG(_))))
+        {
+            // FP-19: signed material in answers that chained to nothing is a
+            // fail-closed Bogus — never silently demote a truncated signed
+            // chain (e.g. hop-cap exceed) to Insecure via the denial path.
+            debug!(
+                "dnssec: signed answer records without a verifiable chain for {}",
+                owner.to_ascii()
+            );
+            return DnssecState::Bogus;
         } else {
             // denial: validate NSEC/NSEC3 RRsets carrying RRSIGs when present
             let mut denial: HashMap<String, (Name, Vec<Record>, RecordType)> = HashMap::new();
@@ -414,7 +432,7 @@ impl DnssecValidator {
             }
             for (_, (name, recs, t)) in denial {
                 if t == RecordType::NSEC || t == RecordType::NSEC3 {
-                    candidates.push((name, recs, t));
+                    candidates.push((name, recs, t, true));
                 }
             }
             if candidates.is_empty() {
@@ -424,13 +442,19 @@ impl DnssecValidator {
         }
 
         let mut saw_insecure = false;
+        // FP-18: coverage-gated denial. Chain-verified but non-covering NSECs
+        // are replayed forgeries for THIS query (skip; Bogus if nothing else
+        // verifies). Interval-only NSECs and all NSEC3s (no hash impl) cap at
+        // Indeterminate — served honestly, never Secure.
+        let mut noncovering_signed = false;
+        let mut saw_capped = false;
         // Strict chain rule: if ANY candidate carries RRSIGs, every link must
         // verify Secure. An unsigned link beside signed links smells like a
         // stripped signature redirecting qname to another valid signed name.
         let any_signed = candidates
             .iter()
-            .any(|(_, recs, t)| !Self::rrsig_records(recs, *t).is_empty());
-        for (name, recs, t) in &candidates {
+            .any(|(_, recs, t, _)| !Self::rrsig_records(recs, *t).is_empty());
+        for (name, recs, t, is_denial) in &candidates {
             let sigs = Self::rrsig_records(recs, *t);
             if sigs.is_empty() {
                 if any_signed {
@@ -465,8 +489,35 @@ impl DnssecValidator {
                     break;
                 }
             }
-            if rrset_secure {
+            if rrset_secure && !is_denial {
                 return DnssecState::Secure;
+            }
+            if rrset_secure {
+                // FP-18: a valid signature is not enough for denial — it must
+                // actually deny THIS (qname, qtype).
+                if *t == RecordType::NSEC {
+                    if let Some((next, has_qtype, has_cname)) = nsec_shape(recs, rtype) {
+                        match nsec_coverage(name, &next, has_qtype, has_cname, &owner, rtype) {
+                            NsecCoverage::CoversNODATA => return DnssecState::Secure,
+                            NsecCoverage::CoversInterval => {
+                                saw_capped = true;
+                                continue;
+                            }
+                            NsecCoverage::NoCover => {
+                                noncovering_signed = true;
+                                continue;
+                            }
+                        }
+                    } else {
+                        // unparseable NSEC shape: cannot prove denial
+                        noncovering_signed = true;
+                        continue;
+                    }
+                } else {
+                    // NSEC3 without hash verification: cap at Indeterminate.
+                    saw_capped = true;
+                    continue;
+                }
             }
             // RRSIGs present but none chain-verify: cryptographic failure
             debug!(
@@ -474,6 +525,19 @@ impl DnssecValidator {
                 name.to_ascii()
             );
             return DnssecState::Bogus;
+        }
+        if noncovering_signed {
+            // chain-valid signatures that deny nothing for this query:
+            // replayed/forged denial material for a different name.
+            debug!(
+                "dnssec: signed but non-covering denial for {}",
+                owner.to_ascii()
+            );
+            return DnssecState::Bogus;
+        }
+        if saw_capped {
+            // wildcard-unproven interval or NSEC3: honestly unverified.
+            return DnssecState::Indeterminate;
         }
         if saw_insecure {
             DnssecState::Insecure
@@ -485,6 +549,94 @@ impl DnssecValidator {
 
 fn name_eq(a: &Name, b: &Name) -> bool {
     a.to_ascii().to_lowercase() == b.to_ascii().to_lowercase()
+}
+
+// FP-18: RFC 4034 §6.1 canonical DNS name ordering (rightmost-label-first,
+// case-insensitive; shorter sorts first on shared suffix). Used to check
+// NSEC interval coverage so replayed non-covering NSECs cannot yield Secure.
+fn canonical_labels(name: &Name) -> Vec<String> {
+    let s = name.to_ascii().to_lowercase();
+    let s = s.strip_suffix('.').unwrap_or(&s);
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split('.').map(|l| l.to_string()).collect()
+    }
+}
+
+fn canonical_cmp(a: &Name, b: &Name) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (la, lb) = (canonical_labels(a), canonical_labels(b));
+    let n = la.len().min(lb.len());
+    for i in 0..n {
+        match la[la.len() - 1 - i].cmp(&lb[lb.len() - 1 - i]) {
+            Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    la.len().cmp(&lb.len())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NsecCoverage {
+    /// Owner == qname and bitmap lacks qtype (genuine NODATA denial).
+    CoversNODATA,
+    /// Interval brackets qname but wildcard/encloser proof is out of scope.
+    CoversInterval,
+    /// Does not deny this (qname, qtype) at all.
+    NoCover,
+}
+
+// thin adapter: first NSEC RDATA in the candidate RRset → coverage inputs.
+// None when no parseable NSEC is present (caller treats as unproven).
+fn nsec_shape(recs: &[Record], qtype: RecordType) -> Option<(Name, bool, bool)> {
+    for rec in recs {
+        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = (&rec.data) {
+            let has_qtype = nsec.type_bit_maps().any(|t| t == qtype);
+            let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
+            return Some((nsec.next_domain_name().clone(), has_qtype, has_cname));
+        }
+    }
+    None
+}
+
+// FP-18: pure coverage decision over primitives (unit-testable without
+// constructing NSEC records). Bitmap/CNAME presence comes from the NSEC RDATA.
+fn nsec_coverage(
+    owner: &Name,
+    next: &Name,
+    bitmap_has_qtype: bool,
+    bitmap_has_cname: bool,
+    qname: &Name,
+    qtype: RecordType,
+) -> NsecCoverage {
+    use std::cmp::Ordering;
+    if name_eq(owner, qname) {
+        if bitmap_has_qtype {
+            return NsecCoverage::NoCover;
+        }
+        // a CNAME at owner means the server should have returned it, not NSEC
+        if bitmap_has_cname && qtype != RecordType::CNAME {
+            return NsecCoverage::NoCover;
+        }
+        return NsecCoverage::CoversNODATA;
+    }
+    let order = canonical_cmp(owner, next);
+    let inside = if order == Ordering::Less {
+        canonical_cmp(owner, qname) == Ordering::Less
+            && canonical_cmp(qname, next) == Ordering::Less
+    } else if order == Ordering::Greater {
+        // wrap-around at the zone end: (owner, +inf) ∪ (-inf, next)
+        canonical_cmp(owner, qname) == Ordering::Less
+            || canonical_cmp(qname, next) == Ordering::Less
+    } else {
+        false
+    };
+    if inside {
+        NsecCoverage::CoversInterval
+    } else {
+        NsecCoverage::NoCover
+    }
 }
 
 // follows CNAME links present in this response (no extra fetches):
@@ -599,6 +751,113 @@ mod tests {
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let state = v.validate("example.com", 1, &[0u8; 4], &resolver).await;
         assert_eq!(state, DnssecState::Indeterminate);
+    }
+
+    // FP-18: canonical ordering (RFC 4034 §6.1) — rightmost-first,
+    // case-insensitive, shorter-first on shared suffix.
+    #[test]
+    fn test_canonical_cmp_ordering() {
+        use std::cmp::Ordering;
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        assert_eq!(
+            canonical_cmp(&n("a.example."), &n("b.example.")),
+            Ordering::Less
+        );
+        assert_eq!(
+            canonical_cmp(&n("example."), &n("a.example.")),
+            Ordering::Less
+        );
+        assert_eq!(
+            canonical_cmp(&n("WWW.EXAMPLE."), &n("www.example.")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            canonical_cmp(&n("a.example."), &n("a.example.")),
+            Ordering::Equal
+        );
+        // zulu.example > alpha.example at the leftmost differing label
+        assert_eq!(
+            canonical_cmp(&n("zulu.example."), &n("alpha.example.")),
+            Ordering::Greater
+        );
+    }
+
+    // FP-18: NSEC coverage matrix over primitives (no network, no keys).
+    #[test]
+    fn test_nsec_coverage_matrix() {
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        // owner == qname, bitmap lacks qtype → genuine NODATA denial
+        assert_eq!(
+            nsec_coverage(
+                &n("host.example."),
+                &n("other.example."),
+                false,
+                false,
+                &n("host.example."),
+                RecordType::A
+            ),
+            NsecCoverage::CoversNODATA
+        );
+        // owner == qname but bitmap HAS qtype → denies nothing (replay/wrong RRset)
+        assert_eq!(
+            nsec_coverage(
+                &n("host.example."),
+                &n("other.example."),
+                true,
+                false,
+                &n("host.example."),
+                RecordType::A
+            ),
+            NsecCoverage::NoCover
+        );
+        // CNAME at owner for non-CNAME query → server should have returned it
+        assert_eq!(
+            nsec_coverage(
+                &n("host.example."),
+                &n("other.example."),
+                false,
+                true,
+                &n("host.example."),
+                RecordType::A
+            ),
+            NsecCoverage::NoCover
+        );
+        // interval brackets qname → NXDOMAIN-shaped, wildcard unproven
+        assert_eq!(
+            nsec_coverage(
+                &n("a.example."),
+                &n("c.example."),
+                false,
+                false,
+                &n("b.example."),
+                RecordType::A
+            ),
+            NsecCoverage::CoversInterval
+        );
+        // replayed NSEC from elsewhere in the zone → no cover (the FP-18 kill)
+        assert_eq!(
+            nsec_coverage(
+                &n("x.example."),
+                &n("z.example."),
+                false,
+                false,
+                &n("b.example."),
+                RecordType::A
+            ),
+            NsecCoverage::NoCover
+        );
+        // wrap-around at zone end covers
+        assert_eq!(
+            nsec_coverage(
+                &n("z.example."),
+                &n("a.example."),
+                false,
+                false,
+                &n("zz.example."),
+                RecordType::A
+            ),
+            NsecCoverage::CoversInterval
+        );
     }
 
     // builds a DO-bit query with hickory (never hand-rolled wire bytes)

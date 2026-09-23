@@ -53,6 +53,9 @@ impl BpfManager {
     // reloads ebpf maps live at runtime without stopping or detaching the program
     // FP-17: push first, swap cfg only on success; absent handles (pre-start)
     // is an explicit error, never a silent Ok.
+    // Follow-up: sync (not just push) set maps so shrunk configs purge stale
+    // entries; on mid-sequence failure best-effort restore the old sets so the
+    // kernel never sits half-migrated while memory claims either version.
     pub fn reload_maps(
         &mut self,
         new_cfg: &BpfManagerConfig,
@@ -67,10 +70,30 @@ impl BpfManager {
             new_cfg.min_mss,
             true,
         );
-        handles.push_config(bpf_cfg)?;
-        handles.push_target_ports(&new_cfg.ports)?;
-        handles.push_exclude_ips(&new_cfg.exclude_ips)?;
-        handles.push_exclude_ips_v6(&new_cfg.exclude_ips_v6)?;
+        let old = &self.cfg;
+        let applied = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            handles.push_config(bpf_cfg)?;
+            handles.sync_target_ports(&old.ports, &new_cfg.ports)?;
+            handles.sync_exclude_ips(&old.exclude_ips, &new_cfg.exclude_ips)?;
+            handles.sync_exclude_ips_v6(&old.exclude_ips_v6, &new_cfg.exclude_ips_v6)?;
+            Ok(())
+        })();
+        if let Err(e) = applied {
+            // best-effort rollback toward the pre-reload kernel state,
+            // including the scalar config map (not just the sets).
+            let old_cfg = BpfConfig::new(
+                old.mss,
+                old.restore_mss,
+                old.restore_after_bytes,
+                old.min_mss,
+                true,
+            );
+            let _ = handles.push_config(old_cfg);
+            let _ = handles.sync_target_ports(&new_cfg.ports, &old.ports);
+            let _ = handles.sync_exclude_ips(&new_cfg.exclude_ips, &old.exclude_ips);
+            let _ = handles.sync_exclude_ips_v6(&new_cfg.exclude_ips_v6, &old.exclude_ips_v6);
+            return Err(e);
+        }
         // all pushes succeeded: now adopt the new config (no cfg/map divergence)
         self.cfg = new_cfg.clone();
         info!(
@@ -157,12 +180,17 @@ impl BpfManager {
         };
 
         let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // FP-13 follow-up: multi_thread with one worker so spawned
+            // estimator tasks are driven independently — a current_thread
+            // runtime only polls tasks during block_on, which starved
+            // estimation whenever the DNS path was idle.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()
                 .ok();
-            // FP-13: enter the runtime so estimator.get_ttl's try_current
-            // finds a context and background estimation actually runs.
+            // Keep the enter guard as well: sync get_ttl must observe a
+            // context via try_current on this thread too.
             let _enter_guard = rt.as_ref().map(|r| r.enter());
             let mut decoy_idx: usize = 0;
 

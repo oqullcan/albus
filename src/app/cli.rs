@@ -140,7 +140,8 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fake_bad_checksum: bool,
 
-    // dynamic hop distance estimation and ttl optimization
+    // hop-distance ttl heuristic and ttl optimization (conservative constant
+    // until true path probing lands; see measure_hop_distance)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub auto_ttl: bool,
 

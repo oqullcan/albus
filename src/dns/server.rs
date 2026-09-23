@@ -131,9 +131,11 @@ impl DnsServer {
                             }
                         }
 
-                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
+                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s.
+                        // Spawned, not awaited: the probe's jitter sleep must
+                        // not stall the passive check or shutdown handling.
                         if tick_count % 4 == 0 {
-                            run_active_canary_probe().await;
+                            tokio::spawn(run_active_canary_probe());
                         }
                     }
                     _ = canary_shutdown_rx.recv() => {
@@ -562,12 +564,14 @@ async fn run_active_canary_probe() {
             ));
         }
         let resp = &resp_buf[..len];
-        // TXID + question echo validation (response carries question + answers,
-        // so compare the echoed prefix, not the whole datagram).
+        // TXID + question echo validation. The response carries our question
+        // as a PREFIX (header + question, then answers): compare exactly the
+        // echoed question section. (Comparing header counts would always fail:
+        // legit replies set ANCOUNT, which the query leaves zero.)
         if resp.len() < query.len()
             || resp[0] != query[0]
             || resp[1] != query[1]
-            || resp[4..query.len()] != query[4..]
+            || resp[12..query.len()] != query[12..]
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -676,20 +680,15 @@ pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
     Some((domain, ips))
 }
 
-// FP-12: labels carrying terminal escape, control, or bidi/format marks must
-// never enter names used by logs, queues, or caches. DNS wire labels for real
-// hostnames are LDH/punycode; no legitimate label needs these code points.
+// FP-12 follow-up: allowlist (LDH + underscore for _dmarc/_acme-style names,
+// case-insensitive). Real wire hostnames are LDH/punycode, so nothing
+// legitimate is lost and whole homograph/confusable classes (Cf/Zl/Zp,
+// controls, bidi) die at once — no denylist to outdate.
 fn label_is_safe(label: &str) -> bool {
-    !label.chars().any(|c| {
-        c.is_control()
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' // zero-width + bidi marks
-                | '\u{202A}'..='\u{202E}' // bidi embeddings/overrides
-                | '\u{2066}'..='\u{2069}' // bidi isolates
-                | '\u{061C}' // arabic letter mark
-                | '\u{FEFF}' // zero-width no-break space
-            )
-    })
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 // unpacks compressed dns name labels resolving RFC 1035 pointer offsets

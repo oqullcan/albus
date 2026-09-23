@@ -77,6 +77,14 @@ impl RawSocket {
         bad_checksum: bool,
     ) -> Result<usize> {
         let pkt = build_packet_stack_opts(conn, payload, ttl, bad_checksum);
+        // Oversize builds yield an empty packet — refuse to sendto(fd, 0 bytes)
+        // and misreport Ok(0) as success; surface it so the caller warns.
+        if pkt.len() == 0 {
+            return Err(Error::other(format!(
+                "oversize fake payload ({} bytes) exceeds stack packet cap",
+                payload.len()
+            )));
+        }
 
         match (conn.src_ip, conn.dst_ip) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(dst_v4)) => {

@@ -54,16 +54,39 @@ impl AutoTtlEstimator {
         }
 
         // spawn non-blocking hop measurement task within runtime context.
-        // FP-13: dedup via the in-flight set — no task storms on hot misses.
+        // FP-13 follow-ups: dedup via the in-flight set (capped — no task
+        // storms on fan-out), poison-tolerant locks (fail open to default,
+        // never silently stuck).
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let fresh = self
-                .inflight
-                .lock()
-                .map(|mut set| set.insert(dst_ip))
-                .unwrap_or(false);
+            // cap the in-flight set: fan-out beyond this falls back to
+            // default instead of queueing unbounded tasks.
+            const MAX_INFLIGHT: usize = 512;
+            let mut set = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = set.len() < MAX_INFLIGHT && set.insert(dst_ip);
+            drop(set);
             if fresh {
                 let this = self.clone();
                 handle.spawn(async move {
+                    // scope guard: the entry is always released, even on
+                    // panic/cancellation, so one bad task cannot suppress
+                    // an IP's estimation for daemon lifetime.
+                    struct Release {
+                        owner: AutoTtlEstimator,
+                        ip: Ipv4Addr,
+                    }
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.owner
+                                .inflight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&self.ip);
+                        }
+                    }
+                    let _release = Release {
+                        owner: this.clone(),
+                        ip: dst_ip,
+                    };
                     this.estimate_and_cache(dst_ip).await;
                 });
             }
@@ -92,9 +115,10 @@ impl AutoTtlEstimator {
         let optimal_ttl = self.calculate_optimal_ttl(estimated_hops);
         debug!(ip = %dst_ip, total_hops = estimated_hops, optimal_ttl = optimal_ttl, "Auto-TTL estimated");
         self.cache.insert(dst_ip, optimal_ttl);
-        if let Ok(mut set) = self.inflight.lock() {
-            set.remove(&dst_ip);
-        }
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&dst_ip);
     }
 }
 
