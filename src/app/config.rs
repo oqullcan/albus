@@ -672,7 +672,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // NV-02 follow-up: O_NONBLOCK so a planted FIFO (e.g. via explicit
+        // --config path) is rejected by the is_file gate below instead of
+        // hanging the caller. Harmless for regular files.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
 
     let mut file = options.open(p)?;
@@ -685,6 +688,20 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
                 p.display()
             ),
         ));
+    }
+
+    // NV-02: clear O_NONBLOCK for the subsequent read (FIFO would already
+    // have been rejected above; regular files are unaffected either way).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -848,7 +865,8 @@ impl Config {
                 options.read(true);
                 {
                     use std::os::unix::fs::OpenOptionsExt;
-                    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                    // NV-02 follow-up: same O_NONBLOCK rationale as safe_read.
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
                 }
                 let mut file = options.open(p).map_err(|e| {
                     format!(
@@ -866,12 +884,20 @@ impl Config {
                 }
                 {
                     use std::os::unix::fs::MetadataExt;
+                    use std::os::unix::io::AsRawFd;
                     if meta.uid() != 0 {
                         return Err(format!(
                             "security violation: --config owned by uid {} (expected root) when running as root",
                             meta.uid()
                         )
                         .into());
+                    }
+                    let fd = file.as_raw_fd();
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    if flags >= 0 {
+                        unsafe {
+                            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                        }
                     }
                 }
                 use std::io::Read;
@@ -1163,6 +1189,23 @@ mod tests {
         assert!(!Config::should_sync_etc(true, Some(1000)));
         assert!(!Config::should_sync_etc(false, None));
         assert!(!Config::should_sync_etc(false, Some(1000)));
+    }
+
+    // NV-02 follow-up: a planted FIFO must be rejected, not block on open.
+    // (Pre-fix this test hangs; post-fix O_NONBLOCK makes open succeed and
+    // the is_file gate deny. No writer ever opens the fifo.)
+    #[test]
+    fn test_fifo_read_rejected_without_hang() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("albus_test_fifo_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let fifo = dir.join("config.fifo");
+        let cstr = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) }, 0);
+        let res = safe_read(&fifo);
+        assert!(res.is_err(), "FIFO must be rejected, not read or hung");
+        let _ = fs::remove_file(&fifo);
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
