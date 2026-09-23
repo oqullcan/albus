@@ -5,4 +5,5 @@ pub mod loader;
 pub mod manager;
 
 pub use features::is_root;
+pub use features::{has_service_privileges, service_uid};
 pub use manager::{BpfManager, BpfManagerConfig};

@@ -17,6 +17,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install eBPF build deps (clang + kernel headers)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+
       - name: rustfmt check
         run: cargo fmt --check
 

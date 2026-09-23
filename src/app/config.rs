@@ -261,6 +261,26 @@ impl Drop for FsPrivilegeGuard {
 }
 
 #[cfg(unix)]
+/// Uids trusted to own system paths (/run/albus, /etc/albus): uid 0 plus the
+/// L1 dedicated service user when that account exists. Centralizes the L1
+/// ownership model so no check can drift back to root-only.
+fn is_trusted_system_uid(uid: libc::uid_t) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    matches!(crate::core::ebpf::service_uid(), Some(suid) if suid == uid)
+}
+
+#[cfg(unix)]
+/// True when this process runs as the L1 dedicated service user (non-root).
+/// Used to resolve daemon paths (shared /run/albus, /etc/albus) instead of
+/// per-user sudo/XDG/HOME paths.
+fn is_service_user_process() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    euid != 0 && matches!(crate::core::ebpf::service_uid(), Some(suid) if suid == euid)
+}
+
+#[cfg(unix)]
 fn validated_sudo_uid() -> Option<libc::uid_t> {
     let uid: libc::uid_t = std::env::var("SUDO_UID").ok()?.trim().parse().ok()?;
     if uid == 0 {
@@ -348,7 +368,8 @@ fn check_parent_ownership(parent: &Path, is_system_path: bool) -> std::io::Resul
     let dir_uid = meta.uid();
     let euid = unsafe { libc::geteuid() };
     if is_system_path {
-        if dir_uid != 0 {
+        // L1: root or the dedicated service user may own system parents.
+        if !is_trusted_system_uid(dir_uid) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -446,7 +467,8 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
 fn check_write_owner(file_uid: libc::uid_t, is_system_path: bool, p: &Path) -> std::io::Result<()> {
     let euid = unsafe { libc::geteuid() };
     if is_system_path {
-        if file_uid != 0 {
+        // L1: root or the dedicated service user may own system files.
+        if !is_trusted_system_uid(file_uid) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -712,7 +734,8 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
         if current_uid == 0 {
             if is_system_path {
-                if file_uid != 0 {
+                // L1: root or the dedicated service user may own system files.
+                if !is_trusted_system_uid(file_uid) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
@@ -885,9 +908,11 @@ impl Config {
                 {
                     use std::os::unix::fs::MetadataExt;
                     use std::os::unix::io::AsRawFd;
-                    if meta.uid() != 0 {
+                    // L1: root or the dedicated service user may own --config
+                    // (/etc/albus is service-owned post-migration).
+                    if !is_trusted_system_uid(meta.uid()) {
                         return Err(format!(
-                            "security violation: --config owned by uid {} (expected root) when running as root",
+                            "security violation: --config owned by uid {} (expected root or service user) when running privileged",
                             meta.uid()
                         )
                         .into());
@@ -933,6 +958,11 @@ impl Config {
                 }
             }
             PathBuf::from("/run/albus/config.json")
+        } else if is_service_user_process() {
+            // L1: the daemon runs as the service user with RuntimeDirectory;
+            // its volatile state lives in the shared daemon path, never in
+            // per-user XDG runtime dirs.
+            PathBuf::from("/run/albus/config.json")
         } else if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             // validate attacker-controlled env: absolute, bounded, no traversal,
             // must live under /run (standard XDG_RUNTIME_DIR location)
@@ -958,6 +988,14 @@ impl Config {
 
     // resolves durable persistent configuration path on physical disk (never returns volatile memory)
     pub fn default_config_path() -> PathBuf {
+        // L1: the daemon runs as the service user — its durable config is the
+        // system file, never a sudo/XDG/HOME-derived user path.
+        #[cfg(unix)]
+        {
+            if is_service_user_process() {
+                return PathBuf::from("/etc/albus/config.json");
+            }
+        }
         // 1. check sudo user environment with strict format and passwd validation
         if let Some(sudo_home) = get_sudo_user_home() {
             let sudo_cfg = sudo_home.join(".config/albus/config.json");
@@ -1189,6 +1227,22 @@ mod tests {
         assert!(!Config::should_sync_etc(true, Some(1000)));
         assert!(!Config::should_sync_etc(false, None));
         assert!(!Config::should_sync_etc(false, Some(1000)));
+    }
+
+    #[test]
+    fn test_l1_trusted_system_uids() {
+        // root is always trusted
+        assert!(is_trusted_system_uid(0));
+        // the service account, if present, is trusted; an unrelated uid is not
+        match crate::core::ebpf::service_uid() {
+            Some(suid) => {
+                assert!(is_trusted_system_uid(suid));
+            }
+            None => {
+                // no albus account here: a high uid must be untrusted
+                assert!(!is_trusted_system_uid(60000));
+            }
+        }
     }
 
     // NV-02 follow-up: a planted FIFO must be rejected, not block on open.

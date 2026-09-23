@@ -140,6 +140,14 @@ albus monitor                # Interactive curses-style telemetry TUI
 sudo albus cleanup           # Restore original /etc/resolv.conf and purge firewall rules
 ```
 
+Privilege model: install/uninstall/cleanup run as real root, but the daemon
+itself runs as the dedicated `albus` system user (created idempotently at
+install) with exactly six ambient capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`,
+`CAP_BPF`, `CAP_PERFMON`, `CAP_NET_BIND_SERVICE`, `CAP_DAC_OVERRIDE`) —
+`has_service_privileges()` enforces the same set in-process, and the engine
+refuses to run without it. `ExecStopPost` keeps the `+` prefix so crash
+cleanup still runs privileged.
+
 ### Options Reference
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |

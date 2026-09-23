@@ -1,6 +1,8 @@
 //! kernel feature inspection, cgroup v2 verification, and status bar telemetry emission.
 
-use crate::core::ebpf::features::{have_sock_ops, is_cgroup_v2, is_root};
+use crate::core::ebpf::features::{
+    has_service_privileges, have_sock_ops, is_cgroup_v2, is_root, service_uid,
+};
 use std::env;
 use std::process::Command;
 
@@ -19,7 +21,7 @@ pub fn show_status() {
     println!("  platform:   linux/{}", env::consts::ARCH);
     println!("  engine:     ebpf-sockops");
 
-    if !is_root() {
+    if !has_service_privileges() {
         println!("  (run with sudo for accurate capability detection)");
         return;
     }
@@ -68,7 +70,7 @@ fn verified_albus_process() -> bool {
 
 // FP-11: single-PID verification step (pure logic over live /proc reads,
 // split out for testing). Counts only non-self PIDs whose exe is this binary
-// (or the installed system binary) and whose uid is root.
+// (or the installed system binary) and whose uid is root or the L1 service user.
 fn pid_is_verified_albus(pid: u32, self_exe: &Option<std::path::PathBuf>, my_pid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -84,7 +86,7 @@ fn pid_is_verified_albus(pid: u32, self_exe: &Option<std::path::PathBuf>, my_pid
         return false;
     }
     std::fs::metadata(format!("/proc/{}", pid))
-        .map(|m| m.uid() == 0)
+        .map(|m| m.uid() == 0 || Some(m.uid()) == service_uid())
         .unwrap_or(false)
 }
 
