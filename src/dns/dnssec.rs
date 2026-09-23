@@ -36,6 +36,31 @@ pub enum DnssecState {
     Indeterminate,
 }
 
+/// Fetch result with proven-NODATA distinguished from failure (island fix):
+/// only a NOERROR response carrying zero matching records proves the RRset
+/// does not exist. Timeouts, SERVFAIL, and parse errors are `Failed` so
+/// callers keep failing closed instead of downgrading on infrastructure errors.
+#[derive(Debug)]
+enum FetchOutcome {
+    Found(Vec<Record>),
+    NODATA,
+    Failed,
+}
+
+/// Chain verdict with unsigned-delegation (island) distinguished from failure:
+///
+/// - `Secure`: full DS→DNSKEY chain to the trust anchor.
+/// - `InsecureIsland`: the parent provably holds no DS for the zone
+///   (NOERROR + zero DS records), i.e. an unsigned delegation per RFC 4035
+///   §4.2. Served as Insecure, never Bogus.
+/// - `Fail`: anything undecided (fetch failure, bad digest, broken chain).
+#[derive(Debug, PartialEq, Eq)]
+enum ChainVerdict {
+    Secure,
+    InsecureIsland,
+    Fail,
+}
+
 // algorithms we accept signatures from (RSASHA1/NSEC3RSASHA1 excluded)
 fn secure_algorithms() -> SupportedAlgorithms {
     SupportedAlgorithms::from_vec(&[
@@ -162,20 +187,31 @@ impl DnssecValidator {
         name: &Name,
         rtype: RecordType,
         resolver: &DoHResolver,
-    ) -> Option<Vec<Record>> {
+    ) -> FetchOutcome {
         if let Some(cached) = self.cache_lookup(name, rtype) {
-            return Some(cached);
+            return FetchOutcome::Found(cached);
         }
         let wire = Self::build_query(name, rtype);
         if wire.is_empty() {
-            return None;
+            return FetchOutcome::Failed;
         }
-        let (resp_wire, _) = resolver.resolve(&wire).await.ok()?;
-        let msg = Message::from_vec(&resp_wire).ok()?;
+        let (resp_wire, _) = match resolver.resolve(&wire).await {
+            Ok(r) => r,
+            Err(_) => return FetchOutcome::Failed,
+        };
+        let msg = match Message::from_vec(&resp_wire) {
+            Ok(m) => m,
+            Err(_) => return FetchOutcome::Failed,
+        };
+        // Only NOERROR with zero matching records is a proven NODATA.
+        // Anything else undecided (SERVFAIL/REFUSED/timeout/parse) stays a
+        // failure so callers fail closed.
         if msg.response_code != ResponseCode::NoError {
-            return None;
+            return FetchOutcome::Failed;
         }
         let mut out = Vec::new();
+        let mut matched = false;
+        let mut denial_marker = false;
         for rec in msg
             .answers
             .iter()
@@ -188,13 +224,27 @@ impl DnssecValidator {
                 out.push(rec.clone());
             } else if name_eq(&rec.name, name) && rec.record_type() == rtype {
                 out.push(rec.clone());
+                matched = true;
+            } else if rec.record_type() == RecordType::SOA
+                || rec.record_type() == RecordType::NSEC
+                || rec.record_type() == RecordType::NSEC3
+            {
+                // NODATA-shaped denial scaffolding (proves the server answered
+                // the question instead of failing it)
+                denial_marker = true;
             }
         }
-        if out.is_empty() {
-            return None;
+        // Proven NODATA (island fix): NOERROR + denial-shaped response + zero
+        // matching records. RRSIG-only or marker-less junk stays a failure
+        // (fail closed) — only a real denial shape downgrades to NODATA.
+        if !matched {
+            if denial_marker {
+                return FetchOutcome::NODATA;
+            }
+            return FetchOutcome::Failed;
         }
         self.cache_store(name, rtype, out.clone());
-        Some(out)
+        FetchOutcome::Found(out)
     }
 
     fn rrsig_records(records: &[Record], covered: RecordType) -> Vec<RRSIG> {
@@ -260,16 +310,20 @@ impl DnssecValidator {
         dnskey_records: &[Record],
         resolver: &DoHResolver,
         depth: usize,
-    ) -> bool {
+    ) -> ChainVerdict {
         if depth > MAX_CHAIN_DEPTH {
-            return false;
+            return ChainVerdict::Fail;
         }
         let keys = Self::dnskey_records(dnskey_records);
         if keys.is_empty() {
-            return false;
+            return ChainVerdict::Fail;
         }
         if zone.is_root() {
-            return self.matches_anchor(&keys);
+            return if self.matches_anchor(&keys) {
+                ChainVerdict::Secure
+            } else {
+                ChainVerdict::Fail
+            };
         }
         // DS RRset lives in the parent; fetch DS + parent DNSKEY concurrently
         let parent = zone.base_name();
@@ -277,16 +331,20 @@ impl DnssecValidator {
             self.fetch_rrset(zone, RecordType::DS, resolver),
             self.fetch_rrset(&parent, RecordType::DNSKEY, resolver)
         );
+        // Proven DS absence (NOERROR + zero records) is an unsigned
+        // delegation — an island — not a failure. Anything undecided stays
+        // fail-closed.
         let ds_records = match ds_records {
-            Some(r) => r,
-            None => {
-                return false;
+            FetchOutcome::Found(r) => r,
+            FetchOutcome::NODATA => return ChainVerdict::InsecureIsland,
+            FetchOutcome::Failed => {
+                return ChainVerdict::Fail;
             }
         };
         let parent_keys = match parent_keys {
-            Some(r) => r,
-            None => {
-                return false;
+            FetchOutcome::Found(r) => r,
+            FetchOutcome::NODATA | FetchOutcome::Failed => {
+                return ChainVerdict::Fail;
             }
         };
         let parent_dnskeys = Self::dnskey_records(&parent_keys);
@@ -315,16 +373,23 @@ impl DnssecValidator {
                 let ds_sigs = Self::rrsig_records(&ds_records, RecordType::DS);
                 for ds_sig in &ds_sigs {
                     let v = self.verify_rrset(zone, &ds_records, ds_sig, &parent_dnskeys, now);
-                    if v.is_some_and(|signer| name_eq(&signer, &parent))
-                        && Box::pin(self.chain_to_root(&parent, &parent_keys, resolver, depth + 1))
-                            .await
+                    if !v.is_some_and(|signer| name_eq(&signer, &parent)) {
+                        continue;
+                    }
+                    // Propagate island upward: a DS under an unsigned parent
+                    // proves nothing, so the subtree is insecure — but it is
+                    // NOT a cryptographic contradiction (never Bogus here).
+                    match Box::pin(self.chain_to_root(&parent, &parent_keys, resolver, depth + 1))
+                        .await
                     {
-                        return true;
+                        ChainVerdict::Secure => return ChainVerdict::Secure,
+                        ChainVerdict::InsecureIsland => return ChainVerdict::InsecureIsland,
+                        ChainVerdict::Fail => continue,
                     }
                 }
             }
         }
-        false
+        ChainVerdict::Fail
     }
 
     fn matches_anchor(&self, keys: &[DNSKEY]) -> bool {
@@ -468,6 +533,7 @@ impl DnssecValidator {
                 continue;
             }
             let mut rrset_secure = false;
+            let mut rrset_island = false;
             for sig in &sigs {
                 let signer = sig.input().signer_name.clone();
                 // fetch the signer's DNSKEY set and try it
@@ -475,8 +541,10 @@ impl DnssecValidator {
                     .fetch_rrset(&signer, RecordType::DNSKEY, resolver)
                     .await
                 {
-                    Some(r) => r,
-                    None => continue,
+                    FetchOutcome::Found(r) => r,
+                    // NODATA/Failed DNSKEY fetches cannot authenticate: try
+                    // the next signature, fail closed at the end.
+                    FetchOutcome::NODATA | FetchOutcome::Failed => continue,
                 };
                 if self
                     .verify_rrset(name, recs, sig, &Self::dnskey_records(&dnskey_recs), now)
@@ -484,10 +552,22 @@ impl DnssecValidator {
                 {
                     continue;
                 }
-                if Box::pin(self.chain_to_root(&signer, &dnskey_recs, resolver, 0)).await {
-                    rrset_secure = true;
-                    break;
+                match Box::pin(self.chain_to_root(&signer, &dnskey_recs, resolver, 0)).await {
+                    ChainVerdict::Secure => {
+                        rrset_secure = true;
+                        break;
+                    }
+                    // Unsigned delegation above a signed RRset: serve as
+                    // insecure (RFC 4035 §4.2), never Bogus.
+                    ChainVerdict::InsecureIsland => {
+                        rrset_island = true;
+                        break;
+                    }
+                    ChainVerdict::Fail => continue,
                 }
+            }
+            if rrset_island {
+                return DnssecState::Insecure;
             }
             if rrset_secure && !is_denial {
                 return DnssecState::Secure;
@@ -918,8 +998,23 @@ mod tests {
         assert_eq!(state, DnssecState::Insecure);
     }
 
-    // Run-4: live-network test — excluded from hermetic gates
-    // (`cargo test -- --ignored`), matching the live_* convention.
+    // Island regression (chatgpt.com 2026-09-23): a signed zone with NO DS
+    // in the parent must validate Insecure (served), never Bogus (SERVFAIL).
+    // Live-network — excluded from hermetic gates like the other live tests.
+    #[tokio::test]
+    #[ignore]
+    async fn test_unsigned_delegation_island_is_insecure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("chatgpt.com", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+        let state = v.validate("chatgpt.com", 1, &resp, &resolver).await;
+        assert_eq!(state, DnssecState::Insecure);
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_tampered_signed_response_is_bogus_live() {
