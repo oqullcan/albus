@@ -34,7 +34,7 @@ fn parse_restore_mss(s: &str) -> Result<u16, String> {
 #[command(
     name = "albus",
     author = "oqullcan",
-    version = "2.1.0",
+    version = "2.2.0",
     about = "ebpf sock_ops tcp mss fragmentation and doh proxy engine",
     long_about = "albus is a kernel-level network utility utilizing ebpf sock_ops and encrypted doh to bypass deep packet inspection."
 )]
