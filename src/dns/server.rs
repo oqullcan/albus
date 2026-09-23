@@ -536,6 +536,16 @@ pub fn build_canary_query() -> Vec<u8> {
     query
 }
 
+// FP-14: pure canary reply check (offline-testable): TXID match plus exact
+// question-section echo. ANCOUNT-and-beyond are the answer and must differ.
+fn canary_reply_valid(resp: &[u8], query: &[u8]) -> bool {
+    resp.len() >= query.len()
+        && query.len() >= 12
+        && resp[0] == query[0]
+        && resp[1] == query[1]
+        && resp[12..query.len()] == query[12..]
+}
+
 // actively probes local loopback resolver to verify canary responsiveness and detect dns leaks.
 // FP-14: pins the reply source to 127.0.0.1:53 and validates TXID + question
 // echo — the first datagram is no longer trusted on pattern alone.
@@ -564,15 +574,11 @@ async fn run_active_canary_probe() {
             ));
         }
         let resp = &resp_buf[..len];
-        // TXID + question echo validation. The response carries our question
+        // TXID + question echo validation (response carries our question
         // as a PREFIX (header + question, then answers): compare exactly the
         // echoed question section. (Comparing header counts would always fail:
         // legit replies set ANCOUNT, which the query leaves zero.)
-        if resp.len() < query.len()
-            || resp[0] != query[0]
-            || resp[1] != query[1]
-            || resp[12..query.len()] != query[12..]
-        {
+        if !canary_reply_valid(resp, &query) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "canary reply TXID/question mismatch",
@@ -909,5 +915,26 @@ mod tests {
         assert!(is_canary_query(&query));
         let canary_resp = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
         assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
+    }
+
+    // FP-14: echo validation accepts legit replies, rejects forgeries.
+    #[test]
+    fn test_canary_reply_valid() {
+        let query = build_canary_query();
+        let good = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
+        assert!(canary_reply_valid(&good, &query));
+        // wrong TXID
+        let mut bad_tx = good.clone();
+        bad_tx[0] ^= 0xFF;
+        assert!(!canary_reply_valid(&bad_tx, &query));
+        // truncated
+        assert!(!canary_reply_valid(&good[..10], &query));
+        // question replaced (pattern-only forgery with valid TXID)
+        let mut forged = good.clone();
+        let qlen = query.len();
+        for b in forged[12..qlen].iter_mut() {
+            *b = 0x41;
+        }
+        assert!(!canary_reply_valid(&forged, &query));
     }
 }

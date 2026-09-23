@@ -537,7 +537,17 @@ Panel {
     args.push("--ram-only", root.ramOnlyEnabled ? "true" : "false")
 
     // preserve backend tuning parameters (FP-08: mirror Config::validate bounds)
+    // Hardening: fast-fail stored ports/cgroup here too (backend remains the
+    // gate; this only avoids a pointless pkexec round-trip on stale values).
     if (root.storedPorts && root.storedPorts.length > 0) {
+      if (root.storedPorts.length > 64) return { ok: false, reason: "Too many ports (max 64)" }
+      var _seen = {}
+      for (var _pi = 0; _pi < root.storedPorts.length; _pi++) {
+        var _pn = parseInt(String(root.storedPorts[_pi]), 10)
+        if (isNaN(_pn) || _pn < 1 || _pn > 65535) return { ok: false, reason: "Invalid port (expected 1..65535)" }
+        if (_seen[_pn]) return { ok: false, reason: "Duplicate port" }
+        _seen[_pn] = true
+      }
       args.push("--ports", root.storedPorts.join(","))
     }
     var _rab = parseInt(String(root.storedRestoreAfterBytes), 10)
@@ -547,7 +557,11 @@ Panel {
     args.push("--restore-after-bytes", String(_rab))
     args.push("--restore-mss", String(_rms))
     if (root.storedCgroup) {
-      args.push("--cgroup", root.storedCgroup)
+      var _cg = String(root.storedCgroup)
+      if (_cg.length === 0 || _cg.length > 256 || _cg.charAt(0) !== '/' || _cg.indexOf("..") !== -1) {
+        return { ok: false, reason: "Invalid cgroup path (absolute, no .., max 256)" }
+      }
+      args.push("--cgroup", _cg)
     }
 
     return { ok: true, args: args }

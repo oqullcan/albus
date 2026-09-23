@@ -80,6 +80,17 @@ impl EchConfigCache {
         if domain.len() > 253 || ech_config.len() > 4096 {
             return;
         }
+        // Hardening: validate-inside — only parseable configs enter the cache,
+        // so no future caller can poison it with unchecked bytes (doh.rs also
+        // pre-validates; defense in depth).
+        if rustls::client::EchConfig::new(
+            ech_config.clone().into(),
+            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+        )
+        .is_err()
+        {
+            return;
+        }
         if let Ok(mut guard) = self.inner.write() {
             // bound memory: simple eviction when too many domains
             if guard.len() >= 1024 {
@@ -178,11 +189,24 @@ fn echconfig_from_records(records: &[&Record], owner: &Name) -> Option<Vec<u8>> 
     }
     None
 }
+/// Hardening note (ex-ECH-TXID): query IDs come from the OS CSPRNG so
+/// upstream observers cannot predict them; time+pid fallback only if the
+/// RNG is unavailable (never a constant).
 fn query_id() -> u16 {
-    std::time::SystemTime::now()
+    let mut buf = [0u8; 2];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        return u16::from_ne_bytes(buf);
+    }
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
-        .unwrap_or(0x5678)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0x5678);
+    let fallback = (nanos ^ (std::process::id().wrapping_mul(0x9E37)) as u32) as u16;
+    if fallback == 0 {
+        1
+    } else {
+        fallback
+    }
 }
 
 #[cfg(test)]
@@ -221,9 +245,45 @@ mod tests {
         let parsed = parse_https_ech_config(&rdata);
         assert_eq!(parsed, Some(dummy_ech.clone()));
 
-        cache.insert(domain.to_string(), dummy_ech.clone());
-        assert_eq!(cache.get(domain), Some(dummy_ech));
+        // insert validates: parseable configs stick, garbage does not.
+        // valid vector is a real-world ECHConfigList (crypto.cloudflare.com).
+        let blob = valid_ech_blob();
+        cache.insert(domain.to_string(), blob.clone());
+        assert_eq!(cache.get(domain), Some(blob));
+        cache.insert("junk.example".to_string(), vec![0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(cache.get("junk.example"), None);
         assert_eq!(cache.get("unknown.com"), None);
+    }
+
+    // real-world ECHConfigList (crypto.cloudflare.com, X25519/AES-128-GCM).
+    // Hand-decoded base64 (no new dependency); any byte drift fails loudly
+    // via the length assert, so silent vector corruption cannot weaken this.
+    fn valid_ech_blob() -> Vec<u8> {
+        const B64: &str = "AEX+DQBBoAAgACDXqb8UltVlB1gDiwNadmQbL4AApc/6BKXFF3w0MsBNbQAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=";
+        fn b64val(c: u8) -> Option<u8> {
+            match c {
+                b'A'..=b'Z' => Some(c - b'A'),
+                b'a'..=b'z' => Some(c - b'a' + 26),
+                b'0'..=b'9' => Some(c - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        let bytes: Vec<u8> = B64.bytes().filter(|b| *b != b'=').collect();
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        for chunk in bytes.chunks(4) {
+            let mut n = 0u32;
+            for (i, b) in chunk.iter().enumerate() {
+                n |= (b64val(*b).expect("test vector must be valid base64") as u32) << (18 - 6 * i);
+            }
+            let emit = if chunk.len() == 4 { 3 } else { chunk.len() - 1 };
+            for i in 0..emit {
+                out.push((n >> (16 - 8 * i)) as u8);
+            }
+        }
+        assert_eq!(out.len(), 71, "test vector must decode to 71 bytes");
+        out
     }
 
     #[test]

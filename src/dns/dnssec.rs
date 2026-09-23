@@ -200,7 +200,7 @@ impl DnssecValidator {
     fn rrsig_records(records: &[Record], covered: RecordType) -> Vec<RRSIG> {
         let mut sigs = Vec::new();
         for rec in records {
-            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = (&rec.data) {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &rec.data {
                 if sig.input().type_covered == covered {
                     sigs.push(sig.clone());
                 }
@@ -212,7 +212,7 @@ impl DnssecValidator {
     fn dnskey_records(records: &[Record]) -> Vec<DNSKEY> {
         let mut keys = Vec::new();
         for rec in records {
-            if let RData::DNSSEC(DNSSECRData::DNSKEY(key)) = (&rec.data) {
+            if let RData::DNSSEC(DNSSECRData::DNSKEY(key)) = &rec.data {
                 keys.push(key.clone());
             }
         }
@@ -294,7 +294,7 @@ impl DnssecValidator {
         // DS must digest a SEP (flag 257) key; the DS RRset itself must be
         // signed by the parent keys, whose chain we then recurse into.
         for rec in &ds_records {
-            let RData::DNSSEC(DNSSECRData::DS(ds)) = (&rec.data) else {
+            let RData::DNSSEC(DNSSECRData::DS(ds)) = &rec.data else {
                 continue;
             };
             if ds.digest_type() != hickory_proto::dnssec::DigestType::SHA256
@@ -405,7 +405,7 @@ impl DnssecValidator {
             candidates.extend(chain.into_iter().map(|(n, r, t)| (n, r, t, false)));
         } else if answer_recs
             .iter()
-            .any(|rec| matches!((&rec.data), RData::DNSSEC(DNSSECRData::RRSIG(_))))
+            .any(|rec| matches!(&rec.data, RData::DNSSEC(DNSSECRData::RRSIG(_))))
         {
             // FP-19: signed material in answers that chained to nothing is a
             // fail-closed Bogus — never silently demote a truncated signed
@@ -591,7 +591,7 @@ enum NsecCoverage {
 // None when no parseable NSEC is present (caller treats as unproven).
 fn nsec_shape(recs: &[Record], qtype: RecordType) -> Option<(Name, bool, bool)> {
     for rec in recs {
-        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = (&rec.data) {
+        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &rec.data {
             let has_qtype = nsec.type_bit_maps().any(|t| t == qtype);
             let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
             return Some((nsec.next_domain_name().clone(), has_qtype, has_cname));
