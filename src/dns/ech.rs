@@ -189,24 +189,10 @@ fn echconfig_from_records(records: &[&Record], owner: &Name) -> Option<Vec<u8>> 
     }
     None
 }
-/// Hardening note (ex-ECH-TXID): query IDs come from the OS CSPRNG so
-/// upstream observers cannot predict them; time+pid fallback only if the
-/// RNG is unavailable (never a constant).
+/// Hardening note (ex-ECH-TXID): query IDs come from the shared OS-CSPRNG
+/// helper so upstream observers cannot predict them.
 fn query_id() -> u16 {
-    let mut buf = [0u8; 2];
-    if getrandom::getrandom(&mut buf).is_ok() {
-        return u16::from_ne_bytes(buf);
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0x5678);
-    let fallback = (nanos ^ (std::process::id().wrapping_mul(0x9E37)) as u32) as u16;
-    if fallback == 0 {
-        1
-    } else {
-        fallback
-    }
+    super::secure_query_id()
 }
 
 #[cfg(test)]

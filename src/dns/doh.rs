@@ -741,7 +741,10 @@ mod tests {
         assert!(ips.contains(&Ipv6Addr::new(0x2a07, 0xe340, 0, 0, 0, 0, 0, 0x0009)));
     }
 
+    // Run-4: live-network test — excluded from hermetic gates
+    // (`cargo test -- --ignored`), matching the live_* convention.
     #[tokio::test]
+    #[ignore]
     async fn test_doh_quad9_live_query() {
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let query_wire = [

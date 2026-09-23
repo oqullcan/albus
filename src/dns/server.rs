@@ -501,16 +501,15 @@ pub fn build_canary_response(query: &[u8], canary_ip: Ipv4Addr) -> Vec<u8> {
 }
 
 // builds standard rfc 1035 dns query for leak-test.albus.internal (type a, class in).
-// FP-14: TXID is randomized per probe (no rand crate: time-nanos folded with pid)
-// so forged replies cannot be precomputed; the verifier checks the echo.
+// FP-14/run-4: TXID from the shared OS-CSPRNG helper (never fixed, never
+// time-only); the verifier checks the echo.
 pub fn build_canary_query() -> Vec<u8> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0xCAFE);
-    let txid = (nanos ^ (std::process::id().wrapping_mul(0x9E37)) as u32) as u16;
-    // never emit the legacy fixed sentinel: unpredictability is the point
-    let txid = if txid == 0xCAFE { 0xCAFF } else { txid };
+    // avoid the legacy fixed sentinel even in the vanishingly unlikely
+    // collision: unpredictability is the point
+    let mut txid = crate::dns::secure_query_id();
+    if txid == 0xCAFE {
+        txid = 0xCAFF;
+    }
     let mut query = vec![
         (txid >> 8) as u8,
         (txid & 0xFF) as u8, // Transaction ID

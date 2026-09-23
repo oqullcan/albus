@@ -23,11 +23,11 @@ jobs:
       - name: clippy deny warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: unit tests (offline)
+      - name: unit tests (hermetic; live-network tests are #[ignore])
         run: cargo test --lib --tests
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: dependency CVE scan
         run: cargo audit

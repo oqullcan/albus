@@ -702,11 +702,11 @@ fn cname_chain(
     None
 }
 
+// Run-4: retired in favor of crate::dns::secure_query_id (OS CSPRNG).
+// All DNS TXIDs — chain queries, ECH queries, canary probes — now share one
+// strength instead of three different ones.
 fn rand_id() -> u16 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
-        .unwrap_or(0x1234)
+    crate::dns::secure_query_id()
 }
 
 fn is_sep(key: &DNSKEY) -> bool {
@@ -875,7 +875,10 @@ mod tests {
         msg.to_vec().unwrap()
     }
 
+    // Run-4: live-network test — excluded from hermetic gates
+    // (`cargo test -- --ignored`), matching the live_* convention.
     #[tokio::test]
+    #[ignore]
     async fn test_signed_zone_validates_secure_live() {
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
@@ -915,7 +918,10 @@ mod tests {
         assert_eq!(state, DnssecState::Insecure);
     }
 
+    // Run-4: live-network test — excluded from hermetic gates
+    // (`cargo test -- --ignored`), matching the live_* convention.
     #[tokio::test]
+    #[ignore]
     async fn test_tampered_signed_response_is_bogus_live() {
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
