@@ -136,21 +136,6 @@ impl Default for Config {
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-/// Resolves the dedicated service user (`albus`, created by
-/// `service install`) to its uid, if the account exists. The rootless
-/// daemon runs as this user, so root-owned-only checks below must also
-/// accept it for daemon-managed paths. None when the account is absent
-/// (pre-migration installs behave exactly as before).
-#[cfg(unix)]
-fn service_uid() -> Option<libc::uid_t> {
-    let name = std::ffi::CString::new("albus").ok()?;
-    let pwd = unsafe { libc::getpwnam(name.as_ptr()) };
-    if pwd.is_null() {
-        return None;
-    }
-    Some(unsafe { (*pwd).pw_uid })
-}
-
 // validates username against Linux / POSIX rules (1..=32 chars, [a-zA-Z_][a-zA-Z0-9_-]*)
 fn is_valid_username(username: &str) -> bool {
     if username.is_empty() || username.len() > 32 {
@@ -239,17 +224,21 @@ impl FsPrivilegeGuard {
                             }
                         }
                         unsafe {
-                            // drop supplementary groups first to close DAC bypass
-                            let _ = libc::setgroups(0, std::ptr::null());
-                            if libc::setfsgid(gid) != 0 {
+                            // drop supplementary groups first to close DAC bypass (fail closed)
+                            if libc::setgroups(0, std::ptr::null()) != 0 {
                                 return Self { active: false };
                             }
-                            if libc::setfsuid(uid) != 0 {
-                                libc::setfsgid(0);
-                                return Self { active: false };
-                            }
-                            // verify drop actually took effect
-                            if libc::setfsgid(gid) != 0 || libc::setfsuid(uid) != 0 {
+                            // NOTE: setfsuid/setfsgid return the *previous* fsid on both
+                            // success and failure (man setfsuid(2) BUGS), so their return
+                            // values must never be treated as 0 == success error codes.
+                            // Ignore them here and verify with a -1 probe below.
+                            let _ = libc::setfsgid(gid);
+                            let _ = libc::setfsuid(uid);
+                            // verify drop actually took effect: setfsuid(-1)/setfsgid(-1)
+                            // always fail but return the current fsuid/fsgid.
+                            let cur_gid = libc::setfsgid(-1i32 as libc::gid_t);
+                            let cur_uid = libc::setfsuid(-1i32 as libc::uid_t);
+                            if (cur_gid as u32) != gid || (cur_uid as u32) != uid {
                                 libc::setfsuid(0);
                                 libc::setfsgid(0);
                                 return Self { active: false };
@@ -269,11 +258,168 @@ impl Drop for FsPrivilegeGuard {
     fn drop(&mut self) {
         if self.active {
             unsafe {
-                libc::setfsuid(0);
-                libc::setfsgid(0);
+                let _ = libc::setfsuid(0);
+                let _ = libc::setfsgid(0);
             }
         }
     }
+}
+
+#[cfg(unix)]
+/// Uids trusted to own system paths (/run/albus, /etc/albus): uid 0 plus the
+/// L1 dedicated service user when that account exists. Centralizes the L1
+/// ownership model so no check can drift back to root-only.
+fn is_trusted_system_uid(uid: libc::uid_t) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    matches!(crate::core::ebpf::service_uid(), Some(suid) if suid == uid)
+}
+
+#[cfg(unix)]
+/// True when this process runs as the L1 dedicated service user (non-root).
+/// Used to resolve daemon paths (shared /run/albus, /etc/albus) instead of
+/// per-user sudo/XDG/HOME paths.
+fn is_service_user_process() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    euid != 0 && matches!(crate::core::ebpf::service_uid(), Some(suid) if suid == euid)
+}
+
+#[cfg(unix)]
+fn validated_sudo_uid() -> Option<libc::uid_t> {
+    let uid: libc::uid_t = std::env::var("SUDO_UID").ok()?.trim().parse().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    // cross-check against passwd database when SUDO_USER is present (anti-spoof)
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !is_valid_username(&sudo_user) {
+            return None;
+        }
+        if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
+            unsafe {
+                let pwd = libc::getpwnam(c_user.as_ptr());
+                if !pwd.is_null() && (*pwd).pw_uid != uid {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(uid)
+}
+
+fn reject_symlink_ancestors(path: &Path) -> std::io::Result<()> {
+    // walk every ancestor (including the full path itself): any symlink -> deny.
+    // This does not close the lstat->open race by itself; O_NOFOLLOW on open
+    // plus post-open fstat checks below are the atomic enforcement point.
+    for ancestor in path.ancestors() {
+        // stop at filesystem root to bound the walk
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: symlink in path chain at {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            // missing intermediate components are fine (create_dir_all will make them)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+            _ => {}
+        }
+        if ancestor == Path::new("/") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_parent_ownership(parent: &Path, is_system_path: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(parent).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "security violation: cannot stat parent {}: {}",
+                parent.display(),
+                e
+            ),
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: parent is symlink at {}",
+                parent.display()
+            ),
+        ));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: parent is not a directory at {}",
+                parent.display()
+            ),
+        ));
+    }
+    let dir_uid = meta.uid();
+    let euid = unsafe { libc::geteuid() };
+    if is_system_path {
+        // L1: root or the dedicated service user may own system parents.
+        if !is_trusted_system_uid(dir_uid) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: system parent {} owned by uid {}",
+                    parent.display(),
+                    dir_uid
+                ),
+            ));
+        }
+    } else if euid == 0 {
+        if let Some(sudo_uid) = validated_sudo_uid() {
+            if dir_uid != 0 && dir_uid != sudo_uid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: user parent {} owned by untrusted uid {}",
+                        parent.display(),
+                        dir_uid
+                    ),
+                ));
+            }
+        } else if dir_uid != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: root parent {} owned by uid {} (no validated sudo user)",
+                    parent.display(),
+                    dir_uid
+                ),
+            ));
+        }
+    } else {
+        let ruid = unsafe { libc::getuid() };
+        if dir_uid != ruid && dir_uid != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: parent {} owned by untrusted uid {}",
+                    parent.display(),
+                    dir_uid
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // safely writes content to path atomically rejecting symlinks and dropping privileges on user paths
@@ -288,19 +434,10 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
         FsPrivilegeGuard { active: false }
     };
 
+    // 1. pre-check: reject any symlink in the full chain before touching the fs
+    reject_symlink_ancestors(p)?;
+
     if let Some(parent) = p.parent() {
-        // refuse symlink parents (TOCTOU mitigation for create_dir_all -> open window)
-        if let Ok(meta) = fs::symlink_metadata(parent) {
-            if meta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "security violation: parent is symlink at {}",
-                        parent.display()
-                    ),
-                ));
-            }
-        }
         let existed = parent.exists();
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -309,32 +446,235 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
             if !existed {
                 let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
             }
+            // 2. post-mkdir revalidation (narrows create_dir_all -> open window):
+            // parent must still be a real dir owned by the expected uid.
+            check_parent_ownership(parent, is_system_path)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = existed;
         }
     }
 
+    // FP-02: unix uses the atomic temp+rename path (no truncate-before-authz,
+    // no torn files); other platforms keep the legacy direct write.
+    #[cfg(unix)]
+    {
+        atomic_safe_write(p, content, is_system_path)
+    }
+    #[cfg(not(unix))]
+    {
+        return legacy_safe_write(p, content);
+    }
+}
+
+#[cfg(unix)]
+fn check_write_owner(file_uid: libc::uid_t, is_system_path: bool, p: &Path) -> std::io::Result<()> {
+    let euid = unsafe { libc::geteuid() };
+    if is_system_path {
+        // L1: root or the dedicated service user may own system files.
+        if !is_trusted_system_uid(file_uid) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: refusing to write system file {} owned by uid {}",
+                    p.display(),
+                    file_uid
+                ),
+            ));
+        }
+    } else if euid == 0 {
+        match validated_sudo_uid() {
+            Some(sudo_uid) => {
+                if file_uid != 0 && file_uid != sudo_uid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "security violation: refusing to write user file {} owned by uid {}",
+                            p.display(),
+                            file_uid
+                        ),
+                    ));
+                }
+            }
+            None => {
+                if file_uid != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "security violation: refusing root write to {} owned by uid {} (no validated sudo user)",
+                            p.display(),
+                            file_uid
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        let ruid = unsafe { libc::getuid() };
+        if file_uid != ruid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: refusing to write {} owned by uid {}",
+                    p.display(),
+                    file_uid
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// FP-02: atomic durable write — temp file in the same directory + fsync +
+// rename + dir fsync. The previous truncate-in-place destroyed content
+// before authorization and left torn files on crash.
+#[cfg(unix)]
+fn atomic_write_temp(parent: &Path, content: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_name = format!(".albus-{}-{}.tmp", std::process::id(), id);
+    let tmp_path = parent.join(&tmp_name);
+    let tmp_cstr = std::ffi::CString::new(tmp_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "security violation: temp path contains NUL",
+        )
+    })?;
+
+    // O_EXCL: never follow/truncate anything pre-existing.
+    let fd = unsafe {
+        libc::open(
+            tmp_cstr.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let result = (|| -> std::io::Result<()> {
+        let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result?;
+    Ok(tmp_path)
+}
+
+#[cfg(unix)]
+fn fsync_dir(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "security violation: parent path contains NUL",
+        )
+    })?;
+    let fd = unsafe {
+        libc::open(
+            cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let res = unsafe { libc::fsync(fd) };
+    unsafe { libc::close(fd) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+// FP-02: unix atomic write body — pre-check existing target (no modification),
+// temp+fsync in same dir, rename, dir fsync. Denial never clobbers (NV-01);
+// FIFOs are rejected without blocking (O_NONBLOCK pre-check).
+#[cfg(unix)]
+fn atomic_safe_write(p: &Path, content: &str, is_system_path: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent: &Path = p.parent().unwrap_or(Path::new("."));
+
+    // 1. pre-check existing target read-only: regular + owner-approved, else deny
+    // before anything is modified.
+    match fs::symlink_metadata(p) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: refusing to write symlink at {}",
+                    p.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            let probe = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(p);
+            match probe {
+                Ok(f) => {
+                    let fm = f.metadata()?;
+                    if !fm.file_type().is_file() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "security violation: refusing to write non-regular file at {}",
+                                p.display()
+                            ),
+                        ));
+                    }
+                    check_write_owner(fm.uid(), is_system_path, p)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "security violation: cannot pre-check {}: {}",
+                            p.display(),
+                            e
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // 2. temp + fsync in the same directory (O_EXCL, 0600, dropped fsuid owner).
+    let tmp_path = atomic_write_temp(parent, content)?;
+
+    // 3. atomic publish + durability.
+    if let Err(e) = fs::rename(&tmp_path, p) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    fsync_dir(parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn legacy_safe_write(p: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-
     let mut file = options.open(p)?;
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "security violation: refusing to write non-regular file at {}",
-                p.display()
-            ),
-        ));
-    }
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -358,7 +698,10 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // NV-02 follow-up: O_NONBLOCK so a planted FIFO (e.g. via explicit
+        // --config path) is rejected by the is_file gate below instead of
+        // hanging the caller. Harmless for regular files.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
 
     let mut file = options.open(p)?;
@@ -373,6 +716,20 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
         ));
     }
 
+    // NV-02: clear O_NONBLOCK for the subsequent read (FIFO would already
+    // have been rejected above; regular files are unaffected either way).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -381,10 +738,8 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
         if current_uid == 0 {
             if is_system_path {
-                // rootless migration: daemon-managed paths may be owned by
-                // the service user instead of root (both are trusted here;
-                // anything else is still refused)
-                if file_uid != 0 && Some(file_uid) != service_uid() {
+                // L1: root or the dedicated service user may own system files.
+                if !is_trusted_system_uid(file_uid) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
@@ -394,19 +749,26 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
                         ),
                     ));
                 }
-            } else if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
-                if let Ok(sudo_uid) = sudo_uid_str.trim().parse::<libc::uid_t>() {
-                    if file_uid != 0 && file_uid != sudo_uid {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "security violation: user config {} owned by untrusted uid {}",
-                                p.display(),
-                                file_uid
-                            ),
-                        ));
-                    }
+            } else if let Some(sudo_uid) = validated_sudo_uid() {
+                if file_uid != 0 && file_uid != sudo_uid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "security violation: user config {} owned by untrusted uid {}",
+                            p.display(),
+                            file_uid
+                        ),
+                    ));
                 }
+            } else if file_uid != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security violation: user config {} owned by uid {} (no validated sudo user)",
+                        p.display(),
+                        file_uid
+                    ),
+                ));
             }
         } else if file_uid != current_uid && file_uid != 0 {
             return Err(std::io::Error::new(
@@ -459,9 +821,20 @@ impl Config {
         if self.min_mss < 32 || self.min_mss > 1460 {
             return Err(format!("invalid min_mss {}", self.min_mss).into());
         }
+        // FP-08: restore path reaches kernel TCP_MAXSEG unclamped — bound it here
+        // so every entry path (CLI, JSON, QML) is covered by the single validator.
+        // 0 for restore_after_bytes would restore immediately (fail-open, no shrinking).
+        if self.restore_after_bytes < 64 {
+            return Err(format!(
+                "invalid restore_after_bytes {} (expected >= 64)",
+                self.restore_after_bytes
+            )
+            .into());
+        }
+        // 0 for restore_mss means 1460 auto; any explicit value must be a sane MSS.
         if self.restore_mss != 0 && (self.restore_mss < 64 || self.restore_mss > 1460) {
             return Err(format!(
-                "invalid restore_mss {} (expected 0=auto or 64..=1460)",
+                "invalid restore_mss {} (expected 0 or 64..=1460)",
                 self.restore_mss
             )
             .into());
@@ -506,37 +879,111 @@ impl Config {
     }
 
     /// Root daemons must not load attacker-owned --config files.
+    /// Opens with O_NOFOLLOW first, then fstat-checks (no lstat->open TOCTOU).
     pub fn load_from_file_root_checked<P: AsRef<Path>>(
         path: P,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(unix)]
         {
             if crate::core::ebpf::is_root() {
-                let meta = fs::symlink_metadata(path.as_ref())?;
-                if meta.file_type().is_symlink() {
+                let p = path.as_ref();
+                reject_symlink_ancestors(p)?;
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    // NV-02 follow-up: same O_NONBLOCK rationale as safe_read.
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+                }
+                let mut file = options.open(p).map_err(|e| {
+                    format!(
+                        "security violation: cannot open --config {}: {}",
+                        p.display(),
+                        e
+                    )
+                })?;
+                let meta = file.metadata()?;
+                if !meta.file_type().is_file() {
                     return Err(
-                        "security violation: --config must not be a symlink when running as root"
+                        "security violation: --config must be a regular file when running as root"
                             .into(),
                     );
                 }
-                use std::os::unix::fs::MetadataExt;
-                if meta.uid() != 0 {
-                    return Err(format!(
-                        "security violation: --config owned by uid {} (expected root) when running as root",
-                        meta.uid()
-                    )
-                    .into());
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    use std::os::unix::io::AsRawFd;
+                    // L1: root or the dedicated service user may own --config
+                    // (/etc/albus is service-owned post-migration).
+                    if !is_trusted_system_uid(meta.uid()) {
+                        return Err(format!(
+                            "security violation: --config owned by uid {} (expected root or service user) when running privileged",
+                            meta.uid()
+                        )
+                        .into());
+                    }
+                    let fd = file.as_raw_fd();
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    if flags >= 0 {
+                        unsafe {
+                            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                        }
+                    }
                 }
+                use std::io::Read;
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                let cfg: Config = serde_json::from_str(&content)?;
+                return Ok(cfg);
             }
         }
         Self::load_from_file(path)
     }
+    // FP-01: per-invoker volatile name (pure, testable).
+    fn sudo_volatile_path(uid: libc::uid_t) -> PathBuf {
+        PathBuf::from(format!("/run/albus/config-{}.json", uid))
+    }
+
+    // FP-01: /etc promotion only for true-root invocations, never for sudo
+    // user invocations (pure, testable). A sudo user's settings must not
+    // silently become system-wide.
+    fn should_sync_etc(is_root: bool, sudo_uid: Option<libc::uid_t>) -> bool {
+        is_root && sudo_uid.is_none()
+    }
+
     // resolves secure volatile shared memory / runtime directory path
     pub fn volatile_config_path() -> PathBuf {
         if crate::core::ebpf::is_root() {
+            // FP-01: isolate sudo invocations per validated uid so one user's
+            // `config set` never overwrites the shared daemon volatile.
+            #[cfg(unix)]
+            {
+                if let Some(uid) = validated_sudo_uid() {
+                    return Self::sudo_volatile_path(uid);
+                }
+            }
+            PathBuf::from("/run/albus/config.json")
+        } else if is_service_user_process() {
+            // L1: the daemon runs as the service user with RuntimeDirectory;
+            // its volatile state lives in the shared daemon path, never in
+            // per-user XDG runtime dirs.
             PathBuf::from("/run/albus/config.json")
         } else if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            PathBuf::from(runtime_dir).join("albus/config.json")
+            // validate attacker-controlled env: absolute, bounded, no traversal,
+            // must live under /run (standard XDG_RUNTIME_DIR location)
+            let uid = unsafe { libc::getuid() };
+            let fallback = PathBuf::from(format!("/run/user/{}/albus/config.json", uid));
+            if runtime_dir.starts_with('/')
+                && !runtime_dir.contains("..")
+                && runtime_dir.len() <= 256
+                && (runtime_dir.starts_with("/run/user/") || runtime_dir.starts_with("/run/"))
+            {
+                let candidate = PathBuf::from(&runtime_dir).join("albus/config.json");
+                // must stay under /run and never escape to /run/albus (root daemon path)
+                if candidate.starts_with("/run/") && !candidate.starts_with("/run/albus") {
+                    return candidate;
+                }
+            }
+            fallback
         } else {
             let uid = unsafe { libc::getuid() };
             PathBuf::from(format!("/run/user/{}/albus/config.json", uid))
@@ -545,6 +992,14 @@ impl Config {
 
     // resolves durable persistent configuration path on physical disk (never returns volatile memory)
     pub fn default_config_path() -> PathBuf {
+        // L1: the daemon runs as the service user — its durable config is the
+        // system file, never a sudo/XDG/HOME-derived user path.
+        #[cfg(unix)]
+        {
+            if is_service_user_process() {
+                return PathBuf::from("/etc/albus/config.json");
+            }
+        }
         // 1. check sudo user environment with strict format and passwd validation
         if let Some(sudo_home) = get_sudo_user_home() {
             let sudo_cfg = sudo_home.join(".config/albus/config.json");
@@ -552,7 +1007,17 @@ impl Config {
                 return sudo_cfg;
             }
         }
-        // 2. check current process home (for user-level execution) — validate shape
+        // 2. check current process home (for user-level execution) — validate shape.
+        // When running as root without a validated sudo user, never trust $HOME
+        // (e.g. `sudo HOME=/tmp/evil ...` or `su` with attacker HOME would otherwise
+        // redirect a root write into an attacker-controlled tree).
+        #[cfg(unix)]
+        {
+            let euid = unsafe { libc::geteuid() };
+            if euid == 0 && validated_sudo_uid().is_none() && get_sudo_user_home().is_none() {
+                return PathBuf::from("/etc/albus/config.json");
+            }
+        }
         if let Ok(home) = std::env::var("HOME") {
             if home.starts_with('/') && !home.contains("..") && home.len() <= 256 {
                 let user_cfg = PathBuf::from(&home).join(".config/albus/config.json");
@@ -594,9 +1059,15 @@ impl Config {
         let target_path = path.as_ref();
         safe_write(target_path, &json)?;
 
-        // 3. also sync to /etc/albus/config.json if running as root or directory exists
+        // 3. sync to /etc/albus/config.json for true-root invocations only.
+        // FP-01: sudo user invocations must not silently promote user settings
+        // to system-wide (that was the /etc persistence channel).
         let etc = Path::new("/etc/albus/config.json");
-        if crate::core::ebpf::is_root() || etc.exists() {
+        #[cfg(unix)]
+        let sync_etc = Self::should_sync_etc(crate::core::ebpf::is_root(), validated_sudo_uid());
+        #[cfg(not(unix))]
+        let sync_etc = crate::core::ebpf::is_root() || etc.exists();
+        if sync_etc {
             let _ = safe_write(etc, &json);
         }
 
@@ -613,9 +1084,14 @@ impl Config {
             }
         }
 
-        // 2. check /run/albus/config.json (system daemon volatile path)
+        // 2. check /run/albus/config.json (system daemon volatile path) —
+        // FP-01: skipped for validated sudo invocations (not their file).
+        #[cfg(unix)]
+        let skip_shared = validated_sudo_uid().is_some();
+        #[cfg(not(unix))]
+        let skip_shared = false;
         let run_root = PathBuf::from("/run/albus/config.json");
-        if run_root.exists() {
+        if !skip_shared && run_root.exists() {
             if let Ok(cfg) = Self::load_from_file(&run_root) {
                 return cfg;
             }
@@ -638,6 +1114,20 @@ impl Config {
         }
 
         Self::default()
+    }
+
+    /// Loads the system-wide daemon config strictly (`/etc/albus/config.json`,
+    /// what the running daemon actually uses). No fallback cascade: a missing
+    /// file is an error (daemon never installed?), so callers can distinguish
+    /// "no system config" from defaults. Used by `config get --system`.
+    pub fn load_system() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::load_system_from(Path::new("/etc/albus/config.json"))
+    }
+
+    pub(crate) fn load_system_from<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::load_from_file(path)
     }
 }
 
@@ -737,6 +1227,27 @@ mod tests {
     }
 
     #[test]
+    fn test_load_system_strict_no_fallback() {
+        // --system semantics: an explicit file parses, a missing file
+        // errors (never silently degrades to defaults — the panel relies
+        // on the distinction to fall back to the user file itself)
+        let dir = std::env::temp_dir().join(format!("albus_syscfg_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        assert!(
+            Config::load_system_from(&path).is_err(),
+            "missing system file must error, not default"
+        );
+        let mut cfg = valid_cfg();
+        cfg.doh_upstream = "cloudflare".to_string();
+        cfg.save_to_file(&path).expect("temp save works");
+        let loaded = Config::load_system_from(&path).expect("explicit file parses");
+        assert_eq!(loaded.doh_upstream, "cloudflare");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn test_validate_rejects_bad_ranges() {
         // (mutator, reason)
         let cases: Vec<(Box<dyn Fn(&mut Config)>, &str)> = vec![
@@ -813,5 +1324,126 @@ mod tests {
         // 0 = auto line-rate is the default and must stay valid
         cfg.restore_mss = 0;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_reject_symlink_ancestors() {
+        let base = std::env::temp_dir().join(format!("albus_test_chain_{}", std::process::id()));
+        let real_dir = base.join("real");
+        let _ = fs::create_dir_all(&real_dir);
+        let link_dir = base.join("link");
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&real_dir, &link_dir);
+        let target = link_dir.join("sub").join("config.json");
+        let result = reject_symlink_ancestors(&target);
+        assert!(result.is_err(), "ancestor symlink chain must be rejected");
+        let _ = fs::remove_file(&link_dir);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_safe_write_roundtrip_and_parent_ownership() {
+        let base = std::env::temp_dir().join(format!("albus_test_rt_{}", std::process::id()));
+        let target = base.join("sub").join("config.json");
+        let res = safe_write(&target, "{\"mss\": 88}");
+        assert!(res.is_ok(), "safe_write roundtrip failed: {:?}", res.err());
+        let back = safe_read(&target);
+        assert!(back.is_ok());
+        assert!(back.unwrap().contains("88"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_restore_bounds_fp08() {
+        // defaults must pass
+        assert!(Config::default().validate().is_ok());
+        // fail-open / DoS payloads must be rejected
+        let mut bad = Config::default();
+        bad.restore_after_bytes = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = Config::default();
+        bad.restore_mss = 1;
+        assert!(bad.validate().is_err());
+        let mut bad = Config::default();
+        bad.restore_mss = 65535;
+        assert!(bad.validate().is_err());
+        // explicit sane values pass (0 restore_mss = 1460 auto)
+        let mut ok = Config::default();
+        ok.restore_after_bytes = 600;
+        ok.restore_mss = 0;
+        assert!(ok.validate().is_ok());
+        let mut ok = Config::default();
+        ok.restore_after_bytes = 64;
+        ok.restore_mss = 1460;
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fp01_isolation_helpers() {
+        // per-invoker volatile is uid-tagged under the daemon dir
+        assert_eq!(
+            Config::sudo_volatile_path(1000),
+            PathBuf::from("/run/albus/config-1000.json")
+        );
+        // /etc promotion: true root only, never sudo invocations
+        assert!(Config::should_sync_etc(true, None));
+        assert!(!Config::should_sync_etc(true, Some(1000)));
+        assert!(!Config::should_sync_etc(false, None));
+        assert!(!Config::should_sync_etc(false, Some(1000)));
+    }
+
+    #[test]
+    fn test_l1_trusted_system_uids() {
+        // root is always trusted
+        assert!(is_trusted_system_uid(0));
+        // the service account, if present, is trusted; an unrelated uid is not
+        match crate::core::ebpf::service_uid() {
+            Some(suid) => {
+                assert!(is_trusted_system_uid(suid));
+            }
+            None => {
+                // no albus account here: a high uid must be untrusted
+                assert!(!is_trusted_system_uid(60000));
+            }
+        }
+    }
+
+    // NV-02 follow-up: a planted FIFO must be rejected, not block on open.
+    // (Pre-fix this test hangs; post-fix O_NONBLOCK makes open succeed and
+    // the is_file gate deny. No writer ever opens the fifo.)
+    #[test]
+    fn test_fifo_read_rejected_without_hang() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("albus_test_fifo_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let fifo = dir.join("config.fifo");
+        let cstr = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) }, 0);
+        let res = safe_read(&fifo);
+        assert!(res.is_err(), "FIFO must be rejected, not read or hung");
+        let _ = fs::remove_file(&fifo);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_volatile_path_rejects_evil_xdg() {
+        // XDG_RUNTIME_DIR outside /run must fall back to /run/user/<uid>
+        let uid = unsafe { libc::getuid() };
+        let expected = PathBuf::from(format!("/run/user/{}/albus/config.json", uid));
+        // SAFETY: single-threaded test env manipulation; restored afterwards.
+        let old = std::env::var("XDG_RUNTIME_DIR").ok();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/tmp/evil") };
+        // is_root() is false in test env (non-root CI); if root, path is /run/albus
+        let got = Config::volatile_config_path();
+        if !crate::core::ebpf::is_root() {
+            assert_eq!(got, expected);
+        }
+        unsafe {
+            if let Some(v) = old {
+                std::env::set_var("XDG_RUNTIME_DIR", v);
+            } else {
+                std::env::remove_var("XDG_RUNTIME_DIR");
+            }
+        }
     }
 }

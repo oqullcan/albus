@@ -13,20 +13,28 @@ pub use doh::{extract_upstream_ips, extract_upstream_ips_v6};
 pub use server::DnsServer;
 pub use system::{cleanup_system_dns, restore_system_dns, set_system_dns};
 
-/// CSPRNG 16-bit transaction ID via getrandom(2); falls back to
-/// time-derived bits only if the syscall fails (never returns a constant).
-/// No new dependencies: libc is already linked. Used for DNS/DoH chain
-/// query IDs so concurrent queries cannot collide trivially.
-pub(crate) fn secure_rand_u16() -> u16 {
+/// Unpredictable 16-bit DNS transaction ID from the OS CSPRNG, with a
+/// time+pid fallback (never a constant) if the RNG is unavailable.
+/// Single shared helper so ECH, DNSSEC chain queries, and the leak canary all
+/// get the same strength (run-4: previously three different strengths).
+pub(crate) fn secure_query_id() -> u16 {
     let mut buf = [0u8; 2];
-    let r = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, 2, 0) };
-    if r == 2 {
-        return u16::from_ne_bytes(buf);
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let v = u16::from_ne_bytes(buf);
+        if v != 0 {
+            return v;
+        }
     }
-    std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() & 0xffff) as u16)
-        .unwrap_or(0x1234)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0x5678);
+    let fallback = (nanos ^ std::process::id().wrapping_mul(0x9E37)) as u16;
+    if fallback == 0 {
+        1
+    } else {
+        fallback
+    }
 }
 
 #[cfg(test)]
@@ -34,14 +42,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_secure_rand_u16_distributes() {
-        // statistical: 512 draws from 2^16 must be overwhelmingly unique
-        // (expected collisions ~2; assert with huge margin, no flakiness)
-        let ids: Vec<u16> = (0..512).map(|_| secure_rand_u16()).collect();
+    fn test_secure_query_id_distributes() {
+        // same statistical gate for the shared run-4 helper
+        let ids: Vec<u16> = (0..512).map(|_| secure_query_id()).collect();
         let uniq: std::collections::HashSet<u16> = ids.iter().cloned().collect();
         assert!(
             uniq.len() > 480,
-            "CSPRNG IDs must distribute, unique={}",
+            "shared query IDs must distribute, unique={}",
             uniq.len()
         );
     }

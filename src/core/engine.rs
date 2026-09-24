@@ -96,7 +96,7 @@ impl Engine {
 
     // starts all subsystems and blocks awaiting sigint or sigterm termination signals
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // rootless-ready gate: uid 0 OR the dedicated service user holding
+        // L1 rootless-ready gate: uid 0 OR the dedicated service user holding
         // the unit's capability set (see has_service_privileges). Plain
         // unprivileged users are still refused before anything is touched.
         if !has_service_privileges() {
@@ -286,7 +286,11 @@ impl Engine {
         if let Err(e) = self.bpf_manager.reload_maps(&bpf_cfg) {
             warn!("Failed to reload eBPF maps dynamically: {}", e);
         } else {
-            info!("Live eBPF map reload successful (target ports & exclusion IPs updated)");
+            // FP-16: honest log — exclusion IPs and cgroup are intentionally
+            // NOT reloaded (restart-required); only ports/MSS-class fields are.
+            info!(
+                "Live eBPF map reload successful (target ports & MSS updated; exclusion IPs/cgroup unchanged — restart to apply those)"
+            );
         }
 
         // merge only hot-reloadable fields into running cfg

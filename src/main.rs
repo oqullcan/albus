@@ -25,8 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // persistent configuration inspection and modification
         Some(Commands::Config(config_args)) => {
             match config_args.command {
-                Some(ConfigCommands::Get) => {
-                    let cfg = Config::load_or_default();
+                Some(ConfigCommands::Get { system }) => {
+                    let cfg = if system {
+                        Config::load_system()?
+                    } else {
+                        Config::load_or_default()
+                    };
                     let json = serde_json::to_string_pretty(&cfg)?;
                     println!("{}", json);
                     Ok(())
@@ -204,6 +208,33 @@ mod tests {
         assert!(!should_signal_daemon(false, true));
         assert!(!should_signal_daemon(true, false));
         assert!(!should_signal_daemon(false, false));
+    }
+
+    #[test]
+    fn test_config_get_system_flag_parses() {
+        use albus::app::cli::{Cli, Commands, ConfigCommands};
+        let sys = match Cli::try_parse_from(["albus", "config", "get", "--system"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Config(a)) => match a.command {
+                Some(ConfigCommands::Get { system }) => system,
+                _ => panic!("expected get subcommand"),
+            },
+            _ => panic!("expected config command"),
+        };
+        assert!(sys, "--system must parse to true");
+        let plain = match Cli::try_parse_from(["albus", "config", "get"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Config(a)) => match a.command {
+                Some(ConfigCommands::Get { system }) => system,
+                _ => panic!("expected get subcommand"),
+            },
+            _ => panic!("expected config command"),
+        };
+        assert!(!plain, "default stays user-file resolution");
     }
 
     #[tokio::test]

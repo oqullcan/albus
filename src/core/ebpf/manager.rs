@@ -65,32 +65,59 @@ impl BpfManager {
     }
 
     // reloads ebpf maps live at runtime without stopping or detaching the program
+    // FP-17: push first, swap cfg only on success; absent handles (pre-start)
+    // is an explicit error, never a silent Ok.
+    // Follow-up: sync (not just push) set maps so shrunk configs purge stale
+    // entries; on mid-sequence failure best-effort restore the old sets so the
+    // kernel never sits half-migrated while memory claims either version.
     pub fn reload_maps(
         &mut self,
         new_cfg: &BpfManagerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.cfg = new_cfg.clone();
-        if let Some(handles) = self.map_handles {
-            let bpf_cfg = BpfConfig::new(
-                new_cfg.mss,
-                new_cfg.restore_mss,
-                new_cfg.restore_after_bytes,
-                new_cfg.min_mss,
+        let Some(handles) = self.map_handles else {
+            return Err("eBPF maps not loaded yet — start the engine before reload".into());
+        };
+        let bpf_cfg = BpfConfig::new(
+            new_cfg.mss,
+            new_cfg.restore_mss,
+            new_cfg.restore_after_bytes,
+            new_cfg.min_mss,
+            true,
+        );
+        let old = &self.cfg;
+        let applied = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            handles.push_config(bpf_cfg)?;
+            handles.sync_target_ports(&old.ports, &new_cfg.ports)?;
+            handles.sync_exclude_ips(&old.exclude_ips, &new_cfg.exclude_ips)?;
+            handles.sync_exclude_ips_v6(&old.exclude_ips_v6, &new_cfg.exclude_ips_v6)?;
+            Ok(())
+        })();
+        if let Err(e) = applied {
+            // best-effort rollback toward the pre-reload kernel state,
+            // including the scalar config map (not just the sets).
+            let old_cfg = BpfConfig::new(
+                old.mss,
+                old.restore_mss,
+                old.restore_after_bytes,
+                old.min_mss,
                 true,
             );
-            handles.push_config(bpf_cfg)?;
-            handles.push_target_ports(&new_cfg.ports)?;
-            handles.push_exclude_ips(&new_cfg.exclude_ips)?;
-            handles.push_exclude_ips_v6(&new_cfg.exclude_ips_v6)?;
-            info!(
-                mss = new_cfg.mss,
-                min_mss = new_cfg.min_mss,
-                ports = ?new_cfg.ports,
-                exclude_count = new_cfg.exclude_ips.len(),
-                exclude_v6_count = new_cfg.exclude_ips_v6.len(),
-                "eBPF runtime maps reloaded dynamically"
-            );
+            let _ = handles.push_config(old_cfg);
+            let _ = handles.sync_target_ports(&new_cfg.ports, &old.ports);
+            let _ = handles.sync_exclude_ips(&new_cfg.exclude_ips, &old.exclude_ips);
+            let _ = handles.sync_exclude_ips_v6(&new_cfg.exclude_ips_v6, &old.exclude_ips_v6);
+            return Err(e);
         }
+        // all pushes succeeded: now adopt the new config (no cfg/map divergence)
+        self.cfg = new_cfg.clone();
+        info!(
+            mss = new_cfg.mss,
+            min_mss = new_cfg.min_mss,
+            ports = ?new_cfg.ports,
+            exclude_count = new_cfg.exclude_ips.len(),
+            exclude_v6_count = new_cfg.exclude_ips_v6.len(),
+            "eBPF runtime maps reloaded dynamically"
+        );
         Ok(())
     }
 
@@ -169,10 +196,18 @@ impl BpfManager {
         self.shaping_lost.store(false, Ordering::SeqCst);
 
         let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // FP-13 follow-up: multi_thread with one worker so spawned
+            // estimator tasks are driven independently — a current_thread
+            // runtime only polls tasks during block_on, which starved
+            // estimation whenever the DNS path was idle.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()
                 .ok();
+            // Keep the enter guard as well: sync get_ttl must observe a
+            // context via try_current on this thread too.
+            let _enter_guard = rt.as_ref().map(|r| r.enter());
             let mut decoy_idx: usize = 0;
             // watchdog snapshot: read once, the worker owns the rest
             let mut last_watchdog_check = Instant::now();
@@ -408,11 +443,18 @@ mod reload_tests {
 
     #[test]
     fn test_reload_maps_without_handles_updates_cfg_only() {
-        // no kernel maps attached: pure config swap, must not error
+        // FP-17: absent handles (pre-start) is an explicit error, never a
+        // silent cfg-only Ok — callers must not mistake it for a live reload.
         let mut mgr = BpfManager::new(cfg_with_ports(vec![443]));
         let next = cfg_with_ports(vec![80, 443]);
-        mgr.reload_maps(&next)
-            .expect("cfg-only reload must succeed");
-        assert_eq!(mgr.cfg.ports, vec![80, 443]);
+        let err = mgr
+            .reload_maps(&next)
+            .expect_err("pre-start reload must error honestly");
+        assert!(
+            err.to_string().contains("not loaded yet"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(mgr.cfg.ports, vec![443]);
     }
 }

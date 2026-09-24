@@ -1,0 +1,23 @@
+name: live-network
+# Live-resolver tests (real DoH/DNSSEC answers). Informational only: never
+# gates merges. Weekly schedule plus manual dispatch.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  live-network:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install eBPF build deps (clang + kernel headers)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-headers-generic linux-libc-dev
+
+      - name: live tests (excluded from hermetic gates)
+        run: cargo test -- --ignored live

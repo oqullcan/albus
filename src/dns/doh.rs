@@ -493,8 +493,22 @@ impl DoHResolver {
                 Some(b) => Some(b),
                 None => {
                     let f = crate::dns::ech::fetch_echconfig_list(&c.server_name, self).await;
+                    // FP-15: validate before caching — a transient bad blob
+                    // must never stick and pin the upstream to plain fallback.
                     if let Some(ref b) = f {
-                        cache.insert(c.server_name.clone(), b.clone());
+                        if rustls::client::EchConfig::new(
+                            b.clone().into(),
+                            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+                        )
+                        .is_ok()
+                        {
+                            cache.insert(c.server_name.clone(), b.clone());
+                        } else {
+                            warn!(
+                                "DoH upstream {}: fetched ECH blob failed parse; not cached",
+                                c.name
+                            );
+                        }
                     }
                     f
                 }
@@ -773,7 +787,8 @@ mod tests {
     /// Live measurement: real Quad9 resolution over the network.
     /// Explicitly opt-in (needs internet); run with:
     /// `cargo test -- --ignored --nocapture test_doh_quad9_live_query`.
-    /// Must stay #[ignore]: the default suite is deterministic and offline.
+    /// Must stay #[ignore]: the default suite is deterministic and offline
+    /// (run-4 hermetic gates, matching the live_* convention).
     #[tokio::test]
     #[ignore]
     async fn test_doh_quad9_live_query() {

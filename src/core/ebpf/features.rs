@@ -9,9 +9,9 @@ pub fn is_root() -> bool {
 }
 
 // Linux capability numbers (linux/capability.h) backing the systemd unit's
-// AmbientCapabilities set. A non-root daemon holding exactly these runs
-// everything albus needs (raw sockets, iptables, eBPF, :53 bind,
-// resolv.conf writes) with nothing else.
+// AmbientCapabilities set (L1 rootless runtime). A non-root daemon holding
+// exactly these runs everything albus needs (raw sockets, iptables, eBPF,
+// :53 bind, resolv.conf writes) with nothing else.
 pub const CAP_DAC_OVERRIDE: u64 = 1;
 pub const CAP_NET_BIND_SERVICE: u64 = 10;
 pub const CAP_NET_ADMIN: u64 = 12;
@@ -53,6 +53,24 @@ pub fn cap_eff_from_status(text: &str) -> Option<u64> {
 fn cap_eff_self() -> Option<u64> {
     let text = fs::read_to_string("/proc/self/status").ok()?;
     cap_eff_from_status(&text)
+}
+
+/// Resolves the dedicated service account uid, if the account exists.
+/// Used to extend root-only ownership checks to the L1 runtime user.
+pub fn service_uid() -> Option<libc::uid_t> {
+    let c_user = std::ffi::CString::new("albus").ok()?;
+    unsafe {
+        let pwd = libc::getpwnam(c_user.as_ptr());
+        if pwd.is_null() {
+            return None;
+        }
+        let uid = (*pwd).pw_uid;
+        // a service account must never be uid 0; treat that as absent
+        if uid == 0 {
+            return None;
+        }
+        Some(uid)
+    }
 }
 
 // inspects /proc/mounts to verify presence of cgroup2 filesystem at target mount path
@@ -107,7 +125,8 @@ pub fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
 
 // checks kernel support for ebpf sock_ops hook points, minimum kernel version (>= 5.10), and cgroup v2
 pub fn have_sock_ops() -> bool {
-    if !is_root() {
+    // L1: capability-holding service user qualifies, not just uid 0.
+    if !has_service_privileges() {
         return false;
     }
 
@@ -250,5 +269,22 @@ mod coverage_tests {
         assert_eq!(parse_kernel_version("5."), None);
         assert_eq!(parse_kernel_version("v6.1"), None);
         assert_eq!(parse_kernel_version("6.13.5-arch1"), Some((6, 13)));
+    }
+
+    #[test]
+    fn test_mount_covers() {
+        assert!(mount_covers("/sys/fs/cgroup", "/sys/fs/cgroup"));
+        assert!(mount_covers("/sys/fs/cgroup", "/sys/fs/cgroup/albus"));
+        assert!(mount_covers("/", "/etc/albus"));
+        assert!(!mount_covers("/sys/fs/cgroup", "/sys/fs/cgroupfoo"));
+        assert!(!mount_covers("/sys/fs/cgroup", "/sys/fs/other"));
+    }
+
+    #[test]
+    fn test_service_privileges_boolean() {
+        // must not panic; true for root, false-or-true for service user
+        let _ = has_service_privileges();
+        // a nonexistent-user lookup path: service_uid returns None or a uid
+        let _ = service_uid();
     }
 }

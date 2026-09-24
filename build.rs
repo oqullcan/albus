@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn clang_binary() -> String {
@@ -17,20 +17,31 @@ fn clang_binary() -> String {
     "clang".to_string()
 }
 
-/// Locate a sysroot include dir providing `asm/types.h` (needed by
-/// kernel UAPI headers under `-target bpf`). Debian/Ubuntu multiarch
-/// keeps it under `/usr/include/<triplet>/`, not `/usr/include/`.
-fn system_include_dir() -> Option<PathBuf> {
-    for cand in [
-        "/usr/include",
-        "/usr/include/x86_64-linux-gnu",
-        "/usr/include/aarch64-linux-gnu",
+// Debian/Ubuntu multiarch ships kernel UAPI `asm/` only under the target
+// triplet dir (e.g. /usr/include/x86_64-linux-gnu/asm) with NO top-level
+// /usr/include/asm symlink — while Arch/Fedora have it directly. Probe the
+// candidates so `#include <asm/types.h>` resolves on both layouts
+// (this exact failure broke CI on ubuntu-latest).
+fn asm_include_args() -> Vec<String> {
+    asm_include_args_under(Path::new("/usr/include"))
+}
+
+fn asm_include_args_under(root: &Path) -> Vec<String> {
+    let mut args = vec!["-I".to_string(), "bpf".to_string()];
+    for tri in [
+        "x86_64-linux-gnu",
+        "aarch64-linux-gnu",
+        "riscv64-linux-gnu",
+        "loongarch64-linux-gnu",
     ] {
-        if PathBuf::from(cand).join("asm/types.h").exists() {
-            return Some(PathBuf::from(cand));
+        let dir = root.join(tri);
+        if dir.join("asm").join("types.h").exists() {
+            args.push("-I".to_string());
+            args.push(dir.to_str().unwrap().to_string());
+            break;
         }
     }
-    None
+    args
 }
 
 fn main() {
@@ -44,12 +55,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CC");
 
     let mut cmd = Command::new(clang_binary());
-    cmd.args([
-        "-target", "bpf", "-O2", "-g", "-Wall", "-Werror", "-I", "bpf",
-    ]);
-    if let Some(dir) = system_include_dir() {
-        cmd.arg("-I").arg(dir);
-    }
+    cmd.args(["-target", "bpf", "-O2", "-g", "-Wall", "-Werror"]);
+    cmd.args(asm_include_args());
     let status = cmd
         .args([
             "-c",

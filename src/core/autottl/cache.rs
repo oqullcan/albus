@@ -34,10 +34,17 @@ impl TtlCache {
         }
     }
 
-    // queries cached ttl value for a destination ipv4 endpoint
+    // queries cached ttl value for a destination ipv4 endpoint.
+    // FP-13: enforce the same 3600s horizon the evictor uses — entries must
+    // expire on read, not linger for daemon lifetime once the table is full.
     pub fn get(&self, ip: &Ipv4Addr) -> Option<u8> {
         let guard = self.inner.read().ok()?;
-        guard.get(ip).map(|entry| entry.ttl)
+        let entry = guard.get(ip)?;
+        if entry.inserted_at.elapsed().as_secs() < 3600 {
+            Some(entry.ttl)
+        } else {
+            None
+        }
     }
 
     // stores calculated optimal ttl with timestamp-based capacity eviction

@@ -3,7 +3,7 @@
 use crate::app::cli::{RunArgs, ServiceCommands};
 use crate::core::ebpf::is_root;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -67,22 +67,56 @@ fn systemctl() -> Command {
 }
 
 /// Fail-closed atomic write for root-owned files: rejects symlinks, enforces mode.
+fn reject_symlink_chain(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "security violation: symlink in path chain at {}",
+                    ancestor.display()
+                )
+                .into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+            _ => {}
+        }
+        if ancestor == Path::new("/") {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn secure_write_root_file(
     path: &str,
     content: &str,
     mode: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let p = Path::new(path);
-    // 1. reject symlink at final component (TOCTOU-safe open follows)
-    if let Ok(meta) = fs::symlink_metadata(p) {
-        if meta.file_type().is_symlink() {
-            return Err(
-                format!("security violation: refusing to write symlink at {}", path).into(),
-            );
-        }
-    }
+    reject_symlink_chain(p)?;
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
+        // post-mkdir revalidation: parent must be a root-owned real dir
+        let pmeta = fs::symlink_metadata(parent)?;
+        if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+            return Err(format!(
+                "security violation: unsafe parent dir at {}",
+                parent.display()
+            )
+            .into());
+        }
+        if pmeta.uid() != 0 {
+            return Err(format!(
+                "security violation: parent {} owned by uid {} (expected root)",
+                parent.display(),
+                pmeta.uid()
+            )
+            .into());
+        }
     }
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
@@ -107,7 +141,17 @@ fn secure_write_root_file(
     }
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
-    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    // enforce mode via fd (no path re-open race)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::fchmod(file.as_raw_fd(), mode) };
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    }
     Ok(())
 }
 
@@ -268,7 +312,8 @@ fn ensure_service_dirs() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 
 /// Renders the systemd unit template (pure; unit-tested). Keeping
 /// rendering separate from install I/O means CI validates the exact bytes
-/// systemd will receive, including the load-bearing `+` on ExecStopPost.
+/// systemd will receive, including the load-bearing `+` on ExecStopPost and
+/// the L1 rootless directives (User=albus + RuntimeDirectory/StateDirectory).
 fn build_unit_content(exec_start: &str, exec_stop: &str) -> String {
     format!(
         r#"[Unit]
@@ -335,12 +380,13 @@ fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
         return Err("albus service install requires root privileges — run with sudo".into());
     }
 
-    // 0. dedicated service user for rootless runtime (idempotent: existing
-    // installs, custom uids, and re-runs all converge here without damage)
+    // L1 rootless runtime: dedicated service user + daemon-owned dirs first,
+    // so the unit below can drop root at startup. Idempotent: existing
+    // installs, custom uids, and re-runs all converge here without damage.
+    // Daemon-managed paths are owned by the service user (config, marker
+    // dir); /etc/resolv.conf itself stays root-owned (daemon rewrites it
+    // via CAP_DAC_OVERRIDE under ReadWritePaths).
     ensure_service_user()?;
-    // daemon-managed paths owned by the service user (config, marker dir);
-    // /etc/resolv.conf itself stays root-owned (daemon rewrites it via
-    // CAP_DAC_OVERRIDE under ReadWritePaths)
     ensure_service_dirs()?;
 
     // copy binary to standard system execution path — FAIL CLOSED, no fallback
@@ -364,7 +410,8 @@ fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     let exec_start = format!("{} run", exe_str);
     let exec_stop = format!("{} cleanup", exe_str);
 
-    // format systemd service specification (least-privilege capabilities + hardening)
+    // L1 rootless unit: systemd service spec (least-privilege capabilities +
+    // hardening; pure renderer below — unit-tested byte for byte).
     let unit_content = build_unit_content(&exec_start, &exec_stop);
 
     secure_write_root_file(SERVICE_FILE_PATH, &unit_content, 0o600)?;
@@ -429,11 +476,52 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err("albus service uninstall requires root privileges — run with sudo".into());
     }
 
-    // stop/disable/remove unit without exists() TOCTOU
-    let stop = systemctl().args(["stop", "albus.service"]).status();
-    let _ = stop;
-    let disable = systemctl().args(["disable", "albus.service"]).status();
-    let _ = disable;
+    // stop/disable/remove unit without exists() TOCTOU.
+    // FP-03: surface stop/disable failures — they gate the ExecStopPost
+    // mitigation, and silent success here used to mask persistent rules.
+    match systemctl().args(["stop", "albus.service"]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: systemctl stop albus.service exited {} — continuing with explicit revert",
+            s
+        ),
+        Err(e) => eprintln!(
+            "warning: systemctl stop albus.service failed to spawn ({}) — continuing with explicit revert",
+            e
+        ),
+    }
+    match systemctl().args(["disable", "albus.service"]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("warning: systemctl disable exited {}", s),
+        Err(e) => eprintln!("warning: systemctl disable failed to spawn ({})", e),
+    }
+
+    // FP-09: revert persistent network state FIRST, before any fallible file
+    // or daemon housekeeping that could abort with `return Err` and strand it.
+    // FP-10: report revert outcomes instead of assuming success.
+    let fw_removed = crate::core::firewall::unblock_quic()
+        + crate::core::firewall::unblock_stun()
+        + crate::core::firewall::disable_kill_switch()
+        + crate::core::firewall::disable_network_lockdown();
+    println!("Removed {} firewall rule(s).", fw_removed);
+    let dns_reverted = match crate::dns::cleanup_system_dns() {
+        Ok(true) => {
+            println!("Restored original system DNS.");
+            true
+        }
+        Ok(false) => {
+            println!("No albus DNS markers found; resolver left untouched.");
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: DNS restore failed: {} — check /etc/resolv.conf manually",
+                e
+            );
+            false
+        }
+    };
+
     match secure_remove_file(SERVICE_FILE_PATH) {
         Ok(true) => println!("Removed {}", SERVICE_FILE_PATH),
         Ok(false) => println!("No albus.service file found at {}", SERVICE_FILE_PATH),
@@ -455,9 +543,20 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => return Err(e),
     }
 
-    crate::core::firewall::unblock_quic();
-    let _ = crate::dns::cleanup_system_dns();
-    println!("albus service uninstalled and system settings cleaned up.");
+    // FP-10: qualify the final message on the revert outcomes above.
+    if dns_reverted {
+        println!("albus service uninstalled and system settings cleaned up.");
+    } else {
+        println!(
+            "albus service uninstalled BUT DNS restore failed — run `sudo albus cleanup` and verify /etc/resolv.conf."
+        );
+    }
+    // FP-04: the system binary is intentionally retained (lets the admin run
+    // `sudo albus cleanup` afterwards); say so instead of implying full removal.
+    println!(
+        "note: system binary retained at {} (run `sudo albus cleanup` if needed, then remove it manually)",
+        SYSTEM_BIN_PATH
+    );
     Ok(())
 }
 
@@ -715,5 +814,22 @@ mod service_fs_tests {
         assert!(POLKIT_RULE_CONTENT.contains("polkit.Result.YES"));
         assert!(POLKIT_RULE_CONTENT.contains("org.freedesktop.systemd1.manage-units"));
         assert!(POLKIT_RULE_CONTENT.contains("polkit.Result.AUTH_ADMIN"));
+    }
+
+    // L1: the rendered unit must carry the rootless directives byte-exactly.
+    #[test]
+    fn test_unit_content_rootless() {
+        let unit = build_unit_content("/usr/local/bin/albus run", "/usr/local/bin/albus cleanup");
+        assert!(unit.contains("User=albus\n"));
+        assert!(unit.contains("Group=albus\n"));
+        assert!(unit.contains("RuntimeDirectory=albus\n"));
+        assert!(unit.contains("StateDirectory=albus\n"));
+        assert!(unit.contains("Environment=HOME=/var/lib/albus\n"));
+        assert!(unit.contains("ExecStopPost=+/usr/local/bin/albus cleanup\n"));
+        assert!(unit.contains("ReadWritePaths=/run /etc/resolv.conf /etc/albus\n"));
+        assert!(unit.contains("AmbientCapabilities=CAP_NET_ADMIN"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/albus run\n"));
+        // management stays root-gated in code (unit has no User= bypass)
+        assert!(!unit.contains("User=root"));
     }
 }

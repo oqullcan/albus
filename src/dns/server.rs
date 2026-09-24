@@ -202,9 +202,13 @@ impl DnsServer {
                             }
                         }
 
-                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s
+                        // 2. Active watchdog check: actively probe local resolver on 127.0.0.1:53 every 60s.
+                        // Spawned, not awaited: the probe's jitter sleep must
+                        // not stall the passive check or shutdown handling.
                         if tick_count % 4 == 0 {
-                            run_active_canary_probe().await;
+                            // Spawned, not awaited: the probe's jitter sleep must
+                            // not stall the passive check or shutdown handling.
+                            tokio::spawn(run_active_canary_probe());
                             // 3. Per-link DNS verification (same cadence): the
                             // systemd NSS path (`resolve` first in nsswitch)
                             // hangs behind the kill-switch unless every link
@@ -475,7 +479,9 @@ pub fn is_aaaa_query(data: &[u8]) -> bool {
     false
 }
 
-// appends rfc 6891 edns0 opt pseudo-rr with dnssec ok (do) bit enabled
+// appends rfc 6891 edns0 opt pseudo-rr with dnssec ok (do) bit enabled.
+// FP-06: DO is forced even when the client sent additional records — an
+// attacker OPT-without-DO must never suppress upstream DNSSEC.
 pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     if query.len() < 12 {
         return query.to_vec();
@@ -484,22 +490,49 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
     let mut out = query.to_vec();
     let arcount = ((query[10] as u16) << 8) | (query[11] as u16);
 
+    // shared OPT RR template: root(0x00), type 41, payload 4096, DO set.
+    let opt_rr: [u8; 11] = [
+        0x00, 0x00, 0x29, // type: opt (41)
+        0x10, 0x00, // payload size: 4096
+        0x00, // extended rcode
+        0x00, // edns version
+        0x80, 0x00, // do bit set (0x8000)
+        0x00, 0x00, // rdlen: 0
+    ];
+
     if arcount == 0 {
-        // opt rr specification: root domain (0x00), type 41 (opt), udp payload size 4096, do-bit (0x8000)
-        let opt_rr: [u8; 11] = [
-            0x00, 0x00, 0x29, // type: opt (41)
-            0x10, 0x00, // payload size: 4096
-            0x00, // extended rcode
-            0x00, // edns version
-            0x80, 0x00, // do bit set (0x8000)
-            0x00, 0x00, // rdlen: 0
-        ];
         out.extend_from_slice(&opt_rr);
         out[10] = 0x00;
         out[11] = 0x01;
+        return out;
     }
 
-    out
+    match crate::dns::cache::scan_opt(&out) {
+        crate::dns::cache::OptScan::Present { ttl_offset } => {
+            // patch the DO bit in place — length and ARCOUNT unchanged.
+            let ttl = u32::from_be_bytes([
+                out[ttl_offset],
+                out[ttl_offset + 1],
+                out[ttl_offset + 2],
+                out[ttl_offset + 3],
+            ]);
+            let patched = (ttl | 0x8000).to_be_bytes();
+            out[ttl_offset..ttl_offset + 4].copy_from_slice(&patched);
+            out
+        }
+        crate::dns::cache::OptScan::Absent => {
+            // additional records but no OPT: append one if ARCOUNT allows.
+            if arcount < 0xFFFF {
+                out.extend_from_slice(&opt_rr);
+                let bumped = arcount + 1;
+                out[10] = (bumped >> 8) as u8;
+                out[11] = (bumped & 0xFF) as u8;
+            }
+            out
+        }
+        // malformed additionals: forward unchanged rather than corrupt.
+        crate::dns::cache::OptScan::Malformed => out,
+    }
 }
 /// L10 cache policy: Indeterminate (validation timed out) must never be
 /// cached — an unverified answer must not linger for the full TTL; the next
@@ -583,15 +616,29 @@ pub fn build_canary_response(query: &[u8], canary_ip: Ipv4Addr) -> Vec<u8> {
     resp
 }
 
-// builds standard rfc 1035 dns query for leak-test.albus.internal (type a, class in)
+// builds standard rfc 1035 dns query for leak-test.albus.internal (type a, class in).
+// FP-14/run-4: TXID from the shared OS-CSPRNG helper (never fixed, never
+// time-only); the verifier checks the echo.
 pub fn build_canary_query() -> Vec<u8> {
+    // avoid the legacy fixed sentinel even in the vanishingly unlikely
+    // collision: unpredictability is the point
+    let mut txid = crate::dns::secure_query_id();
+    if txid == 0xCAFE {
+        txid = 0xCAFF;
+    }
     let mut query = vec![
-        0xca, 0xfe, // Transaction ID
-        0x01, 0x00, // Flags: standard query, recursion desired
-        0x00, 0x01, // Questions: 1
-        0x00, 0x00, // Answer RRs: 0
-        0x00, 0x00, // Authority RRs: 0
-        0x00, 0x00, // Additional RRs: 0
+        (txid >> 8) as u8,
+        (txid & 0xFF) as u8, // Transaction ID
+        0x01,
+        0x00, // Flags: standard query, recursion desired
+        0x00,
+        0x01, // Questions: 1
+        0x00,
+        0x00, // Answer RRs: 0
+        0x00,
+        0x00, // Authority RRs: 0
+        0x00,
+        0x00, // Additional RRs: 0
     ];
     let domain = "leak-test.albus.internal";
     for label in domain.split('.') {
@@ -604,16 +651,55 @@ pub fn build_canary_query() -> Vec<u8> {
     query
 }
 
-// actively probes local loopback resolver to verify canary responsiveness and detect dns leaks
+// FP-14: pure canary reply check (offline-testable): TXID match plus exact
+// question-section echo. ANCOUNT-and-beyond are the answer and must differ.
+fn canary_reply_valid(resp: &[u8], query: &[u8]) -> bool {
+    resp.len() >= query.len()
+        && query.len() >= 12
+        && resp[0] == query[0]
+        && resp[1] == query[1]
+        && resp[12..query.len()] == query[12..]
+}
+
+// actively probes local loopback resolver to verify canary responsiveness and detect dns leaks.
+// FP-14: pins the reply source to 127.0.0.1:53 and validates TXID + question
+// echo — the first datagram is no longer trusted on pattern alone.
 async fn run_active_canary_probe() {
+    // FP-14: jitter the probe inside its window so the exact send instant is
+    // not predictable from the 60s cadence (no rand crate: wall-clock nanos).
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 5000) as u64)
+        .unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
     let probe_res = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let query = build_canary_query();
         sock.send_to(&query, "127.0.0.1:53").await?;
 
         let mut resp_buf = [0u8; 512];
-        let (len, _) = sock.recv_from(&mut resp_buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(resp_buf[..len].to_vec())
+        let (len, peer) = sock.recv_from(&mut resp_buf).await?;
+        // source pin: only our own resolver's answer counts
+        if peer.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+            || peer.port() != 53
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "canary reply from unexpected source",
+            ));
+        }
+        let resp = &resp_buf[..len];
+        // TXID + question echo validation (response carries our question
+        // as a PREFIX (header + question, then answers): compare exactly the
+        // echoed question section. (Comparing header counts would always fail:
+        // legit replies set ANCOUNT, which the query leaves zero.)
+        if !canary_reply_valid(resp, &query) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canary reply TXID/question mismatch",
+            ));
+        }
+        Ok::<Vec<u8>, std::io::Error>(resp.to_vec())
     })
     .await;
 
@@ -715,6 +801,17 @@ pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
     Some((domain, ips))
 }
 
+// FP-12 follow-up: allowlist (LDH + underscore for _dmarc/_acme-style names,
+// case-insensitive). Real wire hostnames are LDH/punycode, so nothing
+// legitimate is lost and whole homograph/confusable classes (Cf/Zl/Zp,
+// controls, bidi) die at once — no denylist to outdate.
+fn label_is_safe(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 // unpacks compressed dns name labels resolving RFC 1035 pointer offsets
 fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
     let mut labels = Vec::new();
@@ -755,7 +852,14 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
             return None;
         }
         if let Ok(label) = std::str::from_utf8(&data[pos..pos + len]) {
-            labels.push(label.to_string());
+            // FP-12: reject control bytes (ESC/C0/C1/DEL) and bidi/format
+            // marks at parse so hostile labels can never flow into logs,
+            // queues, or terminal sinks. Hostile labels are dropped like
+            // non-UTF8 ones (fail-closed-ish: the name no longer matches,
+            // instead of carrying escapes).
+            if label_is_safe(label) {
+                labels.push(label.to_string());
+            }
         }
         pos += len;
     }
@@ -889,10 +993,52 @@ mod tests {
         assert!(is_dnssec_authenticated(&fake_response));
     }
 
+    // FP-06: attacker OPT-without-DO must get DO patched, same length/arcount.
+    #[test]
+    fn test_enable_dnssec_do_forces_do_on_arcount() {
+        let mut query = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(crate::dns::cache::extract_do_bit(&query), Some(false));
+        let forced = enable_dnssec_do(&query);
+        // patched in place: same length, same arcount, DO set
+        assert_eq!(forced.len(), query.len());
+        assert_eq!(forced[11], 1);
+        assert_eq!(crate::dns::cache::extract_do_bit(&forced), Some(true));
+        // idempotent on already-DO queries
+        let do_pos = query.len() - 4;
+        query[do_pos] = 0x80;
+        let again = enable_dnssec_do(&query);
+        assert_eq!(again.len(), query.len());
+        assert_eq!(crate::dns::cache::extract_do_bit(&again), Some(true));
+    }
+
     #[test]
     fn test_parse_dns_response_empty() {
         assert_eq!(parse_dns_response(&[]), None);
         assert_eq!(parse_dns_response(&[0u8; 10]), None);
+    }
+
+    // FP-12: control/bidi bytes must never survive into parsed names.
+    #[test]
+    fn test_label_safety_rejects_terminal_bytes() {
+        assert!(label_is_safe("example"));
+        assert!(label_is_safe("xn--nxasmq6b"));
+        assert!(!label_is_safe("a\x1bb")); // ESC
+        assert!(!label_is_safe("a\x7fb")); // DEL
+        assert!(!label_is_safe("a\u{202e}b")); // RTL override
+        assert!(!label_is_safe("a\u{200b}b")); // zero-width space
+                                               // hostile label is dropped from the parsed name
+        let mut q = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
+            0x1b, b'b', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let (name, _) = parse_dns_name(&q, 12).expect("parses");
+        assert!(!name.contains('\x1b'), "ESC must not survive: {}", name);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let _ = q;
     }
 
     #[test]
@@ -928,6 +1074,27 @@ mod tests {
         assert!(is_canary_query(&query));
         let canary_resp = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
         assert!(canary_resp.windows(4).any(|w| w == [127, 0, 0, 99]));
+    }
+
+    // FP-14: echo validation accepts legit replies, rejects forgeries.
+    #[test]
+    fn test_canary_reply_valid() {
+        let query = build_canary_query();
+        let good = build_canary_response(&query, Ipv4Addr::new(127, 0, 0, 99));
+        assert!(canary_reply_valid(&good, &query));
+        // wrong TXID
+        let mut bad_tx = good.clone();
+        bad_tx[0] ^= 0xFF;
+        assert!(!canary_reply_valid(&bad_tx, &query));
+        // truncated
+        assert!(!canary_reply_valid(&good[..10], &query));
+        // question replaced (pattern-only forgery with valid TXID)
+        let mut forged = good.clone();
+        let qlen = query.len();
+        for b in forged[12..qlen].iter_mut() {
+            *b = 0x41;
+        }
+        assert!(!canary_reply_valid(&forged, &query));
     }
 }
 

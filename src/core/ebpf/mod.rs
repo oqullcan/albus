@@ -6,5 +6,5 @@ pub mod manager;
 pub mod watch;
 
 pub use features::is_root;
-pub use features::{has_service_privileges, REQUIRED_SERVICE_CAPS};
+pub use features::{has_service_privileges, service_uid, REQUIRED_SERVICE_CAPS};
 pub use manager::{BpfManager, BpfManagerConfig};

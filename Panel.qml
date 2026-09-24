@@ -48,6 +48,15 @@ Panel {
   // suppresses the draft-save toast when syncing the user file after a
   // privileged apply (keeps a single source of truth without toast spam)
   property bool suppressSaveToast: false
+  // true when the on-screen draft differs from the EFFECTIVE daemon config
+  // (/etc, what the running engine actually uses): user must restart the
+  // service, a plain apply is not enough for DNS/firewall identity
+  property bool isDirty: false
+  // canonical fingerprint of the effective config, snapshotted at load
+  property string effectiveFingerprint: ""
+  // one-shot fallback: if `config get --system` fails (no system file),
+  // retry once with the plain user-file resolution
+  property bool configTriedFallback: false
 
   // preserved CLI configuration parameters not directly exposed in UI
   property var storedPorts: [443]
@@ -206,6 +215,7 @@ Panel {
 
   function scheduleAutoApply() {
     if (root.isConfigLoading) return
+    root.refreshDirty()
     autoApplyTimer.restart()
   }
 
@@ -464,6 +474,10 @@ Panel {
   }
 
   function loadConfig() {
+    // EFFECTIVE config first (/etc = what the daemon runs); the process
+    // itself falls back to the user file when no system config exists
+    root.configTriedFallback = false
+    configGetProc.command = ["/usr/local/bin/albus", "config", "get", "--system"]
     if (!configGetProc.running) configGetProc.running = true
   }
 
@@ -536,17 +550,122 @@ Panel {
     args.push("--pqc", root.pqcEnabled ? "true" : "false")
     args.push("--ram-only", root.ramOnlyEnabled ? "true" : "false")
 
-    // preserve backend tuning parameters
+    // preserve backend tuning parameters (FP-08: mirror Config::validate bounds)
+    // Hardening: fast-fail stored ports/cgroup here too (backend remains the
+    // gate; this only avoids a pointless pkexec round-trip on stale values).
     if (root.storedPorts && root.storedPorts.length > 0) {
+      if (root.storedPorts.length > 64) return { ok: false, reason: "Too many ports (max 64)" }
+      var _seen = {}
+      for (var _pi = 0; _pi < root.storedPorts.length; _pi++) {
+        var _pn = parseInt(String(root.storedPorts[_pi]), 10)
+        if (isNaN(_pn) || _pn < 1 || _pn > 65535) return { ok: false, reason: "Invalid port (expected 1..65535)" }
+        if (_seen[_pn]) return { ok: false, reason: "Duplicate port" }
+        _seen[_pn] = true
+      }
       args.push("--ports", root.storedPorts.join(","))
     }
-    args.push("--restore-after-bytes", String(root.storedRestoreAfterBytes))
-    args.push("--restore-mss", String(root.storedRestoreMss))
+    var _rab = parseInt(String(root.storedRestoreAfterBytes), 10)
+    if (isNaN(_rab) || _rab < 64) return { ok: false, reason: "Invalid restore window (expected >= 64)" }
+    var _rms = parseInt(String(root.storedRestoreMss), 10)
+    if (isNaN(_rms) || _rms < 0 || _rms > 1460 || (_rms !== 0 && _rms < 64)) return { ok: false, reason: "Invalid restore MSS (expected 0 or 64..1460)" }
+    args.push("--restore-after-bytes", String(_rab))
+    args.push("--restore-mss", String(_rms))
     if (root.storedCgroup) {
-      args.push("--cgroup", root.storedCgroup)
+      var _cg = String(root.storedCgroup)
+      if (_cg.length === 0 || _cg.length > 256 || _cg.charAt(0) !== '/' || _cg.indexOf("..") !== -1) {
+        return { ok: false, reason: "Invalid cgroup path (absolute, no .., max 256)" }
+      }
+      args.push("--cgroup", _cg)
     }
 
     return { ok: true, args: args }
+  }
+
+  // canonical JSON with sorted keys (stable string compare for dirty check)
+  function canon(o) {
+    if (o === null || o === undefined || typeof o !== "object") return JSON.stringify(o)
+    if (Array.isArray(o)) return "[" + o.map(canon).join(",") + "]"
+    var ks = Object.keys(o).sort()
+    return "{" + ks.map(function(k) { return JSON.stringify(k) + ":" + canon(o[k]) }).join(",") + "}"
+  }
+
+  function numOr(v, dflt) {
+    var n = parseInt(v, 10)
+    return isNaN(n) ? dflt : n
+  }
+
+  // canonical shape of the CURRENT on-screen draft (same normalization as
+  // buildConfigArgs, so the two can never disagree about meaning)
+  function uiConfigShape() {
+    var up = root.activeDnsKey
+    if (up.indexOf("mullvad") !== -1) up = root.mullvadProfile === "standard" ? "mullvad" : "mullvad-" + root.mullvadProfile
+    else if (up === "custom") up = root.customDnsUrl.trim()
+    var boots = []
+    var p1 = root.customBootstrapPrimary.trim(), p2 = root.customBootstrapSecondary.trim()
+    if (p1 !== "") boots.push(p1)
+    if (p2 !== "") boots.push(p2)
+    var ttlVal = parseInt(root.customFakeTtl.trim(), 10)
+    var autoTtl = isNaN(ttlVal) || ttlVal <= 0
+    return {
+      doh_upstream: up,
+      doh_bootstrap_ips: boots,
+      mss: numOr(root.customMss.trim(), 88),
+      min_mss: numOr(root.customMinMss.trim(), 64),
+      auto_ttl: autoTtl,
+      fake_ttl: autoTtl ? 8 : Math.min(Math.max(ttlVal, 1), 255),
+      fake_sni: root.customFakeSni.trim(),
+      fake_bad_checksum: root.fakeBadChecksum,
+      block_quic: root.blockQuicEnabled,
+      block_stun: root.blockStunEnabled,
+      kill_switch: root.killSwitchEnabled,
+      network_lockdown: root.networkLockdownEnabled,
+      block_ipv6: root.blockIpv6Enabled,
+      dnssec: root.dnssecEnabled,
+      pqc: root.pqcEnabled,
+      ram_only: root.ramOnlyEnabled,
+      ports: root.storedPorts,
+      restore_after_bytes: root.storedRestoreAfterBytes,
+      restore_mss: root.storedRestoreMss,
+      cgroup: root.storedCgroup
+    }
+  }
+
+  // canonical shape of a LOADED backend config (mirrors the load mapping:
+  // mullvad aliases collapse, missing fields take backend defaults)
+  function cfgFingerprint(cfg) {
+    var up = cfg.doh_upstream || "quad9"
+    if (up === "mullvad-standard") up = "mullvad"
+    return canon({
+      doh_upstream: up,
+      doh_bootstrap_ips: cfg.doh_bootstrap_ips || [],
+      mss: cfg.mss || 88,
+      min_mss: (cfg.min_mss !== undefined ? cfg.min_mss : 64),
+      auto_ttl: cfg.auto_ttl !== false,
+      fake_ttl: cfg.fake_ttl || 8,
+      fake_sni: cfg.fake_sni || "",
+      fake_bad_checksum: !!cfg.fake_bad_checksum,
+      block_quic: cfg.block_quic !== false,
+      block_stun: cfg.block_stun !== false,
+      kill_switch: cfg.kill_switch !== false,
+      network_lockdown: !!cfg.network_lockdown,
+      block_ipv6: cfg.block_ipv6 !== false,
+      dnssec: cfg.dnssec !== false,
+      pqc: cfg.pqc !== false,
+      ram_only: !!cfg.ram_only,
+      ports: cfg.ports || [443],
+      restore_after_bytes: (cfg.restore_after_bytes !== undefined ? cfg.restore_after_bytes : 600),
+      restore_mss: (cfg.restore_mss !== undefined ? cfg.restore_mss : 0),
+      cgroup: cfg.cgroup_path || "/sys/fs/cgroup"
+    })
+  }
+
+  // draft-vs-effective comparison; called after loads and on every edit
+  function refreshDirty() {
+    if (root.isConfigLoading) {
+      root.isDirty = false
+      return
+    }
+    root.isDirty = (canon(root.uiConfigShape()) !== root.effectiveFingerprint)
   }
 
   // draft save: unprivileged user config only, never touches the daemon,
@@ -662,6 +781,16 @@ Panel {
       }
     }
     onExited: function(code) {
+      // one-shot fallback: no system file (daemon never installed) means
+      // the user file IS the effective config — retry plain once
+      if (code !== 0 && !root.configTriedFallback) {
+        root.configTriedFallback = true
+        configGetProc.command = ["/usr/local/bin/albus", "config", "get"]
+        configGetProc.outBuf = ""
+        configGetProc.outBytes = 0
+        configGetProc.running = true
+        return
+      }
       var cfg = root.parseConfigJson(configGetProc.outBuf.slice(0, 65536))
       configGetProc.outBuf = ""
       configGetProc.outBytes = 0
@@ -710,7 +839,11 @@ Panel {
           root.customBootstrapPrimary = (cfg.doh_bootstrap_ips && cfg.doh_bootstrap_ips.length > 0) ? (cfg.doh_bootstrap_ips[0] || "") : ""
           root.customBootstrapSecondary = (cfg.doh_bootstrap_ips && cfg.doh_bootstrap_ips.length > 1) ? (cfg.doh_bootstrap_ips[1] || "") : ""
 
+          // snapshot the EFFECTIVE config: everything shown above now
+          // mirrors the daemon, so the draft is clean by definition
+          root.effectiveFingerprint = root.cfgFingerprint(cfg)
           root.isConfigLoading = false
+          root.refreshDirty()
         }
     }
   }
@@ -885,6 +1018,19 @@ Panel {
                   font.pixelSize: Style.font.caption - 1
                   font.bold: true
                   color: root.isRunning ? "#10B981" : root.dim
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // dirty badge: draft differs from the EFFECTIVE daemon
+                // config — restart required, apply alone is not enough
+                Text {
+                  textFormat: Text.PlainText;
+                  visible: root.isDirty
+                  text: "● RESTART TO APPLY"
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.caption - 1
+                  font.bold: true
+                  color: "#F59E0B"
                   anchors.verticalCenter: parent.verticalCenter
                 }
               }

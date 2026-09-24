@@ -2,6 +2,34 @@
 
 use clap::{Args, Parser, Subcommand};
 
+// FP-08: fail fast at the CLI boundary too (Config::validate remains the
+// single source of truth; these mirror its restore_* bounds).
+fn parse_restore_after_bytes(s: &str) -> Result<u32, String> {
+    let v: u32 = s
+        .parse()
+        .map_err(|_| format!("invalid restore_after_bytes {}", s))?;
+    if v < 64 {
+        return Err(format!(
+            "invalid restore_after_bytes {} (expected >= 64)",
+            v
+        ));
+    }
+    Ok(v)
+}
+
+fn parse_restore_mss(s: &str) -> Result<u16, String> {
+    let v: u16 = s
+        .parse()
+        .map_err(|_| format!("invalid restore_mss {}", s))?;
+    if v != 0 && !(64..=1460).contains(&v) {
+        return Err(format!(
+            "invalid restore_mss {} (expected 0 or 64..=1460)",
+            v
+        ));
+    }
+    Ok(v)
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "albus",
@@ -48,7 +76,12 @@ pub struct ConfigArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCommands {
     // print active configuration parameters in formatted json
-    Get,
+    Get {
+        /// read the system-wide daemon config (/etc/albus/config.json)
+        /// instead of the user file: what the running daemon actually uses
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
 
     // update configuration values and persist to disk
     Set(RunArgs),
@@ -114,6 +147,8 @@ pub struct RunArgs {
 
     // static TTL selection (no probing — see autottl docs): true clamps
     // the default into [min_ttl, max_ttl], false honors --fake-ttl exactly
+    // (hop-distance heuristic stays a conservative constant until true
+    // path probing lands; see measure_hop_distance)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub auto_ttl: bool,
 
@@ -172,16 +207,16 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 88)]
     pub mss: u16,
 
-    // minimum tcp mss clamp for jitter randomization (0 = fixed mss)
+    // minimum tcp mss clamp for jitter randomization (must stay within 32..=mss)
     #[arg(long, default_value_t = 64)]
     pub min_mss: u16,
 
     // transmitted byte threshold before restoring native line-rate mss
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 600, value_parser = parse_restore_after_bytes)]
     pub restore_after_bytes: u32,
 
     // target mss value upon restoration (0 = 1460 auto)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = parse_restore_mss)]
     pub restore_mss: u16,
 
     // target destination ports for ebpf sock_ops attachment

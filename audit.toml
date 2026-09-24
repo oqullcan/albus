@@ -1,0 +1,5 @@
+# cargo-audit policy: the CI gate fails on any known vulnerability.
+# Add an ignore below only with a dated justification and a tracking issue.
+# See: https://rustsec.org/
+[advisories]
+# ignore = []

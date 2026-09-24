@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
+pub const BPF_MAP_DELETE_ELEM: u32 = 3;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_PROG_ATTACH: u32 = 8;
 pub const BPF_PROG_DETACH: u32 = 9;
@@ -306,6 +307,38 @@ impl BpfMapHandles {
         }
         Ok(())
     }
+
+    // synchronizes a set map to exactly `new`: deletes removed keys (stale
+    // entries would otherwise stay active forever — insert-only reload left
+    // shrunk configs partially applied), then inserts current keys.
+    pub fn sync_target_ports(&self, old: &[u16], new: &[u16]) -> Result<()> {
+        for port in old {
+            if !new.contains(port) {
+                bpf_map_delete(self.target_ports_fd, port)?;
+            }
+        }
+        self.push_target_ports(new)
+    }
+
+    pub fn sync_exclude_ips(&self, old: &[Ipv4Addr], new: &[Ipv4Addr]) -> Result<()> {
+        for ip in old {
+            if !new.contains(ip) {
+                let key = u32::from_ne_bytes(ip.octets());
+                bpf_map_delete(self.exclude_ips_fd, &key)?;
+            }
+        }
+        self.push_exclude_ips(new)
+    }
+
+    pub fn sync_exclude_ips_v6(&self, old: &[Ipv6Addr], new: &[Ipv6Addr]) -> Result<()> {
+        for ip in old {
+            if !new.contains(ip) {
+                let key = ip.octets();
+                bpf_map_delete(self.exclude_ips_v6_fd, &key)?;
+            }
+        }
+        self.push_exclude_ips_v6(new)
+    }
 }
 
 impl BpfEngine {
@@ -492,6 +525,39 @@ fn bpf_map_update<K, V>(map_fd: RawFd, key: &K, value: &V) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn bpf_map_delete<K>(map_fd: RawFd, key: &K) -> Result<()> {
+    #[repr(C)]
+    struct BpfAttrMapKey {
+        map_fd: u32,
+        pad: u32,
+        key: u64,
+    }
+
+    let attr = BpfAttrMapKey {
+        map_fd: map_fd as u32,
+        pad: 0,
+        key: key as *const _ as u64,
+    };
+
+    let res = sys_bpf(
+        BPF_MAP_DELETE_ELEM,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrMapKey>(),
+    );
+    if res < 0 {
+        let err = Error::last_os_error();
+        // deleting an absent key already yields the desired state
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(Error::other(format!(
+            "bpf(BPF_MAP_DELETE_ELEM) failed: {}",
+            err
+        )));
+    }
+    Ok(())
 }
 
 fn bpf_load_program(prog_type: u32, insns: &[BpfInsn], name: &str) -> Result<RawFd> {
