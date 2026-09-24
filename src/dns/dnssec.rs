@@ -1274,12 +1274,37 @@ mod tests {
         let _ = (pubkey.algorithm(), pubkey.public_bytes().len());
     }
 
-    // Island regression (chatgpt.com 2026-09-23): a signed zone with NO DS
-    // in the parent must validate Insecure (served), never Bogus (SERVFAIL).
-    // Live-network — excluded from hermetic gates like the other live tests.
+    // Unsigned delegation (neverssl.com 2026-09-24, verified live): a zone
+    // with NO DS in the parent serving UNSIGNED answers must validate
+    // Insecure (served), never Bogus (SERVFAIL). neverssl.com is
+    // purpose-built for stability (plain-HTTP-forever mission, single
+    // unsigned A, no DNSSEC ambitions). Live-network — excluded from
+    // hermetic gates like the other live tests.
     #[tokio::test]
     #[ignore]
-    async fn test_unsigned_delegation_island_is_insecure_live() {
+    async fn test_unsigned_delegation_is_insecure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("neverssl.com", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+        let state = v.validate("neverssl.com", 1, &resp, &resolver).await;
+        assert_eq!(state, DnssecState::Insecure);
+    }
+
+    // FP-19 live lock (chatgpt.com 2026-09-24, verified live): the zone
+    // publishes DNSKEY + RRSIGs but has NO DS in .com (signed-but-unchained).
+    // Such answers are Bogus (SERVFAIL), never silently Insecure. DOMAIN
+    // DRIFT NOTE: on 2026-09-23 this same name served unsigned answers and
+    // the test above asserted Insecure for it; by 2026-09-24 it serves
+    // unanchored RRSIGs, so the expectation moved here. If this test fails
+    // with Insecure/Secure, the zone likely gained a DS (fully chained now)
+    // — verify with a DS lookup before "fixing" the code.
+    #[tokio::test]
+    #[ignore]
+    async fn test_signed_but_unchained_is_bogus_live() {
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let q = doh_query_with_do("chatgpt.com", RecordType::A);
@@ -1288,7 +1313,7 @@ mod tests {
             .await
             .expect("live DoH query should succeed");
         let state = v.validate("chatgpt.com", 1, &resp, &resolver).await;
-        assert_eq!(state, DnssecState::Insecure);
+        assert_eq!(state, DnssecState::Bogus);
     }
 
     // CDN regression (video.twimg.com 2026-09-23): unsigned CNAME in an

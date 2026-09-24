@@ -64,6 +64,43 @@ loopback self-decoy artifact, not a sim RST: `sim_decision` is what counts).
 
 Gate output: `DPI simulator: WITH albus -> connection established (evasion successful).`
 
+## Live DNSSEC proof — 2026-09-24 (post-merge master v2.2.0 → develop)
+
+Repo: `develop` @ `6a025a6` (merge commit). Env: kernel 7.2.5-omarchy,
+cgroup2 + BTF present, Rust 1.89, home network. Command:
+`cargo test --lib <mod> -- --ignored` per module. 8/8 green:
+
+- `test_signed_zone_validates_secure_live` (ietf.org → Secure) — ok.
+  Early-Secure evidence: chain-verified positive answers still Secure
+  after the ChainVerdict rewrite.
+- `test_unsigned_delegation_is_insecure_live` (neverssl.com → Insecure) —
+  ok (NEW, replaces the chatgpt.com island test below).
+- `test_signed_but_unchained_is_bogus_live` (chatgpt.com → Bogus) — ok
+  (NEW). FP-19 live lock: zone publishes DNSKEY+RRSIGs (ECDSA-P256) with
+  NO DS in .com (proven NODATA via com. NSEC3) → Bogus, never silently
+  Insecure.
+- `test_unsigned_cname_to_signed_target_is_secure_live` (twimg → served,
+  not Bogus) — ok. cdb9ce6 defer design holds live.
+- `test_tampered_signed_response_is_bogus_live` (ietf.org byte-flipped →
+  Bogus) — ok. Tamper fail-closed holds live (NSEC3-cap adjacent:
+  NSEC3 denials cap at Indeterminate by construction; offline forged
+  test pins the Bogus direction).
+- `test_doh_quad9_live_query`, `live_probe_upstreams_print_support` — ok.
+- `live_ech_publishers_print_configs` — ok.
+
+FAIL found and fixed in this pass (not ignored): the pre-existing
+`test_unsigned_delegation_island_is_insecure_live` asserted
+chatgpt.com → Insecure but got Bogus (3/3 deterministic). Root cause
+(probed live, DO vs no-DO responses compared): the domain DRIFTED —
+2026-09-23 it served unsigned answers (island → Insecure, correct then);
+2026-09-24 it serves RRSIGs (key_tag 34505) with no DS (signed-but-
+unchained → Bogus per FP-19, correct now). Code is right, the test's
+domain assumption was stale. Fixed by: repurposing chatgpt.com as the
+FP-19 Bogus lock + adding neverssl.com (verified live: unsigned A, DS
+NODATA, → Insecure) as the island lock. Probes for example.com/
+example.net showed the same edge-signing drift — do NOT use them as
+island fixtures.
+
 ## Recurring proof (CI)
 
 Every CI run executes job `dpi-evasion`: Phase A (simulator validity, albus
