@@ -210,13 +210,18 @@ impl FsPrivilegeGuard {
                     gid_s.trim().parse::<libc::gid_t>(),
                 ) {
                     if uid != 0 {
-                        // cross-check SUDO_UID against passwd database (anti-spoof)
+                        // cross-check SUDO_UID/SUDO_GID against passwd database
+                        // (anti-spoof): uid must match pw_uid AND gid must match
+                        // pw_gid, otherwise an env-spoofed primary group would
+                        // survive the drop with the guard reporting active.
                         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
                             if is_valid_username(&sudo_user) {
                                 if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
                                     unsafe {
                                         let pwd = libc::getpwnam(c_user.as_ptr());
-                                        if !pwd.is_null() && (*pwd).pw_uid != uid {
+                                        if !pwd.is_null()
+                                            && ((*pwd).pw_uid != uid || (*pwd).pw_gid != gid)
+                                        {
                                             return Self { active: false };
                                         }
                                     }
@@ -291,7 +296,11 @@ fn validated_sudo_uid() -> Option<libc::uid_t> {
     if uid == 0 {
         return None;
     }
-    // cross-check against passwd database when SUDO_USER is present (anti-spoof)
+    // cross-check against passwd database when SUDO_USER is present (anti-spoof):
+    // uid must match pw_uid AND gid must match pw_gid — same rule as the guard.
+    let gid: Option<libc::gid_t> = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         if !is_valid_username(&sudo_user) {
             return None;
@@ -299,13 +308,30 @@ fn validated_sudo_uid() -> Option<libc::uid_t> {
         if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
             unsafe {
                 let pwd = libc::getpwnam(c_user.as_ptr());
-                if !pwd.is_null() && (*pwd).pw_uid != uid {
+                if !pwd.is_null()
+                    && ((*pwd).pw_uid != uid || gid.is_some_and(|g| g != (*pwd).pw_gid))
+                {
                     return None;
                 }
             }
         }
     }
     Some(uid)
+}
+
+/// Rejects `..` components before path classification: `Path::starts_with`
+/// is component-lexical, so `/run/albus/../tmp/x` would classify as a system
+/// path while resolving outside it. All constructed paths already exclude
+/// `..`; this is defense-in-depth for explicit user-supplied paths.
+fn reject_dotdot(path: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("security violation: `..` in path {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_symlink_ancestors(path: &Path) -> std::io::Result<()> {
@@ -422,9 +448,27 @@ fn check_parent_ownership(parent: &Path, is_system_path: bool) -> std::io::Resul
     Ok(())
 }
 
+#[cfg(unix)]
+/// Pure decision helper (unit-tested): a privilege drop is EXPECTED exactly
+/// when running as euid 0 with a validated sudo user on a non-system path.
+fn drop_expected_for(
+    euid: libc::uid_t,
+    sudo_uid: Option<libc::uid_t>,
+    is_system_path: bool,
+) -> bool {
+    euid == 0 && sudo_uid.is_some() && !is_system_path
+}
+
+#[cfg(unix)]
+fn privilege_drop_expected(is_system_path: bool) -> bool {
+    let euid = unsafe { libc::geteuid() };
+    drop_expected_for(euid, validated_sudo_uid(), is_system_path)
+}
+
 // safely writes content to path atomically rejecting symlinks and dropping privileges on user paths
 fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     let p = path.as_ref();
+    reject_dotdot(p)?;
     let is_system_path = p.starts_with("/run/albus") || p.starts_with("/etc/albus");
 
     #[cfg(unix)]
@@ -433,6 +477,26 @@ fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     } else {
         FsPrivilegeGuard { active: false }
     };
+
+    // HANCORE follow-up (fail-closed guard): when a drop was expected (root +
+    // validated sudo user + user path) but the guard is inactive (setgroups
+    // failure, spoofed env, failed -1 probe), REFUSE the operation instead of
+    // continuing with root filesystem credentials on a user-writable path —
+    // a parent-directory swap could otherwise redirect the privileged write.
+    // Direct root (no sudo), plain users, and system paths never expect a
+    // drop, so their flows are untouched.
+    #[cfg(unix)]
+    {
+        if privilege_drop_expected(is_system_path) && !_guard.active {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: privilege drop failed for {} — refusing privileged write to user path",
+                    p.display()
+                ),
+            ));
+        }
+    }
 
     // 1. pre-check: reject any symlink in the full chain before touching the fs
     reject_symlink_ancestors(p)?;
@@ -683,6 +747,7 @@ fn legacy_safe_write(p: &Path, content: &str) -> std::io::Result<()> {
 // safely reads content while atomically rejecting symlinks and enforcing strict ownership checks
 fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     let p = path.as_ref();
+    reject_dotdot(p)?;
     let is_system_path = p.starts_with("/run/albus") || p.starts_with("/etc/albus");
 
     #[cfg(unix)]
@@ -691,6 +756,20 @@ fn safe_read<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     } else {
         FsPrivilegeGuard { active: false }
     };
+
+    // HANCORE follow-up, same fail-closed rule as safe_write.
+    #[cfg(unix)]
+    {
+        if privilege_drop_expected(is_system_path) && !_guard.active {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "security violation: privilege drop failed for {} — refusing privileged read of user path",
+                    p.display()
+                ),
+            ));
+        }
+    }
 
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -1408,8 +1487,25 @@ mod tests {
         }
     }
 
-    // NV-02 follow-up: a planted FIFO must be rejected, not block on open.
-    // (Pre-fix this test hangs; post-fix O_NONBLOCK makes open succeed and
+    // HANCORE follow-up: drop is expected exactly for root + validated sudo
+    // user + user path. Every other combination must NOT expect one, so legit
+    // direct-root, plain-user, and system-path flows are untouched.
+    #[test]
+    fn test_drop_expected_matrix() {
+        // the HANCORE case: sudo invocation on a user path expects a drop
+        assert!(drop_expected_for(0, Some(1000), false));
+        // system paths never expect a drop (written with ambient creds)
+        assert!(!drop_expected_for(0, Some(1000), true));
+        assert!(!drop_expected_for(0, None, true));
+        // direct root (no sudo user): nobody to drop to
+        assert!(!drop_expected_for(0, None, false));
+        // plain users: nothing privileged to drop
+        assert!(!drop_expected_for(1000, None, false));
+        assert!(!drop_expected_for(1000, Some(1000), false));
+        assert!(!drop_expected_for(1000, None, true));
+    }
+
+    // NV-02 follow-up: a planted FIFO must be rejected, not block on open.    // (Pre-fix this test hangs; post-fix O_NONBLOCK makes open succeed and
     // the is_file gate deny. No writer ever opens the fifo.)
     #[test]
     fn test_fifo_read_rejected_without_hang() {
@@ -1423,6 +1519,15 @@ mod tests {
         assert!(res.is_err(), "FIFO must be rejected, not read or hung");
         let _ = fs::remove_file(&fifo);
         let _ = fs::remove_dir(&dir);
+    }
+
+    // `..` must be rejected before path classification (defense-in-depth;
+    // constructors never emit it, explicit paths might).
+    #[test]
+    fn test_dotdot_rejected() {
+        assert!(reject_dotdot(Path::new("/run/albus/../tmp/x")).is_err());
+        assert!(reject_dotdot(Path::new("/etc/albus/config.json")).is_ok());
+        assert!(safe_write("/run/albus/../tmp/x", "{}").is_err());
     }
 
     #[test]
