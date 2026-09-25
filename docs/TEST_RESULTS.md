@@ -134,6 +134,32 @@ session is refused. `reload_maps` live-kernel sync therefore stays
 UNPROVEN on this host (unit-level FP-17 error path is covered);
 needs a CI root runner or system.slice context — left open, not silent.
 
+## Panel runtime — 2026-09-25 (dirty-badge + --system fallback)
+
+Repo: `develop` @ `cf28c40`. Quickshell 0.3.1, Omarchy live shell.
+Full protocol: `docs/PANEL_TESTING.md`.
+
+- `omarchy-plugin-validate`: exit 0. Installed copies synced
+  (Panel.qml + manifest.json 2.1.0→2.2.0; BarWidget.qml already same).
+- File-watcher reloaded the new Panel.qml on copy + full shell
+  restart with widget enabled: **zero** albus/Panel errors in journal
+  (only the stock IpcHandler WARN noise all panels emit).
+- Backend legs: `--system` as user → PermissionDenied (fallback by
+  design); as root → full system JSON; old installed binary (no flag)
+  → non-zero exit → one-shot plain retry. All three correct.
+- Node harness on REAL backend JSON (`mss:100` persisted tuning
+  included): 9/9 — canon order, fingerprint stability, clean/dirty/
+  clean toggle cycle, mullvad-base round-trip, fallback null parses.
+- Backend↔QML key cross-check: all 20 fingerprint keys exist in
+  `config get`; `buildConfigArgs` normalization mirrors
+  `uiConfigShape` (defaults, ttl clamp, mullvad collapse). One
+  deliberate gap documented: dirty check covers only the
+  panel-managed subset (`doh_enabled`/`min_ttl`/`max_ttl`/
+  `shaping_watchdog`/`verbose` invisible — needs UI toggles first).
+- Widget disabled again after the test (bar state restored).
+- Automation: no qmllint/qmltestrunner/Qt6 here or in CI — manual
+  protocol stands; see PANEL_TESTING.md § Automation gap.
+
 ## Recurring proof (CI)
 
 Every CI run executes job `dpi-evasion`: Phase A (simulator validity, albus
