@@ -101,6 +101,39 @@ NODATA, → Insecure) as the island lock. Probes for example.com/
 example.net showed the same edge-signing drift — do NOT use them as
 island fixtures.
 
+## Root lab — 2026-09-24 (post-merge, pkexec root)
+
+Repo: `develop` @ `b583b30`. Env: kernel 7.2.5-omarchy, cgroup2,
+BTF present, live `albus.service` active (pid 903, system.slice).
+Root via `pkexec bash -c "cd /home/ogy/albusdpi2 && cargo test ..."`
+(pkexec resets cwd to /root, so the `cd` is load-bearing).
+
+Passed as root:
+- `tests/root.rs` 3/3: `root_quic_block_unblock_symmetry` (iptables
+  insert/delete symmetry), `root_service_binary_pinned`,
+  `root_rawsocket_send_loopback`.
+- `loader::root_attach_detach_roundtrip`: SKIP by design (see below).
+- `rawsock` 3/3: create+v4-send, v6-send-or-skip, mixed-family reject.
+- NEW `tests/watchdog.rs` 2/2 (unprivileged, hermetic — no ignore
+  needed): `watchdog_trips_when_connections_outlive_events` (real
+  loopback conn + real /proc snapshots, flat event counter → trip on
+  2nd zero-event window) and `watchdog_stays_quiet_when_events_flow`
+  (same snapshots with events → never trips; closed conn pruned).
+
+Environmental SKIP (designed path, not a bug): eBPF cgroup sock_ops
+ATTACH is refused on this machine — `bpf(BPF_PROG_ATTACH) failed:
+Operation not permitted`, deterministically (3/3 runs), for engine
+AND loader paths alike (early confusion resolved: re-ran loader with
+`--nocapture` and confirmed its SKIP line too). Diagnostics: full
+caps (`CapEff: ffffffffff`), no lockdown, no LSM denial in dmesg,
+`unprivileged_bpf_disabled=2`; caller runs in a user-session scope
+(`user@1000.service/...app.scope`) while the live daemon holds its
+program from `system.slice/albus.service`. So: the mechanism is proven
+live by the running daemon, but manual attach from an interactive
+session is refused. `reload_maps` live-kernel sync therefore stays
+UNPROVEN on this host (unit-level FP-17 error path is covered);
+needs a CI root runner or system.slice context — left open, not silent.
+
 ## Recurring proof (CI)
 
 Every CI run executes job `dpi-evasion`: Phase A (simulator validity, albus
