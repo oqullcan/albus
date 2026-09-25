@@ -134,6 +134,28 @@ session is refused. `reload_maps` live-kernel sync therefore stays
 UNPROVEN on this host (unit-level FP-17 error path is covered);
 needs a CI root runner or system.slice context — left open, not silent.
 
+## Merge proof — master v2.2.0 → develop (2026-09-24/25)
+
+Merged: `9cd55ae..a2f32d4` (12 commits: FP-01..FP-19, L1 rootless,
+DNSSEC islands, rustls bump, v2.2.0) into `develop` (`6a025a6`),
+plus follow-up `10de595` (HANCORE privilege-guard, merged clean).
+18 files conflicted; resolutions favor audited release semantics
+(full rationale in the merge commit message). Post-merge gates,
+all green on `develop`:
+
+- `cargo test`: 147 lib + 22 integration pass, 0 fail (incl. new
+  `tests/watchdog.rs` 2/2 and RSASHA1 locks).
+- Live (ignored, internet): 8/8 (5 dnssec + 2 doh + 1 ech) — see
+  Live DNSSEC proof above, incl. the chatgpt.com drift fix.
+- Root (pkexec): tests/root.rs 3/3, rawsock 3/3, loader SKIP by
+  design (environmental EPERM) — see Root lab above.
+- `cargo fmt --check`: clean. `cargo clippy --workspace --
+  -D warnings` (exact CI gate): clean (7 pre-existing drift lints
+  fixed in passing).
+- `cargo audit` (196 crates): clean, exit 0. `cargo deny check`:
+  advisories/bans/licenses/sources all ok.
+- Panel: validate exit 0, zero journal errors, 9/9 logic harness.
+
 ## Panel runtime — 2026-09-25 (dirty-badge + --system fallback)
 
 Repo: `develop` @ `cf28c40`. Quickshell 0.3.1, Omarchy live shell.
