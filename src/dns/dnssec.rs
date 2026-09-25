@@ -1221,6 +1221,53 @@ mod tests {
         assert_eq!(state, DnssecState::Bogus);
     }
 
+    #[test]
+    fn test_rsasha1_excluded_from_supported_algorithms() {
+        // Decision A (2026-09-25, locked): the RSASHA1 family is rejected
+        // even though hickory could verify it — SHA-1 collision forgery
+        // risk beats legacy-zone compat. Zones using it SERVFAIL (Bogus),
+        // proven by test_rsasha1_signed_answer_is_bogus_offline below.
+        // (hickory itself refuses to SIGN with RSASHA1, so the behavioral
+        // test relabels a real ECDSA signature instead.)
+        assert!(!secure_algorithms().has(Algorithm::RSASHA1));
+        assert!(!secure_algorithms().has(Algorithm::RSASHA1NSEC3SHA1));
+        for alg in [
+            Algorithm::RSASHA256,
+            Algorithm::RSASHA512,
+            Algorithm::ECDSAP256SHA256,
+            Algorithm::ECDSAP384SHA384,
+            Algorithm::ED25519,
+        ] {
+            assert!(secure_algorithms().has(alg), "{alg:?} must stay supported");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rsasha1_signed_answer_is_bogus_offline() {
+        // Same fixture as the Secure control, but the RRSIG is relabeled
+        // RSASHA1: the algorithm gate must reject before any crypto, so a
+        // legacy-signed answer fails closed (Bogus), never served.
+        let fx = signed_root_fixture();
+        let resolver = dummy_resolver();
+        let mut msg = Message::from_vec(&fx.wire).expect("fixture parses");
+        let mut relabeled = false;
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::RRSIG {
+                if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rec.data {
+                    let mut input = rrsig.input().clone();
+                    input.algorithm = Algorithm::RSASHA1;
+                    let relabeled_rrsig = RRSIG::from_sig(input, rrsig.sig().to_vec());
+                    rec.data = RData::DNSSEC(DNSSECRData::RRSIG(relabeled_rrsig));
+                    relabeled = true;
+                }
+            }
+        }
+        assert!(relabeled, "fixture must carry an RRSIG to relabel");
+        let wire = msg.to_vec().unwrap();
+        let state = fx.validator.validate(".", 1, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Bogus);
+    }
+
     // NOTE (merge master→develop): the offline root-island fixture test was
     // retired here. Under the FetchOutcome/ChainVerdict architecture a
     // self-signed ROOT with an untrusted key is Fail (→ Bogus), not

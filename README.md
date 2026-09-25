@@ -86,7 +86,10 @@ Full flag list: `albus run --help`. Defaults (kept in sync with `Config::default
 
 DNSSEC validation: Bogus → SERVFAIL (never cached), unsigned → served
 insecure, unsigned delegations without DS in the parent → insecure (never
-Bogus). Query IDs (ECH, DNSSEC chain, leak canary) come from the OS CSPRNG.
+Bogus). RSASHA1/NSEC3RSASHA1 are deliberately rejected (zones using them
+SERVFAIL — SHA-1 collision-forgery risk beats legacy compat; locked by
+`test_rsasha1_*` in `src/dns/dnssec.rs`). Query IDs (ECH, DNSSEC chain,
+leak canary) come from the OS CSPRNG.
 
 ### Verification
 DPI evasion is verified against a live RST-injection simulator on every CI run — see docs/TEST_RESULTS.md for the latest recorded proof. To verify your own setup: see docs/TESTING.md.
