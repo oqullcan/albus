@@ -8,6 +8,18 @@ tag `archive/dev-465655e` on 2026-09-25 and pruned — see Unreleased.
 
 ## Unreleased (develop)
 
+### Fixed (run-9 audit finding)
+- DNSSEC-STRIP-ALL-UNSIGNED (low): unsigned answers/denials in a
+  proven-signed owner zone now fail closed (Bogus) instead of served
+  Insecure. The `any_signed` fast path is gone — every unsigned link
+  consults DS. Offline behavior preserved (failed fetch counts as
+  not-signed → Insecure). Cost accepted: DS round-trips per unsigned
+  answer. Locked by `test_stripped_signed_zone_answer_is_bogus_offline`
+  and `test_stripped_denial_in_signed_zone_is_bogus_offline`
+  (cache-seeded DS, hermetic); unsigned-island tests moved to
+  RFC 2606 `.invalid` fixtures after real-zone drift (example.com
+  gained edge-signing/DS).
+
 ### Merged upstream
 - `master` v2.2.0 (`9cd55ae..a2f32d4`, 12 commits: FP-01..FP-19 audit
   closure, L1 rootless daemon, DNSSEC island handling, rustls bump,

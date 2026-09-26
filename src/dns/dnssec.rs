@@ -579,7 +579,18 @@ impl DnssecValidator {
                 }
             }
             if candidates.is_empty() {
-                // unsigned denial — insecure, not bogus
+                // Fully stripped denial (no NSEC/NSEC3/RRSIG in authority)
+                // in a signed owner zone is unverifiable denial material
+                // (forgery direction) → Bogus; in an unsigned zone it is a
+                // plain unsigned denial → Insecure. Offline the DS fetch
+                // fails closed to not-signed, preserving Insecure.
+                if self.owner_zone_signed(&owner, resolver).await {
+                    debug!(
+                        "dnssec: stripped denial in signed zone for {}",
+                        owner.to_ascii()
+                    );
+                    return DnssecState::Bogus;
+                }
                 return DnssecState::Insecure;
             }
         }
@@ -597,30 +608,28 @@ impl DnssecValidator {
         // candidate starves later ones (SERVFAIL roulette). Decided below,
         // after every candidate had its chance.
         let mut saw_crypto_failure = false;
-        // Strict chain rule: if ANY candidate carries RRSIGs, every link must
-        // verify Secure. An unsigned link beside signed links smells like a
-        // stripped signature redirecting qname to another valid signed name.
-        let any_signed = candidates
-            .iter()
-            .any(|(_, recs, t, _)| !Self::rrsig_records(recs, *t).is_empty());
+        // Unsigned links are EITHER genuine unsigned data OR stripped
+        // signatures: the two are wire-indistinguishable, so every
+        // unsigned link is checked against DS (at the owner name or its
+        // parent). Signed owner zone with no signatures on the wire is
+        // stripping → Bogus; otherwise an Insecure link. (There is no
+        // any_signed fast path on purpose: strip-all must not bypass
+        // the DS check. Offline the fetch fails closed to not-signed,
+        // preserving plain-unsigned → Insecure.)
         for (name, recs, t, is_denial) in &candidates {
             let sigs = Self::rrsig_records(recs, *t);
             if sigs.is_empty() {
-                if any_signed {
-                    // Unsigned link beside signed candidates: stripping OR
-                    // legitimate cross-zone unsigned data (CDN CNAME in an
-                    // unsigned zone pointing at a signed target). Only Bogus
-                    // when the link's own zone is signed (DS at the owner
-                    // name or its parent); otherwise it is an Insecure link.
-                    if self.owner_zone_signed(name, resolver).await {
-                        debug!(
-                            "dnssec: unsigned link in signed zone among signed candidates for {}",
-                            name.to_ascii()
-                        );
-                        return DnssecState::Bogus;
-                    }
-                    saw_insecure = true;
-                    continue;
+                // Stripping OR legitimate cross-zone unsigned data (CDN
+                // CNAME in an unsigned zone pointing at a signed target).
+                // Only Bogus when the link's own zone is signed (DS at
+                // the owner name or its parent); otherwise it is an
+                // Insecure link.
+                if self.owner_zone_signed(name, resolver).await {
+                    debug!(
+                        "dnssec: unsigned link in signed zone for {}",
+                        name.to_ascii()
+                    );
+                    return DnssecState::Bogus;
                 }
                 saw_insecure = true;
                 continue;
@@ -934,22 +943,91 @@ mod tests {
 
     // builds a minimal unsigned A-response wire message (no RRSIGs)
     fn unsigned_a_response() -> (String, u16, Vec<u8>) {
+        unsigned_a_response_for("probe.invalid")
+    }
+
+    // .invalid (RFC 2606) can never exist in DNS: DS lookups fail
+    // deterministically (NXDOMAIN/SERVFAIL → Failed → not-signed) with
+    // or without network, so unsigned-island tests stay hermetic even
+    // though the resolver is live. Do NOT use example.com/net here —
+    // real zones drift (edge-signing, new DS) as proven 2026-09-24.
+    fn unsigned_a_response_for(domain: &str) -> (String, u16, Vec<u8>) {
         let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
         msg.metadata.response_code = ResponseCode::NoError;
-        let name = Name::from_ascii("example.com.").unwrap();
+        let fqdn = format!("{domain}.");
+        let name = Name::from_ascii(&fqdn).unwrap();
         msg.add_query(Query::query(name.clone(), RecordType::A));
         let rec = Record::from_rdata(name, 300, RData::A(A::new(93, 184, 216, 34)));
         msg.answers.push(rec);
-        ("example.com".to_string(), 1, msg.to_vec().unwrap())
+        (domain.to_string(), 1, msg.to_vec().unwrap())
     }
 
     #[tokio::test]
     async fn test_unsigned_response_is_insecure_offline() {
         let v = DnssecValidator::new();
-        // resolver unused on the insecure path (no RRSIGs → no fetches)
+        // no DS anywhere (offline fetch fails): island → Insecure.
+        // Contrast with test_stripped_signed_zone_answer_is_bogus_offline.
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let (name, qtype, wire) = unsigned_a_response();
         let state = v.validate(&name, qtype, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Insecure);
+    }
+
+    #[tokio::test]
+    async fn test_stripped_signed_zone_answer_is_bogus_offline() {
+        // Strip-all lock (DNSSEC-STRIP-ALL-UNSIGNED): the same unsigned
+        // wire as above, but the owner zone is PROVEN signed via a
+        // cache-seeded DS (no network) → must fail closed (Bogus).
+        let mut v = DnssecValidator::new();
+        let zone = Name::from_ascii("probe.invalid.").unwrap();
+        let ds = Record::from_rdata(
+            zone.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
+                1234,
+                Algorithm::ECDSAP256SHA256,
+                hickory_proto::dnssec::DigestType::SHA256,
+                vec![0u8; 32],
+            ))),
+        );
+        v.cache_store(&zone, RecordType::DS, vec![ds]);
+        let resolver = dummy_resolver();
+        let (name, qtype, wire) = unsigned_a_response();
+        let state = v.validate(&name, qtype, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Bogus);
+    }
+
+    #[tokio::test]
+    async fn test_stripped_denial_in_signed_zone_is_bogus_offline() {
+        // Empty-denial half of the same lock: NOERROR with an empty
+        // authority section in a proven-signed zone → Bogus; without the
+        // seeded DS the identical wire stays Insecure (offline fetch
+        // fails closed to not-signed).
+        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        let name = Name::from_ascii("probe.invalid.").unwrap();
+        msg.add_query(Query::query(name, RecordType::A));
+        let wire = msg.to_vec().unwrap();
+
+        let mut v = DnssecValidator::new();
+        let zone = Name::from_ascii("probe.invalid.").unwrap();
+        let ds = Record::from_rdata(
+            zone.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
+                1234,
+                Algorithm::ECDSAP256SHA256,
+                hickory_proto::dnssec::DigestType::SHA256,
+                vec![0u8; 32],
+            ))),
+        );
+        v.cache_store(&zone, RecordType::DS, vec![ds]);
+        let resolver = dummy_resolver();
+        let state = v.validate("probe.invalid", 1, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Bogus);
+
+        let plain = DnssecValidator::new();
+        let state = plain.validate("probe.invalid", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
     }
 
@@ -1279,11 +1357,14 @@ mod tests {
     #[tokio::test]
     async fn test_unsigned_cname_chain_is_insecure_offline() {
         use hickory_proto::rr::rdata::CNAME;
-        // www -> cdn (unsigned) -> A (unsigned): chain present but unsigned
+        // www -> cdn (unsigned) -> A (unsigned): chain present but unsigned.
+        // .invalid names (RFC 2606) keep this hermetic: no DS can ever
+        // exist, so the owner-zone check fails closed to not-signed with
+        // or without network (cf. unsigned_a_response_for).
         let mut msg = Message::new(0x2222, MessageType::Response, OpCode::Query);
         msg.metadata.response_code = ResponseCode::NoError;
-        let alias = Name::from_ascii("www.example.com.").unwrap();
-        let canon = Name::from_ascii("cdn.example.net.").unwrap();
+        let alias = Name::from_ascii("www.site.invalid.").unwrap();
+        let canon = Name::from_ascii("cdn.site.invalid.").unwrap();
         msg.add_query(Query::query(alias.clone(), RecordType::A));
         msg.answers.push(Record::from_rdata(
             alias.clone(),
@@ -1298,7 +1379,7 @@ mod tests {
         let wire = msg.to_vec().unwrap();
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
-        let state = v.validate("www.example.com", 1, &wire, &resolver).await;
+        let state = v.validate("www.site.invalid", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
     }
 
