@@ -936,6 +936,20 @@ impl Config {
         if self.max_ttl > 64 {
             return Err(format!("max_ttl {} too large", self.max_ttl).into());
         }
+        // TTL bytes reach the wire unclamped (rawsock writes them verbatim):
+        // 0 dies on the local host (fail-open while shaping claims active),
+        // so the floor is 1 everywhere; the 64 ceiling matches max_ttl so
+        // decoys stay TTL-limited by design. Single validator covers CLI,
+        // JSON, QML and SIGHUP paths alike.
+        if !(1..=64).contains(&self.fake_ttl) {
+            return Err(format!("invalid fake_ttl {} (expected 1..=64)", self.fake_ttl).into());
+        }
+        if self.min_ttl == 0 || self.min_ttl > 64 {
+            return Err(format!("invalid min_ttl {} (expected 1..=64)", self.min_ttl).into());
+        }
+        if self.max_ttl == 0 {
+            return Err(format!("invalid max_ttl {} (expected >= 1)", self.max_ttl).into());
+        }
         if let Some(ref sni) = self.fake_sni {
             if sni.len() > 253
                 || sni.contains(|c: char| c.is_whitespace() || c == ';' || c == '$' || c == '`')
@@ -1363,6 +1377,20 @@ mod tests {
                 Box::new(|c: &mut Config| c.max_ttl = 65),
                 "max_ttl too large",
             ),
+            (Box::new(|c: &mut Config| c.max_ttl = 0), "max_ttl zero"),
+            (Box::new(|c: &mut Config| c.min_ttl = 0), "min_ttl zero"),
+            (
+                Box::new(|c: &mut Config| c.min_ttl = 200),
+                "min_ttl over 64",
+            ),
+            (
+                Box::new(|c: &mut Config| c.fake_ttl = 0),
+                "fake_ttl zero (fail-open)",
+            ),
+            (
+                Box::new(|c: &mut Config| c.fake_ttl = 65),
+                "fake_ttl over 64",
+            ),
             (
                 Box::new(|c: &mut Config| c.fake_sni = Some("a;b".into())),
                 "sni metachar",
@@ -1397,6 +1425,8 @@ mod tests {
         cfg.mss = 1460;
         cfg.min_mss = 1460;
         cfg.max_ttl = 64;
+        cfg.min_ttl = 1;
+        cfg.fake_ttl = 64;
         cfg.restore_mss = 1460;
         cfg.fake_sni = Some("valid-host.example".into());
         assert!(cfg.validate().is_ok());

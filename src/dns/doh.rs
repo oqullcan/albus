@@ -128,6 +128,18 @@ pub struct SingleDoHClient {
 }
 
 impl SingleDoHClient {
+    /// Shared reqwest builder for every DoH client in this module.
+    /// Redirects are ALWAYS off (a malicious upstream 307 must never
+    /// re-POST the query elsewhere, downgrade scheme, or escape SSRF
+    /// screening); 3xx responses surface as errors via `is_success`.
+    /// Single choke point so the policy cannot drift per call site.
+    fn client_builder(tls_config: rustls::ClientConfig) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls_config)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+    }
+
     /// Shared TLS client-config builder: classical-only when `pqc` is off,
     /// PQ-offering otherwise; optional ECH mode (forces TLS 1.3-only per RFC).
     fn tls_client_config(
@@ -177,9 +189,7 @@ impl SingleDoHClient {
         }
         let client_config = Self::tls_client_config(pqc, None)?;
 
-        let mut builder = reqwest::Client::builder()
-            .use_preconfigured_tls(client_config)
-            .timeout(Duration::from_secs(3));
+        let mut builder = Self::client_builder(client_config);
 
         // SNI + dial addresses, remembered for the post-quantum verification probe
         let mut server_name = String::new();
@@ -285,9 +295,7 @@ impl SingleDoHClient {
             Ok(c) => c,
             Err(_) => return "plain-ech-build-failed",
         };
-        let mut builder = reqwest::Client::builder()
-            .use_preconfigured_tls(client_config)
-            .timeout(Duration::from_secs(3));
+        let mut builder = Self::client_builder(client_config);
         if !self.bootstrap_addrs.is_empty() {
             builder = builder.resolve_to_addrs(self.server_name.as_str(), &self.bootstrap_addrs);
         }
@@ -873,5 +881,86 @@ mod ssrf_matrix_tests {
         assert!(!out.iter().any(|ip| ip.is_loopback()));
         assert!(out.contains(&Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)));
         let _ = IpAddr::from([127, 0, 0, 1]);
+    }
+
+    // Redirect no-follow lock (DOH-REDIRECT-FOLLOW): the shared builder
+    // must never follow redirects. Fully hermetic plaintext stub (no
+    // TLS needed — the policy lives at the reqwest layer, exercised
+    // identically for https): a 307 to a decoy listener must surface as
+    // an error with ZERO decoy connections. Pre-fix code follows and
+    // the decoy sees exactly one hit → FAIL.
+    #[tokio::test]
+    async fn test_redirect_is_not_followed_offline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Minimal valid rustls config for the builder (never handshakes
+        // here — plaintext stub).
+        let tls_config =
+            SingleDoHClient::tls_client_config(false, None).expect("tls config builds");
+        let client = SingleDoHClient::client_builder(tls_config)
+            .build()
+            .expect("shared builder builds");
+
+        let decoy_hits = Arc::new(AtomicUsize::new(0));
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("decoy bind");
+        let decoy_port = decoy_listener.local_addr().expect("addr").port();
+        let decoy_hits_clone = decoy_hits.clone();
+        tokio::spawn(async move {
+            // Accept at most one followed redirect; then stop.
+            if let Ok((mut sock, _)) = decoy_listener.accept().await {
+                decoy_hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+            }
+        });
+
+        let stub_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub bind");
+        let stub_port = stub_listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = stub_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut head = Vec::new();
+                loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 8192 {
+                        break;
+                    }
+                }
+                let body = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:{}/dns-query\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    decoy_port
+                );
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let res = client
+            .post(format!("http://127.0.0.1:{}/dns-query", stub_port))
+            .body(vec![0x12, 0x34])
+            .send()
+            .await;
+        // 307 is not success -> must surface as an error, never a followed
+        // response (which would be Ok with the decoy's bytes).
+        assert!(
+            res.is_err() || !res.unwrap().status().is_success(),
+            "307 redirect must not yield a followed success response"
+        );
+        // Give a would-be follow a chance to land, then assert zero.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            decoy_hits.load(Ordering::SeqCst),
+            0,
+            "redirect target must see ZERO connections (no-follow)"
+        );
     }
 }

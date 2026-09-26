@@ -417,16 +417,31 @@ impl DnssecValidator {
     // network is down the signed links fail closed to Bogus through their own
     // fetch/verify path, so the end state stays fail-closed regardless.
     async fn owner_zone_signed(&self, name: &Name, resolver: &DoHResolver) -> bool {
+        // Apex discovery (DS-WALK-DEPTH-2 fix): DS lives only at the zone
+        // apex, so a fixed 2-step walk misses deep names. Walk up looking
+        // for the closest enclosing SOA instead, bounded by MAX_CHAIN_DEPTH,
+        // then a single DS probe at the apex decides. Stops AT the zone cut
+        // on purpose: walking blindly to root would hit a higher signed
+        // ancestor's DS and misclassify legitimate unsigned-delegation data
+        // as Bogus. Offline every fetch fails -> false (not-signed),
+        // preserving plain-unsigned -> Insecure.
         let mut current = name.clone();
-        for _ in 0..2 {
+        for _ in 0..MAX_CHAIN_DEPTH {
             if let FetchOutcome::Found(recs) =
-                self.fetch_rrset(&current, RecordType::DS, resolver).await
+                self.fetch_rrset(&current, RecordType::SOA, resolver).await
             {
                 if recs
                     .iter()
-                    .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))))
+                    .any(|r| r.record_type() == RecordType::SOA && name_eq(&r.name, &current))
                 {
-                    return true;
+                    if let FetchOutcome::Found(ds) =
+                        self.fetch_rrset(&current, RecordType::DS, resolver).await
+                    {
+                        return ds
+                            .iter()
+                            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))));
+                    }
+                    return false;
                 }
             }
             if current.is_root() {
@@ -973,28 +988,78 @@ mod tests {
         assert_eq!(state, DnssecState::Insecure);
     }
 
+    // Seeds a zone apex into the validator cache (no network): an SOA
+    // owned by the apex (self-identifying, for apex discovery) plus an
+    // optional DS (for the signed verdict). .invalid keeps it hermetic.
+    fn seed_zone_apex(v: &DnssecValidator, apex: &str, with_ds: bool) {
+        let zone = Name::from_ascii(apex).unwrap();
+        let soa = Record::from_rdata(
+            zone.clone(),
+            300,
+            RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns1.invalid.").unwrap(),
+                Name::from_ascii("hostmaster.invalid.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                300,
+            )),
+        );
+        v.cache_store(&zone, RecordType::SOA, vec![soa]);
+        if with_ds {
+            let ds = Record::from_rdata(
+                zone.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
+                    1234,
+                    Algorithm::ECDSAP256SHA256,
+                    hickory_proto::dnssec::DigestType::SHA256,
+                    vec![0u8; 32],
+                ))),
+            );
+            v.cache_store(&zone, RecordType::DS, vec![ds]);
+        }
+    }
+
     #[tokio::test]
     async fn test_stripped_signed_zone_answer_is_bogus_offline() {
         // Strip-all lock (DNSSEC-STRIP-ALL-UNSIGNED): the same unsigned
         // wire as above, but the owner zone is PROVEN signed via a
-        // cache-seeded DS (no network) → must fail closed (Bogus).
-        let mut v = DnssecValidator::new();
-        let zone = Name::from_ascii("probe.invalid.").unwrap();
-        let ds = Record::from_rdata(
-            zone.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
-                1234,
-                Algorithm::ECDSAP256SHA256,
-                hickory_proto::dnssec::DigestType::SHA256,
-                vec![0u8; 32],
-            ))),
-        );
-        v.cache_store(&zone, RecordType::DS, vec![ds]);
+        // cache-seeded apex (no network) → must fail closed (Bogus).
+        let v = DnssecValidator::new();
+        seed_zone_apex(&v, "probe.invalid.", true);
         let resolver = dummy_resolver();
         let (name, qtype, wire) = unsigned_a_response();
         let state = v.validate(&name, qtype, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Bogus);
+    }
+
+    #[tokio::test]
+    async fn test_stripped_deep_name_in_signed_zone_is_bogus_offline() {
+        // DS-WALK-DEPTH-2 lock: 2 labels below the apex
+        // (deep.sub.probe.invalid, DS only at probe.invalid). The old
+        // fixed 2-step walk never reached the apex; apex discovery must.
+        let v = DnssecValidator::new();
+        seed_zone_apex(&v, "probe.invalid.", true);
+        let resolver = dummy_resolver();
+        let (name, qtype, wire) = unsigned_a_response_for("deep.sub.probe.invalid");
+        let state = v.validate(&name, qtype, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Bogus);
+    }
+
+    #[tokio::test]
+    async fn test_unsigned_delegation_stays_insecure_offline() {
+        // Anti-regression for the depth fix: an UNSIGNED child zone
+        // (apex SOA seeded, no DS anywhere) under nothing signed must
+        // stay Insecure — the walk stops at the zone cut instead of
+        // condemning it on a higher ancestor's DS.
+        let v = DnssecValidator::new();
+        seed_zone_apex(&v, "sub.probe.invalid.", false);
+        let resolver = dummy_resolver();
+        let (name, qtype, wire) = unsigned_a_response_for("host.sub.probe.invalid");
+        let state = v.validate(&name, qtype, &wire, &resolver).await;
+        assert_eq!(state, DnssecState::Insecure);
     }
 
     #[tokio::test]
@@ -1009,19 +1074,8 @@ mod tests {
         msg.add_query(Query::query(name, RecordType::A));
         let wire = msg.to_vec().unwrap();
 
-        let mut v = DnssecValidator::new();
-        let zone = Name::from_ascii("probe.invalid.").unwrap();
-        let ds = Record::from_rdata(
-            zone.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
-                1234,
-                Algorithm::ECDSAP256SHA256,
-                hickory_proto::dnssec::DigestType::SHA256,
-                vec![0u8; 32],
-            ))),
-        );
-        v.cache_store(&zone, RecordType::DS, vec![ds]);
+        let v = DnssecValidator::new();
+        seed_zone_apex(&v, "probe.invalid.", true);
         let resolver = dummy_resolver();
         let state = v.validate("probe.invalid", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Bogus);

@@ -61,6 +61,14 @@ pub(crate) fn sanitize_log_token(s: &str) -> String {
         if c.is_control() {
             continue;
         }
+        // BiDi overrides + invisible format chars reorder/spoof terminal
+        // display without any control byte (log-forgery primitive).
+        if matches!(c,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' |
+            '\u{200B}'..='\u{200F}' | '\u{FEFF}')
+        {
+            continue;
+        }
         if out.len() >= 200 {
             break;
         }
@@ -359,7 +367,7 @@ impl DnsServer {
                                             if dnssec_state == Some(DnssecState::Bogus) {
                                                 let qlabel =
                                                     crate::dns::cache::extract_query_key(&query_data)
-                                                        .map(|k| format!("{}/{}", k.name, k.qtype))
+                                                        .map(|k| sanitize_log_token(&format!("{}/{}", k.name, k.qtype)))
                                                         .unwrap_or_else(|| "?/?".to_string());
                                                 warn!("dnssec BOGUS response rejected for {} (not cached, SERVFAIL sent)", qlabel);
                                                 if query_data.len() >= 4 {
@@ -370,6 +378,18 @@ impl DnsServer {
                                                 }
                                                 return;
                                             }
+                                            // Never forward upstream's AD bit without local
+                                            // proof: a downstream validating stub (trust-ad)
+                                            // would otherwise treat an unverified, insecure
+                                            // or unvalidated answer as authenticated. Only a
+                                            // locally Secure verdict keeps AD; a Secure answer
+                                            // without upstream AD is left alone (no new
+                                            // trust claims are minted here).
+                                            let mut resp_bytes = resp_bytes;
+                                            strip_ad_unless_secure(
+                                                &mut resp_bytes,
+                                                dnssec_state,
+                                            );
                                             // insert response into cache (bogus never cached;
                                             // indeterminate never cached either, see cacheable_state)
                                             if cacheable_state(dnssec_state) {
@@ -543,6 +563,15 @@ pub(crate) fn cacheable_state(state: Option<DnssecState>) -> bool {
         state,
         None | Some(DnssecState::Secure) | Some(DnssecState::Insecure)
     )
+}
+
+/// Clears the upstream AD (authenticated-data) bit unless the answer was
+/// locally verified Secure. Pure so the policy is unit-testable; the serve
+/// path applies it to every forwarded response before cache + send.
+pub(crate) fn strip_ad_unless_secure(resp: &mut [u8], state: Option<DnssecState>) {
+    if state != Some(DnssecState::Secure) && resp.len() >= 4 {
+        resp[3] &= !0x20;
+    }
 }
 
 // inspects header flags to verify presence of authenticated data (ad) bit
@@ -893,6 +922,10 @@ mod tests {
         // benign domains pass through untouched
         assert_eq!(sanitize_log_token("example.com"), "example.com");
         assert_eq!(sanitize_log_token(""), "");
+        // BiDi/format chars must go too (display-reorder forgery without
+        // any control byte): RLO + zero-width + BOM.
+        let bidi = "a\u{202E}b\u{200B}c\u{FEFF}d";
+        assert_eq!(sanitize_log_token(bidi), "abcd");
     }
 
     #[test]
@@ -906,6 +939,32 @@ mod tests {
             redact_upstream_desc("quad9, https://dns.nextdns.io/795926"),
             "quad9,https://dns.nextdns.io"
         );
+    }
+
+    #[test]
+    fn test_strip_ad_unless_secure() {
+        // Upstream AD=1 must not survive without local proof (timeout /
+        // insecure / unvalidated all strip); Secure keeps it; short slices
+        // never panic; Secure without AD is left alone (no minted trust).
+        for state in [
+            None,
+            Some(DnssecState::Insecure),
+            Some(DnssecState::Indeterminate),
+            Some(DnssecState::Bogus),
+        ] {
+            let mut resp = vec![0x12, 0x34, 0x81, 0xA0];
+            strip_ad_unless_secure(&mut resp, state);
+            assert_eq!(resp[3] & 0x20, 0, "AD must strip for {state:?}");
+        }
+        let mut secure = vec![0x12, 0x34, 0x81, 0xA0];
+        strip_ad_unless_secure(&mut secure, Some(DnssecState::Secure));
+        assert_eq!(secure[3] & 0x20, 0x20, "Secure keeps upstream AD");
+        let mut no_ad = vec![0x12, 0x34, 0x81, 0x80];
+        strip_ad_unless_secure(&mut no_ad, Some(DnssecState::Secure));
+        assert_eq!(no_ad[3] & 0x20, 0, "no AD minted on Secure");
+        let mut short = vec![0x12];
+        strip_ad_unless_secure(&mut short, None);
+        assert_eq!(short, vec![0x12]);
     }
 
     #[test]

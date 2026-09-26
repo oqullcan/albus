@@ -8,6 +8,7 @@ use albus::core::fake::ech::has_ech_extension;
 use albus::core::fake::sni::parse_sni;
 use albus::core::rawsock::packet::build_packet;
 use albus::core::rawsock::types::ConnInfo;
+use albus::dns::cache::extract_do_bit;
 use albus::dns::cache::extract_query_key;
 use albus::dns::ech::parse_https_ech_config;
 use albus::dns::server::{build_canary_query, build_canary_response, is_canary_query};
@@ -341,4 +342,280 @@ fn fuzz_ssrf_consistency() {
     assert!(!blocked_ipv6(&Ipv6Addr::new(
         0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
     )));
+}
+
+#[test]
+fn fuzz_opt_do_shapes_never_panic() {
+    // OPT pseudo-RR shapes through the exact-DO parser + cache-key path:
+    // absent / without-DO / with-DO / truncated at every offset /
+    // multi-OPT / absurd rdlen. Invariants: never panics; clean fixtures
+    // give exact bits; truncated additionals fail closed (None key).
+    fn base(arcount: u16) -> Vec<u8> {
+        let mut q = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        q[10] = (arcount >> 8) as u8;
+        q[11] = (arcount & 0xFF) as u8;
+        q
+    }
+    // OPT RR: root name, type 41, class 4096, 4-byte TTL flags, rdlen 0
+    fn opt_rr(do_bit: bool) -> Vec<u8> {
+        let flags: u16 = if do_bit { 0x8000 } else { 0x0000 };
+        vec![
+            0x00,
+            0x00,
+            0x29,
+            0x10,
+            0x00,
+            0x00,
+            0x00,
+            (flags >> 8) as u8,
+            (flags & 0xFF) as u8,
+            0x00,
+            0x00,
+        ]
+    }
+    // clean fixtures: exact bits
+    let mut q_plain = base(0);
+    assert_eq!(extract_do_bit(&q_plain), Some(false));
+    assert!(extract_query_key(&q_plain).is_some());
+    let mut q_nodo = base(1);
+    q_nodo.extend_from_slice(&opt_rr(false));
+    assert_eq!(extract_do_bit(&q_nodo), Some(false));
+    let mut q_do = base(1);
+    q_do.extend_from_slice(&opt_rr(true));
+    assert_eq!(extract_do_bit(&q_do), Some(true));
+    assert!(extract_query_key(&q_do).is_some());
+    // per-offset truncation of the with-DO shape: never panics, and any
+    // answer is fail-closed (None key or deterministic bit)
+    for cut in 0..q_do.len() {
+        let t = &q_do[..cut];
+        let _ = extract_do_bit(t);
+        let _ = extract_query_key(t);
+    }
+    // multi-OPT + absurd rdlen: never panics
+    let mut q_multi = base(2);
+    q_multi.extend_from_slice(&opt_rr(true));
+    q_multi.extend_from_slice(&opt_rr(false));
+    let _ = extract_do_bit(&q_multi);
+    let _ = extract_query_key(&q_multi);
+    let mut q_huge = base(1);
+    q_huge.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x80, 0x00, 0xFF, 0xFF]);
+    let _ = extract_do_bit(&q_huge);
+    let _ = extract_query_key(&q_huge);
+    // random mutation over the with-DO shape: never panics
+    let mut rng = XorShift64(0x0D0B15E4110);
+    for _ in 0..512 {
+        let mut m = q_do.clone();
+        for _ in 0..rng.below(8) {
+            let i = rng.below(m.len());
+            m[i] = rng.byte();
+        }
+        let _ = extract_do_bit(&m);
+        let _ = extract_query_key(&m);
+    }
+}
+
+#[test]
+fn fuzz_svcb_truncation_never_panics() {
+    // Per-offset truncation of a VALID SVCB record (with ECH key): every
+    // prefix must parse-or-reject cleanly, never panic. Plus directed
+    // hostile shapes: label > 63, param_len overrun, truncated RDLENGTH.
+    let mut full = vec![0x00, 0x01, 0x00];
+    full.extend_from_slice(&[0x00, 0x05, 0x00, 0x02, 0xDE, 0xAD]);
+    assert_eq!(
+        parse_https_ech_config(&full),
+        Some(vec![0xDE, 0xAD]),
+        "full fixture must extract"
+    );
+    for cut in 0..=full.len() {
+        let _ = parse_https_ech_config(&full[..cut]);
+    }
+    // label length 64 (overlong) at record start
+    let mut overlong = vec![0x40u8];
+    overlong.extend((0..70).map(|_| b'x'));
+    let _ = parse_https_ech_config(&overlong);
+    // param_len claiming far more than present
+    let mut overrun = vec![0x00, 0x01, 0x00];
+    overrun.extend_from_slice(&[0x00, 0x05, 0xFF, 0xFF, 0xDE]);
+    let _ = parse_https_ech_config(&overrun);
+    // truncated RDLENGTH header (key id without length bytes)
+    for cut in 0..8 {
+        let t = &vec![0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x02, 0xDE][..cut.min(8)];
+        let _ = parse_https_ech_config(t);
+    }
+    // random mutation: never panics, output always sub-slice of input
+    let mut rng = XorShift64(0x5ECB7A11CE94);
+    for _ in 0..512 {
+        let mut m = full.clone();
+        for _ in 0..rng.below(10) {
+            let i = rng.below(m.len());
+            m[i] = rng.byte();
+        }
+        if let Some(b) = parse_https_ech_config(&m) {
+            assert!(b.len() <= m.len());
+            assert!(m.windows(b.len()).any(|w| w == b.as_slice()));
+        }
+    }
+}
+
+#[test]
+fn fuzz_elf_coherent_sections_never_panic() {
+    // ELF with VALID section headers (sane shoff/count, real table in
+    // bounds) plus mutated section bytes: exercises parse_elf_sockops
+    // past the header-math stage the all-zero template never reaches.
+    // Header layout: e_shoff@0x20 u64LE, e_shentsize@0x3A u16LE,
+    // e_shnum@0x3C u16LE, e_shstrndx@0x3E u16LE; each shdr 64B.
+    fn coherent(shnum: u16, mutate: &dyn Fn(&mut Vec<u8>)) -> Vec<u8> {
+        let mut buf = elf_template();
+        let shoff: usize = 64;
+        buf.resize(shoff + shnum as usize * 64 + 128, 0);
+        buf[0x20..0x28].copy_from_slice(&(shoff as u64).to_le_bytes());
+        buf[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+        buf[0x3C..0x3E].copy_from_slice(&shnum.to_le_bytes());
+        buf[0x3E..0x40].copy_from_slice(&0u16.to_le_bytes());
+        for i in 0..shnum as usize {
+            let base = shoff + i * 64;
+            // sh_type PROGBITS(1), sh_offset into tail, sh_size 64
+            buf[base + 4..base + 8].copy_from_slice(&1u32.to_le_bytes());
+            let off = (shoff + shnum as usize * 64 + (i * 16) % 64) as u64;
+            buf[base + 24..base + 32].copy_from_slice(&off.to_le_bytes());
+            buf[base + 32..base + 40].copy_from_slice(&64u64.to_le_bytes());
+        }
+        mutate(&mut buf);
+        buf
+    }
+    let maps: HashMap<String, i32> = HashMap::new();
+    let noop = |_: &mut Vec<u8>| {};
+    // clean coherent inputs across the shnum cap boundary (parser caps
+    // e_shnum at 64): must Err-or-Ok, never panic
+    for shnum in [0u16, 1, 2, 4, 63, 64, 65, 200, 0xFFFF] {
+        let _ = parse_elf_sockops(&coherent(shnum, &noop), &maps);
+    }
+    // mutated coherent inputs: offsets/sizes/fields scrambled
+    let mut rng = XorShift64(0xE1F5EC7105);
+    for _ in 0..256 {
+        let shnum = 2 + rng.below(4) as u16;
+        let mut buf = coherent(shnum, &|_| {});
+        for _ in 0..8 {
+            let i = rng.below(buf.len());
+            buf[i] = rng.byte();
+        }
+        let _ = parse_elf_sockops(&buf, &maps);
+    }
+    // per-offset truncation of a coherent 2-section image
+    let full = coherent(2, &noop);
+    for cut in (0..full.len()).step_by(7) {
+        let _ = parse_elf_sockops(&full[..cut], &maps);
+    }
+}
+
+#[tokio::test]
+async fn fuzz_dnssec_wire_robustness_never_secure_unverified() {
+    // Full-validate() robustness over hostile wires with .invalid names
+    // (DS fetches fail fast offline or NXDOMAIN live — no slow stalls):
+    // unsigned answers, self-loop + deep CNAME chains, NSEC-shaped
+    // denials, per-offset truncations, random mutations. Invariants:
+    // never panics/hangs, and NEVER Secure (no valid signature can
+    // exist in these fixtures — Secure here would be a validation bug).
+    use albus::dns::dnssec::{DnssecState, DnssecValidator};
+    use albus::dns::doh::DoHResolver;
+
+    fn unsigned_for(name: &str) -> Vec<u8> {
+        let fqdn = format!("{}.", name.trim_end_matches('.'));
+        let mut q = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in fqdn.trim_end_matches('.').split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        // unsigned A answer, no RRSIGs
+        q.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        q.extend_from_slice(&[0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216, 34]);
+        q
+    }
+    fn cname_loop(depth: usize) -> Vec<u8> {
+        // alias.invalid -> c1 -> c2 ... (depth links, last unsigned A)
+        let mut q = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        q.extend_from_slice(&[0x05, b'a', b'l', b'i', b'a', b's', 0x00]);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let mut prev = b"alias".to_vec();
+        for i in 0..depth {
+            let next = format!("c{}", i);
+            // owner: prev.invalid (length-prefixed each iteration is
+            // overkill; reuse a flat encoding — parser robustness is
+            // what matters, not zone realism)
+            q.push(prev.len() as u8 + 8);
+            q.extend_from_slice(&prev);
+            q.extend_from_slice(b".invalid");
+            q.push(0x00);
+            q.extend_from_slice(&[0x00, 0x05, 0x00, 0x01]);
+            q.extend_from_slice(&[0x00, 0x00, 0x00, 0x78, 0x00, 0x04]);
+            let nb = next.as_bytes();
+            q.push(nb.len() as u8 + 8);
+            q.extend_from_slice(nb);
+            q.extend_from_slice(b".invalid");
+            q.push(0x00);
+            prev = next.into_bytes();
+        }
+        // terminal unsigned A for last name
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        q.extend_from_slice(&[0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216, 34]);
+        q
+    }
+
+    let v = DnssecValidator::new();
+    let resolver = DoHResolver::new("quad9", &[], true).expect("resolver builds");
+    let mut corpus: Vec<(String, Vec<u8>)> = vec![
+        ("unsigned".into(), unsigned_for("host.invalid")),
+        ("cname-1".into(), cname_loop(1)),
+        ("cname-6-deep".into(), cname_loop(6)),
+        ("self-loop".into(), {
+            let mut q = vec![
+                0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, b'a',
+                b'l', b'i', b'a', b's', 0x00, 0x00, 0x01, 0x00, 0x01,
+            ];
+            q.extend_from_slice(&[0x05, b'a', b'l', b'i', b'a', b's', 0x00]);
+            q.extend_from_slice(&[0x00, 0x05, 0x00, 0x01]);
+            q.extend_from_slice(&[0x00, 0x00, 0x00, 0x78, 0x00, 0x04]);
+            q.extend_from_slice(&[0x05, b'a', b'l', b'i', b'a', b's', 0x00]);
+            q
+        }),
+    ];
+    // per-offset truncations of the unsigned fixture
+    let base = unsigned_for("host.invalid");
+    for cut in (0..base.len()).step_by(5) {
+        corpus.push((format!("trunc-{cut}"), base[..cut].to_vec()));
+    }
+    // random mutations over unsigned + deep-chain fixtures
+    let mut rng = XorShift64(0xD5EC571204);
+    for (label, wire) in [
+        ("mut-u", unsigned_for("host.invalid")),
+        ("mut-c", cname_loop(3)),
+    ] {
+        for _ in 0..48 {
+            let mut m = wire.clone();
+            for _ in 0..rng.below(8) {
+                let i = rng.below(m.len().max(1));
+                if i < m.len() {
+                    m[i] = rng.byte();
+                }
+            }
+            corpus.push((format!("{label}-{}", rng.below(100000)), m));
+        }
+    }
+    for (label, wire) in &corpus {
+        let state = v.validate("host.invalid", 1, wire, &resolver).await;
+        assert_ne!(
+            state,
+            DnssecState::Secure,
+            "fixture {label} must never validate Secure (no valid sig possible)"
+        );
+    }
 }

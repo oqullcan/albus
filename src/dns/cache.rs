@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct DnsCacheKey {
     pub name: String,
+    /// Exact label vector: disambiguates what dotted `name` cannot (a
+    /// single label containing '.' vs several labels; pointer-resolved
+    /// suffixes). Part of Hash/Eq so wire-distinct queries never share
+    /// an entry. `name` stays dotted for the validator/display path.
+    pub qlabels: Vec<String>,
     pub qtype: u16,
     pub qclass: u16,
     pub do_bit: bool,
@@ -239,6 +244,18 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
             break;
         }
         if (len & 0xC0) == 0xC0 {
+            // Compression pointer: resolve the target for key fidelity
+            // (bounded jumps) instead of ignoring it — distinct QNAMEs
+            // sharing a prefix must not conflate. qtype/class still read
+            // after these 2 pointer bytes.
+            if pos + 2 > data.len() {
+                return None;
+            }
+            let target = (((data[pos] as usize) & 0x3F) << 8) | data[pos + 1] as usize;
+            match resolve_pointer_labels(data, target) {
+                Some(mut suffix) => labels.append(&mut suffix),
+                None => return None,
+            }
             pos += 2;
             break;
         }
@@ -271,10 +288,44 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     let do_bit = extract_do_bit(data)?;
     Some(DnsCacheKey {
         name: labels.join("."),
+        qlabels: labels,
         qtype,
         qclass,
         do_bit,
     })
+}
+
+/// Follows a DNS compression pointer chain collecting suffix labels for
+/// cache-key fidelity. Mirrors the main loop's lenient semantics
+/// (non-UTF8 labels skipped, parsing continues) but caps pointer jumps
+/// so hostile pointer loops fail closed (None) instead of spinning.
+fn resolve_pointer_labels(data: &[u8], mut offset: usize) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for _ in 0..8 {
+        if offset >= data.len() {
+            return None;
+        }
+        let len = data[offset] as usize;
+        if len == 0 {
+            return Some(out);
+        }
+        if (len & 0xC0) == 0xC0 {
+            if offset + 2 > data.len() {
+                return None;
+            }
+            offset = (((data[offset] as usize) & 0x3F) << 8) | data[offset + 1] as usize;
+            continue;
+        }
+        offset += 1;
+        if offset + len > data.len() {
+            return None;
+        }
+        if let Ok(label) = std::str::from_utf8(&data[offset..offset + len]) {
+            out.push(label.to_lowercase());
+        }
+        offset += len;
+    }
+    None
 }
 
 // parses answer section resource records to compute lowest ttl value
@@ -532,6 +583,86 @@ mod ttl_tests {
             q.extend_from_slice(arcount_extra);
         }
         q
+    }
+
+    // Cache-key collision locks: wire-distinct queries must never share an
+    // entry (unprivileged local queriers share the loopback cache).
+    fn query_with_qname(section: &[u8]) -> Vec<u8> {
+        let mut q = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        q.extend_from_slice(section);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        q
+    }
+
+    #[test]
+    fn test_key_splits_dot_label_vs_split_labels() {
+        // single label "a.b" (len 3, embedded dot) vs labels ["a","b"]:
+        // identical dotted `name`, but must NOT share a cache key.
+        let single = query_with_qname(&[0x03, b'a', b'.', b'b', 0x00]);
+        let split = query_with_qname(&[0x01, b'a', 0x01, b'b', 0x00]);
+        let k1 = extract_query_key(&single).expect("single-dot parses");
+        let k2 = extract_query_key(&split).expect("split parses");
+        assert_eq!(k1.name, k2.name, "dotted display form coincides");
+        assert_ne!(k1, k2, "exact label vectors must differ");
+    }
+
+    #[test]
+    fn test_key_resolves_pointer_targets() {
+        // "x" + pointer->"example.com" vs "x" + pointer->"other.com":
+        // same prefix bytes, different targets -> different keys.
+        // Layout: header(12) + [1 'x'] + ptr + qtype/qclass, with two
+        // candidate suffixes appended after (only the pointer target
+        // matters for the key).
+        fn pointed(target_labels: &[u8], target_offset: u16) -> Vec<u8> {
+            let mut q = vec![
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
+            ];
+            q.push(0xC0 | ((target_offset >> 8) as u8));
+            q.push((target_offset & 0xFF) as u8);
+            q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            q.extend_from_slice(target_labels);
+            q
+        }
+        // suffix A at offset 20: example.com; suffix B at offset 20: other.com
+        // (each query carries only its own suffix)
+        let qa = pointed(
+            &[
+                0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            ],
+            20,
+        );
+        let qb = pointed(
+            &[
+                0x05, b'o', b't', b'h', b'e', b'r', 0x03, b'c', b'o', b'm', 0x00,
+            ],
+            20,
+        );
+        let ka = extract_query_key(&qa).expect("pointer A resolves");
+        let kb = extract_query_key(&qb).expect("pointer B resolves");
+        assert_ne!(ka, kb, "different pointer targets must differ");
+        assert_eq!(ka.qlabels, vec!["x", "example", "com"]);
+        assert_eq!(kb.qlabels, vec!["x", "other", "com"]);
+    }
+
+    #[test]
+    fn test_key_rejects_pointer_loop_and_truncation() {
+        // self-looping pointer (offset points at itself) fails closed.
+        let mut qloop = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
+        ];
+        qloop.extend_from_slice(&[0xC0, 0x0C]); // -> offset 12 (the length byte area loops)
+        qloop.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // offset 12 holds 0x01 'x' then pointer at 14 -> 12: bounded walk
+        // must terminate fail-closed (None), never spin.
+        assert_eq!(extract_query_key(&qloop), None);
+        // truncated pointer (single trailing byte) fails closed.
+        let mut qtrunc = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
+            0xC0,
+        ];
+        assert_eq!(extract_query_key(&qtrunc), None);
     }
 
     // FP-06: OPT-without-DO and OPT-with-DO must NOT share a cache key.

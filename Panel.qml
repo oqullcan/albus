@@ -531,7 +531,7 @@ Panel {
       root.autoTtlEnabled = true
     } else {
       args.push("--auto-ttl", "false")
-      var clampedTtl = Math.min(Math.max(ttlVal, 1), 255)
+      var clampedTtl = Math.min(Math.max(ttlVal, 1), 64)
       args.push("--fake-ttl", String(clampedTtl))
       root.autoTtlEnabled = false
     }
@@ -612,7 +612,7 @@ Panel {
       mss: numOr(root.customMss.trim(), 88),
       min_mss: numOr(root.customMinMss.trim(), 64),
       auto_ttl: autoTtl,
-      fake_ttl: autoTtl ? 8 : Math.min(Math.max(ttlVal, 1), 255),
+      fake_ttl: autoTtl ? 8 : Math.min(Math.max(ttlVal, 1), 64),
       fake_sni: root.customFakeSni.trim(),
       fake_bad_checksum: root.fakeBadChecksum,
       block_quic: root.blockQuicEnabled,

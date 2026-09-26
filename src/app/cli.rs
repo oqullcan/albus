@@ -17,6 +17,17 @@ fn parse_restore_after_bytes(s: &str) -> Result<u32, String> {
     Ok(v)
 }
 
+// TTL bytes reach the wire unclamped: reject 0 (fail-open decoy) and
+// anything above the max_ttl ceiling (64) at the CLI layer too;
+// Config::validate enforces the same bounds for JSON/QML/SIGHUP paths.
+fn parse_ttl_bound(s: &str) -> Result<u8, String> {
+    let v: u8 = s.parse().map_err(|_| format!("invalid ttl {}", s))?;
+    if !(1..=64).contains(&v) {
+        return Err(format!("invalid ttl {} (expected 1..=64)", v));
+    }
+    Ok(v)
+}
+
 fn parse_restore_mss(s: &str) -> Result<u16, String> {
     let v: u16 = s
         .parse()
@@ -134,7 +145,7 @@ pub struct RunArgs {
     pub config: Option<String>,
 
     // fallback time-to-live for fake packet injection
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, value_parser = parse_ttl_bound)]
     pub fake_ttl: u8,
 
     // custom server name indication string for fake clienthello
@@ -153,11 +164,11 @@ pub struct RunArgs {
     pub auto_ttl: bool,
 
     // minimum ttl boundary clamp for the static default
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, value_parser = parse_ttl_bound)]
     pub min_ttl: u8,
 
     // maximum ttl boundary clamp for the static default
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 12, value_parser = parse_ttl_bound)]
     pub max_ttl: u8,
 
     // enable local dns-over-https proxy listener on 127.0.0.1:53

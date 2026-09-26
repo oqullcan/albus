@@ -8,6 +8,40 @@ tag `archive/dev-465655e` on 2026-09-25 and pruned — see Unreleased.
 
 ## Unreleased (develop)
 
+### Fixed (run-12/13 audit findings, uncommitted)
+- DOH-REDIRECT-FOLLOW (medium): shared reqwest builder now sets
+  `Policy::none()` on both DoH client builders; upstream 307 can no
+  longer re-POST queries elsewhere, downgrade scheme, or escape SSRF
+  screening. Locked by `test_redirect_is_not_followed_offline`
+  (plaintext stub + decoy listener, no-follow proven incl. negative
+  control against pre-fix behavior).
+- DNS-CACHE-KEY-COLLISION (medium): exact `qlabels` vector in
+  `Hash`/`Eq` (dotted `name` kept for validator/display) + bounded
+  8-jump pointer resolution instead of target-skipping; validation
+  still runs (fail-open avoided). Locked by 3 hermetic tests
+  (dot-vs-split, pointer targets, loop/truncation).
+- LOG-QLABEL-FORGERY (low): BOGUS `qlabel` wrapped in
+  `sanitize_log_token`, extended with BiDi/format set; unit test
+  extended.
+- Fuzz corpora (robustness, no findings): OPT/DO shapes incl.
+  per-offset truncation, per-offset SVCB truncation + overlong/
+  overrun shapes, coherent-ELF section images, validate-level wire
+  fuzz (unsigned/CNAME-loop/denial/truncation/mutation, never-Secure
+  invariant) — 12/12 green.
+
+### Fixed (run-10/11 audit findings, uncommitted)
+
+### Fixed (run-10/11 audit findings, uncommitted)
+- DNSSEC-DS-WALK-DEPTH-2 (low): apex-discovery walk with zone-cut
+  stop; 2-deep seeded Bogus lock + delegation Insecure lock.
+- Upstream AD no longer forwarded without local proof
+  (`strip_ad_unless_secure`; only Secure keeps AD). Timeout still
+  serves unverified (availability tradeoff, documented) but never
+  as authenticated.
+- TTL validator gaps (low, self-inflicted): `fake_ttl`/`min_ttl`/
+  `max_ttl` now bounded 1..=64 in `validate` + clap parsers + QML
+  clamp (was 255); 0 TTL fail-open closed.
+
 ### Fixed (run-9 audit finding)
 - DNSSEC-STRIP-ALL-UNSIGNED (low): unsigned answers/denials in a
   proven-signed owner zone now fail closed (Bogus) instead of served
