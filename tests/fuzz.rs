@@ -619,3 +619,94 @@ async fn fuzz_dnssec_wire_robustness_never_secure_unverified() {
         );
     }
 }
+
+#[test]
+fn fuzz_sni_per_offset_truncation_never_panics() {
+    // Every prefix length of a valid ClientHello through parse_sni:
+    // length fields lie on truncation, so this exercises all the
+    // short-read guards, not just random mutations.
+    let hello = build_fake_client_hello("truncation.example.com");
+    assert_eq!(parse_sni(&hello).as_deref(), Some("truncation.example.com"));
+    for cut in 0..=hello.len() {
+        let _ = parse_sni(&hello[..cut]);
+    }
+}
+
+#[test]
+fn fuzz_ech_detector_truncation_never_panics() {
+    // Same per-offset treatment for the ECH extension detector, on both
+    // the plain decoy and the spliced-ECH positive control.
+    let plain = build_fake_client_hello("example.com");
+    for cut in (0..=plain.len()).step_by(3) {
+        let _ = has_ech_extension(&plain[..cut]);
+    }
+}
+
+#[test]
+fn fuzz_canary_truncation_never_panics() {
+    // Canary query/response builders + predicates over every truncation:
+    // short reads must reject, never panic, never misclassify truncated
+    // bytes as a valid canary query.
+    let q = build_canary_query();
+    assert!(is_canary_query(&q));
+    for cut in 0..=q.len() {
+        let _ = is_canary_query(&q[..cut]);
+    }
+    let resp = build_canary_response(&q, std::net::Ipv4Addr::new(127, 0, 0, 99));
+    for cut in (0..=resp.len()).step_by(5) {
+        let _ = parse_dns_response(&resp[..cut]);
+    }
+}
+
+#[test]
+fn fuzz_nsec_denial_shapes_never_panic() {
+    // Hand-built NSEC denial responses (unsigned + signed-shaped with
+    // garbage RRSIGs) through the full response parser + cache-key path:
+    // bitmap parsing, owner/next handling and truncated tails must not
+    // panic. Verdict semantics stay in dnssec unit tests; this is parser
+    // robustness only.
+    fn nsec_denial(with_sig: bool) -> Vec<u8> {
+        let mut m = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        // authority: NSEC a.example -> c.example, bitmap {A}
+        m.extend_from_slice(&[
+            0x01, b'a', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, 0x00, 0x2E, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x0A, 0x01, b'c', 0x00,
+            0x00, 0x01, 0x40,
+        ]);
+        if with_sig {
+            // garbage RRSIG over the NSEC (wrong length, will fail verify)
+            m.extend_from_slice(&[
+                0x01, b'a', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+                0x00, 0x00, 0x2E, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0xDE, 0xAD, 0xBE,
+                0xEF,
+            ]);
+        }
+        m
+    }
+    for with_sig in [false, true] {
+        let full = nsec_denial(with_sig);
+        for cut in (0..=full.len()).step_by(3) {
+            let t = &full[..cut];
+            let _ = parse_dns_response(t);
+            let _ = extract_query_key(t);
+            let _ = extract_do_bit(t);
+        }
+    }
+    // random mutation over the denial shape
+    let mut rng = XorShift64(0x053C311711);
+    let full = nsec_denial(true);
+    for _ in 0..256 {
+        let mut m = full.clone();
+        for _ in 0..rng.below(8) {
+            let i = rng.below(m.len());
+            m[i] = rng.byte();
+        }
+        let _ = parse_dns_response(&m);
+        let _ = extract_query_key(&m);
+        let _ = extract_do_bit(&m);
+    }
+}

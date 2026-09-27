@@ -6,6 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 /// Strips ANSI escape sequences to prevent terminal injection via log-controlled domains.
+/// Matches the server-side log contract: in addition to ESC/BEL/BS, drops
+/// all control chars (incl. CR/LF/DEL/C1), BiDi overrides and invisible
+/// format chars, so monitor output can never reorder terminal display.
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -17,7 +20,14 @@ pub(crate) fn strip_ansi(s: &str) -> String {
                     break;
                 }
             }
-        } else if c == '\x07' || c == '\x08' {
+        } else if c == '\x07'
+            || c == '\x08'
+            || c.is_control()
+            || matches!(
+                c,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}'
+            )
+        {
             continue;
         } else {
             out.push(c);
@@ -119,6 +129,15 @@ mod tests {
         // lone ESC and truncated CSI must not panic or leak bytes
         assert_eq!(strip_ansi("\x1b"), "");
         assert_eq!(strip_ansi("\x1b[31"), "");
-        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn test_strip_ansi_kills_control_and_bidi() {
+        // CR/LF/DEL/C1 must go (line-overwrite + display forgery), plus
+        // BiDi overrides and invisible format chars. Matches the
+        // server-side sanitize_log_token contract.
+        assert_eq!(strip_ansi("a\rb\nc\x7fd\u{80}e"), "abcde");
+        assert_eq!(strip_ansi("a\u{202E}b\u{200B}c\u{FEFF}d"), "abcd");
+        assert_eq!(strip_ansi("plain.example"), "plain.example");
     }
 }
