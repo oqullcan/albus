@@ -37,6 +37,30 @@ pair observed live, traced through both verdict options, measuring
 false-SERVFAIL rate vs forgery coverage. Until then: behavior locked
 by the live CDN test (asserts never-Bogus), question stays open.
 
+### Measurement 2026-09-27 (6-domain live corpus, Quad9 DO-bit)
+
+Searched for a live specimen of the exact OQ-1 shape
+(signed CNAME + unsigned terminal, both verifiable):
+
+- `ietf.org` → Secure (fully signed control).
+- `example.com` → Secure. DRIFT COMPLETE: 09-24 edge-signed without
+  DS → 09-27 full chain verifies. Zones move under our feet; no live
+  domain is a permanent fixture.
+- `neverssl.com` → Insecure (unsigned; island lock holds).
+- `video.twimg.com` → Insecure (today fully unsigned: CNAME + A,
+  zero RRSIGs anywhere — plain-unsigned path, not the OQ-1 shape).
+- `chatgpt.com` → Bogus (FP-19 lock holds).
+- `dnssec-failed.org` → Indeterminate, empty answers. The canonical
+  negative control never reaches us as bad signatures: Quad9 SERVFAILs
+  upstream, so our pipeline sees infrastructure failure, not crypto
+  failure. True-Bogus coverage rests on the local byte-flip test
+  (`test_tampered_signed_response_is_bogus_live`), not on this domain.
+
+RESULT: no live specimen of signed-CNAME→unsigned-terminal found in
+this corpus — the early-Secure path with an unsigned terminal remains
+UNOBSERVED live. The question stays open for lack of a specimen, not
+for lack of looking.
+
 ## OQ-2: NSEC3 denial ceiling (context, already decided)
 
 NSEC3 denials cap at Indeterminate (no hash verification without new
@@ -47,3 +71,11 @@ positive answers. Revisit only if a deployment needs Secure NSEC3
 denials (e.g. aggressive-NSEC caching). Offline coverage: forged
 NSEC3 groups still fail closed (Bogus) via
 `test_nxdomain_denial_forged_group_is_bogus_offline`.
+
+### Measurement 2026-09-27 (NXDOMAIN denials, Quad9 DO-bit)
+
+`missing-xyz-123.ietf.org` and `missing-xyz-123.example.com` both
+returned NSEC (not NSEC3) denials with covering spans → Secure via
+the FP-18 gate. The NSEC coverage path is live-proven; the NSEC3
+Indeterminate cap did not trigger in this sample, so its live
+frequency is still unmeasured. No action — recorded for the record.

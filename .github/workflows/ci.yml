@@ -44,6 +44,11 @@ jobs:
         run: cargo test --test fuzz
       - name: docs sync check
         run: cargo test --test docs
+      # Panel.qml pure-logic tests: extracted verbatim from the shipped
+      # QML at test time (no duplicated logic to drift). Runner node,
+      # no new supply.
+      - name: panel logic tests (node)
+        run: node --version && node --test scripts/panel-logic-test.mjs
       # audit tools release faster than our pinned toolchain (1.89 cannot
       # compile current cargo-audit); run them on stable, code stays pinned.
       - name: Install stable toolchain for audit tools

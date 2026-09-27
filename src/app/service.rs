@@ -238,6 +238,22 @@ fn persist_install_config_at(
     Ok(())
 }
 
+/// Writes the managed-install marker through the general safe_write gate.
+/// Split into `_at` for testability (production passes the standard marker
+/// path, tests a temp file): regression lock for the L1 ordering bug where
+/// ensure_service_dirs chowns /etc/albus to the service user and the old
+/// root-parent-only writer then refused the marker mid-install.
+fn write_managed_marker_at(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::app::config::safe_write(path, "managed\n").map_err(|e| {
+        format!(
+            "failed to write managed marker at {}: {}",
+            path.display(),
+            e
+        )
+        .into()
+    })
+}
+
 /// Ensures the `albus` system user/group exist for rootless runtime.
 /// Idempotent: existing accounts (any uid, locked password, nologin shell
 /// or otherwise) are accepted as-is — install never mutates an existing
@@ -425,13 +441,13 @@ fn install_service(args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     secure_write_root_file(POLKIT_RULE_PATH, POLKIT_RULE_CONTENT, 0o644)?;
     println!("Created polkit authorization rule: {}", POLKIT_RULE_PATH);
 
-    // managed-install marker: proves albus lived here so firewall cleanup
-    // may sweep legacy uncommented rules without risking admin rules
-    secure_write_root_file(
-        crate::core::firewall::MANAGED_MARKER_PATH,
-        "managed\n",
-        0o600,
-    )?;
+    // managed-install marker: proves albus lived here for install-state
+    // queries. Written through the general safe_write gate (not the
+    // root-parent-only writer): /etc/albus is daemon-owned since L1
+    // (ensure_service_dirs chowns it to albus), and safe_write already
+    // accepts root-or-service-owned system parents with symlink/O_NOFOLLOW
+    // enforcement — the same path persist_install_config uses 3 steps up.
+    write_managed_marker_at(Path::new(crate::core::firewall::MANAGED_MARKER_PATH))?;
 
     // reload daemon manager and enable unit (absolute path, checked)
     let reload = systemctl().arg("daemon-reload").status()?;
@@ -733,6 +749,20 @@ mod service_fs_tests {
         let _ = fs::remove_file(&link);
         let _ = fs::remove_file(&target);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_managed_marker_writes_through_general_gate() {
+        // L1-ordering regression: the marker must persist even when the
+        // parent dir is NOT root-owned (ensure_service_dirs chowns
+        // /etc/albus to the service user before this step runs). Uses a
+        // temp dir owned by the test user — never the live marker.
+        let dir = tmpdir("marker");
+        let path = dir.join("sub").join(".managed");
+        write_managed_marker_at(&path).expect("marker write must succeed");
+        let content = fs::read_to_string(&path).expect("marker readable");
+        assert_eq!(content, "managed\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -466,7 +466,7 @@ fn privilege_drop_expected(is_system_path: bool) -> bool {
 }
 
 // safely writes content to path atomically rejecting symlinks and dropping privileges on user paths
-fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
+pub(crate) fn safe_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     let p = path.as_ref();
     reject_dotdot(p)?;
     let is_system_path = p.starts_with("/run/albus") || p.starts_with("/etc/albus");

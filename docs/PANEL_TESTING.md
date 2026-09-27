@@ -51,6 +51,18 @@ file with a global `root`, feed REAL backend JSON
 9 checks, all must pass. Do NOT commit the harness (verbatim drift
 risk); this protocol is the durable artifact.
 
+## 3. JS-logic harness (CI-gated, single-source)
+
+`scripts/panel-logic-test.mjs` (`node --test`, CI `panel logic tests`
+step): extracts `canon`, `numOr`, `uiConfigShape`, `cfgFingerprint`,
+`parseConfigJson` VERBATIM from the shipped `Panel.qml` (string- and
+comment-aware brace matching — no copied logic to drift) and asserts,
+against an embedded backend fixture mirroring `config get` output:
+key-order stability, fingerprint invariance, clean/dirty toggle cycle,
+mullvad round-trip, fallback null parses, `numOr` defaults. 6 checks.
+Run locally with the same command; edit the QML freely — the tests run
+whatever ships.
+
 ## 4. Backend↔QML key cross-check
 
 Every key `cfgFingerprint` reads must exist in `config get` output;
@@ -70,9 +82,10 @@ limitation, not a bug.
 - Old installed binary: `--system` unknown flag → non-zero exit →
   one-shot plain retry (migration path).
 
-## Automation gap
+## Automation gap (narrowed 2026-09-27)
 
-No `qmllint`/`qmltestrunner`/Qt6 on this host or in CI; `qml6` cannot
-resolve Quickshell imports by design. CI automation would need a Qt6
-install purely for lint — deferred as not worth the weight today.
-Revisit if Qt tooling becomes available.
+`qmllint`/`qmltestrunner`/Qt6 remain unavailable here and in CI, so
+widget rendering and the click path stay manual (protocol above).
+What IS automated now: the pure-logic layer (§3) runs in CI on every
+push. Remaining manual-only surface: visual layout, overlay open
+behavior, live daemon round-trips.

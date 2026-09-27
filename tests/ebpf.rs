@@ -74,5 +74,19 @@ fn ebpf_load_attach_write_detach() {
         .push_target_ports(&[443])
         .expect("target_ports map must accept writes");
 
+    // Live reload-sync proof: migrate the LIVE maps to a new config
+    // generation and back, exercising the exact push-then-sync sequence
+    // SIGHUP uses (manager.rs reload_maps delegates to these). No
+    // read-back helper exists on purpose (no privileged API widened for
+    // tests); Ok on live maps proves the reload path executes end to
+    // end against the real kernel, including shrink deletes.
+    let live = engine.map_handles();
+    live.sync_target_ports(&[443], &[80, 443])
+        .expect("live sync grow must succeed");
+    live.sync_target_ports(&[80, 443], &[443])
+        .expect("live sync shrink must succeed");
+    live.push_config(BpfConfig::new(100, 0, 600, 64, true))
+        .expect("live config re-push must succeed");
+
     engine.detach().expect("clean detach must succeed");
 }
