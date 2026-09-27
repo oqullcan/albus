@@ -1,0 +1,33 @@
+---
+const faqs = [
+  {
+    q: 'Is it a VPN?',
+    a: 'No — and that is the point. There is no server, no tunnel, no subscription. Packets are shaped and DNS is resolved locally over HTTPS. Nobody to trust means nobody to compel.',
+  },
+  {
+    q: 'Which platforms?',
+    a: 'Linux 5.10+ with cgroup v2, full stop. Windows, macOS and routers are out of scope by design — GoodbyeDPI and Zapret already serve those.',
+  },
+  {
+    q: 'Does it slow me down?',
+    a: 'Only the first ~600 bytes of a connection fragment; MSS restores to line rate right after. DNS answers come from a local cache, usually faster than your ISP.',
+  },
+  {
+    q: 'Why would a site fail to resolve?',
+    a: 'Bogus DNSSEC answers return SERVFAIL on purpose — that is the validator catching tampering or a broken zone, not a bug. Unsigned zones keep working, labeled insecure.',
+  },
+];
+---
+<section class="block" id="faq">
+  <div class="wrap">
+    <p class="micro rv">Questions</p>
+    <div class="faq rv" style="margin-top:28px">
+      {faqs.map((f) => (
+        <details>
+          <summary>{f.q}</summary>
+          <div><p>{f.a}</p></div>
+        </details>
+      ))}
+    </div>
+  </div>
+</section>

@@ -1,0 +1,21 @@
+---
+import Base from '../layouts/Base.astro';
+import Hero from '../components/Hero.astro';
+import Rule from '../components/Rule.astro';
+import Rows from '../components/Rows.astro';
+import Terminal from '../components/Terminal.astro';
+import InstallStrip from '../components/InstallStrip.astro';
+import Faq from '../components/Faq.astro';
+---
+<Base>
+  <main id="main">
+    <Hero />
+    <div class="wrap"><Rule /></div>
+    <Rows />
+    <div class="wrap"><Rule /></div>
+    <Terminal />
+    <InstallStrip />
+    <div class="wrap"><Rule /></div>
+    <Faq />
+  </main>
+</Base>

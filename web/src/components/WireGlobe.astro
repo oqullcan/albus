@@ -1,0 +1,143 @@
+---
+// Wireframe globe: meridians + parallels as faint line loops.
+// Monochrome on pure black. Zero dependencies.
+interface Props { id?: string }
+const { id = 'wire-cv' } = Astro.props;
+---
+<div class="wireglobe" aria-hidden="true"><canvas id={id}></canvas></div>
+
+<script define:vars={{ cvId: id }}>
+  (() => {
+    const cv = document.getElementById(cvId);
+    if (!cv || !('getContext' in cv)) return;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Build loops: 20 meridians + 13 parallels, 96 pts each.
+    // Dense like the reference: fine dotted mesh, not bare wires.
+    const loops = [];
+    for (let m = 0; m < 20; m++) {
+      const lon = (m / 20) * Math.PI * 2, pts = [];
+      for (let i = 0; i < 96; i++) {
+        const lat = (i / 96) * Math.PI * 2 - Math.PI / 2;
+        pts.push([Math.cos(lat) * Math.cos(lon), Math.sin(lat), Math.cos(lat) * Math.sin(lon)]);
+      }
+      loops.push({ pts, w: m % 5 === 0 ? 1.15 : 1 });
+    }
+    for (let p = 1; p < 14; p++) {
+      const lat = -Math.PI / 2 + (p / 14) * Math.PI, pts = [];
+      for (let i = 0; i < 96; i++) {
+        const lon = (i / 96) * Math.PI * 2;
+        pts.push([Math.cos(lat) * Math.cos(lon), Math.sin(lat), Math.cos(lat) * Math.sin(lon)]);
+      }
+      // equator carries a touch more ink
+      loops.push({ pts, w: p === 7 ? 1.15 : 1 });
+    }
+    // Pulse nodes: fixed surface points that breathe.
+    const nodes = [];
+    for (let i = 0; i < 16; i++) {
+      const y = 1 - ((i * 0.37 + 0.11) % 1) * 2;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = i * 2.399963 + 1;
+      nodes.push({ p: [Math.cos(th) * r, y, Math.sin(th) * r], ph: i * 0.7 });
+    }
+
+    let W = 0, H = 0, R = 0, dpr = 1;
+    const fit = () => {
+      const rect = cv.parentElement.getBoundingClientRect();
+      dpr = Math.min(devicePixelRatio || 1, 2);
+      W = rect.width; H = rect.height;
+      cv.width = W * dpr; cv.height = H * dpr;
+      R = Math.min(W, H) * 0.4;
+    };
+    fit();
+    addEventListener('resize', fit);
+
+    let rot = 0.8, tilt = 0.45, tiltT = 0.45;
+    addEventListener('pointermove', (e) => {
+      tiltT = 0.45 + (e.clientY / innerHeight - 0.5) * 0.3;
+    }, { passive: true });
+
+    let running = true;
+    new IntersectionObserver(([e]) => (running = e.isIntersecting)).observe(cv);
+
+    const F = 3.4;
+    // Node sprite prerendered once — no per-frame gradients.
+    const sprite = document.createElement('canvas');
+    sprite.width = sprite.height = 32;
+    {
+      const g = sprite.getContext('2d');
+      const grad = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+      grad.addColorStop(0, 'rgba(255,255,255,1)');
+      grad.addColorStop(0.35, 'rgba(255,255,255,0.5)');
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = grad;
+      g.fillRect(0, 0, 32, 32);
+    }
+    // Alpha buckets: quantize depth shading so each bucket strokes ONCE.
+    const LEVELS = 9;
+    let paths = Array.from({ length: LEVELS }, () => new Path2D());
+    // Projects one surface point. Returns null only off-canvas (never).
+    function proj(x, y, z, cA, sA, cB, sB, cx, cy) {
+      const x1 = x * cA + z * sA, z1 = -x * sA + z * cA;
+      const y1 = y * cB - z1 * sB, z2 = y * sB + z1 * cB;
+      const s = F / (F + z2);
+      return [cx + x1 * R * s, cy + y1 * R * s, z2];
+    }
+    function frame() {
+      requestAnimationFrame(frame);
+      if (!running) return;
+      if (!reduced) {
+        rot += 0.0016;
+        tilt += (tiltT - tilt) * 0.03;
+      }
+      const cA = Math.cos(rot), sA = Math.sin(rot), cB = Math.cos(tilt), sB = Math.sin(tilt);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      const cx = W / 2, cy = H / 2;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([1.5, 3.2]);
+      for (let l = 0; l < LEVELS; l++) paths[l] = new Path2D();
+      for (const loop of loops) {
+        // Continuous wireframe with depth shading: back fades, never breaks.
+        let px = 0, py = 0, pz = 0, started = false;
+        for (const [x, y, z] of loop.pts) {
+          const q = proj(x, y, z, cA, sA, cB, sB, cx, cy);
+          const depth = (q[2] + pz) / 2; // -1 back .. +1 front
+          const lvl = Math.max(0, Math.min(LEVELS - 1, Math.floor(((depth + 1) / 2) * LEVELS)));
+          if (started) {
+            const path = paths[lvl];
+            path.moveTo(px, py);
+            path.lineTo(q[0], q[1]);
+          }
+          px = q[0]; py = q[1]; pz = q[2]; started = true;
+        }
+      }
+      for (let l = 0; l < LEVELS; l++) {
+        const a = 0.028 + ((l + 0.5) / LEVELS) * 0.15;
+        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`;
+        ctx.stroke(paths[l]);
+      }
+      ctx.setLineDash([]);
+      // Breathing nodes on the near side only (sprite blits, no gradients).
+      const t = performance.now() / 1000;
+      for (const n of nodes) {
+        const q = proj(n.p[0], n.p[1], n.p[2], cA, sA, cB, sB, cx, cy);
+        if (q[2] < 0.3) continue;
+        const pulse = 0.5 + 0.5 * Math.sin(t * 1.4 + n.ph);
+        const sz = 5 + pulse * 7;
+        ctx.globalAlpha = 0.2 + pulse * 0.5;
+        ctx.drawImage(sprite, q[0] - sz / 2, q[1] - sz / 2, sz, sz);
+      }
+      ctx.globalAlpha = 1;
+      if (reduced) running = false;
+    }
+    frame();
+  })();
+</script>
+
+<style>
+  .wireglobe { width: 100%; aspect-ratio: 1; max-height: 460px; }
+  .wireglobe canvas { width: 100%; height: 100%; display: block; }
+</style>

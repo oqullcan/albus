@@ -1,0 +1,176 @@
+---
+---
+<div class="wrap hero" id="top">
+  <span class="mark" style="left:6px;top:34%" aria-hidden="true">×</span>
+  <span class="mark" style="right:22px;top:22%" aria-hidden="true">—</span>
+  <div class="hero-center">
+    <h1 class="rv">Uncensored Internet<br />Access</h1>
+    <p class="lede rv" style="transition-delay:90ms">Type a hostname. Watch it shatter into fragments no middlebox can reassemble in time.</p>
+    <div class="lab rv" style="transition-delay:180ms">
+      <div class="lab-bar">
+        <span class="lab-title">LIVE SCHEMATIC — MSS 88 · TTL DECOYS</span>
+        <label class="lab-input">
+          <span aria-hidden="true">SNI host</span>
+          <input id="frag-host" type="text" value="www.youtube.com" maxlength="48"
+            spellcheck="false" autocomplete="off" aria-label="Hostname to fragment" />
+        </label>
+      </div>
+      <canvas id="frag-cv" height="210"></canvas>
+      <div class="lab-foot"><span>clienthello: <span id="frag-bytes">0</span>B in <span id="frag-n">0</span> segments</span><span>reassembled by DPI: never in time</span></div>
+    </div>
+    <div class="btnrow rv" style="transition-delay:260ms">
+      <a class="btn" href="https://github.com/oqullcan/albus/releases">Download Albus</a>
+    </div>
+  </div>
+</div>
+
+<script>
+  (() => {
+    const cv = document.getElementById('frag-cv');
+    const input = document.getElementById('frag-host');
+    const bytesEl = document.getElementById('frag-bytes');
+    const nEl = document.getElementById('frag-n');
+    if (!cv || !input || !('getContext' in cv)) return;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Faithful model of the engine: a ClientHello carrying the SNI is
+    // ~200-400 bytes; eBPF clamps MSS to 88 so it leaves as ceil(n/88)
+    // segments with sequence numbers; TTL-limited decoys fire ahead.
+    const MSS = 88, BASE = 176;
+    let W = 0, dpr = 1, wallX = 0;
+    const H = 210;
+    const fit = () => {
+      const rect = cv.parentElement.getBoundingClientRect();
+      dpr = Math.min(devicePixelRatio || 1, 2);
+      W = rect.width;
+      cv.width = W * dpr; cv.height = H * dpr;
+      wallX = W * 0.56;
+    };
+    fit();
+    addEventListener('resize', fit);
+
+    let host = 'www.youtube.com';
+    let segs = [];
+    let decoys = [];
+    const layout = () => {
+      const total = BASE + host.length * 2;
+      const n = Math.max(2, Math.ceil(total / MSS));
+      segs = [];
+      let seq = 0;
+      for (let i = 0; i < n; i++) {
+        const len = Math.min(MSS, total - seq);
+        segs.push({ seq, len, x: -140 - i * 96, spd: 1.35 });
+        seq += len;
+      }
+      if (bytesEl) bytesEl.textContent = String(total);
+      if (nEl) nEl.textContent = String(n);
+    };
+    layout();
+    input.addEventListener('input', () => {
+      host = input.value.toLowerCase().replace(/[^a-z0-9.\-]/g, '').slice(0, 48) || 'untitled.invalid';
+      if (input.value !== host) input.value = host;
+      layout();
+    });
+
+    let tick = 0, running = true;
+    new IntersectionObserver(([e]) => (running = e.isIntersecting)).observe(cv);
+
+    function frame() {
+      requestAnimationFrame(frame);
+      if (!running) return;
+      tick++;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      const midY = H / 2 + 10;
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 7]);
+      ctx.beginPath(); ctx.moveTo(wallX, 12); ctx.lineTo(wallX, H - 12); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,255,255,0.34)';
+      ctx.font = '10px ui-monospace, monospace';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('MIDDLEBOX', wallX + 8, 26);
+      ctx.fillStyle = 'rgba(255,255,255,0.30)';
+      ctx.fillText('you', 8, 26);
+      ctx.fillText('server', W - 52, 26);
+      ctx.fillText('MSS 88', 8, H - 16);
+
+      if (!reduced && tick % 34 === 0 && decoys.length < 5) {
+        decoys.push({ x: wallX - 120 - Math.random() * 80, y: midY - 34, life: 1 });
+      }
+      ctx.font = '9px ui-monospace, monospace';
+      for (let i = decoys.length - 1; i >= 0; i--) {
+        const d = decoys[i];
+        if (!reduced) { d.x += 0.9; d.y -= 0.55; d.life -= 0.014; }
+        if (d.life <= 0) { decoys.splice(i, 1); continue; }
+        ctx.strokeStyle = 'rgba(255,255,255,' + (d.life * 0.4).toFixed(3) + ')';
+        ctx.strokeRect(d.x, d.y, 30, 13);
+        ctx.fillStyle = 'rgba(255,255,255,' + (d.life * 0.55).toFixed(3) + ')';
+        ctx.fillText('TTL 8', d.x + 4, d.y + 7);
+      }
+
+      const pxPerByte = 0.62;
+      ctx.font = '9px ui-monospace, monospace';
+      let head = null, allPassed = true;
+      for (let si = 0; si < segs.length; si++) {
+        const s = segs[si];
+        if (!reduced) {
+          s.x += s.spd;
+          if (s.x > W + 40) s.x = -160 - Math.random() * 60;
+        }
+        const w = Math.max(40, s.len * pxPerByte);
+        let y = midY - 10, alpha = 0.9;
+        if (s.x > wallX) {
+          y = midY - 10 + ((si % 3) - 1) * 30;
+          const dd = (s.x - wallX) / Math.max(1, W - wallX);
+          alpha = Math.max(0.35, 0.9 - dd * 0.4);
+        } else {
+          allPassed = false;
+        }
+        ctx.strokeStyle = 'rgba(244,244,244,' + alpha.toFixed(3) + ')';
+        ctx.strokeRect(s.x, y, w, 20);
+        ctx.fillStyle = 'rgba(244,244,244,' + alpha.toFixed(3) + ')';
+        ctx.fillText('seq ' + s.seq, s.x + 5, y + 10);
+        head = s;
+      }
+      ctx.fillStyle = 'rgba(255,255,255,0.34)';
+      if (head && head.x < wallX) ctx.fillText('SNI \u201c' + host + '\u201d: legible', 8, H - 16);
+      else if (allPassed) ctx.fillText('SNI: unreadable past the wall', 8, H - 16);
+
+      if (reduced) running = false;
+    }
+    frame();
+  })();
+</script>
+
+<style>
+  .hero-center { text-align: center; max-width: 860px; margin: 0 auto; }
+  .hero-center .lede { margin-left: auto; margin-right: auto; }
+  .hero-center .btnrow { justify-content: center; margin-bottom: 0; }
+  .lab {
+    border: 1px solid var(--line); border-radius: 3px; background: #020202;
+    margin: 0 0 38px; overflow: hidden; text-align: left;
+  }
+  .lab-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    border-bottom: 1px solid var(--line); padding: 10px 16px; flex-wrap: wrap;
+  }
+  .lab-title { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--muted); }
+  .lab-input { display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .lab-input input {
+    background: #000; border: 1px solid var(--line); border-radius: 3px;
+    color: var(--ink); font-family: var(--mono); font-size: 13px;
+    padding: 7px 12px; width: 220px; outline: none;
+  }
+  .lab-input input:focus { border-color: rgba(255,255,255,0.35); }
+  .lab canvas { width: 100%; height: 210px; display: block; }
+  .lab-foot {
+    display: flex; justify-content: space-between;
+    border-top: 1px solid var(--line); padding: 9px 16px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--faint);
+  }
+</style>

@@ -1,0 +1,18 @@
+---
+import WireGlobe from './WireGlobe.astro';
+---
+<section class="block">
+  <div class="wrap">
+    <div class="duo rv">
+      <div class="hero-art"><WireGlobe id="wire-feat" /></div>
+      <div class="feat">
+        <h4>KERNEL-LEVEL EVASION</h4>
+        <p>eBPF sock_ops clamps the MSS to ~88 bytes so handshakes shatter across segments. TTL-limited decoys poison whatever the middlebox remembers.</p>
+        <h4>VALIDATING DNS</h4>
+        <p>A resolver on 127.0.0.1:53 answers over DoH with ECH. Every answer is DNSSEC chain-validated against an embedded root anchor — Bogus means SERVFAIL, never cached, never served.</p>
+        <h4>FAIL-CLOSED</h4>
+        <p>Kill-switch drops plaintext DNS on the floor. If shaping is ever lost, lockdown engages until restart. Uncertainty is answered with refusal, not hope.</p>
+      </div>
+    </div>
+  </div>
+</section>

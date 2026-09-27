@@ -4,3 +4,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+# Astro site
+web/node_modules/
+web/dist/
+web/.astro/

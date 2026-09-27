@@ -1,0 +1,51 @@
+---
+---
+<section class="block">
+  <div class="wrap">
+    <div class="install-strip rv">
+      <code id="install-steps"><span class="p">$ </span>git clone https://github.com/oqullcan/albus.git<br /><span class="p">$ </span>cd albus && cargo build --release<br /><span class="p">$ </span>sudo ./target/release/albus service install</code>
+      <button class="copybtn" data-copy-cmd>copy</button>
+    </div>
+  </div>
+</section>
+
+<script>
+  (() => {
+    const btn = document.querySelector('[data-copy-cmd]');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const code = btn.parentElement?.querySelector('code');
+      const lines = [...(code?.innerText || '').split('\n')]
+        .map((l) => l.replace(/^\$\s*/, '').trim())
+        .filter(Boolean);
+      const cmd = lines.join(' && ');
+      try {
+        await navigator.clipboard.writeText(cmd);
+        btn.textContent = 'copied';
+        setTimeout(() => (btn.textContent = 'copy'), 1400);
+      } catch {
+        btn.textContent = 'select manually';
+      }
+    });
+  })();
+</script>
+
+<style>
+  .install-strip {
+    display: flex; align-items: center; gap: 18px;
+    border: 1px solid var(--line); border-radius: 3px; background: #020202;
+    padding: 18px 20px;
+  }
+  .install-strip code {
+    font-family: var(--mono); font-size: 13px; line-height: 2; color: #cfcfcf;
+    flex: 1;
+  }
+  .install-strip code .p { color: var(--faint); }
+  .install-strip .copybtn {
+    flex-shrink: 0; background: transparent; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 3px;
+    color: var(--muted); font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.1em; padding: 7px 14px;
+  }
+  .install-strip .copybtn:hover { color: var(--ink); border-color: var(--faint); }
+</style>
