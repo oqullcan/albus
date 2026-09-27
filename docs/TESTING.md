@@ -12,13 +12,21 @@ cargo test --test fuzz --test docs --test net
 cargo llvm-cov --workspace --fail-under-lines 55 --summary-only  # needs stable + llvm-tools
 ```
 
-QML (`BarWidget.qml`, `Panel.qml`) has no automated tests: no Quickshell
-runtime exists in CI or here — reviewed by reading (process spawning uses
-absolute paths + arg arrays, all text is `PlainText`, inputs validated).
-Best available evidence: the installed copy under
-`~/.config/omarchy/plugins/` is byte-identical to the repo, and the live
-Omarchy shell journal shows zero QML errors for it. If Qt tooling ever
-becomes available, add at least a parse smoke test.
+QML widget rendering has no automated tests (no Quickshell runtime
+exists in CI or here), but the pure-logic layer is CI-gated:
+`scripts/panel-logic-test.mjs` extracts `canon`, `numOr`,
+`uiConfigShape`, `cfgFingerprint` and `parseConfigJson` verbatim from
+the shipped `Panel.qml` and asserts key-order stability, fingerprint
+invariance, clean/dirty cycling, mullvad round-trip and fallback
+parses (`node --test scripts/panel-logic-test.mjs`, CI `panel logic
+tests` step). Rendering, overlay-open behavior and live daemon
+round-trips stay manual per `docs/PANEL_TESTING.md`. Reviewed by
+reading for the rest (process spawning uses absolute paths + arg
+arrays, all text is `PlainText`, inputs validated). Best available
+runtime evidence: the installed copy under
+`~/.config/omarchy/plugins/` is byte-identical to the repo, and the
+live Omarchy shell journal shows zero QML errors for it. If Qt
+tooling ever becomes available, add at least a parse smoke test.
 
 Privileged suites need interactive root and never fail spuriously
 (they SKIP when preconditions are missing):
@@ -41,6 +49,16 @@ bad checksum.
 Requirements: Linux, root (AF_PACKET + raw RST), Python 3.10+,
 `openssl` CLI, albus installed. Add targets in `TARGETS` or pass
 `--targets host1,host2` (current: `roblox.com`, `discord.com`).
+
+Loopback prerequisite (else GSO hands the stub a whole Hello and the
+sim RSTs a false positive): disable segmentation offloads first,
+exactly like CI does (`.github/workflows/ci.yml` DPI job):
+
+```bash
+sudo ethtool -K lo gso off gro off tso off
+sudo ethtool -k lo | grep -E "tcp-segmentation-offload: off" || echo "GSO still on, lab would race — abort"
+sudo ethtool -k lo | grep -E "generic-segmentation-offload: off" || echo "GSO still on, lab would race — abort"
+```
 
 ```bash
 # baseline WITHOUT shaping: expect handshake_ok=false, sim_decision=rst

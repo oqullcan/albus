@@ -73,20 +73,19 @@ fn main() {
                 bpf_out.to_str().unwrap()
             );
         }
+        // No stale-object fallback, ever: a prebuilt bpf/sockops.bpf.o
+        // would ship unverifiable bytecode as root-enforced eBPF while
+        // review sees clean C (plus .gitignore hides it from status).
+        // Fail closed here so a broken toolchain can never produce a
+        // releasable binary silently.
         _ => {
-            // If clang isn't available or fails, check if a pre-compiled bpf.o is present in bpf/
-            let fallback = PathBuf::from("bpf/sockops.bpf.o");
-            if fallback.exists() {
-                eprintln!(
-                    "warning: clang failed, using stale fallback bpf/sockops.bpf.o — verify hash before release"
-                );
-                println!(
-                    "cargo:rustc-env=ALBUS_BPF_BYTECODE={}",
-                    fallback.to_str().unwrap()
-                );
-            } else {
-                panic!("Failed to compile eBPF bytecode and no fallback sockops.bpf.o found");
-            }
+            panic!(
+                "Failed to compile eBPF bytecode (clang {:?} exited {:?}): \
+                 refusing to substitute any prebuilt object — fix the \
+                 toolchain and rebuild",
+                clang_binary(),
+                status
+            );
         }
     }
 }
