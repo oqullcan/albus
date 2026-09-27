@@ -32,9 +32,12 @@ Panel {
   property string customMss: "88"
   property string customMinMss: "64"
   property string customFakeTtl: "0"
+  property string customMinTtl: "3"
+  property string customMaxTtl: "12"
   property string customFakeSni: ""
   property bool fakeBadChecksum: false
   property bool autoTtlEnabled: true
+  property bool shapingWatchdogEnabled: true
   property bool dnssecEnabled: true
   property bool pqcEnabled: true
   property bool ramOnlyEnabled: false
@@ -535,6 +538,17 @@ Panel {
       args.push("--fake-ttl", String(clampedTtl))
       root.autoTtlEnabled = false
     }
+    // TTL bound clamps mirror Config::validate (1..=64) and min<=max;
+    // backend remains the gate, this avoids a pointless pkexec round-trip.
+    var minTtl = parseInt(root.customMinTtl.trim(), 10)
+    var maxTtl = parseInt(root.customMaxTtl.trim(), 10)
+    if (isNaN(minTtl) || isNaN(maxTtl) || minTtl < 1 || minTtl > 64
+        || maxTtl < 1 || maxTtl > 64 || minTtl > maxTtl) {
+      return { ok: false, reason: "Invalid TTL bounds (expected 1..=64, min <= max)" }
+    }
+    args.push("--min-ttl", String(minTtl))
+    args.push("--max-ttl", String(maxTtl))
+    args.push("--shaping-watchdog", root.shapingWatchdogEnabled ? "true" : "false")
     if (root.customFakeSni.trim() !== "") {
       var _sni = root.customFakeSni.trim()
       if (_sni.length > 253 || !/^[A-Za-z0-9._-]+$/.test(_sni)) return { ok: false, reason: "Invalid Fake SNI" }
@@ -613,8 +627,11 @@ Panel {
       min_mss: numOr(root.customMinMss.trim(), 64),
       auto_ttl: autoTtl,
       fake_ttl: autoTtl ? 8 : Math.min(Math.max(ttlVal, 1), 64),
+      min_ttl: numOr(root.customMinTtl.trim(), 3),
+      max_ttl: numOr(root.customMaxTtl.trim(), 12),
       fake_sni: root.customFakeSni.trim(),
       fake_bad_checksum: root.fakeBadChecksum,
+      shaping_watchdog: root.shapingWatchdogEnabled,
       block_quic: root.blockQuicEnabled,
       block_stun: root.blockStunEnabled,
       kill_switch: root.killSwitchEnabled,
@@ -642,8 +659,11 @@ Panel {
       min_mss: (cfg.min_mss !== undefined ? cfg.min_mss : 64),
       auto_ttl: cfg.auto_ttl !== false,
       fake_ttl: cfg.fake_ttl || 8,
+      min_ttl: (cfg.min_ttl !== undefined ? cfg.min_ttl : 3),
+      max_ttl: (cfg.max_ttl !== undefined ? cfg.max_ttl : 12),
       fake_sni: cfg.fake_sni || "",
       fake_bad_checksum: !!cfg.fake_bad_checksum,
+      shaping_watchdog: cfg.shaping_watchdog !== false,
       block_quic: cfg.block_quic !== false,
       block_stun: cfg.block_stun !== false,
       kill_switch: cfg.kill_switch !== false,
@@ -800,9 +820,12 @@ Panel {
           root.customMss = String(cfg.mss || 88)
           root.customMinMss = String(cfg.min_mss !== undefined ? cfg.min_mss : 64)
           root.customFakeTtl = cfg.auto_ttl === false ? String(cfg.fake_ttl || 8) : "0"
+          root.customMinTtl = String(cfg.min_ttl !== undefined ? cfg.min_ttl : 3)
+          root.customMaxTtl = String(cfg.max_ttl !== undefined ? cfg.max_ttl : 12)
           root.customFakeSni = cfg.fake_sni || ""
           root.fakeBadChecksum = !!cfg.fake_bad_checksum
           root.autoTtlEnabled = cfg.auto_ttl !== false
+          root.shapingWatchdogEnabled = cfg.shaping_watchdog !== false
           root.dnssecEnabled = cfg.dnssec !== false
           root.pqcEnabled = cfg.pqc !== false
           root.ramOnlyEnabled = !!cfg.ram_only
@@ -1437,6 +1460,49 @@ Panel {
                 }
               }
 
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Column {
+                  width: (parent.width - Style.space(6)) / 2
+                  spacing: 2
+                  Text {
+                  textFormat: Text.PlainText; text: "Min TTL (1-64)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  TextField {
+                    width: parent.width
+                    text: root.customMinTtl
+                    placeholderText: "3"
+                    font.family: "monospace"
+                    font.pixelSize: Style.font.caption
+                    accent: "#10B981"
+                    onTextEdited: {
+                      root.customMinTtl = text
+                      root.scheduleAutoApply()
+                    }
+                  }
+                }
+
+                Column {
+                  width: (parent.width - Style.space(6)) / 2
+                  spacing: 2
+                  Text {
+                  textFormat: Text.PlainText; text: "Max TTL (1-64)"; color: root.dim; font.pixelSize: Style.font.caption - 1; font.family: root.fontFamily }
+                  TextField {
+                    width: parent.width
+                    text: root.customMaxTtl
+                    placeholderText: "12"
+                    font.family: "monospace"
+                    font.pixelSize: Style.font.caption
+                    accent: "#10B981"
+                    onTextEdited: {
+                      root.customMaxTtl = text
+                      root.scheduleAutoApply()
+                    }
+                  }
+                }
+              }
+
               Column {
                 width: parent.width
                 spacing: 2
@@ -1494,9 +1560,19 @@ Panel {
                     label: "Block WebRTC STUN"
                     description: "Drop UDP 3478/5349 to prevent browser IP leaks"
                     checked: root.blockStunEnabled
-                    showDivider: false
                     onClicked: {
                       root.blockStunEnabled = !root.blockStunEnabled
+                      root.applyAndSave()
+                    }
+                  }
+
+                  CompactToggle {
+                    label: "Shaping watchdog"
+                    description: "Fail-closed lockdown on unexplained connections"
+                    checked: root.shapingWatchdogEnabled
+                    showDivider: false
+                    onClicked: {
+                      root.shapingWatchdogEnabled = !root.shapingWatchdogEnabled
                       root.applyAndSave()
                     }
                   }

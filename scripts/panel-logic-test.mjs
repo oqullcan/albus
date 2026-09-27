@@ -62,7 +62,7 @@ const BACKEND = {
   fake_sni: null, fake_bad_checksum: false, doh_upstream: 'quad9',
   doh_bootstrap_ips: [], block_quic: true, block_stun: true, kill_switch: true,
   network_lockdown: false, block_ipv6: true, dnssec: true, pqc: true,
-  ram_only: false,
+  ram_only: false, min_ttl: 3, max_ttl: 12, shaping_watchdog: true,
 };
 
 function draftRoot(over = {}) {
@@ -71,10 +71,11 @@ function draftRoot(over = {}) {
       activeDnsKey: BACKEND.doh_upstream, mullvadProfile: 'standard', customDnsUrl: '',
       customBootstrapPrimary: '', customBootstrapSecondary: '',
       customMss: String(BACKEND.mss), customMinMss: String(BACKEND.min_mss),
-      customFakeTtl: '', customFakeSni: '', fakeBadChecksum: false,
+      customFakeTtl: '', customMinTtl: String(BACKEND.min_ttl),
+      customMaxTtl: String(BACKEND.max_ttl), customFakeSni: '', fakeBadChecksum: false,
       blockQuicEnabled: true, blockStunEnabled: true, killSwitchEnabled: true,
       networkLockdownEnabled: false, blockIpv6Enabled: true, dnssecEnabled: true,
-      pqcEnabled: true, ramOnlyEnabled: false, storedPorts: BACKEND.ports,
+      pqcEnabled: true, ramOnlyEnabled: false, shapingWatchdogEnabled: true, storedPorts: BACKEND.ports,
       storedRestoreAfterBytes: BACKEND.restore_after_bytes,
       storedRestoreMss: BACKEND.restore_mss, storedCgroup: BACKEND.cgroup_path,
       isConfigLoading: false, isDirty: false,
@@ -119,4 +120,18 @@ test('numOr defaults', () => {
   assert.equal(numOr('', 88), 88);
   assert.equal(numOr('abc', 64), 64);
   assert.equal(numOr('100', 88), 100);
+});
+
+test('watchdog toggle dirties; ttl bounds mirror backend', () => {
+  globalThis.root = draftRoot();
+  assert.equal(canon(uiConfigShape()), root.effectiveFingerprint);
+  root.shapingWatchdogEnabled = false;
+  assert.notEqual(canon(uiConfigShape()), root.effectiveFingerprint);
+  root.shapingWatchdogEnabled = true;
+  root.customMinTtl = '5';
+  root.customMaxTtl = '20';
+  const shaped = cfgFingerprint(
+    Object.assign({}, BACKEND, { min_ttl: 5, max_ttl: 20 })
+  );
+  assert.equal(canon(uiConfigShape()), shaped);
 });
