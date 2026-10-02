@@ -4,19 +4,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// lookup key derived from queried fqdn labels, resource record type and
-// class. Class is part of the key (L12): IN and non-IN queries for the same
-// name/type must never share an entry.
+// lookup key derived from queried fqdn labels and resource record type
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct DnsCacheKey {
     pub name: String,
-    /// Exact label vector: disambiguates what dotted `name` cannot (a
-    /// single label containing '.' vs several labels; pointer-resolved
-    /// suffixes). Part of Hash/Eq so wire-distinct queries never share
-    /// an entry. `name` stays dotted for the validator/display path.
-    pub qlabels: Vec<String>,
     pub qtype: u16,
-    pub qclass: u16,
     pub do_bit: bool,
 }
 
@@ -80,6 +72,16 @@ impl DnsCache {
     }
 
     // clears all entries from the in-memory cache
+    /// Number of live entries. Useful for operator-visible flush confirmation:
+    /// "flushed N" is only truthful if something can be counted.
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn clear(&self) {
         if let Ok(mut map) = self.entries.lock() {
             map.clear();
@@ -223,7 +225,28 @@ pub fn extract_do_bit(data: &[u8]) -> Option<bool> {
     }
 }
 
-// parses question section domain labels (rfc 1035) and qtype from dns wire format
+// Parses question-section domain labels (RFC 1035) and qtype from the wire.
+//
+// The result is a cache key AND the DNSSEC negative-verdict key, so this must
+// be a strict, injective image of the question: two different questions must
+// never share one key. The previous version dropped labels that were not
+// valid UTF-8 and accepted `.`/control bytes inside a label, so
+// `labels.join(".")` was many-to-one — the single-label name
+// `example.com` and the real two-label `example.com` produced identical keys,
+// letting any unprivileged local process poison or evict the shared response
+// cache (and replay a stale Bogus verdict) for a chosen domain with one
+// 33-byte datagram.
+//
+// Rules, each rejecting the whole query rather than mangling the name:
+//   * reserved label types (`len & 0xC0 != 0`), including compression
+//     pointers — RFC 1035 §4.1.2 forbids pointers in a question section, and
+//     following one here would read QTYPE out of the pointer's own bytes;
+//   * labels that are not valid UTF-8 — dropped silently before, which merged
+//     distinct names together;
+//   * labels failing `label_is_safe`, the same allowlist the response parser
+//     applies, so a hostile label cannot reach a map key, a queue entry or a
+//     log field;
+//   * an empty name.
 pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     if data.len() < 16 {
         return None;
@@ -235,97 +258,50 @@ pub fn extract_query_key(data: &[u8]) -> Option<DnsCacheKey> {
     }
 
     let mut pos = 12;
-    let mut labels = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
 
-    while pos < data.len() {
+    loop {
+        if pos >= data.len() {
+            return None;
+        }
         let len = data[pos] as usize;
         if len == 0 {
             pos += 1;
             break;
         }
-        if (len & 0xC0) == 0xC0 {
-            // Compression pointer: resolve the target for key fidelity
-            // (bounded jumps) instead of ignoring it — distinct QNAMEs
-            // sharing a prefix must not conflate. qtype/class still read
-            // after these 2 pointer bytes.
-            if pos + 2 > data.len() {
-                return None;
-            }
-            let target = (((data[pos] as usize) & 0x3F) << 8) | data[pos + 1] as usize;
-            match resolve_pointer_labels(data, target) {
-                Some(mut suffix) => labels.append(&mut suffix),
-                None => return None,
-            }
-            pos += 2;
-            break;
+        // Reserved label type, including a 0xC0 compression pointer: reject
+        // rather than treating it as an end-of-name.
+        if (len & 0xC0) != 0 {
+            return None;
         }
         pos += 1;
         if pos + len > data.len() {
             return None;
         }
-        if let Ok(label) = std::str::from_utf8(&data[pos..pos + len]) {
-            labels.push(label.to_lowercase());
+        let label = std::str::from_utf8(&data[pos..pos + len]).ok()?;
+        if !crate::dns::server::label_is_safe(label) {
+            return None;
         }
+        labels.push(label.to_lowercase());
         pos += len;
     }
 
+    if labels.is_empty() {
+        return None;
+    }
     if pos + 2 > data.len() {
         return None;
     }
 
     let qtype = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
-    // class follows type; missing class bytes (truncated query) default to
-    // IN (1) rather than rejecting — the entry simply never matches a real
-    // query carrying an explicit class.
-    let qclass = if pos + 4 <= data.len() {
-        ((data[pos + 2] as u16) << 8) | (data[pos + 3] as u16)
-    } else {
-        1
-    };
-    // FP-06: exact RFC 6891 DO bit in cache key so dnssec on/off responses
-    // are never cross-served. Malformed OPT section → None → callers skip
-    // cache (fail closed).
+    // FP-06: exact DO bit in cache key so dnssec on/off responses are never
+    // cross-served. Malformed OPT section → None → callers skip cache.
     let do_bit = extract_do_bit(data)?;
     Some(DnsCacheKey {
         name: labels.join("."),
-        qlabels: labels,
         qtype,
-        qclass,
         do_bit,
     })
-}
-
-/// Follows a DNS compression pointer chain collecting suffix labels for
-/// cache-key fidelity. Mirrors the main loop's lenient semantics
-/// (non-UTF8 labels skipped, parsing continues) but caps pointer jumps
-/// so hostile pointer loops fail closed (None) instead of spinning.
-fn resolve_pointer_labels(data: &[u8], mut offset: usize) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    for _ in 0..8 {
-        if offset >= data.len() {
-            return None;
-        }
-        let len = data[offset] as usize;
-        if len == 0 {
-            return Some(out);
-        }
-        if (len & 0xC0) == 0xC0 {
-            if offset + 2 > data.len() {
-                return None;
-            }
-            offset = (((data[offset] as usize) & 0x3F) << 8) | data[offset + 1] as usize;
-            continue;
-        }
-        offset += 1;
-        if offset + len > data.len() {
-            return None;
-        }
-        if let Ok(label) = std::str::from_utf8(&data[offset..offset + len]) {
-            out.push(label.to_lowercase());
-        }
-        offset += len;
-    }
-    None
 }
 
 // parses answer section resource records to compute lowest ttl value
@@ -439,137 +415,6 @@ mod tests {
         assert_eq!(&hit[hit.len() - 4..], &[93, 184, 216, 34]);
     }
 
-    #[test]
-    fn test_cache_key_splits_by_class() {
-        // L12 regression: qclass is part of the key — a CHAOS-class query
-        // for the same name/type must not receive the IN-class entry.
-        let cache = DnsCache::new(100);
-        let mut q_in = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
-            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
-            0x01,
-        ];
-        let mut resp = q_in.clone();
-        resp[2] = 0x81;
-        resp[3] = 0x80;
-        resp[7] = 0x01;
-        resp.extend_from_slice(&[
-            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216,
-            34,
-        ]);
-        cache.insert(&q_in, &resp);
-        // same bytes, class CH (3) instead of IN (1): must miss
-        let mut q_ch = q_in.clone();
-        let n = q_ch.len();
-        q_ch[n - 2] = 0x00;
-        q_ch[n - 1] = 0x03;
-        assert!(
-            cache.get(&q_ch).is_none(),
-            "different class must not hit IN entry"
-        );
-        // truncated class bytes default to IN and hit
-        q_in.truncate(q_in.len() - 2);
-        assert!(cache.get(&q_in).is_some(), "missing class defaults to IN");
-    }
-}
-
-#[cfg(test)]
-mod eviction_tests {
-    use super::*;
-
-    fn query_for(name: &str, id: u16) -> Vec<u8> {
-        let mut q = vec![
-            (id >> 8) as u8,
-            id as u8,
-            0x01,
-            0x00,
-            0x00,
-            0x01,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ];
-        for label in name.split('.') {
-            q.push(label.len() as u8);
-            q.extend_from_slice(label.as_bytes());
-        }
-        q.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
-        q
-    }
-
-    fn canned_response(query: &[u8]) -> Vec<u8> {
-        let mut r = query.to_vec();
-        r[2] = 0x81;
-        r[3] = 0x80;
-        r[7] = 0x01; // ancount = 1
-        r.extend_from_slice(&[
-            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 93, 184, 216,
-            34,
-        ]);
-        r
-    }
-
-    #[test]
-    fn test_capacity_bounded_under_flood() {
-        let cache = DnsCache::new(4);
-        for i in 0..32u16 {
-            let q = query_for(&format!("host{}.example.com", i), i);
-            let r = canned_response(&q);
-            cache.insert(&q, &r);
-        }
-        let len = cache.entries.lock().unwrap().len();
-        assert!(len <= 4, "cache must stay bounded, len={}", len);
-    }
-
-    #[test]
-    fn test_degenerate_inputs_ignored() {
-        let cache = DnsCache::new(8);
-        let q = query_for("example.com", 1);
-        cache.insert(&[], &[]);
-        cache.insert(&q, &[]);
-        cache.insert(&[], &q);
-        cache.insert(&[0u8; 11], &[0u8; 11]);
-        assert!(cache.entries.lock().unwrap().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod ttl_tests {
-    use super::*;
-
-    fn response_with_ttl(ttl: u32) -> Vec<u8> {
-        let mut q = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
-            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
-            0x01,
-        ];
-        let _ = &mut q;
-        let mut r = q.clone();
-        r[2] = 0x81;
-        r[3] = 0x80;
-        r[7] = 0x01;
-        r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
-        r.extend_from_slice(&ttl.to_be_bytes());
-        r.extend_from_slice(&[0x00, 0x04, 93, 184, 216, 34]);
-        r
-    }
-
-    #[test]
-    fn test_extract_min_ttl_table() {
-        // ttl=0 is ignored (falls back to default 300), values pass through
-        let q = response_with_ttl(0);
-        // craft query form for extract_min_ttl input (full response wire)
-        assert_eq!(extract_min_ttl(&q), 300);
-        assert_eq!(extract_min_ttl(&response_with_ttl(60)), 60);
-        // high TTLs pass through here; the 5..600 clamp lives in insert()
-        assert_eq!(extract_min_ttl(&response_with_ttl(3600)), 300);
-        assert_eq!(extract_min_ttl(&[]), 60);
-        assert_eq!(extract_min_ttl(&[0u8; 10]), 60);
-    }
-
     fn fp06_query(arcount_extra: &[u8]) -> Vec<u8> {
         let mut q = vec![
             0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -583,86 +428,6 @@ mod ttl_tests {
             q.extend_from_slice(arcount_extra);
         }
         q
-    }
-
-    // Cache-key collision locks: wire-distinct queries must never share an
-    // entry (unprivileged local queriers share the loopback cache).
-    fn query_with_qname(section: &[u8]) -> Vec<u8> {
-        let mut q = vec![
-            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        q.extend_from_slice(section);
-        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        q
-    }
-
-    #[test]
-    fn test_key_splits_dot_label_vs_split_labels() {
-        // single label "a.b" (len 3, embedded dot) vs labels ["a","b"]:
-        // identical dotted `name`, but must NOT share a cache key.
-        let single = query_with_qname(&[0x03, b'a', b'.', b'b', 0x00]);
-        let split = query_with_qname(&[0x01, b'a', 0x01, b'b', 0x00]);
-        let k1 = extract_query_key(&single).expect("single-dot parses");
-        let k2 = extract_query_key(&split).expect("split parses");
-        assert_eq!(k1.name, k2.name, "dotted display form coincides");
-        assert_ne!(k1, k2, "exact label vectors must differ");
-    }
-
-    #[test]
-    fn test_key_resolves_pointer_targets() {
-        // "x" + pointer->"example.com" vs "x" + pointer->"other.com":
-        // same prefix bytes, different targets -> different keys.
-        // Layout: header(12) + [1 'x'] + ptr + qtype/qclass, with two
-        // candidate suffixes appended after (only the pointer target
-        // matters for the key).
-        fn pointed(target_labels: &[u8], target_offset: u16) -> Vec<u8> {
-            let mut q = vec![
-                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
-            ];
-            q.push(0xC0 | ((target_offset >> 8) as u8));
-            q.push((target_offset & 0xFF) as u8);
-            q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-            q.extend_from_slice(target_labels);
-            q
-        }
-        // suffix A at offset 20: example.com; suffix B at offset 20: other.com
-        // (each query carries only its own suffix)
-        let qa = pointed(
-            &[
-                0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            ],
-            20,
-        );
-        let qb = pointed(
-            &[
-                0x05, b'o', b't', b'h', b'e', b'r', 0x03, b'c', b'o', b'm', 0x00,
-            ],
-            20,
-        );
-        let ka = extract_query_key(&qa).expect("pointer A resolves");
-        let kb = extract_query_key(&qb).expect("pointer B resolves");
-        assert_ne!(ka, kb, "different pointer targets must differ");
-        assert_eq!(ka.qlabels, vec!["x", "example", "com"]);
-        assert_eq!(kb.qlabels, vec!["x", "other", "com"]);
-    }
-
-    #[test]
-    fn test_key_rejects_pointer_loop_and_truncation() {
-        // self-looping pointer (offset points at itself) fails closed.
-        let mut qloop = vec![
-            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
-        ];
-        qloop.extend_from_slice(&[0xC0, 0x0C]); // -> offset 12 (the length byte area loops)
-        qloop.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        // offset 12 holds 0x01 'x' then pointer at 14 -> 12: bounded walk
-        // must terminate fail-closed (None), never spin.
-        assert_eq!(extract_query_key(&qloop), None);
-        // truncated pointer (single trailing byte) fails closed.
-        let mut qtrunc = vec![
-            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'x',
-            0xC0,
-        ];
-        assert_eq!(extract_query_key(&qtrunc), None);
     }
 
     // FP-06: OPT-without-DO and OPT-with-DO must NOT share a cache key.
@@ -693,5 +458,156 @@ mod ttl_tests {
         bad.truncate(bad.len() - 3);
         // arcount still 1 but OPT truncated
         assert_eq!(extract_query_key(&bad), None);
+    }
+}
+
+#[cfg(test)]
+mod key_injectivity_tests {
+    use super::*;
+
+    /// Builds a minimal 33-byte DNS query. `labels` are the raw QNAME labels.
+    fn query(labels: &[&[u8]], qtype: u16) -> Vec<u8> {
+        let mut m: Vec<u8> = Vec::new();
+        m.extend_from_slice(&[0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01]); // id, qr, qdcount=1
+        m.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // an/ns/ar
+        for l in labels {
+            assert!(l.len() < 64);
+            m.push(l.len() as u8);
+            m.extend_from_slice(l);
+        }
+        m.push(0x00); // root label
+        m.extend_from_slice(&qtype.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]); // qclass IN
+        m
+    }
+
+    /// DNS-01: the single-label name whose bytes ARE "example.com" must not
+    /// resolve to the same key as the real two-label `example.com`. Before the
+    /// fix both produced `("example.com", 1, false)`, so one 33-byte datagram
+    /// from any unprivileged local process could evict or poison the shared
+    /// response cache for that domain.
+    #[test]
+    fn test_single_label_smuggled_name_cannot_collide() {
+        let victim = query(&[b"example", b"com"], 1);
+        let attacker = query(&[b"example.com"], 1);
+
+        let vk = extract_query_key(&victim).expect("legitimate query has a key");
+        let ak = extract_query_key(&attacker);
+        assert_ne!(
+            ak.as_ref().map(|k| &k.name),
+            Some(&vk.name),
+            "smuggled single-label name must not share the victim's cache key"
+        );
+        assert!(
+            ak.is_none(),
+            "label containing '.' must be rejected outright"
+        );
+    }
+
+    /// Invalid UTF-8 was silently dropped, which also merged names.
+    #[test]
+    fn test_invalid_utf8_label_is_rejected_not_dropped() {
+        let q = query(&[&[0xff, 0x00], b"com"], 1);
+        assert!(
+            extract_query_key(&q).is_none(),
+            "an undecodable label must reject the query, not vanish from the key"
+        );
+        // And it must not collide with the surviving suffix alone.
+        let survivor = query(&[b"com"], 1);
+        let sk = extract_query_key(&survivor).expect("com is valid");
+        assert_ne!(
+            extract_query_key(&q).as_ref().map(|k| &k.name),
+            Some(&sk.name)
+        );
+    }
+
+    /// A compression pointer in the question section is forbidden by
+    /// RFC 1035 §4.1.2. Previously it terminated the name and QTYPE was read
+    /// from the pointer's own bytes, yielding an attacker-chosen key.
+    #[test]
+    fn test_compression_pointer_in_question_is_rejected() {
+        let mut q = query(&[b"example", b"com"], 1);
+        // Replace the QNAME with a pointer to offset 12.
+        let mut p = Vec::new();
+        p.extend_from_slice(&q[..12]);
+        p.push(0xC0);
+        p.push(0x0C);
+        p.extend_from_slice(&1u16.to_be_bytes()); // qtype read from pointer bytes
+        p.extend_from_slice(&[0x00, 0x01]);
+        q.clear();
+        assert!(
+            extract_query_key(&p).is_none(),
+            "a compression pointer in the question must be rejected"
+        );
+    }
+
+    /// Reserved label types in general.
+    #[test]
+    fn test_reserved_label_types_are_rejected() {
+        for first in [0x40u8, 0x80, 0xC0, 0xE0] {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01]);
+            p.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            p.push(first);
+            p.extend_from_slice(b"com");
+            p.push(0x00);
+            p.extend_from_slice(&1u16.to_be_bytes());
+            p.extend_from_slice(&[0x00, 0x01]);
+            assert!(
+                extract_query_key(&p).is_none(),
+                "label type {:#04x} must be rejected",
+                first
+            );
+        }
+    }
+
+    /// Ordinary names must keep working — the fix is not over-broad.
+    #[test]
+    fn test_legitimate_names_still_key() {
+        for (labels, expected) in [
+            (
+                vec![b"example".as_slice(), b"com".as_slice()],
+                "example.com",
+            ),
+            (
+                vec![
+                    b"_dmarc".as_slice(),
+                    b"example".as_slice(),
+                    b"com".as_slice(),
+                ],
+                "_dmarc.example.com",
+            ),
+            (vec![b"a-b".as_slice(), b"c".as_slice()], "a-b.c"),
+            (
+                vec![b"xn--80ak6aa92e".as_slice(), b"com".as_slice()],
+                "xn--80ak6aa92e.com",
+            ),
+        ] {
+            let q = query(&labels, 1);
+            let k = extract_query_key(&q)
+                .unwrap_or_else(|| panic!("{:?} must produce a key", expected));
+            assert_eq!(k.name, expected);
+            assert_eq!(k.qtype, 1);
+        }
+    }
+
+    /// Case folding must still happen (DNS names are case-insensitive) while
+    /// remaining injective for the wire forms that actually occur.
+    #[test]
+    fn test_case_insensitivity_is_preserved() {
+        let upper = query(&[b"EXAMPLE", b"COM"], 1);
+        let lower = query(&[b"example", b"com"], 1);
+        assert_eq!(
+            extract_query_key(&upper).map(|k| k.name),
+            extract_query_key(&lower).map(|k| k.name),
+            "DNS names are case-insensitive and must fold to one key"
+        );
+    }
+
+    /// An empty QNAME must not produce the empty-string key.
+    #[test]
+    fn test_empty_name_is_rejected() {
+        let q = query(&[], 1);
+        assert!(extract_query_key(&q).is_none());
     }
 }

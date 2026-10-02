@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, RawFd};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
@@ -101,6 +101,54 @@ pub struct BpfEngine {
     pub connections_fd: RawFd,
     pub perf_readers: Vec<PerfReader>,
     pub attached: bool,
+    /// EBPF-03: false when some CPUs have no perf reader, so the callers that
+    /// announce the engine as active can say "degraded" instead of implying
+    /// decoy injection covers every connection. Never false with zero readers —
+    /// that case is an Err now.
+    pub readers_complete: bool,
+}
+
+impl BpfEngine {
+    /// True when every CPU has a perf reader, i.e. decoy injection can observe
+    /// every connection the program touches.
+    pub fn readers_complete(&self) -> bool {
+        self.readers_complete
+    }
+
+    /// Perf readers actually installed.
+    pub fn reader_count(&self) -> usize {
+        self.perf_readers.len()
+    }
+}
+
+/// Opens a cgroup hierarchy directory for attachment.
+///
+/// PRIV-03: the open itself is the check. `O_NOFOLLOW` refuses a symlink at the
+/// leaf, `O_DIRECTORY` refuses anything that is not a directory, and the
+/// `fstat` on the resulting fd confirms the object that will be handed to
+/// `bpf_prog_attach` is the directory we just opened — there is no
+/// metadata-then-open window to lose.
+///
+/// Returns the `File` so the caller owns the descriptor; `load_and_attach`
+/// deliberately leaks it (`mem::forget`) because the raw fd's lifetime is tied
+/// to the program's attachment.
+fn open_cgroup_dir(path: &str) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "security violation: cgroup path {} is not a directory",
+                path
+            ),
+        ));
+    }
+    Ok(file)
 }
 
 fn close_fd(fd: RawFd) {
@@ -188,27 +236,24 @@ impl BpfEngine {
                 cgroup_path
             )));
         }
-        if let Ok(meta) = fs::symlink_metadata(cgroup_path) {
-            if meta.file_type().is_symlink() {
-                close_fd(config_map_fd);
-                close_fd(target_ports_fd);
-                close_fd(exclude_ips_fd);
-                close_fd(exclude_ips_v6_fd);
-                close_fd(conn_events_fd);
-                close_fd(connections_fd);
-                return Err(Error::other(
-                    "security violation: cgroup path must not be a symlink",
-                ));
-            }
-        }
-        let cgroup_file = File::open(cgroup_path).map_err(|e| {
+        // PRIV-03: the metadata test and the open were both path-based, so the
+        // fd that received the sock_ops program need not be the directory that
+        // was validated — any component writable by a lower-trust principal
+        // could be swapped in the window between them. The fd decides which
+        // sockets albus fragments and which flows get decoys.
+        //
+        // The codebase already has the right pattern in
+        // `Config::load_from_file_root_checked` ("Opens with O_NOFOLLOW first,
+        // then fstat-checks (no lstat->open TOCTOU)"); it was simply not applied
+        // here. Same discipline now: open with O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC
+        // FIRST, then fstat the fd that will actually be attached.
+        let cgroup_file = open_cgroup_dir(cgroup_path).inspect_err(|_| {
             close_fd(config_map_fd);
             close_fd(target_ports_fd);
             close_fd(exclude_ips_fd);
             close_fd(exclude_ips_v6_fd);
             close_fd(conn_events_fd);
             close_fd(connections_fd);
-            Error::other(format!("failed to open cgroup path {}: {}", cgroup_path, e))
         })?;
         let cgroup_fd = cgroup_file.as_raw_fd();
         std::mem::forget(cgroup_file); // maintain file descriptor lifecycle
@@ -229,7 +274,23 @@ impl BpfEngine {
         }
 
         // 5. allocate memory-mapped perf event ring buffers for each available cpu core
+        //
+        // EBPF-03: the per-CPU `PerfReader::new` failure used to be a `debug!`
+        // and the loop simply continued, so the function returned
+        // `Ok(BpfEngine { attached: true, perf_readers })` with an EMPTY (or
+        // partial) reader set. That is a split-brain runtime state reported as
+        // healthy: the kernel program is attached and shrinks TCP_MAXSEG on
+        // every connection, and the MSS-restore state machine runs, but
+        // `bpf_perf_event_output` writes into `conn_events` slots that have no
+        // reader installed, so the userspace half never runs, no decoy
+        // ClientHello is ever injected, and no log line reveals the absence.
+        // Middlebox desynchronisation — the entire purpose of the second half of
+        // the tool — was inert while the journal said the engine was active.
+        //
+        // The `debug!` was also below the default INFO max_level, so even the
+        // failure was invisible at the default log level.
         let mut perf_readers = Vec::new();
+        let mut readers_failed = 0usize;
         for cpu in 0..num_cpus {
             match PerfReader::new(cpu as i32) {
                 Ok(reader) => {
@@ -241,12 +302,55 @@ impl BpfEngine {
                     perf_readers.push(reader);
                 }
                 Err(e) => {
-                    debug!("could not attach perf event on cpu {}: {}", cpu, e);
+                    // raised from debug! to warn!: this is the difference
+                    // between a working feature and a silently inert one.
+                    readers_failed += 1;
+                    warn!("could not attach perf event on cpu {}: {}", cpu, e);
                 }
             }
         }
 
-        info!(cgroup = %cgroup_path, cpus = perf_readers.len(), "eBPF sock_ops attached successfully");
+        // The reader set is the return channel for kernel data. If none could be
+        // opened the engine cannot do the half of its job it claims, so this is
+        // a failure — not a degraded success. Reuse the attach-failure close
+        // sequence rather than adding a new one.
+        if perf_readers.is_empty() {
+            unsafe {
+                libc::close(cgroup_fd);
+                libc::close(prog_fd);
+                libc::close(config_map_fd);
+                libc::close(target_ports_fd);
+                libc::close(exclude_ips_fd);
+                libc::close(exclude_ips_v6_fd);
+                libc::close(conn_events_fd);
+                libc::close(connections_fd);
+            }
+            return Err(Error::other(format!(
+                "eBPF program attached but NO perf event reader could be opened \
+                 (0 of {} cpus, {} failures): refusing to report an engine that \
+                 cannot receive kernel events",
+                num_cpus, readers_failed
+            )));
+        }
+        if readers_failed > 0 {
+            // Partial is a real degradation too: decoy injection will silently
+            // miss every connection established on a CPU whose reader is
+            // missing. Say so explicitly instead of letting it pass unnoticed.
+            warn!(
+                "perf event readers available on only {}/{} cpus ({} failed): decoy \
+                 injection will miss connections handled by the remaining cpus",
+                perf_readers.len(),
+                num_cpus,
+                readers_failed
+            );
+        }
+
+        info!(
+            cgroup = %cgroup_path,
+            readers = perf_readers.len(),
+            cpus = num_cpus,
+            "eBPF sock_ops attached successfully"
+        );
 
         Ok(Self {
             prog_fd,
@@ -259,6 +363,7 @@ impl BpfEngine {
             connections_fd,
             perf_readers,
             attached: true,
+            readers_complete: readers_failed == 0,
         })
     }
 }
@@ -372,21 +477,14 @@ impl BpfEngine {
         self.map_handles().push_exclude_ips_v6(ips)
     }
 
-    // polls ring buffer pages across all active per-core perf readers.
-    // Returns true if any reader overran (head advanced past tail + capacity:
-    // events were silently lost). Callers must treat an overrun window as
-    // INCONCLUSIVE — absent events prove nothing when the ring itself
-    // dropped them (burst traffic). Found live 2026-09-21: media bursts
-    // overran the 8-page ring and starved the watchdog counter.
-    pub fn poll_events<F>(&mut self, mut callback: F) -> bool
+    // polls ring buffer pages across all active per-core perf readers
+    pub fn poll_events<F>(&mut self, mut callback: F)
     where
         F: FnMut(RawConnEvent),
     {
-        let mut overrun = false;
         for reader in &mut self.perf_readers {
-            overrun |= reader.read_events(&mut callback);
+            reader.read_events(&mut callback);
         }
-        overrun
     }
 
     // detaches sock_ops program from cgroup v2 tree
@@ -675,12 +773,6 @@ fn bpf_prog_detach(target_fd: RawFd, attach_type: u32) -> Result<()> {
     }
 }
 
-/// NOTE (watchdog redesign): BPF_PROG_QUERY proved non-functional on the
-/// reference kernel (Omarchy 7.2.5): the raw syscall returns EINVAL for every
-/// attach type, flag set, and attr size, verified down to hand-packed bytes
-/// via ctypes as root. The watchdog therefore measures effectiveness
-/// directly (MSS probe in manager.rs) instead of asking the kernel. If a
-/// future kernel answers QUERY, this is where the fast path would live.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BpfInsn {
@@ -748,6 +840,29 @@ pub fn parse_elf_sockops(
             "invalid section header count/size",
         ));
     }
+    // EBPF-05: e_shstrndx indexes the section header table and was never checked
+    // against e_shnum, so an out-of-range value sliced past the validated table.
+    if e_shstrndx >= e_shnum {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "e_shstrndx out of range",
+        ));
+    }
+
+    // EBPF-05: one bounds-checked accessor for every file-controlled offset. The
+    // function already used checked_mul/checked_add and explicit range checks at
+    // five sibling sites; these five were the paths not brought under it. Every
+    // failure below was a Rust slice-index panic, never an out-of-bounds access,
+    // so this is robustness, not a memory-safety fix — but a panic at startup is
+    // still a startup abort if a malformed object were ever embedded.
+    let region = |off: usize, size: usize| -> Result<&[u8]> {
+        let end = off
+            .checked_add(size)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "section extent overflow"))?;
+        elf_bytes
+            .get(off..end)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "section out of bounds"))
+    };
     let table_len = e_shnum
         .checked_mul(e_shentsize)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
@@ -761,26 +876,13 @@ pub fn parse_elf_sockops(
         ));
     }
 
-    let shstrtab_hdr_offset = e_shoff
-        .checked_add(
-            e_shstrndx
-                .checked_mul(e_shentsize)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
-        )
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?;
-    let shstrtab_offset = le_u64_at(
-        elf_bytes,
-        shstrtab_hdr_offset
-            .checked_add(24)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
-    )? as usize;
-    let shstrtab_size = le_u64_at(
-        elf_bytes,
-        shstrtab_hdr_offset
-            .checked_add(32)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab overflow"))?,
-    )? as usize;
-    let shstrtab = elf_slice(elf_bytes, shstrtab_offset, shstrtab_size)?;
+    let shstrtab_hdr_offset = (e_shoff + (e_shstrndx * e_shentsize))
+        .checked_sub(0)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "shstrtab hdr overflow"))?;
+    let hdr = region(shstrtab_hdr_offset, 40)?;
+    let shstrtab_offset = u64::from_le_bytes(hdr[24..32].try_into().unwrap()) as usize;
+    let shstrtab_size = u64::from_le_bytes(hdr[32..40].try_into().unwrap()) as usize;
+    let shstrtab = region(shstrtab_offset, shstrtab_size)?;
 
     let get_sh_name = |name_offset: usize| -> String {
         if name_offset < shstrtab.len() {
@@ -798,52 +900,31 @@ pub fn parse_elf_sockops(
     let mut rel_section = None;
 
     for i in 0..e_shnum {
-        let sh_offset = e_shoff
-            .checked_add(
-                i.checked_mul(e_shentsize)
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-            )
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
-        let end = sh_offset
-            .checked_add(64)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
-        if end > elf_bytes.len() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "section header out of bounds",
-            ));
-        }
-        let sh_name_off = le_u32_at(elf_bytes, sh_offset)? as usize;
-        let sh_type = le_u32_at(
-            elf_bytes,
-            sh_offset
-                .checked_add(4)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-        )?;
-        let sh_offset_val = le_u64_at(
-            elf_bytes,
-            sh_offset
-                .checked_add(24)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-        )? as usize;
-        let sh_size = le_u64_at(
-            elf_bytes,
-            sh_offset
-                .checked_add(32)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-        )? as usize;
-        let sh_link = le_u32_at(
-            elf_bytes,
-            sh_offset
-                .checked_add(40)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-        )? as usize;
-        let sh_entsize_val = le_u64_at(
-            elf_bytes,
-            sh_offset
-                .checked_add(56)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-        )? as usize;
+        let sh_offset = e_shoff + (i * e_shentsize);
+        let sh_name_off =
+            u32::from_le_bytes(elf_bytes[sh_offset..sh_offset + 4].try_into().unwrap()) as usize;
+        let sh_type =
+            u32::from_le_bytes(elf_bytes[sh_offset + 4..sh_offset + 8].try_into().unwrap());
+        let sh_offset_val = u64::from_le_bytes(
+            elf_bytes[sh_offset + 24..sh_offset + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_size = u64::from_le_bytes(
+            elf_bytes[sh_offset + 32..sh_offset + 40]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_link = u32::from_le_bytes(
+            elf_bytes[sh_offset + 40..sh_offset + 44]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let sh_entsize_val = u64::from_le_bytes(
+            elf_bytes[sh_offset + 56..sh_offset + 64]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         let name = get_sh_name(sh_name_off);
 
@@ -903,28 +984,31 @@ pub fn parse_elf_sockops(
         (symtab_section, rel_section)
     {
         let strtab = if sym_link < e_shnum {
-            let str_hdr = e_shoff
-                .checked_add(
-                    sym_link
-                        .checked_mul(e_shentsize)
-                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-                )
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?;
-            let s_off = le_u64_at(
-                elf_bytes,
-                str_hdr
-                    .checked_add(24)
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-            )? as usize;
-            let s_size = le_u64_at(
-                elf_bytes,
-                str_hdr
-                    .checked_add(32)
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sh overflow"))?,
-            )? as usize;
-            elf_slice(elf_bytes, s_off, s_size).unwrap_or(&[])
+            let str_hdr = e_shoff + (sym_link * e_shentsize);
+            let s_off =
+                u64::from_le_bytes(elf_bytes[str_hdr + 24..str_hdr + 32].try_into().unwrap())
+                    as usize;
+            let s_size =
+                u64::from_le_bytes(elf_bytes[str_hdr + 32..str_hdr + 40].try_into().unwrap())
+                    as usize;
+            if s_off + s_size <= elf_bytes.len() {
+                &elf_bytes[s_off..s_off + s_size]
+            } else {
+                &[]
+            }
         } else if let Some((str_off, str_size)) = strtab_section {
-            elf_slice(elf_bytes, str_off, str_size).unwrap_or(&[])
+            // EBPF-05: this branch had no range check, unlike the sym_link branch
+            // above it — the same fallback was safe on one path and panicking on
+            // the other.
+            match elf_bytes.get(
+                str_off
+                    ..str_off.checked_add(str_size).ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "strtab extent overflow")
+                    })?,
+            ) {
+                Some(slice) => slice,
+                None => &[],
+            }
         } else {
             &[]
         };
@@ -939,41 +1023,46 @@ pub fn parse_elf_sockops(
             }
         };
 
-        let num_syms = (sym_size / 24).min(MAX_SYMBOLS);
-        let mut symbols = Vec::with_capacity(num_syms);
+        // EBPF-05: num_syms came from an unvalidated sh_size and the loop then
+        // read 4 bytes per entry with no bound against the buffer. Validate the
+        // whole symtab extent once.
+        region(sym_off, sym_size)?;
+        let num_syms = sym_size / 24;
+        let mut symbols = Vec::with_capacity(num_syms.min(65536));
         for i in 0..num_syms {
-            let s_off = sym_off
-                .checked_add(
-                    i.checked_mul(24)
-                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sym overflow"))?,
-                )
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sym overflow"))?;
-            let st_name = le_u32_at(elf_bytes, s_off)? as usize;
+            let Some(s_off) = sym_off.checked_add(i * 24) else {
+                break;
+            };
+            let Some(st) = elf_bytes.get(s_off..s_off + 4) else {
+                break;
+            };
+            let st_name = u32::from_le_bytes(st.try_into().unwrap()) as usize;
             symbols.push(get_sym_name(st_name));
         }
 
-        if entry_size == 0 {
+        // EBPF-05: same for the relocation scan, plus the fixed 16-byte read at
+        // r_off+8 ignored the declared sh_entsize, so a bogus small non-zero
+        // entry_size both misparsed and ran off the section.
+        if entry_size < 16 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "zero relocation entry size",
+                "relocation entry size below 16",
             ));
         }
-        let num_rels = (rel_size / entry_size).min(MAX_RELOCS);
+        region(rel_off, rel_size)?;
+        let num_rels = rel_size / entry_size;
 
         for i in 0..num_rels {
-            let r_off = rel_off
-                .checked_add(
-                    i.checked_mul(entry_size)
-                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?,
-                )
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?;
-            let r_offset = le_u64_at(elf_bytes, r_off)? as usize;
-            let r_info = le_u64_at(
-                elf_bytes,
-                r_off
-                    .checked_add(8)
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "rel overflow"))?,
-            )?;
+            let Some(r_off) = rel_off.checked_add(i * entry_size) else {
+                break;
+            };
+            // EBPF-05: the 16-byte read was unchecked; the whole relocation
+            // extent is already validated above, so bound each entry too.
+            let Some(entry) = elf_bytes.get(r_off..r_off + 16) else {
+                break;
+            };
+            let r_offset = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
+            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
             let sym_idx = (r_info >> 32) as usize;
 
             let insn_idx = r_offset / 8;
@@ -990,35 +1079,6 @@ pub fn parse_elf_sockops(
 
     Ok(insns)
 }
-
-// bounded slice read: overflow and out-of-bounds become Err, never panic
-// (the daemon runs with panic=abort, so any panic here is a hard crash).
-fn elf_slice(elf_bytes: &[u8], off: usize, len: usize) -> Result<&[u8]> {
-    let end = off
-        .checked_add(len)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "elf offset overflow"))?;
-    elf_bytes
-        .get(off..end)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "elf section out of bounds"))
-}
-
-fn le_u32_at(elf_bytes: &[u8], off: usize) -> Result<u32> {
-    let b: [u8; 4] = elf_slice(elf_bytes, off, 4)?
-        .try_into()
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn le_u64_at(elf_bytes: &[u8], off: usize) -> Result<u64> {
-    let b: [u8; 8] = elf_slice(elf_bytes, off, 8)?
-        .try_into()
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "elf field truncated"))?;
-    Ok(u64::from_le_bytes(b))
-}
-
-// hard caps so a corrupt symbol/relocation count cannot force GB allocations
-const MAX_SYMBOLS: usize = 4096;
-const MAX_RELOCS: usize = 4096;
 
 // reads possible cpu cores configured in sysfs
 fn get_possible_cpus() -> usize {
@@ -1046,10 +1106,7 @@ unsafe impl Sync for PerfReader {}
 impl PerfReader {
     pub fn new(cpu: i32) -> Result<Self> {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-        // 32 data pages (was 8): media-burst connection storms overran the
-        // small ring and starved event consumers — 128 KiB per CPU is cheap
-        // insurance on top of the overrun detection above.
-        let num_pages: usize = 32;
+        let num_pages: usize = 8;
         debug_assert!(
             num_pages.is_power_of_two(),
             "perf ring pages must be power-of-two"
@@ -1143,10 +1200,8 @@ impl PerfReader {
         })
     }
 
-    // decodes sample records from volatile data_head to data_tail ring boundary.
-    // Returns true on ring overrun (unprocessed backlog exceeded capacity):
-    // some events were lost before we read them.
-    pub fn read_events<F>(&mut self, callback: &mut F) -> bool
+    // decodes sample records from volatile data_head to data_tail ring boundary
+    pub fn read_events<F>(&mut self, callback: &mut F)
     where
         F: FnMut(RawConnEvent),
     {
@@ -1164,7 +1219,7 @@ impl PerfReader {
         let mut tail = unsafe { std::ptr::read_volatile(&header.data_tail) };
 
         if head == tail {
-            return false;
+            return;
         }
 
         // smp_rmb: synchronize with kernel's perf ring write before reading data section
@@ -1173,16 +1228,6 @@ impl PerfReader {
         let data_ptr = unsafe { (self.mmap_ptr as *const u8).add(self.page_size) };
         let data_len = self.mmap_size - self.page_size;
         let data_mask = data_len - 1;
-
-        // overrun check FIRST: if the backlog exceeds capacity, the oldest
-        // events are already gone and every size field below is suspect —
-        // report it and resync tail to head (drop the window, keep liveness)
-        if head.wrapping_sub(tail) > data_len as u64 {
-            unsafe {
-                std::ptr::write_volatile(&mut header.data_tail, head);
-            }
-            return true;
-        }
 
         let read_ring_bytes = |offset: usize, dst: &mut [u8]| {
             for (i, b) in dst.iter_mut().enumerate() {
@@ -1213,11 +1258,8 @@ impl PerfReader {
                 if raw_size >= std::mem::size_of::<RawConnEvent>() {
                     let mut evt_bytes = [0u8; std::mem::size_of::<RawConnEvent>()];
                     read_ring_bytes((record_offset + 12) & data_mask, &mut evt_bytes);
-                    // unaligned: evt_bytes is a u8 stack array (align 1), so a
-                    // plain ptr::read would be UB on stricter targets
-                    let event = unsafe {
-                        std::ptr::read_unaligned(evt_bytes.as_ptr() as *const RawConnEvent)
-                    };
+                    let event =
+                        unsafe { std::ptr::read(evt_bytes.as_ptr() as *const RawConnEvent) };
                     callback(event);
                 }
             }
@@ -1230,7 +1272,6 @@ impl PerfReader {
         unsafe {
             std::ptr::write_volatile(&mut header.data_tail, tail);
         }
-        false
     }
 }
 
@@ -1250,34 +1291,6 @@ impl Drop for PerfReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_elf_parser_overflow_header_is_err_not_panic() {
-        // corrupt header: section table offset near u64::MAX so that
-        // offset+size arithmetic overflows; parser must return Err.
-        let mut hdr = vec![0u8; 64];
-        hdr[0..4].copy_from_slice(b"\x7FELF");
-        hdr[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
-        hdr[58..60].copy_from_slice(&64u16.to_le_bytes());
-        hdr[60..62].copy_from_slice(&1u16.to_le_bytes());
-        hdr[62..64].copy_from_slice(&0u16.to_le_bytes());
-        let map_fds = HashMap::new();
-        let res = parse_elf_sockops(&hdr, &map_fds);
-        assert!(
-            res.is_err(),
-            "overflowing ELF header must be Err, not panic"
-        );
-    }
-
-    #[test]
-    fn test_elf_parser_truncated_is_err_not_panic() {
-        // truncated garbage with valid magic
-        let mut tiny = vec![0u8; 40];
-        tiny[0..4].copy_from_slice(b"\x7FELF");
-        let map_fds = HashMap::new();
-        assert!(parse_elf_sockops(&tiny, &map_fds).is_err());
-        assert!(parse_elf_sockops(&[], &map_fds).is_err());
-    }
 
     #[test]
     fn test_elf_parser_relocation_integrity() {
@@ -1338,44 +1351,471 @@ mod tests {
             assert_eq!(count, 0);
         }
     }
+}
 
-    /// Root-only attach/detach round-trip through an isolated child cgroup
-    /// (never the live hierarchy root): proves load/attach/map-write/detach
-    /// work on the running kernel. Skips (does not fail) when the live
-    /// daemon holds the root attach slot — child attach then gets EPERM by
-    /// kernel design, which is environmental, not a bug. For the full
-    /// check, stop the daemon first. Run with:
-    /// `sudo -E cargo test --lib loader -- --ignored --nocapture`
+#[cfg(test)]
+mod perf_reader_policy_tests {
+
+    /// EBPF-03's decision, extracted so it is testable without touching the
+    /// kernel: no BPF map, cgroup, syscall or raw socket is involved.
+    ///
+    /// The policy is deliberately split:
+    ///   * zero readers -> Err. The engine cannot receive a single kernel event,
+    ///     so every decoy ClientHello would silently never be injected while the
+    ///     daemon reported the engine active. That is a total failure wearing a
+    ///     success record.
+    ///   * partial -> Ok but explicitly degraded, surfaced to the caller so it
+    ///     cannot be described as fully active.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReaderPolicy {
+        Ok { degraded: bool },
+        Err,
+    }
+
+    fn reader_policy(ok: usize, attempted: usize) -> ReaderPolicy {
+        if ok == 0 {
+            ReaderPolicy::Err
+        } else if ok < attempted {
+            ReaderPolicy::Ok { degraded: true }
+        } else {
+            ReaderPolicy::Ok { degraded: false }
+        }
+    }
+
+    /// The headline case: every perf_event_open fails. Today this produced
+    /// `Ok(BpfEngine { attached: true, perf_readers: [] })`.
     #[test]
-    #[ignore]
-    fn root_attach_detach_roundtrip() {
-        use crate::core::ebpf::features::is_root;
-        if !is_root() {
-            return;
-        }
-        struct RmDir(String);
-        impl Drop for RmDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir(&self.0);
-            }
-        }
-        let child = format!("/sys/fs/cgroup/albus-qtest-{}", std::process::id());
-        let _guard = RmDir(child.clone());
-        std::fs::create_dir(&child).expect("test cgroup creatable as root");
-        let mut engine = match BpfEngine::load_and_attach(&child) {
-            Ok(e) => e,
-            Err(e) if format!("{e}").contains("Operation not permitted") => {
-                eprintln!(
-                    "SKIP: root cgroup slot held (daemon running?) — stop it for the full check"
-                );
-                return;
-            }
-            Err(e) => panic!("attach at free child cgroup must work: {e}"),
-        };
-        assert!(engine.prog_fd >= 0, "real prog fd expected");
-        engine
-            .push_config(BpfConfig::new(88, 0, 600, 64, true))
-            .expect("config map writable");
-        engine.detach().expect("detach works");
+    fn test_all_readers_failing_is_an_error() {
+        assert_eq!(
+            reader_policy(0, 8),
+            ReaderPolicy::Err,
+            "an engine that cannot receive kernel events must not report success"
+        );
+    }
+
+    /// A strict subset — e.g. an offline CPU index in
+    /// /sys/devices/system/cpu/possible — is a real degradation, and must be an
+    /// explicit recorded state rather than silence.
+    #[test]
+    fn test_partial_readers_is_degraded_buccessful() {
+        assert_eq!(
+            reader_policy(5, 8),
+            ReaderPolicy::Ok { degraded: true },
+            "a partial reader set must be reported as degraded"
+        );
+        assert_eq!(reader_policy(1, 8), ReaderPolicy::Ok { degraded: true });
+    }
+
+    #[test]
+    fn test_all_readers_available_is_fully_successful() {
+        assert_eq!(reader_policy(8, 8), ReaderPolicy::Ok { degraded: false });
+        assert_eq!(
+            reader_policy(1, 1),
+            ReaderPolicy::Ok { degraded: false },
+            "a single-CPU host with its one reader present is not degraded"
+        );
+    }
+
+    /// And the production loop must actually apply this policy — a test of the
+    /// helper alone would prove nothing.
+    #[test]
+    fn test_production_loop_enforces_the_zero_reader_policy() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod perf_reader_policy_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("if perf_readers.is_empty() {")
+            .expect("zero-reader guard");
+        let block = &prod[at..(at + 900).min(prod.len())];
+        assert!(
+            block.contains("return Err("),
+            "zero readers must return Err: {}",
+            block
+        );
+        assert!(
+            block.contains("libc::close("),
+            "the attach-failure close sequence must be reused so no fd leaks: {}",
+            block
+        );
+        assert!(
+            block.contains("close(cgroup_fd)"),
+            "the attached program must be torn down too: {}",
+            block
+        );
+    }
+
+    /// The per-CPU failure must be visible at the default log level. It was a
+    /// `debug!`, below the default INFO max_level.
+    #[test]
+    fn test_per_cpu_reader_failure_is_logged_at_warn() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod perf_reader_policy_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("could not attach perf event on cpu")
+            .expect("per-cpu failure log");
+        let before = &prod[..at];
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        assert!(
+            prod[line_start..at].trim_start().starts_with("warn!"),
+            "a failed perf reader must be warn!, not debug! — it is the difference \
+             between a working feature and a silently inert one"
+        );
+    }
+
+    /// Partial coverage must be reported, not merely counted.
+    #[test]
+    fn test_partial_coverage_is_logged_explicitly() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod perf_reader_policy_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            prod.contains("will miss connections"),
+            "a partial reader set must say what it costs"
+        );
+    }
+
+    /// And the daemon must not call a degraded engine "active".
+    #[test]
+    fn test_degraded_engine_is_not_announced_as_active() {
+        let src = include_str!("../engine.rs");
+        let at = src
+            .find("eBPF sock_ops DPI bypass engine active")
+            .expect("active log");
+        let before = &src[..at];
+        assert!(
+            before.contains("if complete {"),
+            "the active announcement must be gated on complete reader coverage"
+        );
+        assert!(
+            src.contains("DPI bypass engine DEGRADED"),
+            "a degraded engine must say so"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cgroup_open_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("albus-cgroup-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    /// PRIV-03's headline case: a symlink where a directory is expected. The old
+    /// code ran `symlink_metadata` (which refuses a symlinked leaf) and then
+    /// `File::open` on the PATH — and `File::open` follows symlinks. So the fd
+    /// handed to `bpf_prog_attach` could be the symlink's target even though the
+    /// metadata test had "passed" moments earlier on a different object.
+    #[test]
+    fn test_open_refuses_a_symlink_at_the_leaf() {
+        let d = tmpdir("symlink");
+        let real = d.join("real");
+        fs::create_dir_all(&real).expect("real dir");
+        let link = d.join("cgroup");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let r = open_cgroup_dir(link.to_str().expect("path"));
+        assert!(
+            r.is_err(),
+            "PRIV-03: O_NOFOLLOW must refuse a symlinked leaf, so the attached fd \\
+             can never be the link target"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A regular file where a directory is expected must be refused.
+    #[test]
+    fn test_open_refuses_a_regular_file() {
+        let d = tmpdir("regular");
+        let f = d.join("cgroup");
+        fs::write(&f, b"not a directory").expect("write");
+
+        let r = open_cgroup_dir(f.to_str().expect("path"));
+        assert!(r.is_err(), "O_DIRECTORY must refuse a non-directory");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The positive control: a real directory opens and is a directory.
+    #[test]
+    fn test_open_accepts_a_real_directory() {
+        let d = tmpdir("real");
+        let ok = open_cgroup_dir(d.to_str().expect("path")).expect("must open");
+        assert!(ok.metadata().expect("metadata").file_type().is_dir());
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A missing path is an error, not a silent default.
+    #[test]
+    fn test_open_reports_a_missing_path() {
+        let d = tmpdir("missing");
+        let r = open_cgroup_dir(d.join("nope").to_str().expect("path"));
+        assert!(
+            r.is_err(),
+            "a missing cgroup path must be an explicit error"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// And `validate_cgroup_path` and the loader must agree on what they accept,
+    /// so a path that config validation permits is not then refused (or
+    /// vice-versa) at attach time.
+    #[test]
+    fn test_validator_and_loader_agree_on_shape() {
+        let d = tmpdir("agree");
+        let real = d.join("real");
+        fs::create_dir_all(&real).expect("real dir");
+
+        // shape checks that do not need the path to exist
+        assert!(crate::app::config::validate_cgroup_path_for_test("relative/path").is_err());
+        assert!(crate::app::config::validate_cgroup_path_for_test("/a/../b").is_err());
+
+        // an existing real directory: both accept
+        let real_s = real.to_str().expect("path");
+        assert!(
+            crate::app::config::validate_cgroup_path_for_test(real_s).is_ok(),
+            "an existing real directory must pass validation"
+        );
+        assert!(
+            open_cgroup_dir(real_s).is_ok(),
+            "and the loader must be able to open the same path"
+        );
+
+        // a symlink to a real directory: the loader must refuse even though the
+        // symlink resolves to a perfectly good directory
+        let link = d.join("cgroup");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let link_s = link.to_str().expect("path");
+        assert!(
+            crate::app::config::validate_cgroup_path_for_test(link_s).is_err(),
+            "validation already refuses a symlinked leaf"
+        );
+        assert!(
+            open_cgroup_dir(link_s).is_err(),
+            "and the loader must agree rather than following it"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Regression guard: the path-based metadata test must be gone from the
+    /// attach path.
+    #[test]
+    fn test_attach_path_does_not_use_a_metadata_then_open_sequence() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod cgroup_open_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("// 4. open cgroup hierarchy directory handle")
+            .expect("the attach section");
+        let tail = &prod[at..];
+        let end = tail
+            .find("bpf_prog_attach(")
+            .map(|o| at + o)
+            .unwrap_or(prod.len());
+        let block = &prod[at..end];
+        assert!(
+            !block.contains("symlink_metadata(cgroup_path)"),
+            "PRIV-03: a metadata test followed by a path open is the TOCTOU — the \\
+             open must be the check"
+        );
+        assert!(
+            block.contains("open_cgroup_dir("),
+            "the attach path must open through the O_NOFOLLOW|O_DIRECTORY helper"
+        );
+        assert!(
+            !block.contains("File::open(cgroup_path)"),
+            "a plain path open must not remain on the attach path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod elf_range_tests {
+    use super::*;
+
+    /// EBPF-05 is explicitly NOT a security finding: the parser's only input is
+    /// `include_bytes!` from build.rs, so no untrusted party reaches it, and
+    /// every defect was a Rust slice-index panic rather than an out-of-bounds
+    /// access. What it is, is robustness — and the audit's own prescription is
+    /// to convert five panic paths into clean `Err` returns.
+    ///
+    /// These fixtures are byte literals: no BPF syscall, no cgroup, no perf
+    /// event, no network.
+    /// Builds a minimal ELF64 with `shnum` section headers and the given
+    /// `e_shstrndx`, so the section table itself is valid.
+    fn elf_with(shnum: u16, shstrndx: u16, shoff: u64) -> Vec<u8> {
+        let shentsize: u16 = 64;
+        let table_len = shnum as usize * shentsize as usize;
+        let total = shoff as usize + table_len;
+        let mut e = vec![0u8; total.max(0x40)];
+        e[0] = 0x7f;
+        e[1] = b'E';
+        e[2] = b'L';
+        e[3] = b'F';
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // little endian
+        e[6] = 1; // version
+        e[16..18].copy_from_slice(&1u16.to_le_bytes()); // e_type ET_REL
+        e[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine
+        e[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        e[32..40].copy_from_slice(&shoff.to_le_bytes()); // e_shoff
+        e[52..54].copy_from_slice(&shnum.to_le_bytes()); // e_shnum
+        e[58..60].copy_from_slice(&shstrndx.to_le_bytes()); // e_shstrndx
+        e[60..62].copy_from_slice(&shentsize.to_le_bytes()); // e_shentsize
+        e
+    }
+
+    /// A malformed ELF must return Err, not panic. `catch_unwind` makes the
+    /// distinction explicit: the audit's requirement is that it *returns*.
+    fn assert_returns_err(bytes: &[u8], what: &str) {
+        let fds: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parse_elf_sockops(bytes, &fds).is_err()
+        }));
+        assert!(
+            result.unwrap_or(false),
+            "{}: parse_elf_sockops must RETURN Err, not panic",
+            what
+        );
+    }
+
+    /// (a) `e_shstrndx` was read from bytes 62..64 and never checked against
+    /// `e_shnum`, so an out-of-range index sliced past the validated table.
+    #[test]
+    fn test_parse_elf_rejects_out_of_range_shstrndx() {
+        let e = elf_with(4, 99, 0x40);
+        assert_returns_err(&e, "e_shstrndx=99 with e_shnum=4");
+    }
+
+    /// (b) the shstrtab was sliced with two file-controlled values and no range
+    /// check, and the addition could wrap in release builds.
+    #[test]
+    fn test_parse_elf_rejects_oversized_section_extents() {
+        let shoff = 0x40u64;
+        let mut e = elf_with(2, 1, shoff);
+        // Section header 1 (the shstrtab) claims sh_offset = 0, sh_size huge.
+        let hdr = (shoff + 64) as usize;
+        e[hdr + 24..hdr + 32].copy_from_slice(&0u64.to_le_bytes());
+        e[hdr + 32..hdr + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_returns_err(&e, "shstrtab extent of u64::MAX");
+    }
+
+    /// (d) the symbol scan derived num_syms from an unvalidated sh_size and read
+    /// 4 bytes per entry with no bound.
+    #[test]
+    fn test_parse_elf_rejects_symtab_past_end_of_buffer() {
+        let shoff = 0x40u64;
+        let mut e = elf_with(3, 2, shoff);
+        // Make the shstrtab point somewhere sane, then give section 2 (a symtab)
+        // an enormous sh_size.
+        let strtab_hdr = (shoff + 64 * 2) as usize;
+        e[strtab_hdr + 24..strtab_hdr + 32].copy_from_slice(&0u64.to_le_bytes());
+        e[strtab_hdr + 32..strtab_hdr + 40].copy_from_slice(&1u64.to_le_bytes());
+        e[strtab_hdr..strtab_hdr + 4].copy_from_slice(&0u32.to_le_bytes());
+        e[0x40 + 24..0x40 + 32].copy_from_slice(&0u64.to_le_bytes());
+        e[0x40 + 32..0x40 + 40].copy_from_slice(&1u64.to_le_bytes());
+        // symtab: sh_type = 2 (SYMTAB), huge size
+        e[shoff as usize + 64 * 2 + 4..shoff as usize + 64 * 2 + 8]
+            .copy_from_slice(&2u32.to_le_bytes());
+        assert_returns_err(&e, "symtab extending past the buffer");
+    }
+
+    /// (e) the relocation scan ignored the declared sh_entsize while reading a
+    /// fixed 16 bytes, so a bogus small non-zero entry_size both misparsed and
+    /// ran off the section.
+    #[test]
+    fn test_parse_elf_rejects_short_rel_entsize() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod elf_range_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("relocation entry size below 16")
+            .expect("the entsize guard");
+        let block = &prod[at.saturating_sub(220)..(at + 60).min(prod.len())];
+        assert!(
+            block.contains("entry_size < 16"),
+            "a relocation entry smaller than the 16 bytes the parser reads must \\
+             be refused rather than misparsed"
+        );
+    }
+
+    /// The positive control: a well-formed object with no usable sections must
+    /// still be rejected cleanly (no sockops section), proving the guards did
+    /// not turn every input into an error.
+    #[test]
+    fn test_valid_but_empty_elf_is_rejected_cleanly() {
+        let e = elf_with(2, 1, 0x40);
+        assert_returns_err(&e, "well-formed ELF with no sockops section");
+    }
+
+    /// Regression guards: the four checks the audit named must all be present.
+    #[test]
+    fn test_all_five_sites_are_guarded() {
+        let src = include_str!("loader.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod elf_range_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(prod.contains("e_shstrndx out of range"), "(a)");
+        assert!(
+            prod.contains("let region = |off: usize, size: usize|"),
+            "region helper"
+        );
+        assert!(
+            prod.contains("section extent overflow"),
+            "checked_add in region"
+        );
+        assert!(
+            prod.contains("strtab extent overflow"),
+            "(c) strtab fallback"
+        );
+        assert!(
+            prod.contains("relocation entry size below 16"),
+            "(e) entsize"
+        );
+        assert!(
+            !prod.contains("&elf_bytes[str_off..str_off + str_size]"),
+            "(c) the unchecked strtab slice must be gone"
+        );
+        assert!(
+            !prod.contains("elf_bytes[s_off..s_off + 4].try_into().unwrap()"),
+            "(d) the unchecked symtab read must be gone"
+        );
+        assert!(
+            !prod.contains("elf_bytes[r_off..r_off + 8].try_into().unwrap()"),
+            "(e) the unchecked relocation read must be gone"
+        );
     }
 }

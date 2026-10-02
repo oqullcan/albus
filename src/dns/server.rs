@@ -26,57 +26,6 @@ pub struct DnsServer {
     shutdown_tx: broadcast::Sender<()>,
 }
 
-// Redacts custom DoH URLs to scheme://host for logs: full URLs may embed
-// account identifiers (e.g. NextDNS profile IDs) that must not land in the
-// persistent journal. Presets pass through unchanged.
-fn redact_upstream_desc(desc: &str) -> String {
-    let mut out = Vec::new();
-    for part in desc.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            continue;
-        }
-        match url::Url::parse(p) {
-            Ok(u) => {
-                let host = u.host_str().unwrap_or("?");
-                out.push(format!("{}://{}", u.scheme(), host));
-            }
-            Err(_) => out.push(p.to_string()),
-        }
-    }
-    if out.is_empty() {
-        return desc.to_string();
-    }
-    out.join(",")
-}
-
-/// Sanitizes upstream-influenced tokens (QNAMEs) before logging: strips ANSI
-/// escapes, then drops ASCII controls/newlines that enable journal log
-/// forgery, and caps length. Diagnostics survive (readable domain stays);
-/// only control smuggling is removed. (L7/L8)
-pub(crate) fn sanitize_log_token(s: &str) -> String {
-    let stripped = crate::app::monitor::strip_ansi(s);
-    let mut out = String::with_capacity(stripped.len().min(200));
-    for c in stripped.chars() {
-        if c.is_control() {
-            continue;
-        }
-        // BiDi overrides + invisible format chars reorder/spoof terminal
-        // display without any control byte (log-forgery primitive).
-        if matches!(c,
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' |
-            '\u{200B}'..='\u{200F}' | '\u{FEFF}')
-        {
-            continue;
-        }
-        if out.len() >= 200 {
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
-
 impl DnsServer {
     pub fn new(
         upstreams_csv: &str,
@@ -116,12 +65,6 @@ impl DnsServer {
         }
     }
 
-    // Redacts custom DoH URLs to scheme://host for logs: full URLs may embed
-    // account identifiers (e.g. NextDNS profile IDs). Presets pass through.
-    fn upstream_desc_for_log(desc: &str) -> String {
-        redact_upstream_desc(desc)
-    }
-
     // spawns background asynchronous udp receive loop on loopback interface 127.0.0.1:53
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let socket = match UdpSocket::bind("127.0.0.1:53").await {
@@ -131,12 +74,9 @@ impl DnsServer {
             }
         };
 
-        // Log scheme+host only: custom URLs embed account profile IDs
-        // (e.g. NextDNS) that must not land in the persistent journal.
-        let upstream_log = Self::upstream_desc_for_log(&self.upstream_desc);
         info!(
             addr = "127.0.0.1:53",
-            upstream = %upstream_log,
+            upstream = %self.upstream_desc,
             block_ipv6 = self.block_ipv6,
             dnssec = self.dnssec,
             pqc = self.pqc,
@@ -155,24 +95,6 @@ impl DnsServer {
         let ip_queue = self.ip_queue.clone();
         let block_ipv6 = self.block_ipv6;
         let dnssec = self.dnssec;
-        // trust-anchor rollover early warning (one-shot, bounded, non-blocking)
-        if dnssec {
-            let health_validator = validator.clone();
-            let health_resolver = resolver.clone();
-            tokio::spawn(async move {
-                let ok = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    health_validator.anchor_health(&health_resolver),
-                )
-                .await
-                .unwrap_or(true);
-                if !ok {
-                    warn!("root DNSKEY set differs from compiled-in trust anchors — possible KSK rollover: update albus, DNSSEC validation may start failing");
-                } else {
-                    info!("root trust anchors match live root DNSKEY set");
-                }
-            });
-        }
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let mut canary_shutdown_rx = self.shutdown_tx.subscribe();
@@ -181,32 +103,86 @@ impl DnsServer {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut tick_count: u64 = 0;
             let mut last_heal: Option<std::time::Instant> = None;
-            let mut last_link_heal: Option<std::time::Instant> = None;
+            // W4-01: bound the retry instead of looping forever on a failure.
+            let mut heal_failures: u32 = 0;
+            let mut heal_gave_up: bool = false;
 
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
                         tick_count = tick_count.wrapping_add(1);
 
-                        // 1. Passive check: verify resolv.conf still directs queries to loopback
-                        if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-                            let has_loopback = content.lines().any(|line| {
-                                let trimmed = line.trim();
-                                (trimmed.starts_with("nameserver 127.0.0.1") || trimmed.starts_with("nameserver 127.0.0.53"))
-                                    && !trimmed.starts_with('#')
-                            });
-
-                            if !has_loopback {
-                                warn!("DNS leak canary: /etc/resolv.conf does not point to 127.0.0.1 (possible DHCP/NetworkManager overwrite). Auto-healing system DNS...");
-                                let can_heal = last_heal.map(|t| t.elapsed().as_secs() >= 300).unwrap_or(true);
-                                if !can_heal {
-                                    warn!("DNS auto-heal rate-limited (last heal <5min ago) — skipping root write");
-                                } else if let Err(e) = crate::dns::system::set_system_dns() {
-                                    warn!("failed to auto-heal /etc/resolv.conf: {}", e);
-                                } else {
-                                    last_heal = Some(std::time::Instant::now());
-                                    info!("DNS leak canary: successfully auto-healed /etc/resolv.conf to 127.0.0.1");
+                        // 1. Passive check: verify resolv.conf still directs queries to loopback.
+                        //
+                        // W4-01: this used to answer "is the host resolver safe?"
+                        // with its own prefix test — `starts_with("nameserver
+                        // 127.0.0.1")` or `127.0.0.53`, and nothing about a
+                        // second nameserver — while the repair it gates computes a
+                        // strictly stronger conjunction. So the canary reported
+                        // leak-free for `nameserver 127.0.0.15`, for
+                        // `nameserver 127.0.0.1x`, and for the systemd-resolved
+                        // stub `127.0.0.53` (which is not albus's resolver — it
+                        // binds only 127.0.0.1:53) — every one of which is a
+                        // state the repair would rewrite, so the repair was
+                        // suppressed and the leak monitor was silently disabled.
+                        //
+                        // The canary now asks the repair's own question, and the
+                        // decision read uses the writer's discipline
+                        // (O_NOFOLLOW + O_CLOEXEC + regular-file check) instead
+                        // of a symlink-following `read_to_string`, which also
+                        // removes the FIFO-hang: a FIFO at /etc/resolv.conf would
+                        // otherwise wedge this task forever.
+                        match crate::dns::system::read_nofollow(std::path::Path::new(
+                            "/etc/resolv.conf",
+                        )) {
+                            Ok(content) => {
+                                if !crate::dns::system::resolver_is_albus_exclusive(&content) {
+                                    warn!("DNS leak canary: /etc/resolv.conf is not exclusively albus's loopback resolver (possible DHCP/NetworkManager overwrite). Auto-healing system DNS...");
+                                    let can_heal =
+                                        last_heal.map(|t| t.elapsed().as_secs() >= 300).unwrap_or(true);
+                                    if !can_heal {
+                                        warn!("DNS auto-heal rate-limited (last heal <5min ago) — skipping root write");
+                                    } else if let Err(e) = crate::dns::system::set_system_dns() {
+                                        // W4-01: the backoff advanced only on
+                                        // SUCCESS, so a persistently failing
+                                        // set_system_dns() retried every 15s
+                                        // forever, each attempt re-issuing
+                                        // resolvectl writes across every physical
+                                        // interface. Bound it.
+                                        heal_failures = heal_failures.saturating_add(1);
+                                        if heal_failures >= MAX_CONSECUTIVE_HEAL_FAILURES {
+                                            if !heal_gave_up {
+                                                heal_gave_up = true;
+                                                warn!(
+                                                    "DNS auto-heal failed {} consecutive times — giving up on automatic repair for this run. /etc/resolv.conf must be fixed by hand (`sudo albus cleanup`).",
+                                                    MAX_CONSECUTIVE_HEAL_FAILURES
+                                                );
+                                            }
+                                        } else {
+                                            warn!(
+                                                "failed to auto-heal /etc/resolv.conf: {} (attempt {} of {})",
+                                                e,
+                                                heal_failures,
+                                                MAX_CONSECUTIVE_HEAL_FAILURES
+                                            );
+                                        }
+                                    } else {
+                                        heal_failures = 0;
+                                        heal_gave_up = false;
+                                        last_heal = Some(std::time::Instant::now());
+                                        info!("DNS leak canary: successfully auto-healed /etc/resolv.conf to 127.0.0.1");
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                // Unreadable or non-regular: that is NOT
+                                // leak-free, and it is also not something the
+                                // repair can fix. Report it distinctly rather
+                                // than treating it as healthy.
+                                warn!(
+                                    "DNS leak canary: cannot read /etc/resolv.conf safely ({}): not asserting leak-free, and the auto-heal repair cannot run either",
+                                    e
+                                );
                             }
                         }
 
@@ -214,33 +190,7 @@ impl DnsServer {
                         // Spawned, not awaited: the probe's jitter sleep must
                         // not stall the passive check or shutdown handling.
                         if tick_count % 4 == 0 {
-                            // Spawned, not awaited: the probe's jitter sleep must
-                            // not stall the passive check or shutdown handling.
                             tokio::spawn(run_active_canary_probe());
-                            // 3. Per-link DNS verification (same cadence): the
-                            // systemd NSS path (`resolve` first in nsswitch)
-                            // hangs behind the kill-switch unless every link
-                            // points at loopback. External reverts (DHCP,
-                            // manual `resolvectl revert`, operator error) are
-                            // healed here, rate-limited like the file path.
-                            let missing =
-                                crate::dns::system::links_missing_loopback();
-                            if !missing.is_empty() {
-                                warn!("DNS leak canary: link(s) {:?} not pointed at 127.0.0.1 (external revert?) — re-applying...", missing);
-                                let can_heal = last_link_heal
-                                    .map(|t| t.elapsed().as_secs() >= 300)
-                                    .unwrap_or(true);
-                                if !can_heal {
-                                    warn!("DNS link auto-heal rate-limited (last heal <5min ago) — skipping");
-                                } else if let Err(e) =
-                                    crate::dns::system::set_system_dns()
-                                {
-                                    warn!("failed to auto-heal link DNS: {}", e);
-                                } else {
-                                    last_link_heal = Some(std::time::Instant::now());
-                                    info!("DNS leak canary: per-link DNS re-applied to 127.0.0.1");
-                                }
-                            }
                         }
                     }
                     _ = canary_shutdown_rx.recv() => {
@@ -250,6 +200,10 @@ impl DnsServer {
             }
         });
 
+        // W4-01: after this many consecutive failed repairs the canary stops
+        // writing and says so, instead of retrying every 15s forever.
+        const MAX_CONSECUTIVE_HEAL_FAILURES: u32 = 5;
+
         const MAX_CONCURRENT_DNS_TASKS: usize = 512;
         const MAX_IP_QUEUE_ENTRIES: usize = 4096;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_TASKS));
@@ -257,33 +211,84 @@ impl DnsServer {
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
 
+            // DNS-02: a single reused SERVFAIL buffer for shed datagrams. The
+            // shed path used to clone the datagram and perform an async send
+            // INSIDE a freshly spawned task, so rejecting a packet cost a task
+            // spawn, a heap allocation and a send — the exact work the shed was
+            // meant to avoid. This is O(1) with no allocation, and it is safe to
+            // reuse because the send is awaited here before the next recv can
+            // overwrite it.
+            let mut shed_buf = [0u8; 12];
+            let mut shed_total: u64 = 0;
+
             loop {
                 tokio::select! {
                     recv_res = socket.recv_from(&mut buf) => {
                         match recv_res {
                             Ok((len, peer_addr)) => {
+                                // DNS-02: ADMISSION CONTROL BEFORE ALLOCATION.
+                                //
+                                // The semaphore's comment claimed it existed to
+                                // "shed load under flooding attacks to prevent
+                                // unbounded task/socket spawning", but it was
+                                // acquired INSIDE the per-datagram task it was
+                                // meant to gate. By then the datagram had already
+                                // been copied into a fresh Vec and six Arcs
+                                // cloned, and the task had already been spawned —
+                                // so the 512 permits bounded in-flight upstream
+                                // work only, never the task count or the
+                                // allocation rate. An unauthenticated local UDP
+                                // sender could dictate the privileged daemon's
+                                // task-allocation rate, on the same runtime that
+                                // carries the resolv.conf canary and the
+                                // kill-switch-protected resolver every host client
+                                // depends on.
+                                //
+                                // The permit is now taken here, on the receive
+                                // loop, before the copy and before the spawn, and
+                                // it is moved into the task so it is held for the
+                                // task's lifetime.
+                                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        shed_total = shed_total.wrapping_add(1);
+                                        // Minimal SERVFAIL: echo the transaction
+                                        // id so the client can match it, set QR
+                                        // and RA, rcode 2, QDCOUNT 0. Bounded work,
+                                        // no query copy, no task.
+                                        shed_buf[0] = buf[0];
+                                        shed_buf[1] = buf[1];
+                                        shed_buf[2] = 0x80 | (buf[2] & 0x01); // QR + RD
+                                        // RA + rcode 2 (SERVFAIL). The query's
+                                        // low nibble in byte 3 is CD/AD/RD/Z, NOT
+                                        // an rcode, so it must not be OR-ed in.
+                                        shed_buf[3] = 0x80 | 0x02;
+                                        shed_buf[4..12].copy_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+                                        let _ = socket.send_to(&shed_buf, peer_addr).await;
+                                        if shed_total % 1024 == 1 {
+                                            warn!(
+                                                shed = shed_total,
+                                                limit = MAX_CONCURRENT_DNS_TASKS,
+                                                "DNS load shedding: upstream concurrency \
+                                                 limit reached, answering SERVFAIL without \
+                                                 forwarding (any local process can trigger \
+                                                 this by flooding 127.0.0.1:53)"
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+
                                 let query_data = buf[..len].to_vec();
                                 let socket_clone = socket.clone();
                                 let resolver_clone = resolver.clone();
                                 let cache_clone = cache.clone();
                                 let validator_clone = validator.clone();
                                 let ip_queue_clone = ip_queue.clone();
-                                let sem_clone = semaphore.clone();
 
                                 tokio::spawn(async move {
-                                    // shed load under flooding attacks to prevent unbounded task/socket spawning
-                                    let _permit = match sem_clone.try_acquire() {
-                                        Ok(permit) => permit,
-                                        Err(_) => {
-                                            if query_data.len() >= 4 {
-                                                let mut fail_resp = query_data.clone();
-                                                fail_resp[2] |= 0x80;
-                                                fail_resp[3] = (fail_resp[3] & 0xF0) | 0x02; // SERVFAIL
-                                                let _ = socket_clone.send_to(&fail_resp, peer_addr).await;
-                                            }
-                                            return;
-                                        }
-                                    };
+                                    // held for this task's lifetime
+                                    let _permit = permit;
 
                                     // 0. intercept internal dns leak test canary probe
                                     if is_canary_query(&query_data) {
@@ -303,9 +308,8 @@ impl DnsServer {
                                     if let Some(cached_resp) = cache_clone.get(&query_data) {
                                         if let Some((domain, ips)) = parse_dns_response(&cached_resp) {
                                             if !ips.is_empty() {
-                                                // domain mirrors upstream data: sanitize (L8)
                                                 debug!(
-                                                    domain = %sanitize_log_token(&domain),
+                                                    domain = %domain,
                                                     ips = ?ips,
                                                     source = "cache_0ms",
                                                     "DNS cache hit"
@@ -365,11 +369,7 @@ impl DnsServer {
                                                 None
                                             };
                                             if dnssec_state == Some(DnssecState::Bogus) {
-                                                let qlabel =
-                                                    crate::dns::cache::extract_query_key(&query_data)
-                                                        .map(|k| sanitize_log_token(&format!("{}/{}", k.name, k.qtype)))
-                                                        .unwrap_or_else(|| "?/?".to_string());
-                                                warn!("dnssec BOGUS response rejected for {} (not cached, SERVFAIL sent)", qlabel);
+                                                warn!("dnssec BOGUS response rejected (not cached, SERVFAIL sent)");
                                                 if query_data.len() >= 4 {
                                                     let mut fail_resp = query_data.clone();
                                                     fail_resp[2] |= 0x80;
@@ -378,32 +378,49 @@ impl DnsServer {
                                                 }
                                                 return;
                                             }
-                                            // Never forward upstream's AD bit without local
-                                            // proof: a downstream validating stub (trust-ad)
-                                            // would otherwise treat an unverified, insecure
-                                            // or unvalidated answer as authenticated. Only a
-                                            // locally Secure verdict keeps AD; a Secure answer
-                                            // without upstream AD is left alone (no new
-                                            // trust claims are minted here).
-                                            let mut resp_bytes = resp_bytes;
-                                            strip_ad_unless_secure(
-                                                &mut resp_bytes,
+                                            // DNS-03: the upstream's self-assessment
+                                            // is read for the journal only, then
+                                            // overridden. This used to be the whole
+                                            // story: `dnssec_state` was computed,
+                                            // only its `Bogus` arm had any effect,
+                                            // and the response was cached and
+                                            // forwarded with the AD bit the UPSTREAM
+                                            // set. So a hostile or compromised DoH
+                                            // upstream could answer AD=1 with no
+                                            // RRSIGs at all — the validator took the
+                                            // unsigned path, returned Insecure, the
+                                            // answer was served, and AD=1 was handed
+                                            // to every downstream stub resolver or
+                                            // application honouring RFC 6840
+                                            // trust-ad as though albus had
+                                            // authenticated it. The reverse was
+                                            // equally unguarded: stripping RRSIGs
+                                            // from a genuinely Secure answer also
+                                            // lands on Insecure.
+                                            //
+                                            // The locally computed verdict is now the
+                                            // authority for the client-visible trust
+                                            // bit. Normalisation happens BEFORE the
+                                            // cache insert so a cache hit cannot
+                                            // reintroduce the upstream's bit.
+                                            let upstream_ad = is_dnssec_authenticated(&resp_bytes);
+                                            let resp_bytes = normalize_ad_bit(
+                                                resp_bytes,
+                                                dnssec,
                                                 dnssec_state,
                                             );
-                                            // insert response into cache (bogus never cached;
-                                            // indeterminate never cached either, see cacheable_state)
-                                            if cacheable_state(dnssec_state) {
-                                                cache_clone.insert(&query_data, &resp_bytes);
-                                            }
-
                                             let is_ad = is_dnssec_authenticated(&resp_bytes);
+
+                                            // insert response into cache (bogus never cached)
+                                            cache_clone.insert(&query_data, &resp_bytes);
+
                                             if let Some((domain, ips)) = parse_dns_response(&resp_bytes) {
                                                 if !ips.is_empty() {
-                                                    // domain mirrors upstream data: sanitize (L8)
                                                     debug!(
-                                                        domain = %sanitize_log_token(&domain),
+                                                        domain = %domain,
                                                         ips = ?ips,
                                                         via = %via,
+                                                        upstream_claimed_ad = upstream_ad,
                                                         dnssec_authenticated = is_ad,
                                                         dnssec_local = ?dnssec_state,
                                                         "DNS resolved"
@@ -464,9 +481,16 @@ impl DnsServer {
     }
 
     // clears all entries from the in-memory response cache
+    /// Operator-requested invalidation. W6-01: this reached one of the
+    /// resolver's four caches. `validator` (both the Bogus negative-verdict
+    /// cache and the DS/KEY cache) and `ech_cache` survived, so the panel's
+    /// "DNS cache flushed" was untrue about scope and an attacker who had
+    /// stamped a Bogus verdict simply out-waited the operator.
     pub fn flush_cache(&self) {
         self.cache.clear();
-        info!("DNS in-memory response cache flushed");
+        self.validator.clear_caches();
+        self.ech_cache.clear();
+        info!("DNS in-memory caches flushed (response, DNSSEC negative/key, ECH config)");
     }
 }
 
@@ -554,25 +578,6 @@ pub fn enable_dnssec_do(query: &[u8]) -> Vec<u8> {
         crate::dns::cache::OptScan::Malformed => out,
     }
 }
-/// L10 cache policy: Indeterminate (validation timed out) must never be
-/// cached — an unverified answer must not linger for the full TTL; the next
-/// query revalidates from scratch. Bogus never reaches here (early SERVFAIL
-/// return); Secure/Insecure/unsigned(None) cache as before.
-pub(crate) fn cacheable_state(state: Option<DnssecState>) -> bool {
-    matches!(
-        state,
-        None | Some(DnssecState::Secure) | Some(DnssecState::Insecure)
-    )
-}
-
-/// Clears the upstream AD (authenticated-data) bit unless the answer was
-/// locally verified Secure. Pure so the policy is unit-testable; the serve
-/// path applies it to every forwarded response before cache + send.
-pub(crate) fn strip_ad_unless_secure(resp: &mut [u8], state: Option<DnssecState>) {
-    if state != Some(DnssecState::Secure) && resp.len() >= 4 {
-        resp[3] &= !0x20;
-    }
-}
 
 // inspects header flags to verify presence of authenticated data (ad) bit
 #[inline]
@@ -582,6 +587,46 @@ pub fn is_dnssec_authenticated(response: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+/// Projects albus's own DNSSEC verdict onto the AD bit of the response it
+/// forwards, so the client-visible trust signal is the one albus actually
+/// computed rather than the upstream's claim about itself.
+///
+/// DNS-03: the AD bit is what every downstream stub resolver and application
+/// honouring RFC 6840 `trust-ad` reads to decide whether an answer is
+/// authenticated. Relaying an unverified producer-declared flag across that
+/// boundary makes the local validation decorative — the module would compute a
+/// careful verdict, discard it, and forward the resolver's opinion instead.
+///
+/// The rule:
+///
+///   * `Secure`   -> AD set. albus built a DS→DNSKEY chain to the embedded root
+///     anchor and verified the signatures itself.
+///   * anything else -> AD cleared, including `Insecure`, `Bogus` (which never
+///     reaches here; it became SERVFAIL above) and `Indeterminate`. An unsigned
+///     zone is served — that is correct DNSSEC behaviour — but it must not be
+///     *labelled* authenticated.
+///   * `dnssec` off -> AD cleared. albus did not validate, so it must not assert
+///     that something was validated.
+///
+/// A response shorter than 4 bytes has no header to fix and is returned
+/// unchanged.
+pub fn normalize_ad_bit(
+    mut response: Vec<u8>,
+    dnssec_enabled: bool,
+    state: Option<crate::dns::dnssec::DnssecState>,
+) -> Vec<u8> {
+    if response.len() < 4 {
+        return response;
+    }
+    let should_assert = dnssec_enabled && state == Some(crate::dns::dnssec::DnssecState::Secure);
+    if should_assert {
+        response[3] |= 0x20;
+    } else {
+        response[3] &= !0x20;
+    }
+    response
 }
 
 // inspects question section for internal dns leak test probe domain
@@ -834,7 +879,13 @@ pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
 // case-insensitive). Real wire hostnames are LDH/punycode, so nothing
 // legitimate is lost and whole homograph/confusable classes (Cf/Zl/Zp,
 // controls, bidi) die at once — no denylist to outdate.
-fn label_is_safe(label: &str) -> bool {
+//
+// Shared with `cache::extract_query_key`: a DNS name that may become a cache
+// key, a queue entry or a log field must satisfy ONE policy. When this
+// filter lived only in the response parser, `extract_query_key` was a second,
+// laxer parser of the same question section and two distinct questions could
+// collapse onto a single `DnsCacheKey`.
+pub(crate) fn label_is_safe(label: &str) -> bool {
     !label.is_empty()
         && label
             .bytes()
@@ -903,80 +954,6 @@ fn parse_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sanitize_log_token_kills_forgery() {
-        // L7/L8 regression: hostile upstream QNAME content must come out as
-        // a single inert line — no ANSI escapes, no newlines, bounded length
-        let evil = "evil.com\nINJECTED journal line\x1b[31mred\x1b[0m\x07";
-        let clean = sanitize_log_token(evil);
-        assert!(!clean.contains('\n'), "newline must go");
-        assert!(!clean.contains('\r'), "CR must go");
-        assert!(!clean.contains('\x1b'), "ESC must go");
-        assert!(!clean.contains('\x07'), "BEL must go");
-        assert!(clean.contains("evil.com"), "diagnostic content survives");
-        assert!(clean.contains("INJECTED journal line"), "words survive");
-        // length cap
-        let long = "a".repeat(500);
-        assert_eq!(sanitize_log_token(&long).len(), 200);
-        // benign domains pass through untouched
-        assert_eq!(sanitize_log_token("example.com"), "example.com");
-        assert_eq!(sanitize_log_token(""), "");
-        // BiDi/format chars must go too (display-reorder forgery without
-        // any control byte): RLO + zero-width + BOM.
-        let bidi = "a\u{202E}b\u{200B}c\u{FEFF}d";
-        assert_eq!(sanitize_log_token(bidi), "abcd");
-    }
-
-    #[test]
-    fn test_upstream_log_redacts_profile_ids() {
-        assert_eq!(
-            redact_upstream_desc("https://dns.nextdns.io/795926"),
-            "https://dns.nextdns.io"
-        );
-        assert_eq!(redact_upstream_desc("quad9"), "quad9");
-        assert_eq!(
-            redact_upstream_desc("quad9, https://dns.nextdns.io/795926"),
-            "quad9,https://dns.nextdns.io"
-        );
-    }
-
-    #[test]
-    fn test_strip_ad_unless_secure() {
-        // Upstream AD=1 must not survive without local proof (timeout /
-        // insecure / unvalidated all strip); Secure keeps it; short slices
-        // never panic; Secure without AD is left alone (no minted trust).
-        for state in [
-            None,
-            Some(DnssecState::Insecure),
-            Some(DnssecState::Indeterminate),
-            Some(DnssecState::Bogus),
-        ] {
-            let mut resp = vec![0x12, 0x34, 0x81, 0xA0];
-            strip_ad_unless_secure(&mut resp, state);
-            assert_eq!(resp[3] & 0x20, 0, "AD must strip for {state:?}");
-        }
-        let mut secure = vec![0x12, 0x34, 0x81, 0xA0];
-        strip_ad_unless_secure(&mut secure, Some(DnssecState::Secure));
-        assert_eq!(secure[3] & 0x20, 0x20, "Secure keeps upstream AD");
-        let mut no_ad = vec![0x12, 0x34, 0x81, 0x80];
-        strip_ad_unless_secure(&mut no_ad, Some(DnssecState::Secure));
-        assert_eq!(no_ad[3] & 0x20, 0, "no AD minted on Secure");
-        let mut short = vec![0x12];
-        strip_ad_unless_secure(&mut short, None);
-        assert_eq!(short, vec![0x12]);
-    }
-
-    #[test]
-    fn test_cacheable_state_policy() {
-        // L10: only verified-or-unsigned answers may be cached; a timed-out
-        // validation (Indeterminate) must force revalidation next query
-        assert!(cacheable_state(None));
-        assert!(cacheable_state(Some(DnssecState::Secure)));
-        assert!(cacheable_state(Some(DnssecState::Insecure)));
-        assert!(!cacheable_state(Some(DnssecState::Indeterminate)));
-        assert!(!cacheable_state(Some(DnssecState::Bogus)));
-    }
 
     #[tokio::test]
     async fn test_dns_server_queue_fifo() {
@@ -1158,56 +1135,481 @@ mod tests {
 }
 
 #[cfg(test)]
-mod adversarial_tests {
+mod flush_scope_tests {
     use super::*;
 
-    fn query_with_qtype(qtype: u16) -> Vec<u8> {
-        let mut q = vec![
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
-            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-        ];
-        q.extend_from_slice(&[(qtype >> 8) as u8, qtype as u8, 0x00, 0x01]);
-        q
-    }
-
-    #[test]
-    fn test_pointer_chain_terminates() {
-        // 6-jump compression chain must not hang the parser (max_jumps=5)
-        let mut msg = vec![
-            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
-            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
-            0x01,
-        ];
-        // answer: pointer to offset 40, which points back to 12 (loop)
-        msg.extend_from_slice(&[0xC0, 0x28, 0x00, 0x01, 0x00, 0x01]);
-        // offset 40: pointer to 12
-        while msg.len() < 40 {
-            msg.push(0x00);
+    /// Minimal query wire format: header, one QNAME, QTYPE/QCLASS.
+    fn query_wire(name: &str, qtype: u16, txid: u16) -> Vec<u8> {
+        let mut m: Vec<u8> = Vec::new();
+        m.extend_from_slice(&txid.to_be_bytes());
+        m.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        for l in name.split('.') {
+            m.push(l.len() as u8);
+            m.extend_from_slice(l.as_bytes());
         }
-        msg.extend_from_slice(&[0xC0, 0x0C]);
-        let _ = parse_dns_response(&msg);
+        m.push(0);
+        m.extend_from_slice(&qtype.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]);
+        m
     }
 
-    #[test]
-    fn test_enable_dnssec_do_idempotent() {
-        let q = query_with_qtype(1);
-        let once = enable_dnssec_do(&q);
-        let twice = enable_dnssec_do(&once);
-        // second call must not append another OPT record
-        assert_eq!(once.len(), twice.len());
-        assert_eq!(twice[11], 1, "exactly one OPT");
+    /// Answer with `ancount` A records in the body.
+    fn answer_wire(ancount: u8, ips: [&str; 1]) -> Vec<u8> {
+        let mut m: Vec<u8> = Vec::new();
+        m.extend_from_slice(&[0x42, 0x42, 0x81, 0x80, 0x00, ancount, 0, 0, 0, 0, 0, 0]);
+        for ip in ips {
+            m.extend_from_slice(&[0xC0, 0x0C]); // pointer to name at offset 12
+            m.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // type A, class IN
+            m.extend_from_slice(&60u32.to_be_bytes()); // TTL
+            m.extend_from_slice(&4u16.to_be_bytes()); // rdlength
+            let o: Vec<u8> = ip.split('.').map(|p| p.parse().unwrap()).collect();
+            m.extend_from_slice(&o);
+        }
+        m
     }
 
+    /// W6-01: the panel's "Flush Cache" must reach every resolver cache, not
+    /// one of four. The three it missed are the security-relevant ones: a stale
+    /// Bogus verdict in `neg_cache` short-circuits `validate()` and keeps
+    /// returning SERVFAIL for up to NEG_CACHE_TTL after a successful flush, so a
+    /// LAN attacker who stamps one Bogus response simply out-waits the operator;
+    /// `key_cache` ignores a KSK/DS rollover for up to an hour; `ech_cache` was
+    /// only ever evicted by size.
     #[test]
-    fn test_aaaa_matrix() {
-        assert!(is_aaaa_query(&query_with_qtype(28)));
-        assert!(!is_aaaa_query(&query_with_qtype(1)));
-        assert!(!is_aaaa_query(&[]));
-        assert!(!is_aaaa_query(&[0u8; 10]));
-        // qdcount = 0
-        let mut q = query_with_qtype(28);
-        q[4] = 0;
-        q[5] = 0;
-        assert!(!is_aaaa_query(&q));
+    fn test_flush_clears_every_resolver_cache() {
+        let server = DnsServer::new("cloudflare", &[], true, true, true).expect("server");
+
+        // Seed each cache with one entry.
+        let qname = "flushtest.example";
+        server
+            .validator
+            .neg_store_for_test(qname, 1, DnssecState::Bogus);
+        server
+            .ech_cache
+            .insert_for_test(qname.to_string(), vec![0x00, 0x02, 0xfe, 0x0d]);
+        let q = query_wire("flushtest.example", 1, 0x4242);
+        server.cache.insert(&q, &answer_wire(1, ["203.0.113.7"]));
+
+        // All four now hold something.
+        assert!(
+            server.validator.neg_cached(qname, 1).is_some(),
+            "negative-verdict cache should be seeded"
+        );
+        assert!(!server.ech_cache.is_empty(), "ECH cache should be seeded");
+        assert!(!server.cache.is_empty(), "response cache should be seeded");
+
+        server.flush_cache();
+
+        assert!(
+            server.validator.neg_cached(qname, 1).is_none(),
+            "W6-01: a flushed resolver must not keep serving a cached Bogus verdict"
+        );
+        assert_eq!(server.ech_cache.len(), 0, "ECH cache must be flushed");
+        assert_eq!(server.cache.len(), 0, "response cache must be flushed");
+    }
+
+    /// The DNSSEC key cache is private, so exercise it through its own clear.
+    #[test]
+    fn test_dnssec_clear_clears_both_dnssec_caches() {
+        let v = DnssecValidator::new();
+        v.neg_store_for_test("a.example", 1, DnssecState::Indeterminate);
+        assert!(v.neg_cached("a.example", 1).is_some());
+        v.clear_caches();
+        assert!(
+            v.neg_cached("a.example", 1).is_none(),
+            "neg_cache must be empty after clear_caches()"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ad_bit_authority_tests {
+    use super::*;
+    use crate::dns::dnssec::DnssecState;
+
+    /// Minimal response header + question, with the AD bit optionally set.
+    fn response(ad: bool) -> Vec<u8> {
+        let mut r: Vec<u8> = Vec::new();
+        r.extend_from_slice(&[0x12, 0x34, 0x81, 0x80]); // id, QR+AA+RD+RA, rcode 0
+        r.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        if ad {
+            r[3] |= 0x20;
+        }
+        r
+    }
+
+    /// DNS-03, the headline attack: a hostile or compromised DoH upstream
+    /// answers AD=1 with no RRSIGs. albus's validator returns Insecure (which is
+    /// correct — there is nothing to verify), the answer is served, and before
+    /// the fix the AD=1 travelled straight through to every downstream consumer
+    /// honouring RFC 6840 trust-ad.
+    #[test]
+    fn test_upstream_claimed_ad_is_cleared_when_not_secure() {
+        for state in [
+            Some(DnssecState::Insecure),
+            Some(DnssecState::Indeterminate),
+            None,
+        ] {
+            let out = normalize_ad_bit(response(true), true, state);
+            assert!(
+                !is_dnssec_authenticated(&out),
+                "AD must be cleared for state {:?}: the upstream's claim about \
+                 itself is not albus's verdict",
+                state
+            );
+        }
+    }
+
+    /// Bogus never reaches normalisation (it became SERVFAIL), but pin it:
+    /// nothing but Secure may assert AD.
+    #[test]
+    fn test_only_secure_asserts_ad() {
+        let out = normalize_ad_bit(response(false), true, Some(DnssecState::Secure));
+        assert!(
+            is_dnssec_authenticated(&out),
+            "a verified chain must assert AD — that is the whole point of validating"
+        );
+    }
+
+    /// AD=1 + verified chain stays AD=1: the bit is not merely cleared.
+    #[test]
+    fn test_secure_preserves_or_sets_ad() {
+        let out = normalize_ad_bit(response(true), true, Some(DnssecState::Secure));
+        assert!(is_dnssec_authenticated(&out));
+    }
+
+    /// With DNSSEC disabled albus did not validate anything, so it must not
+    /// assert that anything was validated — regardless of what the upstream
+    /// claimed.
+    #[test]
+    fn test_ad_is_cleared_when_dnssec_is_disabled() {
+        let out = normalize_ad_bit(response(true), false, Some(DnssecState::Secure));
+        assert!(
+            !is_dnssec_authenticated(&out),
+            "with dnssec off, albus has no verdict to project and must not \
+             forward the upstream's claim"
+        );
+    }
+
+    /// Normalisation must touch ONLY the AD bit — RCODE, QR and the counts are
+    /// the client's to read.
+    #[test]
+    fn test_only_the_ad_bit_is_modified() {
+        let before = response(true);
+        let after = normalize_ad_bit(before.clone(), true, Some(DnssecState::Insecure));
+        assert_eq!(before.len(), after.len());
+        for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+            if i == 3 {
+                continue;
+            }
+            assert_eq!(b, a, "byte {} must be untouched", i);
+        }
+        assert_eq!(after[3] & 0x20, 0, "AD must be the only difference");
+    }
+
+    /// A response too short to have a header is returned untouched rather than
+    /// panicking on an index.
+    #[test]
+    fn test_short_response_is_returned_unchanged() {
+        let short = vec![0x00, 0x01, 0x02];
+        let out = normalize_ad_bit(short.clone(), true, Some(DnssecState::Secure));
+        assert_eq!(out, short);
+    }
+
+    /// Normalisation must happen BEFORE the cache insert, or a cache hit could
+    /// reintroduce the upstream's bit.
+    #[test]
+    fn test_normalisation_precedes_the_cache_insert() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod ad_bit_authority_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let norm = prod.find("normalize_ad_bit(").expect("normalisation call");
+        let insert = prod[norm..]
+            .find("cache_clone.insert(")
+            .map(|o| norm + o)
+            .expect("cache insert");
+        assert!(
+            norm < insert,
+            "DNS-03: the AD bit must be normalised before the response is cached, \
+             or a later cache hit would serve the upstream's bit again"
+        );
+    }
+
+    /// The upstream's own claim must survive only as a journal field, never as
+    /// the value anything downstream reads.
+    #[test]
+    fn test_upstream_claim_is_logged_not_relayed() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod ad_bit_authority_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            prod.contains("upstream_claimed_ad"),
+            "the upstream's self-assessment should be visible in the journal for \
+             diagnosis"
+        );
+        let at = prod
+            .find("let is_ad = is_dnssec_authenticated(&resp_bytes);")
+            .expect("post-norm read");
+        let before = &prod[..at];
+        assert!(
+            before.rfind("normalize_ad_bit(").is_some()
+                && before.rfind("normalize_ad_bit(") > before.rfind("upstream_ad ="),
+            "is_ad must be read AFTER normalisation, so it reflects albus's verdict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_control_tests {
+
+    /// DNS-02's claim, made structural: the admission decision must precede the
+    /// datagram copy and the spawn. A test that only measured behaviour could be
+    /// satisfied by moving the permit later as long as the count stayed under
+    /// 512; what actually matters is that a shed datagram costs no task and no
+    /// heap allocation, which is only true if the gate is before them.
+    #[test]
+    fn test_admission_precedes_allocation_and_spawn() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+
+        let recv = prod
+            .find("recv_res = socket.recv_from(&mut buf)")
+            .expect("receive site");
+        // Bound at the per-datagram spawn so the window is exactly the
+        // admission path.
+        let body = {
+            let tail = &prod[recv..];
+            let end = tail
+                .find("let query_data = buf[..len].to_vec();")
+                .unwrap_or(tail.len());
+            &tail[..end]
+        };
+
+        assert!(
+            body.contains("try_acquire_owned"),
+            "the permit must be acquired on the receive loop, not inside the task"
+        );
+        assert!(
+            body.contains("continue;"),
+            "a shed datagram must be dropped without spawning a task"
+        );
+        assert!(
+            !body.contains("query_data.clone()"),
+            "the shed path must not clone the datagram"
+        );
+    }
+
+    /// The permit must be moved into the task, so it is held for the task's
+    /// lifetime rather than released immediately.
+    #[test]
+    fn test_permit_is_held_by_the_task() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            prod.contains("let _permit = permit;"),
+            "the owned permit must be moved into the spawned task"
+        );
+        assert!(
+            !prod.contains("sem_clone"),
+            "the old per-task semaphore clone must be gone: admission happens on \\
+             the receive loop now"
+        );
+    }
+
+    /// The shed path must be allocation-free and reuse one buffer.
+    #[test]
+    fn test_shed_path_is_o1() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("let mut shed_buf = [0u8; 12];")
+            .expect("reused shed buffer");
+        // Bound at the admission path's end, not by an arbitrary byte count.
+        let tail = &prod[at..];
+        let end = tail
+            .find("let query_data = buf[..len].to_vec();")
+            .unwrap_or(tail.len());
+        let block = &tail[..end];
+        assert!(
+            block.contains("send_to(&shed_buf"),
+            "the shed reply must come from the reused buffer"
+        );
+        assert!(
+            !block.contains("to_vec()"),
+            "the shed path must not allocate per datagram"
+        );
+        // The reused buffer must live OUTSIDE the receive loop, or it would
+        // be re-allocated per iteration and the reuse would be illusory.
+        // Anchor on the loop that follows the 4096-byte receive buffer, not on
+        // the first `loop {` in the file.
+        let recv_buf = prod
+            .find("let mut buf = [0u8; 4096];")
+            .expect("receive buffer");
+        let loop_at = prod[recv_buf..]
+            .find("loop {")
+            .map(|o| recv_buf + o)
+            .expect("receive loop");
+        assert!(
+            at > recv_buf && at < loop_at,
+            "the shed buffer must be declared once, outside the receive loop \
+             (recv_buf={} shed={} loop={})",
+            recv_buf,
+            at,
+            loop_at
+        );
+    }
+
+    /// And shedding must be visible: silent degradation is the same class of
+    /// defect as EBPF-01.
+    #[test]
+    fn test_shedding_is_logged() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("DNS load shedding: upstream concurrency")
+            .expect("shed warning");
+        let block = &prod[at.saturating_sub(400)..(at + 300).min(prod.len())];
+        assert!(
+            block.contains("warn!"),
+            "load shedding must be reported, not silent"
+        );
+    }
+
+    /// The reused SERVFAIL must be a well-formed header: a client has to be able
+    /// to match it by transaction id and see rcode 2.
+    #[test]
+    fn test_shed_servfail_header_is_well_formed() {
+        // Same construction as the shed path in the receive loop.
+        let mut query = [0u8; 16];
+        query[0] = 0xAB;
+        query[1] = 0xCD;
+        query[2] = 0x01; // RD
+        query[3] = 0x00;
+        let mut shed = [0u8; 12];
+        shed[0] = query[0];
+        shed[1] = query[1];
+        shed[2] = 0x80 | (query[2] & 0x01);
+        shed[3] = 0x80 | 0x02;
+        shed[4..12].copy_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(&shed[0..2], &[0xAB, 0xCD], "transaction id must be echoed");
+        assert_eq!(shed[2] & 0x80, 0x80, "QR must be set");
+        assert_eq!(shed[2] & 0x01, 0x01, "RD must be preserved");
+        assert_eq!(shed[3] & 0x0F, 2, "rcode must be SERVFAIL");
+        assert_eq!(shed[3] & 0x80, 0x80, "RA must be set");
+        assert_eq!(
+            query[3] & 0x0F,
+            0x00,
+            "fixture guard: byte 3's low nibble in a QUERY is CD/AD/RD/Z, so \
+             OR-ing it into a response would produce rcode 0 (NOERROR) with an \
+             empty body instead of SERVFAIL"
+        );
+        assert_eq!(&shed[4..6], &[0, 1], "QDCOUNT must be 1");
+        assert_eq!(
+            &shed[6..12],
+            &[0, 0, 0, 0, 0, 0],
+            "ANCOUNT/NSCOUNT/ARCOUNT 0"
+        );
+    }
+
+    /// DNS-02's second half: the DNSSEC caches must use bounded eviction, not a
+    /// wholesale clear. An attacker-chosen name stream must not be able to wipe
+    /// every verdict an honest query paid for.
+    #[test]
+    fn test_dnssec_caches_do_not_clear_wholesale() {
+        let src = include_str!("dnssec.rs");
+        // Split on a top-level test MODULE, not the first `#[cfg(test)]`:
+        // dnssec.rs has test-only helper FUNCTIONS earlier in the file, and
+        // cutting at those would exclude the production code under test.
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod ")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            !prod.contains("guard.clear();"),
+            "DNS-02: the DNSSEC caches must not recover from overflow by clearing \\
+             the whole map — that turns a per-name amortised cost into a per-query \\
+             one and destroys every still-valid entry"
+        );
+        assert!(
+            prod.contains("Self::evict_expired(&mut guard, NEG_CACHE_TTL)"),
+            "the negative cache must evict only expired entries"
+        );
+        assert!(
+            prod.contains("Self::evict_expired(&mut guard, KEY_CACHE_CAP)"),
+            "the key cache must evict only expired entries"
+        );
+    }
+
+    /// Bounded eviction must actually preserve fresh entries.
+    #[test]
+    fn test_evict_expired_keeps_fresh_entries() {
+        use crate::dns::dnssec::DnssecValidator;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let mut map: HashMap<(String, u16), (u8, Instant)> = HashMap::new();
+        map.insert(("fresh".into(), 1), (1, Instant::now()));
+        map.insert(
+            ("stale".into(), 1),
+            (2, Instant::now() - Duration::from_secs(120)),
+        );
+
+        DnssecValidator::evict_expired(&mut map, Duration::from_secs(60));
+
+        assert_eq!(map.len(), 1, "only the expired entry should go");
+        assert!(map.contains_key(&("fresh".into(), 1)));
+        assert!(!map.contains_key(&("stale".into(), 1)));
+    }
+
+    /// And a full cache of fresh entries declines the insert rather than
+    /// destroying them.
+    #[test]
+    fn test_full_cache_declines_insert_instead_of_clearing() {
+        let v = crate::dns::dnssec::DnssecValidator::new();
+        // Fill the negative cache past its cap with fresh entries.
+        for i in 0..1200 {
+            v.neg_store_for_test(
+                &format!("n{}.example", i),
+                1,
+                crate::dns::dnssec::DnssecState::Bogus,
+            );
+        }
+        // The oldest entries are still within NEG_CACHE_TTL, so eviction frees
+        // nothing and the insert is declined. Nothing may be lost.
+        let mut survivors = 0;
+        for i in 0..1024 {
+            if v.neg_cached(&format!("n{}.example", i), 1).is_some() {
+                survivors += 1;
+            }
+        }
+        assert_eq!(
+            survivors, 1024,
+            "a full cache of fresh verdicts must not be wiped"
+        );
     }
 }

@@ -378,7 +378,7 @@ fn fuzz_opt_do_shapes_never_panic() {
         ]
     }
     // clean fixtures: exact bits
-    let mut q_plain = base(0);
+    let q_plain = base(0);
     assert_eq!(extract_do_bit(&q_plain), Some(false));
     assert!(extract_query_key(&q_plain).is_some());
     let mut q_nodo = base(1);

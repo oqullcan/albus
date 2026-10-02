@@ -13,16 +13,14 @@ fn skip(reason: &str) {
 }
 
 fn iptables_bin(v6: bool) -> Option<&'static str> {
-    for cand in if v6 {
+    (if v6 {
         ["/usr/sbin/ip6tables", "/sbin/ip6tables"]
     } else {
         ["/usr/sbin/iptables", "/sbin/iptables"]
-    } {
-        if std::path::Path::new(cand).exists() {
-            return Some(cand);
-        }
-    }
-    None
+    })
+    .into_iter()
+    .find(|&cand| std::path::Path::new(cand).exists())
+    .map(|v| v as _)
 }
 
 fn albus_rules(v6: bool) -> Option<Vec<String>> {
@@ -57,7 +55,7 @@ fn root_quic_block_unblock_symmetry() {
     impl Drop for RestoreGuard {
         fn drop(&mut self) {
             if self.had_quic {
-                block_quic();
+                let _ = block_quic();
             }
         }
     }
@@ -72,7 +70,7 @@ fn root_quic_block_unblock_symmetry() {
         // daemon may already hold the rule: assert convergence, not growth
         let had_quic = before.iter().any(|r| r.contains("albus-quic"));
         let _guard = RestoreGuard { had_quic };
-        block_quic();
+        let _ = block_quic();
         let during = albus_rules(v6).unwrap_or_default();
         assert!(
             during.iter().any(|r| r.contains("albus-quic")),
@@ -80,7 +78,7 @@ fn root_quic_block_unblock_symmetry() {
             v6
         );
         // restore even on failure paths below
-        unblock_quic();
+        let _ = unblock_quic();
         let after = albus_rules(v6).unwrap_or_default();
         assert!(
             !after.iter().any(|r| r.contains("albus-quic")),
@@ -89,7 +87,7 @@ fn root_quic_block_unblock_symmetry() {
         );
         // put the live daemon's rule back if we found one
         if had_quic {
-            block_quic();
+            let _ = block_quic();
             let restored = albus_rules(v6).unwrap_or_default();
             assert!(
                 restored.iter().any(|r| r.contains("albus-quic")),

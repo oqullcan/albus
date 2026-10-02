@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 use crate::app::cli::RunArgs;
 
@@ -169,12 +170,21 @@ fn get_sudo_user_home() -> Option<PathBuf> {
             return None;
         }
 
-        // 3. Cross-check SUDO_UID if present
-        if let Ok(uid_str) = std::env::var("SUDO_UID") {
-            if let Ok(expected_uid) = uid_str.trim().parse::<libc::uid_t>() {
-                if unsafe { (*pwd).pw_uid } != expected_uid {
-                    return None;
-                }
+        // 3. Cross-check SUDO_UID when it is present. PRIV-02: this used to be
+        // a bare "if the uid parses and matches" with no requirement that it
+        // parse at all, so an unparseable SUDO_UID skipped the comparison and
+        // the caller proceeded on an unverified identity. It now shares the one
+        // fail-closed predicate with the privilege-drop guard.
+        if std::env::var("SUDO_UID").is_ok() {
+            let expected_uid: libc::uid_t = std::env::var("SUDO_UID").ok()?.trim().parse().ok()?;
+            let gid: Option<libc::gid_t> = std::env::var("SUDO_GID")
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
+            if unsafe { (*pwd).pw_uid } != expected_uid {
+                return None;
+            }
+            if !sudo_identity_verified(expected_uid, gid) {
+                return None;
             }
         }
 
@@ -210,23 +220,14 @@ impl FsPrivilegeGuard {
                     gid_s.trim().parse::<libc::gid_t>(),
                 ) {
                     if uid != 0 {
-                        // cross-check SUDO_UID/SUDO_GID against passwd database
-                        // (anti-spoof): uid must match pw_uid AND gid must match
-                        // pw_gid, otherwise an env-spoofed primary group would
-                        // survive the drop with the guard reporting active.
-                        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-                            if is_valid_username(&sudo_user) {
-                                if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
-                                    unsafe {
-                                        let pwd = libc::getpwnam(c_user.as_ptr());
-                                        if !pwd.is_null()
-                                            && ((*pwd).pw_uid != uid || (*pwd).pw_gid != gid)
-                                        {
-                                            return Self { active: false };
-                                        }
-                                    }
-                                }
-                            }
+                        // PRIV-02: cross-check SUDO_UID/SUDO_GID against the
+                        // passwd database before dropping. Fail-closed: an
+                        // SUDO_USER with no passwd entry, or a missing/unparseable
+                        // SUDO_GID, now DENIES the drop instead of skipping the
+                        // comparison and proceeding with the environment-declared
+                        // uid.
+                        if !sudo_identity_verified(uid, Some(gid)) {
+                            return Self { active: false };
                         }
                         unsafe {
                             // drop supplementary groups first to close DAC bypass (fail closed)
@@ -290,31 +291,69 @@ fn is_service_user_process() -> bool {
     euid != 0 && matches!(crate::core::ebpf::service_uid(), Some(suid) if suid == euid)
 }
 
+/// The single decision behind every `SUDO_*` trust site.
+///
+/// PRIV-02: the rule "a SUDO_* identity is trusted only when the passwd
+/// database confirms it" was enforced as "the database is consulted IF IT
+/// HAPPENS TO ANSWER". Every call site had the shape
+/// `if !pwd.is_null() && (...mismatch...) { deny }`, so a `getpwnam` that
+/// returned NULL — an SUDO_USER that passes the syntax check but has no passwd
+/// entry, or an unparseable SUDO_GID — skipped the comparison entirely and the
+/// environment-declared uid was trusted verbatim.
+///
+/// That one value is simultaneously the privilege-drop target, the DAC identity
+/// used for directory creation and rename, and the allow-list entry in
+/// `check_parent_ownership` / `check_write_owner`. So a fail-open here is a
+/// dropped-privilege failure, not merely a skipped check.
+///
+/// Fail-closed: if SUDO_USER is present, the lookup must SUCCEED and both
+/// pw_uid and pw_gid must match. If SUDO_USER is absent there is nothing to
+/// cross-check against and the existing euid rules govern, so that case is left
+/// as it was.
+#[cfg(unix)]
+fn sudo_identity_verified(uid: libc::uid_t, gid: Option<libc::gid_t>) -> bool {
+    let Ok(sudo_user) = std::env::var("SUDO_USER") else {
+        // No name to cross-check: nothing is being asserted about passwd, so the
+        // pre-existing euid/privilege_drop_expected rules apply unchanged.
+        return true;
+    };
+    if !is_valid_username(&sudo_user) {
+        return false;
+    }
+    let Ok(c_user) = std::ffi::CString::new(sudo_user) else {
+        return false;
+    };
+    unsafe {
+        let pwd = libc::getpwnam(c_user.as_ptr());
+        // PRIV-02: an unanswerable database is NOT a pass. Previously a NULL
+        // here fell straight through to trusting the environment.
+        if pwd.is_null() {
+            return false;
+        }
+        if (*pwd).pw_uid != uid {
+            return false;
+        }
+        // SUDO_GID must be present AND parseable whenever SUDO_UID is trusted:
+        // an env-spoofed primary group would otherwise survive the drop while
+        // the guard reports itself active.
+        match gid {
+            Some(g) => g == (*pwd).pw_gid,
+            None => false,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn validated_sudo_uid() -> Option<libc::uid_t> {
     let uid: libc::uid_t = std::env::var("SUDO_UID").ok()?.trim().parse().ok()?;
     if uid == 0 {
         return None;
     }
-    // cross-check against passwd database when SUDO_USER is present (anti-spoof):
-    // uid must match pw_uid AND gid must match pw_gid — same rule as the guard.
     let gid: Option<libc::gid_t> = std::env::var("SUDO_GID")
         .ok()
         .and_then(|s| s.trim().parse().ok());
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        if !is_valid_username(&sudo_user) {
-            return None;
-        }
-        if let Ok(c_user) = std::ffi::CString::new(sudo_user) {
-            unsafe {
-                let pwd = libc::getpwnam(c_user.as_ptr());
-                if !pwd.is_null()
-                    && ((*pwd).pw_uid != uid || gid.is_some_and(|g| g != (*pwd).pw_gid))
-                {
-                    return None;
-                }
-            }
-        }
+    if !sudo_identity_verified(uid, gid) {
+        return None;
     }
     Some(uid)
 }
@@ -888,6 +927,17 @@ pub fn validate_cgroup_path(path: &str) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+/// Test-only re-export so  can assert that the config validator and
+/// the attach-time opener accept and reject the same set. PRIV-03: two
+/// independent implementations of "is this an acceptable cgroup path" is the
+/// same class of defect as the leak detector/repair pair in W4-01.
+#[cfg(test)]
+pub(crate) fn validate_cgroup_path_for_test(
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    validate_cgroup_path(path)
+}
+
 impl Config {
     /// Validates tunable ranges to prevent DoS / BPF map overflow / malformed state.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1169,15 +1219,52 @@ impl Config {
 
     // loads existing configuration or initializes default schema
     pub fn load_or_default() -> Self {
-        // 1. first check active runtime volatile memory (/run/albus or $XDG_RUNTIME_DIR/albus)
+        // PRIV-01: this used to discard the error from EVERY candidate and fall
+        // through to `Self::default()` with no log, no error and no marker, so
+        // "nothing configured" and "something is configured but unreadable"
+        // were indistinguishable to every caller.
+        //
+        // The damage was a silent policy downgrade. The only field in
+        // `Config::default()` that is weaker than a configured state is
+        // `network_lockdown` (false in the default), which is the fail-closed
+        // "block outbound http/https if eBPF fails" mode. A config that
+        // explicitly enabled it came up with it off, and engine.rs even logged
+        // "network_lockdown is OFF" as though that were the operator's choice.
+        // A corrupted or foreign-schema file hid in the same ignored Result.
+        match Self::load_strict() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(
+                    "no usable configuration found ({}). Falling back to built-in \
+                     defaults — note that network_lockdown will be OFF, so a \
+                     configured fail-closed policy is NOT in effect.",
+                    e
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Loads configuration from the first candidate that both EXISTS and parses.
+    ///
+    /// PRIV-01: the distinction that matters is absence vs. failure. A missing
+    /// file is a legitimate "not configured" and falls through to the next
+    /// candidate; a file that exists but cannot be read or parsed is an ERROR,
+    /// because silently replacing it with defaults can only reduce the
+    /// configured protection. The two are no longer collapsed.
+    pub fn load_strict() -> std::result::Result<Self, String> {
+        let mut seen: Vec<String> = Vec::new();
+
+        // 1. active runtime volatile memory (/run/albus or $XDG_RUNTIME_DIR/albus)
         let volatile_path = Self::volatile_config_path();
         if volatile_path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&volatile_path) {
-                return cfg;
+            match Self::load_from_file(&volatile_path) {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => seen.push(format!("{}: {}", volatile_path.display(), e)),
             }
         }
 
-        // 2. check /run/albus/config.json (system daemon volatile path) —
+        // 2. /run/albus/config.json (system daemon volatile path) —
         // FP-01: skipped for validated sudo invocations (not their file).
         #[cfg(unix)]
         let skip_shared = validated_sudo_uid().is_some();
@@ -1185,28 +1272,40 @@ impl Config {
         let skip_shared = false;
         let run_root = PathBuf::from("/run/albus/config.json");
         if !skip_shared && run_root.exists() {
-            if let Ok(cfg) = Self::load_from_file(&run_root) {
-                return cfg;
+            match Self::load_from_file(&run_root) {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => seen.push(format!("{}: {}", run_root.display(), e)),
             }
         }
 
-        // 3. load from durable user configuration path on disk
+        // 3. durable user configuration path on disk
         let path = Self::default_config_path();
         if path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&path) {
-                return cfg;
+            match Self::load_from_file(&path) {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => seen.push(format!("{}: {}", path.display(), e)),
             }
         }
 
-        // 4. check system-wide /etc/albus/config.json fallback
+        // 4. system-wide /etc/albus/config.json fallback
         let etc_path = PathBuf::from("/etc/albus/config.json");
         if etc_path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&etc_path) {
-                return cfg;
+            match Self::load_from_file(&etc_path) {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => seen.push(format!("{}: {}", etc_path.display(), e)),
             }
         }
 
-        Self::default()
+        if seen.is_empty() {
+            Err("no configuration file present".into())
+        } else {
+            // A file existed at every one of these locations but none parsed.
+            Err(format!(
+                "{} configuration file(s) present but unreadable: {}",
+                seen.len(),
+                seen.join("; ")
+            ))
+        }
     }
 
     /// Loads the system-wide daemon config strictly (`/etc/albus/config.json`,
@@ -1261,6 +1360,7 @@ pub fn apply_run_args(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::type_complexity)]
 mod tests {
     use super::*;
 
@@ -1580,5 +1680,308 @@ mod tests {
                 std::env::remove_var("XDG_RUNTIME_DIR");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_load_failure_tests {
+    use super::*;
+
+    /// PRIV-01: the fallback must never be MORE PERMISSIVE than what is on disk.
+    ///
+    /// `Config::default()` differs from a configured state in exactly one
+    /// security-relevant field — `network_lockdown` is false — and that field is
+    /// the fail-closed "block outbound http/https if eBPF fails" mode. So if a
+    /// file on disk enabled it and loading failed, the old code silently came up
+    /// with the guarantee off, and engine.rs logged "network_lockdown is OFF" as
+    /// if the operator had chosen that.
+    #[test]
+    fn test_the_default_is_never_more_permissive_than_configured_lockdown() {
+        // This is the property the fix depends on: knowing the default's
+        // network_lockdown value is enough to reason about the downgrade.
+        assert!(
+            !Config::default().network_lockdown,
+            "if this ever becomes true, the downgrade reasoning in PRIV-01 changes \\
+             and this test must be revisited"
+        );
+        assert!(
+            Config::default().dnssec,
+            "every other default field is expected to be at least as protective \
+             as a configured state"
+        );
+        assert!(Config::default().kill_switch);
+        assert!(Config::default().block_ipv6);
+        assert!(Config::default().doh_enabled);
+    }
+
+    /// The load logic must distinguish absence from failure.
+    ///
+    /// `load_strict` returns Err with a diagnostic when a file existed but could
+    /// not be loaded, and Ok only when a candidate actually parsed. A missing
+    /// file is legitimately "not configured" and must NOT be reported as a
+    /// failure — otherwise a first run would look like a broken install.
+    #[test]
+    fn test_load_strict_distinguishes_absent_from_unreadable() {
+        // On a machine with no configuration at all, absence must be the
+        // "nothing present" case, not a corruption report.
+        match Config::load_strict() {
+            Ok(_) => {} // a real config exists here; nothing to assert about absence
+            Err(e) => {
+                assert!(
+                    !e.contains("unreadable"),
+                    "with no configuration present the error must say so plainly, \\
+                     not report unreadable files: {}",
+                    e
+                );
+                assert_eq!(e, "no configuration file present");
+            }
+        }
+    }
+
+    /// And the diagnostic must name the files, so an operator can act on it.
+    #[test]
+    fn test_load_failure_diagnostic_names_the_paths() {
+        let err = Config::load_strict().err();
+        if let Some(e) = err {
+            if e != "no configuration file present" {
+                assert!(
+                    e.contains("present but unreadable"),
+                    "a failure diagnostic must distinguish itself from absence: {}",
+                    e
+                );
+                assert!(
+                    e.contains("/"),
+                    "the diagnostic must name the offending paths: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Regression guard: `load_or_default` must not go back to discarding the
+    /// error and stepping silently into `Self::default()`. The fallback is still
+    /// permitted (a first run needs it), but it must be logged and it must say
+    /// that the configured fail-closed policy is not in effect.
+    #[test]
+    fn test_load_or_default_announces_a_policy_downgrade() {
+        let src = include_str!("config.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod config_load_failure_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+
+        let at = prod
+            .find("pub fn load_or_default()")
+            .expect("load_or_default");
+        let tail = &prod[at..];
+        let end = tail
+            .find("pub fn load_strict()")
+            .map(|o| at + o)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+
+        assert!(
+            body.contains("load_strict()"),
+            "load_or_default must go through load_strict, not re-implement the \\
+             candidate walk"
+        );
+        assert!(
+            body.contains("warn!"),
+            "a fallback to defaults must be logged"
+        );
+        assert!(
+            body.contains("network_lockdown will be OFF"),
+            "the warning must say that the configured fail-closed policy is not \\
+             in effect, rather than presenting the default as a choice"
+        );
+    }
+
+    /// And the candidate walk must record the failure of each existing file
+    /// rather than swallowing it with `if let Ok(..)`.
+    #[test]
+    fn test_candidate_walk_records_failures() {
+        let src = include_str!("config.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod config_load_failure_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod.find("pub fn load_strict()").expect("load_strict");
+        let body = &prod[at..];
+        assert!(
+            !body.contains("if let Ok(cfg) = Self::load_from_file"),
+            "PRIV-01: `if let Ok(..)` is exactly the swallow that made absence and \\
+             unreadability indistinguishable — each candidate's error must be \
+             recorded"
+        );
+        assert!(
+            body.contains("seen.push("),
+            "each existing-but-unloadable candidate must be recorded"
+        );
+        assert!(
+            body.contains("present but unreadable"),
+            "the summary must distinguish failure from absence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sudo_identity_tests {
+    /// PRIV-02's decision, mirrored as a pure predicate so it can be tested
+    /// without mutating the process environment or touching the passwd
+    /// database. `pwd` is what `getpwnam` answered.
+    ///
+    /// The bug was that the real code had the shape
+    /// `if !pwd.is_null() && (mismatch) { deny }`, so a NULL answer skipped the
+    /// comparison entirely and the environment-declared identity was trusted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Passwd {
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+
+    fn sudo_identity_ok(pwd: Option<Passwd>, uid: libc::uid_t, gid: Option<libc::gid_t>) -> bool {
+        // Mirrors validated_sudo_uid's own precondition: uid 0 is never a valid
+        // drop target, and drop_to_sudo_user gates on `uid != 0` too.
+        if uid == 0 {
+            return false;
+        }
+        match pwd {
+            // PRIV-02: an unanswerable database is NOT a pass.
+            None => false,
+            Some(p) => {
+                if p.uid != uid {
+                    return false;
+                }
+                match gid {
+                    // SUDO_GID must be present and parseable whenever SUDO_UID
+                    // is trusted, or an env-spoofed primary group survives the
+                    // drop with the guard reporting itself active.
+                    Some(g) => p.gid == g,
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// The reference case: everything agrees.
+    #[test]
+    fn test_matching_identity_is_accepted() {
+        assert!(sudo_identity_ok(
+            Some(Passwd {
+                uid: 1000,
+                gid: 1000
+            }),
+            1000,
+            Some(1000)
+        ));
+    }
+
+    /// The headline bug: `getpwnam` returned NULL. The old code skipped the
+    /// comparison and trusted the environment.
+    #[test]
+    fn test_missing_passwd_entry_is_refused() {
+        assert!(
+            !sudo_identity_ok(None, 1000, Some(1000)),
+            "PRIV-02: an SUDO_USER with no passwd entry must NOT be trusted"
+        );
+    }
+
+    /// SUDO_GID missing or unparseable: the environment cannot prove which
+    /// primary group it is claiming.
+    #[test]
+    fn test_missing_gid_is_refused() {
+        assert!(
+            !sudo_identity_ok(
+                Some(Passwd {
+                    uid: 1000,
+                    gid: 1000
+                }),
+                1000,
+                None
+            ),
+            "PRIV-02: SUDO_GID must be present whenever SUDO_UID is trusted"
+        );
+    }
+
+    /// A uid mismatch and a gid mismatch are each independently fatal.
+    #[test]
+    fn test_mismatches_are_refused() {
+        let p = Some(Passwd {
+            uid: 1000,
+            gid: 1000,
+        });
+        assert!(
+            !sudo_identity_ok(p, 999, Some(1000)),
+            "uid mismatch must refuse"
+        );
+        assert!(
+            !sudo_identity_ok(p, 1000, Some(999)),
+            "gid mismatch must refuse"
+        );
+        assert!(
+            !sudo_identity_ok(p, 999, Some(999)),
+            "both mismatching must refuse"
+        );
+    }
+
+    /// Regression guard on the production code: the `!pwd.is_null() && (...)`
+    /// shape is what made an unanswerable database a silent pass. It must not
+    /// come back at any of the three call sites.
+    #[test]
+    fn test_no_call_site_skips_a_null_lookup() {
+        let src = include_str!("config.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod sudo_identity_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        // Strip line comments first: the surrounding prose names the bad pattern
+        // in order to document it, and matching the documentation would make the
+        // assertion meaningless.
+        let code: String = prod
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("!pwd.is_null()"),
+            "PRIV-02: `!pwd.is_null() && <mismatch>` is the fail-open shape — an \
+             unanswerable database skipped the comparison"
+        );
+        assert!(
+            !code.contains("if pwd.is_null() &&"),
+            "the guard must never combine a NULL-tolerant test with a mismatch test"
+        );
+        // And the fail-closed direction must be present in production.
+        assert!(
+            code.contains("if pwd.is_null() {\n            return false;"),
+            "sudo_identity_verified must treat a NULL lookup as a refusal"
+        );
+    }
+
+    /// And all three sites must route through the one predicate.
+    #[test]
+    fn test_all_sudo_sites_share_one_predicate() {
+        let src = include_str!("config.rs");
+        let uses = src.matches("sudo_identity_verified(").count();
+        // definition + validated_sudo_uid + drop_to_sudo_user + get_sudo_user_home
+        assert!(
+            uses >= 4,
+            "expected the predicate to be defined and used at every SUDO_* trust \\
+             site, found {} occurrences",
+            uses
+        );
+    }
+
+    /// uid 0 is never a valid drop target — the guard drops to whatever it is
+    /// told, so a zero would leave the process at full privilege.
+    #[test]
+    fn test_uid_zero_is_refused() {
+        assert!(
+            !sudo_identity_ok(Some(Passwd { uid: 0, gid: 0 }), 0, Some(0)),
+            "uid 0 must never be a privilege-drop target"
+        );
     }
 }

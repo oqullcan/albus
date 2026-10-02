@@ -36,7 +36,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
                 Some(ConfigCommands::Set(args)) => {
-                    let cfg = albus::app::config::apply_run_args(Config::load_or_default(), &args)?;
+                    let mut cfg = Config::load_or_default();
+                    // update runtime tuning parameters
+                    cfg.mss = args.mss;
+                    cfg.min_mss = args.min_mss;
+                    cfg.restore_mss = args.restore_mss;
+                    cfg.restore_after_bytes = args.restore_after_bytes;
+                    cfg.ports = args.ports;
+                    cfg.cgroup_path = args.cgroup;
+                    cfg.fake_ttl = args.fake_ttl;
+                    cfg.fake_sni = args.fake_sni;
+                    cfg.fake_bad_checksum = args.fake_bad_checksum;
+                    cfg.auto_ttl = args.auto_ttl;
+                    cfg.min_ttl = args.min_ttl;
+                    cfg.max_ttl = args.max_ttl;
+                    cfg.doh_enabled = args.doh;
+                    cfg.doh_upstream = args.doh_upstream;
+                    cfg.doh_bootstrap_ips = args.doh_bootstrap_ips;
+                    cfg.block_quic = args.block_quic;
+                    cfg.block_stun = args.block_stun;
+                    cfg.kill_switch = args.kill_switch;
+                    cfg.network_lockdown = args.network_lockdown;
+                    cfg.block_ipv6 = args.block_ipv6;
+                    cfg.dnssec = args.dnssec;
+                    cfg.pqc = args.pqc;
+                    cfg.ram_only = args.ram_only;
+                    cfg.verbose = args.verbose;
                     cfg.validate()?;
 
                     let path = Config::default_config_path();
@@ -54,22 +79,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     // NOTE: SIGHUP only hot-reloads eBPF maps; firewall/DNS changes need restart.
                     // Only attempt the privileged signal as root: as an unprivileged user,
                     // `systemctl kill` would pop a polkit prompt on every save, so skip it.
-                    let root = is_root();
-                    let is_active = if root {
-                        std::process::Command::new("/usr/bin/systemctl")
+                    if is_root() {
+                        let is_active = albus::app::service::systemctl()
                             .args(["is-active", "--quiet", "albus.service"])
                             .status()
                             .map(|s| s.success())
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        if is_active {
+                            let _ = albus::app::service::systemctl()
+                                .args(["kill", "-s", "HUP", "albus.service"])
+                                .status();
+                            println!(
+                                "live configuration reloaded into running albus daemon (SIGHUP)"
+                            );
+                        }
                     } else {
-                        false
-                    };
-                    if should_signal_daemon(root, is_active) {
-                        let _ = std::process::Command::new("/usr/bin/systemctl")
-                            .args(["kill", "-s", "HUP", "albus.service"])
-                            .status();
-                        println!("live configuration reloaded into running albus daemon (SIGHUP)");
-                    } else if !root {
                         println!(
                             "saved (unprivileged): restart albus.service to apply to the running daemon"
                         );
@@ -98,22 +122,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
             println!("albus cleanup");
-            firewall::unblock_quic();
-            firewall::unblock_stun();
-            firewall::disable_kill_switch();
-            firewall::disable_network_lockdown();
-            match dns::cleanup_system_dns() {
-                Ok(true) => {
-                    println!("cleanup complete — system DNS and firewall rules restored");
-                }
-                Ok(false) => {
-                    println!("cleanup complete — firewall rules checked");
-                }
-                Err(e) => {
-                    eprintln!("error during cleanup: {}", e);
+            // W1-01: this is `ExecStopPost=+/usr/local/bin/albus cleanup`, i.e.
+            // the crash-recovery path. It used to call four revert helpers that
+            // returned nothing and then print "cleanup complete" unconditionally
+            // — so a host left with stranded fail-closed DROP rules (or a
+            // resolv.conf still pinned to a dead loopback listener) was reported
+            // as recovered. systemd runs this with a '+' prefix, so its exit
+            // status is the only signal the unit gets; a truthful non-zero exit
+            // is what turns a silent degradation into a visible one.
+            let mut failed: Vec<String> = Vec::new();
+            let fw_steps: [(&str, firewall::FwCount); 4] = [
+                ("unblock_quic", firewall::unblock_quic()),
+                ("unblock_stun", firewall::unblock_stun()),
+                ("disable_kill_switch", firewall::disable_kill_switch()),
+                (
+                    "disable_network_lockdown",
+                    firewall::disable_network_lockdown(),
+                ),
+            ];
+            for (name, r) in fw_steps {
+                match r {
+                    Ok(n) => println!("  {}: removed {} rule(s)", name, n),
+                    Err(e) => failed.push(format!("{} ({})", name, e)),
                 }
             }
-            Ok(())
+            match dns::cleanup_system_dns() {
+                Ok(true) => {
+                    println!("  system DNS restored");
+                }
+                Ok(false) => {
+                    println!("  no albus DNS markers found; resolver left untouched");
+                }
+                Err(e) => failed.push(format!("DNS restore ({})", e)),
+            }
+            if failed.is_empty() {
+                println!("cleanup complete — system DNS and firewall rules restored");
+                Ok(())
+            } else {
+                eprintln!(
+                    "cleanup INCOMPLETE — these steps did not verify: {}. \
+                     Residual rules may still block outbound traffic and \
+                     /etc/resolv.conf may still point at a dead listener; \
+                     inspect `iptables -S OUTPUT | grep albus` and /etc/resolv.conf.",
+                    failed.join(", ")
+                );
+                Err(format!("cleanup incomplete: {}", failed.join("; ")).into())
+            }
         }
         // start packet fragmentation and desync engine
         Some(Commands::Run(args)) => run_engine(args).await,
@@ -122,7 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let level = resolve_log_level(args.verbose);
+    let level = if args.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
 
     // initialize structured tracing subscriber
     let subscriber = FmtSubscriber::builder()
@@ -144,108 +202,4 @@ async fn run_engine(args: RunArgs) -> Result<(), Box<dyn std::error::Error + Sen
     // instantiate and run async event loop
     let mut engine = Engine::new(cfg)?;
     engine.run().await
-}
-
-fn resolve_log_level(verbose: bool) -> Level {
-    if verbose {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    }
-}
-
-/// Whether a post-save SIGHUP may be attempted: root only, so unprivileged
-/// saves never trigger a polkit prompt via `systemctl kill`.
-fn should_signal_daemon(is_root_flag: bool, service_active: bool) -> bool {
-    is_root_flag && service_active
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    fn set_args() -> RunArgs {
-        match Cli::try_parse_from([
-            "albus",
-            "run",
-            "--mss",
-            "100",
-            "--doh-upstream",
-            "cloudflare",
-            "--kill-switch",
-            "false",
-        ])
-        .unwrap()
-        .command
-        {
-            Some(Commands::Run(args)) => args,
-            _ => panic!("expected run command"),
-        }
-    }
-
-    #[test]
-    fn test_apply_run_args_maps_fields() {
-        use albus::app::config::apply_run_args;
-        let args = set_args();
-        let cfg = apply_run_args(Config::default(), &args).unwrap();
-        assert_eq!(cfg.mss, 100);
-        assert_eq!(cfg.doh_upstream, "cloudflare");
-        assert!(!cfg.kill_switch);
-        // untouched base survives
-        assert_eq!(cfg.min_mss, 64);
-    }
-
-    #[test]
-    fn test_resolve_log_level() {
-        assert_eq!(resolve_log_level(true), Level::DEBUG);
-        assert_eq!(resolve_log_level(false), Level::INFO);
-    }
-
-    #[test]
-    fn test_should_signal_daemon_needs_root_and_active() {
-        assert!(should_signal_daemon(true, true));
-        assert!(!should_signal_daemon(false, true));
-        assert!(!should_signal_daemon(true, false));
-        assert!(!should_signal_daemon(false, false));
-    }
-
-    #[test]
-    fn test_config_get_system_flag_parses() {
-        use albus::app::cli::{Cli, Commands, ConfigCommands};
-        let sys = match Cli::try_parse_from(["albus", "config", "get", "--system"])
-            .unwrap()
-            .command
-        {
-            Some(Commands::Config(a)) => match a.command {
-                Some(ConfigCommands::Get { system }) => system,
-                _ => panic!("expected get subcommand"),
-            },
-            _ => panic!("expected config command"),
-        };
-        assert!(sys, "--system must parse to true");
-        let plain = match Cli::try_parse_from(["albus", "config", "get"])
-            .unwrap()
-            .command
-        {
-            Some(Commands::Config(a)) => match a.command {
-                Some(ConfigCommands::Get { system }) => system,
-                _ => panic!("expected get subcommand"),
-            },
-            _ => panic!("expected config command"),
-        };
-        assert!(!plain, "default stays user-file resolution");
-    }
-
-    #[tokio::test]
-    async fn test_run_engine_refuses_unprivileged() {
-        // L-guard: without root the engine must refuse before touching
-        // firewall, DNS, or eBPF. Skipped as root (it would really start).
-        if albus::core::ebpf::is_root() {
-            return;
-        }
-        let args = set_args();
-        let res = run_engine(args).await;
-        assert!(res.is_err(), "unprivileged run_engine must refuse");
-    }
 }

@@ -4,7 +4,6 @@ use crate::core::ebpf::features::{
     has_service_privileges, have_sock_ops, is_cgroup_v2, is_root, service_uid,
 };
 use std::env;
-use std::process::Command;
 
 // dispatches status query to plaintext or json formatter
 pub fn handle_status_command(json: bool) {
@@ -90,10 +89,8 @@ fn pid_is_verified_albus(pid: u32, self_exe: &Option<std::path::PathBuf>, my_pid
 
 // generates structured json payload consumed by desktop panels and status bars
 pub fn show_status_json() {
-    let is_service_active = Command::new("/usr/bin/systemctl")
+    let is_service_active = crate::app::service::systemctl()
         .args(["is-active", "--quiet", "albus.service"])
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .status()
         .map(|s| s.success())
         .unwrap_or(false);

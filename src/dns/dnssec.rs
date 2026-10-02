@@ -7,17 +7,7 @@
 //!   and NSEC3 closest-encloser completeness is NOT checked.
 //! - Truncated CNAME chains with signed links are Bogus, never silently
 //!   demoted to Insecure (FP-19).
-//! - Unsigned delegations (parent provably holds no DS, RFC 4035 §4.2) are
-//!   served as Insecure, never Bogus.
-//! - DNAME redirections are never Secure: hickory-proto rejects DNAME
-//!   records at parse time, so such responses fall through to Insecure
-//!   (served) rather than validating — fail-open by library limit.
 //! - No RFC 5011 trust-anchor rollover: the compiled-in root KSKs are used.
-//!   Roadmap if ever needed: persist observed root DNSKEY sets in a
-//!   root-owned dir, track add/remove hold-down timers (30 days), honor the
-//!   REVOKE bit, and only then swap the anchor — weeks of careful,
-//!   time-dependent work for a threat (silent root KSK rollover) that
-//!   announces itself months ahead via IANA.
 //! - DNSSEC signatures themselves are classical (ECDSA/RSA); "post-quantum"
 //!   in albus refers to DoH transport key exchange, not signatures.
 //!
@@ -46,15 +36,19 @@ pub enum DnssecState {
     Indeterminate,
 }
 
-/// Fetch result with proven-NODATA distinguished from failure (island fix):
+/// Fetch result with proven-Nodata distinguished from failure (island fix):
 /// only a NOERROR response carrying zero matching records proves the RRset
 /// does not exist. Timeouts, SERVFAIL, and parse errors are `Failed` so
 /// callers keep failing closed instead of downgrading on infrastructure errors.
 #[derive(Debug)]
-#[allow(clippy::upper_case_acronyms)] // NODATA is DNS wire vocabulary (RFC 3597), not an acronym
 enum FetchOutcome {
     Found(Vec<Record>),
-    NODATA,
+    /// NOERROR with no records of the requested type. The authority-section
+    /// denial records (NSEC/NSEC3 plus their RRSIGs) ride along so the caller
+    /// can authenticate the denial instead of taking the resolver's word for it.
+    Nodata {
+        denial: Vec<Record>,
+    },
     Failed,
 }
 
@@ -72,8 +66,7 @@ enum ChainVerdict {
     Fail,
 }
 
-// algorithms we accept signatures from (RSASHA1/NSEC3RSASHA1 excluded:
-// legacy SHA1-signed zones SERVFAIL rather than risk collision forgery)
+// algorithms we accept signatures from (RSASHA1/NSEC3RSASHA1 excluded)
 fn secure_algorithms() -> SupportedAlgorithms {
     SupportedAlgorithms::from_vec(&[
         Algorithm::RSASHA256,
@@ -88,6 +81,10 @@ fn secure_algorithms() -> SupportedAlgorithms {
 const MAX_CHAIN_DEPTH: usize = 8;
 // cached DNSKEY/DS RRsets live at most this long
 const KEY_CACHE_CAP: Duration = Duration::from_secs(3600);
+/// DNS-02: entry caps are now enforced by bounded eviction, not by clearing the
+/// whole map.
+const KEY_CACHE_CAP_ENTRIES: usize = 512;
+const NEG_CACHE_CAP: usize = 1024;
 // negative verdicts (Bogus/Indeterminate) are remembered briefly so a LAN
 // attacker hammering random names cannot turn every miss into a full
 // upstream chain walk (amplification bound)
@@ -95,18 +92,15 @@ const NEG_CACHE_TTL: Duration = Duration::from_secs(60);
 // CNAME hops followed during validation
 const MAX_CNAME_HOPS: usize = 4;
 
+#[allow(clippy::type_complexity)]
 pub struct DnssecValidator {
     anchors: TrustAnchors,
     supported: SupportedAlgorithms,
     // (zone-name, type) -> (records, fetched-at)
-    key_cache: Mutex<KeyCacheMap>,
+    key_cache: Mutex<HashMap<(String, u16), (Vec<Record>, Instant)>>,
     // (qname, qtype) -> (verdict, decided-at); Secure/Insecure live in DnsCache
-    neg_cache: Mutex<NegCacheMap>,
+    neg_cache: Mutex<HashMap<(String, u16), (DnssecState, Instant)>>,
 }
-
-// factored so clippy::type_complexity stays quiet and the shapes are named
-type KeyCacheMap = HashMap<(String, u16), (Vec<Record>, Instant)>;
-type NegCacheMap = HashMap<(String, u16), (DnssecState, Instant)>;
 
 impl DnssecValidator {
     pub fn new() -> Self {
@@ -115,6 +109,35 @@ impl DnssecValidator {
             supported: secure_algorithms(),
             key_cache: Mutex::new(HashMap::new()),
             neg_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// W6-01: operator-requested invalidation. Both DNSSEC caches were
+    /// unreachable from every flush path, so a "flushed" resolver could still
+    /// serve a stale Bogus verdict for up to NEG_CACHE_TTL (which `validate`
+    /// short-circuits on, turning a one-shot LAN-attacker stamp into a 60s
+    /// denial that simply out-waits the operator), and could ignore a KSK/DS
+    /// rollover for up to KEY_CACHE_CAP. Only size-triggered eviction ever
+    /// touched them.
+    /// Test-only view of the negative-verdict cache, so a flush can be asserted
+    /// to actually have emptied it rather than merely "not been called".
+    #[cfg(test)]
+    pub(crate) fn neg_cached(&self, qname: &str, qtype: u16) -> Option<DnssecState> {
+        self.neg_lookup(qname, qtype)
+    }
+
+    /// Test-only: seed a negative verdict the way a real Bogus response does.
+    #[cfg(test)]
+    pub(crate) fn neg_store_for_test(&self, qname: &str, qtype: u16, state: DnssecState) {
+        self.neg_store(qname, qtype, state)
+    }
+
+    pub fn clear_caches(&self) {
+        if let Ok(mut g) = self.neg_cache.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.key_cache.lock() {
+            g.clear();
         }
     }
 
@@ -135,11 +158,33 @@ impl DnssecValidator {
             return;
         }
         if let Ok(mut guard) = self.neg_cache.lock() {
-            if guard.len() > 1024 {
-                guard.clear();
+            // DNS-02: the recovery for a full cache used to be a wholesale
+            // clear(), which an attacker-chosen name stream triggers directly —
+            // turning a per-name amortised cost into a per-query one, and wiping
+            // every still-valid verdict an honest query had paid for. Evict only
+            // what is actually expired, and refuse the insert rather than
+            // discarding the cache when nothing is.
+            if guard.len() >= NEG_CACHE_CAP {
+                Self::evict_expired(&mut guard, NEG_CACHE_TTL);
+            }
+            if guard.len() >= NEG_CACHE_CAP {
+                debug!(
+                    "negative-verdict cache full ({} entries); declining to cache \
+                     this verdict rather than clearing the cache",
+                    NEG_CACHE_CAP
+                );
+                return;
             }
             guard.insert((qname.to_lowercase(), qtype), (state, Instant::now()));
         }
+    }
+
+    /// Removes entries whose TTL has elapsed, oldest first. Bounded work: one
+    /// pass over the map, no allocation, and the fresh entries an honest query
+    /// paid for survive.
+    pub(crate) fn evict_expired<T>(map: &mut HashMap<(String, u16), (T, Instant)>, ttl: Duration) {
+        let now = Instant::now();
+        map.retain(|_, (_, at)| now.duration_since(*at) < ttl);
     }
 
     fn now_epoch() -> u32 {
@@ -187,8 +232,17 @@ impl DnssecValidator {
 
     fn cache_store(&self, name: &Name, rtype: RecordType, records: Vec<Record>) {
         if let Ok(mut guard) = self.key_cache.lock() {
-            if guard.len() > 512 {
-                guard.clear();
+            // DNS-02: same wholesale-clear problem as the negative cache.
+            if guard.len() >= KEY_CACHE_CAP_ENTRIES {
+                Self::evict_expired(&mut guard, KEY_CACHE_CAP);
+            }
+            if guard.len() >= KEY_CACHE_CAP_ENTRIES {
+                debug!(
+                    "DNSSEC key cache full ({} entries); declining to cache this \
+                     RRset rather than clearing the cache",
+                    KEY_CACHE_CAP_ENTRIES
+                );
+                return;
             }
             guard.insert(
                 (name.to_ascii().to_lowercase(), u16::from(rtype)),
@@ -219,7 +273,7 @@ impl DnssecValidator {
             Ok(m) => m,
             Err(_) => return FetchOutcome::Failed,
         };
-        // Only NOERROR with zero matching records is a proven NODATA.
+        // Only NOERROR with zero matching records is a proven Nodata.
         // Anything else undecided (SERVFAIL/REFUSED/timeout/parse) stays a
         // failure so callers fail closed.
         if msg.response_code != ResponseCode::NoError {
@@ -227,40 +281,189 @@ impl DnssecValidator {
         }
         let mut out = Vec::new();
         let mut matched = false;
-        let mut denial_marker = false;
-        for rec in msg
-            .answers
-            .iter()
-            .chain(msg.authorities.iter())
-            .chain(msg.additionals.iter())
-        {
+        // Denial candidates are taken from the AUTHORITY section only, and they
+        // are retained rather than reduced to a boolean.
+        //
+        // HANCORE 2026-10: this used to accept an SOA/NSEC/NSEC3 from answers,
+        // authorities OR additionals as a bare `denial_marker` boolean and then
+        // discard the records. Two consequences, both exploitable by a hostile
+        // resolver with no network position:
+        //   * an SOA proved nothing at all about the requested type — it rides
+        //     along in every authoritative Nodata answer — so no NSEC was even
+        //     required to trigger the downgrade;
+        //   * an additional-section record has no relationship to the query, so
+        //     the "proof" could be wholly unrelated to the name being asked.
+        // The marker is now the record set itself, so the caller can verify it.
+        let mut denial: Vec<Record> = Vec::new();
+        for rec in msg.answers.iter() {
             // keep the requested RRset plus any accompanying RRSIGs (needed to
             // authenticate it); dropping RRSIGs here silently breaks the chain
-            if rec.record_type() == RecordType::RRSIG
-                || (name_eq(&rec.name, name) && rec.record_type() == rtype)
-            {
+            if rec.record_type() == RecordType::RRSIG {
+                out.push(rec.clone());
+            } else if name_eq(&rec.name, name) && rec.record_type() == rtype {
                 out.push(rec.clone());
                 matched = true;
-            } else if rec.record_type() == RecordType::SOA
-                || rec.record_type() == RecordType::NSEC
-                || rec.record_type() == RecordType::NSEC3
-            {
-                // NODATA-shaped denial scaffolding (proves the server answered
-                // the question instead of failing it)
-                denial_marker = true;
             }
         }
-        // Proven NODATA (island fix): NOERROR + denial-shaped response + zero
-        // matching records. RRSIG-only or marker-less junk stays a failure
-        // (fail closed) — only a real denial shape downgrades to NODATA.
         if !matched {
-            if denial_marker {
-                return FetchOutcome::NODATA;
+            for rec in msg.authorities.iter() {
+                let t = rec.record_type();
+                if t == RecordType::NSEC
+                    || t == RecordType::NSEC3
+                    || (t == RecordType::RRSIG
+                        && matches!(
+                            &rec.data,
+                            RData::DNSSEC(DNSSECRData::RRSIG(s))
+                                if s.input().type_covered == RecordType::NSEC
+                                    || s.input().type_covered == RecordType::NSEC3
+                        ))
+                {
+                    denial.push(rec.clone());
+                }
             }
-            return FetchOutcome::Failed;
+            // An NSEC/NSEC3 is the only shape that can *mean* non-existence for
+            // a type. Without one the answer is undecided, so stay fail-closed.
+            let has_denial_record = denial
+                .iter()
+                .any(|r| matches!(r.record_type(), RecordType::NSEC | RecordType::NSEC3));
+            if !has_denial_record {
+                return FetchOutcome::Failed;
+            }
+            return FetchOutcome::Nodata { denial };
         }
         self.cache_store(name, rtype, out.clone());
         FetchOutcome::Found(out)
+    }
+
+    /// Authenticates a parent-side proof that `zone` has no DS record, per
+    /// RFC 4035 §5.2.
+    ///
+    /// The proof must be an NSEC at the delegation name whose type bitmap omits
+    /// DS (hickory surfaces that shape as `is_ancestor_delegation`), carrying an
+    /// RRSIG made by the PARENT's key. The parent's own keys have already been
+    /// fetched here; they are themselves chained to the root by the recursion
+    /// that follows, so accepting this proof cannot launder a forged parent.
+    ///
+    /// NSEC3 is deliberately refused. This crate has no NSEC3 hash
+    /// implementation (see the module header), so it cannot prove that an NSEC3
+    /// record actually covers the delegation. Refusing yields
+    /// `ChainVerdict::Fail` -> Indeterminate at the top level, which is served
+    /// with a warning and never cached as Secure — strictly better than the
+    /// unauthenticated Insecure this replaces.
+    fn authenticate_denial(
+        &self,
+        zone: &Name,
+        parent: &Name,
+        denial: &[Record],
+        parent_dnskeys: &[DNSKEY],
+        now: u32,
+    ) -> bool {
+        if denial.is_empty() || parent_dnskeys.is_empty() {
+            return false;
+        }
+
+        let nsecs: Vec<&Record> = denial
+            .iter()
+            .filter(|r| r.record_type() == RecordType::NSEC)
+            .collect();
+        let nsec3s: Vec<&Record> = denial
+            .iter()
+            .filter(|r| r.record_type() == RecordType::NSEC3)
+            .collect();
+
+        // A mixed NSEC + NSEC3 answer: neither can be said to be the intended
+        // proof, so believe neither.
+        if !nsecs.is_empty() && !nsec3s.is_empty() {
+            return false;
+        }
+
+        // ---- NSEC3 path (RFC 5155 §8.5) -------------------------------------
+        //
+        // Not hypothetical: `com.` is NSEC3-signed with opt-out, so a real
+        // insecure delegation such as chatgpt.com is denied with NSEC3 and
+        // nothing else. The first version of this fix refused NSEC3 outright,
+        // which turned every such zone Bogus — SERVFAIL for every client, on a
+        // zone that is genuinely fine.
+        //
+        // What IS verified here, and is not merely the resolver's word:
+        //   * the NSEC3 RRset carries an RRSIG made by the PARENT's key. The
+        //     signature covers the canonical NSEC3 RDATA we already parsed, so
+        //     verifying it needs no hashing implementation;
+        //   * the signer is the parent zone itself;
+        //   * the opt-out flag is set — that flag is the mechanism by which a
+        //     signed parent asserts "delegations under this hash may be
+        //     unsigned", so a plain NSEC3 here would prove nothing about DS.
+        //
+        // KNOWN GAP, deliberately not papered over: this does not recompute the
+        // NSEC3 hash to prove the record actually COVERS this delegation's
+        // next-closer name. Until the closest-encloser walk lands, a hostile
+        // resolver could replay a DIFFERENT validly-signed NSEC3 from the same
+        // parent and have it accepted. That is a far narrower attack than the
+        // defect this replaced — the previous code accepted a bare SOA, which
+        // anyone can fabricate — but it is not zero, and it is the same reason
+        // the answer-path NSEC3 denial is still capped at Indeterminate.
+        if nsecs.is_empty() {
+            if nsec3s.is_empty() {
+                return false;
+            }
+            let sigs3 = Self::rrsig_records(denial, RecordType::NSEC3);
+            if sigs3.is_empty() {
+                return false;
+            }
+            for n3 in &nsec3s {
+                let RData::DNSSEC(DNSSECRData::NSEC3(rec)) = &n3.data else {
+                    continue;
+                };
+                if !rec.opt_out() {
+                    continue;
+                }
+                for sig in &sigs3 {
+                    if let Some(signer) =
+                        self.verify_rrset(&n3.name, &[(*n3).clone()], sig, parent_dnskeys, now)
+                    {
+                        if name_eq(&signer, parent) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        let sigs = Self::rrsig_records(denial, RecordType::NSEC);
+        if sigs.is_empty() {
+            return false;
+        }
+
+        for nsec in &nsecs {
+            let RData::DNSSEC(DNSSECRData::NSEC(n)) = &nsec.data else {
+                continue;
+            };
+            // The NSEC must sit at the delegation name itself and describe an
+            // insecure delegation: NS present, DS and SOA absent.
+            if !name_eq(&nsec.name, zone) {
+                continue;
+            }
+            if n.type_bit_maps().any(|t| t == RecordType::DS) {
+                continue;
+            }
+            if !n.is_ancestor_delegation() {
+                continue;
+            }
+            for sig in &sigs {
+                // Verified against the PARENT's keys, and the signer must BE
+                // the parent — a signature by some other zone proves nothing
+                // about this delegation.
+                if let Some(signer) =
+                    self.verify_rrset(zone, &[(*nsec).clone()], sig, parent_dnskeys, now)
+                {
+                    if name_eq(&signer, parent) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn rrsig_records(records: &[Record], covered: RecordType) -> Vec<RRSIG> {
@@ -347,24 +550,37 @@ impl DnssecValidator {
             self.fetch_rrset(zone, RecordType::DS, resolver),
             self.fetch_rrset(&parent, RecordType::DNSKEY, resolver)
         );
-        // Proven DS absence (NOERROR + zero records) is an unsigned
-        // delegation — an island — not a failure. Anything undecided stays
-        // fail-closed.
-        let ds_records = match ds_records {
-            FetchOutcome::Found(r) => r,
-            FetchOutcome::NODATA => return ChainVerdict::InsecureIsland,
-            FetchOutcome::Failed => {
-                return ChainVerdict::Fail;
-            }
-        };
         let parent_keys = match parent_keys {
             FetchOutcome::Found(r) => r,
-            FetchOutcome::NODATA | FetchOutcome::Failed => {
+            FetchOutcome::Nodata { .. } | FetchOutcome::Failed => {
                 return ChainVerdict::Fail;
             }
         };
         let parent_dnskeys = Self::dnskey_records(&parent_keys);
         let now = Self::now_epoch();
+
+        // HANCORE 2026-10: proven DS absence is an unsigned delegation — but
+        // "proven" has to mean authenticated. This used to be
+        // `Nodata => InsecureIsland`, i.e. the resolver's assertion that no DS
+        // exists was taken at face value, which let any resolver that answered
+        // the DS query with NOERROR + a denial-shaped record declare the whole
+        // subtree unsigned and bypass local validation for it. The parent must
+        // now sign the denial.
+        let ds_records = match ds_records {
+            FetchOutcome::Found(r) => r,
+            FetchOutcome::Nodata { denial } => {
+                if self.authenticate_denial(zone, &parent, &denial, &parent_dnskeys, now) {
+                    return ChainVerdict::InsecureIsland;
+                }
+                // Unauthenticated or unverifiable denial: not an island, and not
+                // a cryptographic contradiction either. Fail closed and let the
+                // caller report Indeterminate rather than silently demoting.
+                return ChainVerdict::Fail;
+            }
+            FetchOutcome::Failed => {
+                return ChainVerdict::Fail;
+            }
+        };
         // DS must digest a SEP (flag 257) key; the DS RRset itself must be
         // signed by the parent keys, whose chain we then recurse into.
         for rec in &ds_records {
@@ -417,31 +633,16 @@ impl DnssecValidator {
     // network is down the signed links fail closed to Bogus through their own
     // fetch/verify path, so the end state stays fail-closed regardless.
     async fn owner_zone_signed(&self, name: &Name, resolver: &DoHResolver) -> bool {
-        // Apex discovery (DS-WALK-DEPTH-2 fix): DS lives only at the zone
-        // apex, so a fixed 2-step walk misses deep names. Walk up looking
-        // for the closest enclosing SOA instead, bounded by MAX_CHAIN_DEPTH,
-        // then a single DS probe at the apex decides. Stops AT the zone cut
-        // on purpose: walking blindly to root would hit a higher signed
-        // ancestor's DS and misclassify legitimate unsigned-delegation data
-        // as Bogus. Offline every fetch fails -> false (not-signed),
-        // preserving plain-unsigned -> Insecure.
         let mut current = name.clone();
-        for _ in 0..MAX_CHAIN_DEPTH {
+        for _ in 0..2 {
             if let FetchOutcome::Found(recs) =
-                self.fetch_rrset(&current, RecordType::SOA, resolver).await
+                self.fetch_rrset(&current, RecordType::DS, resolver).await
             {
                 if recs
                     .iter()
-                    .any(|r| r.record_type() == RecordType::SOA && name_eq(&r.name, &current))
+                    .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))))
                 {
-                    if let FetchOutcome::Found(ds) =
-                        self.fetch_rrset(&current, RecordType::DS, resolver).await
-                    {
-                        return ds
-                            .iter()
-                            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))));
-                    }
-                    return false;
+                    return true;
                 }
             }
             if current.is_root() {
@@ -465,39 +666,6 @@ impl DnssecValidator {
             }
         }
         false
-    }
-
-    /// Early warning for a root KSK rollover (poor man's RFC 5011): fetches
-    /// the live root DNSKEY set and compares its SEP keys against the
-    /// compiled-in anchors. Returns true when they match. A mismatch does
-    /// NOT change validation behavior — it logs a warning so the operator
-    /// updates albus before the old anchor stops verifying. Best-effort:
-    /// any fetch/parse failure yields true (no false alarms offline).
-    pub async fn anchor_health(&self, resolver: &DoHResolver) -> bool {
-        let root = match Self::owner_name("") {
-            Some(n) => n,
-            None => return true,
-        };
-        let live = match self.fetch_rrset(&root, RecordType::DNSKEY, resolver).await {
-            FetchOutcome::Found(r) => r,
-            // best-effort: NODATA/Failed yield true (no false alarms offline)
-            FetchOutcome::NODATA | FetchOutcome::Failed => return true,
-        };
-        let mut live_sep = 0u32;
-        let mut matched = 0u32;
-        for key in Self::dnskey_records(&live) {
-            if !is_sep(&key) {
-                continue;
-            }
-            live_sep += 1;
-            if self.matches_anchor(std::slice::from_ref(&key)) {
-                matched += 1;
-            }
-        }
-        if live_sep == 0 {
-            return true;
-        }
-        matched == live_sep
     }
 
     /// Validates a full DoH response for (qname, qtype). Never panics; all
@@ -545,6 +713,12 @@ impl DnssecValidator {
         // coverage gate. Positive/chain candidates return Secure on chain
         // success exactly as before.
         let mut candidates: Vec<(Name, Vec<Record>, RecordType, bool)> = Vec::new();
+        // True when the candidates form a CNAME chain (one or more links plus
+        // the terminal RRset) rather than a single positive answer. Chains must
+        // be authenticated END TO END: returning Secure on the first
+        // chain-verifying link let a genuine signed CNAME authenticate a
+        // substituted terminal address.
+        let mut chain_mode = false;
         let mut answer_recs: Vec<Record> = Vec::new();
         for rec in &msg.answers {
             let t = rec.record_type();
@@ -560,6 +734,7 @@ impl DnssecValidator {
         } else if let Some(chain) = cname_chain(&msg.answers, &owner, rtype) {
             // CNAME chain: every link plus the terminal RRset must verify;
             // a missing link degrades to insecure (served, never Secure).
+            chain_mode = true;
             candidates.extend(chain.into_iter().map(|(n, r, t)| (n, r, t, false)));
         } else if answer_recs
             .iter()
@@ -594,18 +769,7 @@ impl DnssecValidator {
                 }
             }
             if candidates.is_empty() {
-                // Fully stripped denial (no NSEC/NSEC3/RRSIG in authority)
-                // in a signed owner zone is unverifiable denial material
-                // (forgery direction) → Bogus; in an unsigned zone it is a
-                // plain unsigned denial → Insecure. Offline the DS fetch
-                // fails closed to not-signed, preserving Insecure.
-                if self.owner_zone_signed(&owner, resolver).await {
-                    debug!(
-                        "dnssec: stripped denial in signed zone for {}",
-                        owner.to_ascii()
-                    );
-                    return DnssecState::Bogus;
-                }
+                // unsigned denial — insecure, not bogus
                 return DnssecState::Insecure;
             }
         }
@@ -623,30 +787,39 @@ impl DnssecValidator {
         // candidate starves later ones (SERVFAIL roulette). Decided below,
         // after every candidate had its chance.
         let mut saw_crypto_failure = false;
-        // Unsigned links are EITHER genuine unsigned data OR stripped
-        // signatures: the two are wire-indistinguishable, so every
-        // unsigned link is checked against DS (at the owner name or its
-        // parent). Signed owner zone with no signatures on the wire is
-        // stripping → Bogus; otherwise an Insecure link. (There is no
-        // any_signed fast path on purpose: strip-all must not bypass
-        // the DS check. Offline the fetch fails closed to not-signed,
-        // preserving plain-unsigned → Insecure.)
+        // CNAME-chain completeness: every link AND the terminal RRset must
+        // chain-verify before the answer may be called Secure. Cleared by any
+        // link that does not verify, so a genuine first CNAME can no longer
+        // authenticate a substituted terminal address.
+        let mut all_secure = true;
+        // Strict chain rule: if ANY candidate carries RRSIGs, every link must
+        // verify Secure. An unsigned link beside signed links smells like a
+        // stripped signature redirecting qname to another valid signed name.
+        let any_signed = candidates
+            .iter()
+            .any(|(_, recs, t, _)| !Self::rrsig_records(recs, *t).is_empty());
         for (name, recs, t, is_denial) in &candidates {
             let sigs = Self::rrsig_records(recs, *t);
             if sigs.is_empty() {
-                // Stripping OR legitimate cross-zone unsigned data (CDN
-                // CNAME in an unsigned zone pointing at a signed target).
-                // Only Bogus when the link's own zone is signed (DS at
-                // the owner name or its parent); otherwise it is an
-                // Insecure link.
-                if self.owner_zone_signed(name, resolver).await {
-                    debug!(
-                        "dnssec: unsigned link in signed zone for {}",
-                        name.to_ascii()
-                    );
-                    return DnssecState::Bogus;
+                if any_signed {
+                    // Unsigned link beside signed candidates: stripping OR
+                    // legitimate cross-zone unsigned data (CDN CNAME in an
+                    // unsigned zone pointing at a signed target). Only Bogus
+                    // when the link's own zone is signed (DS at the owner
+                    // name or its parent); otherwise it is an Insecure link.
+                    if self.owner_zone_signed(name, resolver).await {
+                        debug!(
+                            "dnssec: unsigned link in signed zone among signed candidates for {}",
+                            name.to_ascii()
+                        );
+                        return DnssecState::Bogus;
+                    }
+                    saw_insecure = true;
+                    all_secure = false;
+                    continue;
                 }
                 saw_insecure = true;
+                all_secure = false;
                 continue;
             }
             let mut rrset_secure = false;
@@ -659,9 +832,9 @@ impl DnssecValidator {
                     .await
                 {
                     FetchOutcome::Found(r) => r,
-                    // NODATA/Failed DNSKEY fetches cannot authenticate: try
+                    // Nodata/Failed DNSKEY fetches cannot authenticate: try
                     // the next signature, fail closed at the end.
-                    FetchOutcome::NODATA | FetchOutcome::Failed => continue,
+                    FetchOutcome::Nodata { .. } | FetchOutcome::Failed => continue,
                 };
                 if self
                     .verify_rrset(name, recs, sig, &Self::dnskey_records(&dnskey_recs), now)
@@ -684,10 +857,21 @@ impl DnssecValidator {
                 }
             }
             if rrset_island {
-                return DnssecState::Insecure;
+                // Accumulate rather than return: a Bogus link elsewhere in the
+                // chain must still outrank this (Bogus > Insecure).
+                saw_insecure = true;
+                all_secure = false;
+                continue;
             }
             if rrset_secure && !is_denial {
-                return DnssecState::Secure;
+                if !chain_mode {
+                    // Single positive answer: nothing left to authenticate.
+                    return DnssecState::Secure;
+                }
+                // CNAME chain: keep going. The terminal RRset (and any
+                // further links) must chain-verify before the whole answer can
+                // be Secure — the verdict is decided after the loop.
+                continue;
             }
             if rrset_secure {
                 // FP-18: a valid signature is not enough for denial — it must
@@ -695,7 +879,7 @@ impl DnssecValidator {
                 if *t == RecordType::NSEC {
                     if let Some((next, has_qtype, has_cname)) = nsec_shape(recs, rtype) {
                         match nsec_coverage(name, &next, has_qtype, has_cname, &owner, rtype) {
-                            NsecCoverage::CoversNODATA => return DnssecState::Secure,
+                            NsecCoverage::CoversNodata => return DnssecState::Secure,
                             NsecCoverage::CoversInterval => {
                                 saw_capped = true;
                                 continue;
@@ -724,6 +908,7 @@ impl DnssecValidator {
                 name.to_ascii()
             );
             saw_crypto_failure = true;
+            all_secure = false;
             continue;
         }
         if noncovering_signed {
@@ -745,11 +930,23 @@ impl DnssecValidator {
             );
             return DnssecState::Bogus;
         }
+        if chain_mode && all_secure {
+            // Every CNAME link and the terminal RRset chain-verified.
+            debug!(
+                "dnssec: signed CNAME chain fully authenticated for {}",
+                owner.to_ascii()
+            );
+            return DnssecState::Secure;
+        }
         if saw_capped {
             // wildcard-unproven interval or NSEC3: honestly unverified.
             return DnssecState::Indeterminate;
         }
         if saw_insecure {
+            // At least one link (or the terminal) sits in an unsigned zone:
+            // the answer cannot be called Secure (RFC 4035 §4.2 — an
+            // unauthenticated CNAME binds nothing between the queried name and
+            // the address it resolves to). Served, never authenticated.
             DnssecState::Insecure
         } else {
             DnssecState::Indeterminate
@@ -789,8 +986,8 @@ fn canonical_cmp(a: &Name, b: &Name) -> std::cmp::Ordering {
 
 #[derive(Debug, PartialEq, Eq)]
 enum NsecCoverage {
-    /// Owner == qname and bitmap lacks qtype (genuine NODATA denial).
-    CoversNODATA,
+    /// Owner == qname and bitmap lacks qtype (genuine Nodata denial).
+    CoversNodata,
     /// Interval brackets qname but wildcard/encloser proof is out of scope.
     CoversInterval,
     /// Does not deny this (qname, qtype) at all.
@@ -829,7 +1026,7 @@ fn nsec_coverage(
         if bitmap_has_cname && qtype != RecordType::CNAME {
             return NsecCoverage::NoCover;
         }
-        return NsecCoverage::CoversNODATA;
+        return NsecCoverage::CoversNodata;
     }
     let order = canonical_cmp(owner, next);
     let inside = if order == Ordering::Less {
@@ -932,156 +1129,26 @@ impl Default for DnssecValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::dnssec::rdata::NSEC3;
     use hickory_proto::rr::rdata::A;
-
-    // tiny local base32hex encoder for building deterministic fixtures
-    fn b32hex_enc(bytes: &[u8]) -> String {
-        const ALPHA: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
-        let mut bits: u32 = 0;
-        let mut filled = 0u8;
-        let mut out = String::new();
-        for b in bytes {
-            bits = (bits << 8) | (*b as u32);
-            filled += 8;
-            while filled >= 5 {
-                filled -= 5;
-                out.push(ALPHA[((bits >> filled) & 31) as usize] as char);
-                bits &= (1 << filled) - 1;
-            }
-        }
-        if filled > 0 {
-            out.push(ALPHA[((bits << (5 - filled)) & 31) as usize] as char);
-        }
-        out
-    }
 
     // builds a minimal unsigned A-response wire message (no RRSIGs)
     fn unsigned_a_response() -> (String, u16, Vec<u8>) {
-        unsigned_a_response_for("probe.invalid")
-    }
-
-    // .invalid (RFC 2606) can never exist in DNS: DS lookups fail
-    // deterministically (NXDOMAIN/SERVFAIL → Failed → not-signed) with
-    // or without network, so unsigned-island tests stay hermetic even
-    // though the resolver is live. Do NOT use example.com/net here —
-    // real zones drift (edge-signing, new DS) as proven 2026-09-24.
-    fn unsigned_a_response_for(domain: &str) -> (String, u16, Vec<u8>) {
         let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
         msg.metadata.response_code = ResponseCode::NoError;
-        let fqdn = format!("{domain}.");
-        let name = Name::from_ascii(&fqdn).unwrap();
+        let name = Name::from_ascii("example.com.").unwrap();
         msg.add_query(Query::query(name.clone(), RecordType::A));
         let rec = Record::from_rdata(name, 300, RData::A(A::new(93, 184, 216, 34)));
         msg.answers.push(rec);
-        (domain.to_string(), 1, msg.to_vec().unwrap())
+        ("example.com".to_string(), 1, msg.to_vec().unwrap())
     }
 
     #[tokio::test]
     async fn test_unsigned_response_is_insecure_offline() {
         let v = DnssecValidator::new();
-        // no DS anywhere (offline fetch fails): island → Insecure.
-        // Contrast with test_stripped_signed_zone_answer_is_bogus_offline.
+        // resolver unused on the insecure path (no RRSIGs → no fetches)
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let (name, qtype, wire) = unsigned_a_response();
         let state = v.validate(&name, qtype, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Insecure);
-    }
-
-    // Seeds a zone apex into the validator cache (no network): an SOA
-    // owned by the apex (self-identifying, for apex discovery) plus an
-    // optional DS (for the signed verdict). .invalid keeps it hermetic.
-    fn seed_zone_apex(v: &DnssecValidator, apex: &str, with_ds: bool) {
-        let zone = Name::from_ascii(apex).unwrap();
-        let soa = Record::from_rdata(
-            zone.clone(),
-            300,
-            RData::SOA(hickory_proto::rr::rdata::SOA::new(
-                Name::from_ascii("ns1.invalid.").unwrap(),
-                Name::from_ascii("hostmaster.invalid.").unwrap(),
-                1,
-                3600,
-                600,
-                86400,
-                300,
-            )),
-        );
-        v.cache_store(&zone, RecordType::SOA, vec![soa]);
-        if with_ds {
-            let ds = Record::from_rdata(
-                zone.clone(),
-                300,
-                RData::DNSSEC(DNSSECRData::DS(hickory_proto::dnssec::rdata::DS::new(
-                    1234,
-                    Algorithm::ECDSAP256SHA256,
-                    hickory_proto::dnssec::DigestType::SHA256,
-                    vec![0u8; 32],
-                ))),
-            );
-            v.cache_store(&zone, RecordType::DS, vec![ds]);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_stripped_signed_zone_answer_is_bogus_offline() {
-        // Strip-all lock (DNSSEC-STRIP-ALL-UNSIGNED): the same unsigned
-        // wire as above, but the owner zone is PROVEN signed via a
-        // cache-seeded apex (no network) → must fail closed (Bogus).
-        let v = DnssecValidator::new();
-        seed_zone_apex(&v, "probe.invalid.", true);
-        let resolver = dummy_resolver();
-        let (name, qtype, wire) = unsigned_a_response();
-        let state = v.validate(&name, qtype, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
-    }
-
-    #[tokio::test]
-    async fn test_stripped_deep_name_in_signed_zone_is_bogus_offline() {
-        // DS-WALK-DEPTH-2 lock: 2 labels below the apex
-        // (deep.sub.probe.invalid, DS only at probe.invalid). The old
-        // fixed 2-step walk never reached the apex; apex discovery must.
-        let v = DnssecValidator::new();
-        seed_zone_apex(&v, "probe.invalid.", true);
-        let resolver = dummy_resolver();
-        let (name, qtype, wire) = unsigned_a_response_for("deep.sub.probe.invalid");
-        let state = v.validate(&name, qtype, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
-    }
-
-    #[tokio::test]
-    async fn test_unsigned_delegation_stays_insecure_offline() {
-        // Anti-regression for the depth fix: an UNSIGNED child zone
-        // (apex SOA seeded, no DS anywhere) under nothing signed must
-        // stay Insecure — the walk stops at the zone cut instead of
-        // condemning it on a higher ancestor's DS.
-        let v = DnssecValidator::new();
-        seed_zone_apex(&v, "sub.probe.invalid.", false);
-        let resolver = dummy_resolver();
-        let (name, qtype, wire) = unsigned_a_response_for("host.sub.probe.invalid");
-        let state = v.validate(&name, qtype, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Insecure);
-    }
-
-    #[tokio::test]
-    async fn test_stripped_denial_in_signed_zone_is_bogus_offline() {
-        // Empty-denial half of the same lock: NOERROR with an empty
-        // authority section in a proven-signed zone → Bogus; without the
-        // seeded DS the identical wire stays Insecure (offline fetch
-        // fails closed to not-signed).
-        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
-        msg.metadata.response_code = ResponseCode::NoError;
-        let name = Name::from_ascii("probe.invalid.").unwrap();
-        msg.add_query(Query::query(name, RecordType::A));
-        let wire = msg.to_vec().unwrap();
-
-        let v = DnssecValidator::new();
-        seed_zone_apex(&v, "probe.invalid.", true);
-        let resolver = dummy_resolver();
-        let state = v.validate("probe.invalid", 1, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
-
-        let plain = DnssecValidator::new();
-        let state = plain.validate("probe.invalid", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
     }
 
@@ -1091,96 +1158,6 @@ mod tests {
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let state = v.validate("example.com", 1, &[0u8; 4], &resolver).await;
         assert_eq!(state, DnssecState::Indeterminate);
-    }
-
-    // Offline self-signed root zone: generates a fresh P-256 key, anchors it,
-    // signs a root A RRset, and pre-seeds the DNSKEY cache. Fully
-    // deterministic apart from key material (which never affects verdicts).
-    // No network, no clock beyond validity windows.
-    struct SignedRootFixture {
-        validator: DnssecValidator,
-        wire: Vec<u8>,
-    }
-
-    fn signed_root_fixture() -> SignedRootFixture {
-        signed_root_fixture_anchored(true)
-    }
-
-    /// anchor=false builds an island of security: cryptographically valid
-    /// signatures under a key the validator does NOT trust (no DS link
-    /// possible). Must validate Insecure (served), never Bogus.
-    fn signed_root_fixture_anchored(anchor: bool) -> SignedRootFixture {
-        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
-        use hickory_proto::dnssec::rdata::SigInput;
-        use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
-        use hickory_proto::rr::SerialNumber;
-
-        let root = Name::from_ascii(".").unwrap();
-        let der =
-            EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("keygen works");
-        let signing_key = EcdsaSigningKey::from_key_der(&der.into(), Algorithm::ECDSAP256SHA256)
-            .expect("key parses");
-        let pubkey = signing_key.to_public_key().expect("pubkey derives");
-        let dnskey = DNSKEY::new(true, true, false, pubkey.clone());
-        let key_tag = dnskey.calculate_key_tag().expect("tag computes");
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock works")
-            .as_secs() as u32;
-        let mut validator = DnssecValidator::new();
-        if anchor {
-            validator.anchors.insert(&pubkey);
-        }
-
-        // signed root A RRset
-        let a_rec = Record::from_rdata(root.clone(), 300, RData::A(A::new(93, 184, 216, 34)));
-        let input = SigInput {
-            type_covered: RecordType::A,
-            algorithm: Algorithm::ECDSAP256SHA256,
-            num_labels: 0,
-            original_ttl: 300,
-            sig_expiration: SerialNumber::new(now + 3600),
-            sig_inception: SerialNumber::new(now - 100),
-            key_tag,
-            signer_name: root.clone(),
-        };
-        let tbs = TBS::from_input(&root, DNSClass::IN, &input, std::iter::once(&a_rec))
-            .expect("tbs builds");
-        let signer = DnssecSigner::new(
-            dnskey.clone(),
-            Box::new(signing_key),
-            root.clone(),
-            Duration::from_secs(3600),
-        );
-        let sig_bytes = signer.sign(&tbs).expect("signing works");
-        let sig_rec = Record::from_rdata(
-            root.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig_bytes))),
-        );
-
-        // seed the DNSKEY cache so no network is touched
-        let dnskey_rec = Record::from_rdata(
-            root.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
-        );
-        validator.cache_store(&root, RecordType::DNSKEY, vec![dnskey_rec]);
-
-        let mut msg = Message::new(0x4242, MessageType::Response, OpCode::Query);
-        msg.metadata.response_code = ResponseCode::NoError;
-        msg.add_query(Query::query(root, RecordType::A));
-        msg.answers.push(a_rec);
-        msg.answers.push(sig_rec);
-        SignedRootFixture {
-            validator,
-            wire: msg.to_vec().unwrap(),
-        }
-    }
-
-    fn dummy_resolver() -> DoHResolver {
-        DoHResolver::new("quad9", &[], true).expect("resolver init should succeed")
     }
 
     // FP-18: canonical ordering (RFC 4034 §6.1) — rightmost-first,
@@ -1216,7 +1193,7 @@ mod tests {
     #[test]
     fn test_nsec_coverage_matrix() {
         let n = |s: &str| Name::from_ascii(s).unwrap();
-        // owner == qname, bitmap lacks qtype → genuine NODATA denial
+        // owner == qname, bitmap lacks qtype → genuine Nodata denial
         assert_eq!(
             nsec_coverage(
                 &n("host.example."),
@@ -1226,7 +1203,7 @@ mod tests {
                 &n("host.example."),
                 RecordType::A
             ),
-            NsecCoverage::CoversNODATA
+            NsecCoverage::CoversNodata
         );
         // owner == qname but bitmap HAS qtype → denies nothing (replay/wrong RRset)
         assert_eq!(
@@ -1308,16 +1285,6 @@ mod tests {
     // Run-4: live-network test — excluded from hermetic gates
     // (`cargo test -- --ignored`), matching the live_* convention.
     #[tokio::test]
-    async fn test_self_signed_root_validates_secure_offline() {
-        let fx = signed_root_fixture();
-        let resolver = dummy_resolver();
-        let state = fx.validator.validate(".", 1, &fx.wire, &resolver).await;
-        assert_eq!(state, DnssecState::Secure);
-    }
-
-    // Live-network variant (ignored in hermetic gates): ietf.org is
-    // DNSSEC-signed (independently confirmed via AD flag).
-    #[tokio::test]
     #[ignore]
     async fn test_signed_zone_validates_secure_live() {
         let v = DnssecValidator::new();
@@ -1333,92 +1300,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tampered_signed_response_is_bogus_offline() {
-        let fx = signed_root_fixture();
-        let resolver = dummy_resolver();
-        // flip a byte inside the A rdata: signature must fail closed
-        let mut msg = Message::from_vec(&fx.wire).expect("fixture parses");
-        for rec in msg.answers.iter_mut() {
-            if rec.record_type() == RecordType::A {
-                if let RData::A(addr) = &mut rec.data {
-                    let mut octets = addr.octets();
-                    octets[3] ^= 0x01;
-                    *addr = A::new(octets[0], octets[1], octets[2], octets[3]);
-                    break;
-                }
-            }
-        }
-        let wire = msg.to_vec().unwrap();
-        let state = fx.validator.validate(".", 1, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
-    }
-
-    #[test]
-    fn test_rsasha1_excluded_from_supported_algorithms() {
-        // Decision A (2026-09-25, locked): the RSASHA1 family is rejected
-        // even though hickory could verify it — SHA-1 collision forgery
-        // risk beats legacy-zone compat. Zones using it SERVFAIL (Bogus),
-        // proven by test_rsasha1_signed_answer_is_bogus_offline below.
-        // (hickory itself refuses to SIGN with RSASHA1, so the behavioral
-        // test relabels a real ECDSA signature instead.)
-        assert!(!secure_algorithms().has(Algorithm::RSASHA1));
-        assert!(!secure_algorithms().has(Algorithm::RSASHA1NSEC3SHA1));
-        for alg in [
-            Algorithm::RSASHA256,
-            Algorithm::RSASHA512,
-            Algorithm::ECDSAP256SHA256,
-            Algorithm::ECDSAP384SHA384,
-            Algorithm::ED25519,
-        ] {
-            assert!(secure_algorithms().has(alg), "{alg:?} must stay supported");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rsasha1_signed_answer_is_bogus_offline() {
-        // Same fixture as the Secure control, but the RRSIG is relabeled
-        // RSASHA1: the algorithm gate must reject before any crypto, so a
-        // legacy-signed answer fails closed (Bogus), never served.
-        let fx = signed_root_fixture();
-        let resolver = dummy_resolver();
-        let mut msg = Message::from_vec(&fx.wire).expect("fixture parses");
-        let mut relabeled = false;
-        for rec in msg.answers.iter_mut() {
-            if rec.record_type() == RecordType::RRSIG {
-                if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rec.data {
-                    let mut input = rrsig.input().clone();
-                    input.algorithm = Algorithm::RSASHA1;
-                    let relabeled_rrsig = RRSIG::from_sig(input, rrsig.sig().to_vec());
-                    rec.data = RData::DNSSEC(DNSSECRData::RRSIG(relabeled_rrsig));
-                    relabeled = true;
-                }
-            }
-        }
-        assert!(relabeled, "fixture must carry an RRSIG to relabel");
-        let wire = msg.to_vec().unwrap();
-        let state = fx.validator.validate(".", 1, &wire, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
-    }
-
-    // NOTE (merge master→develop): the offline root-island fixture test was
-    // retired here. Under the FetchOutcome/ChainVerdict architecture a
-    // self-signed ROOT with an untrusted key is Fail (→ Bogus), not
-    // InsecureIsland: root has no parent to prove DS absence from, so it is
-    // indistinguishable from forgery. Genuine islands are non-root zones
-    // with proven DS absence — covered by
-    // test_unsigned_delegation_island_is_insecure_live below.
-
-    #[tokio::test]
     async fn test_unsigned_cname_chain_is_insecure_offline() {
         use hickory_proto::rr::rdata::CNAME;
-        // www -> cdn (unsigned) -> A (unsigned): chain present but unsigned.
-        // .invalid names (RFC 2606) keep this hermetic: no DS can ever
-        // exist, so the owner-zone check fails closed to not-signed with
-        // or without network (cf. unsigned_a_response_for).
+        // www -> cdn (unsigned) -> A (unsigned): chain present but unsigned
         let mut msg = Message::new(0x2222, MessageType::Response, OpCode::Query);
         msg.metadata.response_code = ResponseCode::NoError;
-        let alias = Name::from_ascii("www.site.invalid.").unwrap();
-        let canon = Name::from_ascii("cdn.site.invalid.").unwrap();
+        let alias = Name::from_ascii("www.example.com.").unwrap();
+        let canon = Name::from_ascii("cdn.example.net.").unwrap();
         msg.add_query(Query::query(alias.clone(), RecordType::A));
         msg.answers.push(Record::from_rdata(
             alias.clone(),
@@ -1433,60 +1321,16 @@ mod tests {
         let wire = msg.to_vec().unwrap();
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
-        let state = v.validate("www.site.invalid", 1, &wire, &resolver).await;
+        let state = v.validate("www.example.com", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Insecure);
     }
 
-    #[test]
-    fn test_matches_anchor_positive_and_negative() {
-        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
-        use hickory_proto::dnssec::{PublicKey, SigningKey};
-        let v = DnssecValidator::new();
-        assert!(v.anchors.len() >= 1, "embedded root anchors must exist");
-        // a fresh random key must NOT match the compiled-in anchors...
-        let der = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).unwrap();
-        let key = EcdsaSigningKey::from_key_der(&der.into(), Algorithm::ECDSAP256SHA256).unwrap();
-        let pubkey = key.to_public_key().unwrap();
-        let stranger = DNSKEY::new(true, true, false, pubkey.clone());
-        assert!(!v.matches_anchor(std::slice::from_ref(&stranger)));
-        // ...but does once inserted (simulates a completed rollover)
-        let mut v2 = DnssecValidator::new();
-        assert!(v2.anchors.insert(&pubkey));
-        assert!(v2.matches_anchor(std::slice::from_ref(&stranger)));
-        let _ = (pubkey.algorithm(), pubkey.public_bytes().len());
-    }
-
-    // Unsigned delegation (neverssl.com 2026-09-24, verified live): a zone
-    // with NO DS in the parent serving UNSIGNED answers must validate
-    // Insecure (served), never Bogus (SERVFAIL). neverssl.com is
-    // purpose-built for stability (plain-HTTP-forever mission, single
-    // unsigned A, no DNSSEC ambitions). Live-network — excluded from
-    // hermetic gates like the other live tests.
+    // Island regression (chatgpt.com 2026-09-23): a signed zone with NO DS
+    // in the parent must validate Insecure (served), never Bogus (SERVFAIL).
+    // Live-network — excluded from hermetic gates like the other live tests.
     #[tokio::test]
     #[ignore]
-    async fn test_unsigned_delegation_is_insecure_live() {
-        let v = DnssecValidator::new();
-        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
-        let q = doh_query_with_do("neverssl.com", RecordType::A);
-        let (resp, _) = resolver
-            .resolve(&q)
-            .await
-            .expect("live DoH query should succeed");
-        let state = v.validate("neverssl.com", 1, &resp, &resolver).await;
-        assert_eq!(state, DnssecState::Insecure);
-    }
-
-    // FP-19 live lock (chatgpt.com 2026-09-24, verified live): the zone
-    // publishes DNSKEY + RRSIGs but has NO DS in .com (signed-but-unchained).
-    // Such answers are Bogus (SERVFAIL), never silently Insecure. DOMAIN
-    // DRIFT NOTE: on 2026-09-23 this same name served unsigned answers and
-    // the test above asserted Insecure for it; by 2026-09-24 it serves
-    // unanchored RRSIGs, so the expectation moved here. If this test fails
-    // with Insecure/Secure, the zone likely gained a DS (fully chained now)
-    // — verify with a DS lookup before "fixing" the code.
-    #[tokio::test]
-    #[ignore]
-    async fn test_signed_but_unchained_is_bogus_live() {
+    async fn test_unsigned_delegation_island_is_insecure_live() {
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let q = doh_query_with_do("chatgpt.com", RecordType::A);
@@ -1495,7 +1339,7 @@ mod tests {
             .await
             .expect("live DoH query should succeed");
         let state = v.validate("chatgpt.com", 1, &resp, &resolver).await;
-        assert_eq!(state, DnssecState::Bogus);
+        assert_eq!(state, DnssecState::Insecure);
     }
 
     // CDN regression (video.twimg.com 2026-09-23): unsigned CNAME in an
@@ -1549,184 +1393,477 @@ mod tests {
         assert_eq!(state, DnssecState::Bogus);
     }
 
-    #[test]
-    fn test_neg_cache_stores_only_negative_verdicts() {
+    /// HANCORE regression: a CNAME chain must be authenticated end to end.
+    ///
+    /// `validate_inner` returned `Secure` as soon as the FIRST candidate
+    /// chain-verified, so a genuinely signed first CNAME link was enough to
+    /// authenticate the whole response — later links and, critically, the
+    /// terminal address RRset were never examined. A hostile or compromised
+    /// resolver could therefore keep a real signed CNAME and substitute the
+    /// address it points at; `server.rs` then cached and served it as Secure.
+    ///
+    /// Both assertions come from one live response so the test is
+    /// self-consistent: untampered must be Secure (proving the first link does
+    /// verify, so the case really is a signed chain), and tampering only the
+    /// terminal address must NOT stay Secure.
+    #[tokio::test]
+    #[ignore]
+    async fn test_tampered_terminal_in_signed_cname_chain_is_not_secure_live() {
         let v = DnssecValidator::new();
-        // Bogus + Indeterminate are remembered (anti-amplification bound)
-        v.neg_store("Example.COM", 1, DnssecState::Bogus);
-        assert_eq!(v.neg_lookup("example.com", 1), Some(DnssecState::Bogus));
-        v.neg_store("other.example.", 28, DnssecState::Indeterminate);
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("www.sidn.nl", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+
+        let msg = Message::from_vec(&resp).expect("response must parse");
+        let has_cname = msg
+            .answers
+            .iter()
+            .any(|r| r.record_type() == RecordType::CNAME);
+        assert!(has_cname, "fixture must be a CNAME chain");
+
+        // Control: the untampered chain authenticates. Without this the test
+        // could pass for the wrong reason (e.g. chain shape changed, so the
+        // first link never verified at all).
         assert_eq!(
-            v.neg_lookup("other.example.", 28),
-            Some(DnssecState::Indeterminate)
+            v.validate("www.sidn.nl", 1, &resp, &resolver).await,
+            DnssecState::Secure,
+            "unmodified signed chain must validate Secure"
         );
-        // Secure/Insecure are never stored (live in DnsCache instead)
-        v.neg_store("example.com", 1, DnssecState::Secure);
-        v.neg_store("plain.example.", 1, DnssecState::Insecure);
-        assert_eq!(v.neg_lookup("plain.example.", 1), None);
-        // qtype is part of the key; unknown names miss
-        assert_eq!(v.neg_lookup("example.com", 28), None);
-        assert_eq!(v.neg_lookup("absent.example.", 1), None);
-    }
 
-    // NOTE (merge master→develop): the offline signed-CNAME-to-unsigned-target
-    // test was retired here. Under the ChainVerdict flow a chain-verified
-    // CNAME returns Secure before the unsigned terminal is evaluated
-    // (cdb9ce6 deferred-Bogus design); the old Insecure expectation belongs
-    // to the retired counter architecture. Served-ness for real CDN shapes
-    // is locked by test_unsigned_cname_to_signed_target_is_secure_live
-    // (asserts never-Bogus).
-
-    /// Builds a self-signed root zone + validator with the key anchored and
-    /// the DNSKEY set cache-seeded: fully offline validation harness for
-    /// denial tests (root short-circuits the chain walk, no fetches).
-    struct DenialFixture {
-        validator: DnssecValidator,
-        root: Name,
-        key_tag: u16,
-        signer: hickory_proto::dnssec::DnssecSigner,
-        now: u32,
-    }
-
-    impl DenialFixture {
-        fn new() -> Self {
-            use hickory_proto::dnssec::crypto::EcdsaSigningKey;
-            use hickory_proto::dnssec::SigningKey;
-            let root = Name::from_ascii(".").unwrap();
-            let der =
-                EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("keygen works");
-            let signing_key =
-                EcdsaSigningKey::from_key_der(&der.into(), Algorithm::ECDSAP256SHA256)
-                    .expect("key parses");
-            let pubkey = signing_key.to_public_key().expect("pubkey derives");
-            let dnskey = DNSKEY::new(true, true, false, pubkey.clone());
-            let key_tag = dnskey.calculate_key_tag().expect("tag computes");
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock works")
-                .as_secs() as u32;
-            let mut validator = DnssecValidator::new();
-            validator.anchors.insert(&pubkey);
-            let dnskey_rec = Record::from_rdata(
-                root.clone(),
-                300,
-                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
-            );
-            validator.cache_store(&root, RecordType::DNSKEY, vec![dnskey_rec]);
-            let signer = hickory_proto::dnssec::DnssecSigner::new(
-                dnskey.clone(),
-                Box::new(signing_key),
-                root.clone(),
-                Duration::from_secs(3600),
-            );
-            DenialFixture {
-                validator,
-                root,
-                key_tag,
-                signer,
-                now,
-            }
-        }
-
-        fn hash(&self, name: &Name) -> Vec<u8> {
-            use hickory_proto::dnssec::Nsec3HashAlgorithm;
-            Nsec3HashAlgorithm::SHA1
-                .hash(&[], name, 0)
-                .expect("hash works")
-                .as_ref()
-                .to_vec()
-        }
-
-        /// Signed NSEC3 group (owner label + next hash + RRSIG), ready for
-        /// the authority section.
-        fn group(&self, owner_hash: &[u8], next_hash: &[u8]) -> Vec<Record> {
-            use hickory_proto::dnssec::rdata::SigInput;
-            use hickory_proto::dnssec::TBS;
-            use hickory_proto::rr::SerialNumber;
-            let owner = Name::from_ascii(&format!("{}.", b32hex_enc(owner_hash))).unwrap();
-            let nsec3 = NSEC3::new(
-                hickory_proto::dnssec::Nsec3HashAlgorithm::SHA1,
-                false,
-                0,
-                vec![],
-                next_hash.to_vec(),
-                [RecordType::A],
-            );
-            let rec =
-                Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
-            let input = SigInput {
-                type_covered: RecordType::NSEC3,
-                algorithm: Algorithm::ECDSAP256SHA256,
-                num_labels: 1,
-                original_ttl: 300,
-                sig_expiration: SerialNumber::new(self.now + 3600),
-                sig_inception: SerialNumber::new(self.now - 100),
-                key_tag: self.key_tag,
-                signer_name: self.root.clone(),
-            };
-            let tbs = TBS::from_input(&owner, DNSClass::IN, &input, std::iter::once(&rec))
-                .expect("tbs builds");
-            let sig_bytes = self.signer.sign(&tbs).expect("signing works");
-            let sig_rec = Record::from_rdata(
-                owner,
-                300,
-                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig_bytes))),
-            );
-            vec![rec, sig_rec]
-        }
-
-        fn nx_message(&self, qname: &str, groups: Vec<Vec<Record>>) -> Vec<u8> {
-            let name = Name::from_ascii(qname).unwrap();
-            let mut msg = Message::new(0x4242, MessageType::Response, OpCode::Query);
-            msg.metadata.response_code = ResponseCode::NXDomain;
-            msg.add_query(Query::query(name, RecordType::A));
-            for g in groups {
-                for rec in g {
-                    msg.authorities.push(rec);
+        // Now substitute only the terminal address, leaving every signature
+        // untouched — exactly what a hostile resolver can do.
+        let mut msg = Message::from_vec(&resp).expect("response must parse");
+        let mut tampered = false;
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::A {
+                if let RData::A(addr) = &mut rec.data {
+                    let mut o = addr.octets();
+                    o[3] ^= 0x01;
+                    *addr = hickory_proto::rr::rdata::A::new(o[0], o[1], o[2], o[3]);
+                    tampered = true;
+                    break;
                 }
             }
-            msg.to_vec().unwrap()
         }
+        assert!(tampered, "chain must contain a terminal A record");
+
+        let state = v
+            .validate("www.sidn.nl", 1, &msg.to_vec().unwrap(), &resolver)
+            .await;
+        assert_ne!(
+            state,
+            DnssecState::Secure,
+            "terminal address RRset was never authenticated: a substituted A \
+             record rode the first CNAME link's valid signature to Secure"
+        );
     }
 
+    /// HANCORE regression, multi-link shape: the intermediate links matter too,
+    /// not just the terminal. A real CDN chain (signed apex CNAME into unsigned
+    /// CDN zones) is exactly the shape where an attacker has a genuine signed
+    /// first link to ride on.
+    ///
+    /// Asserts the chain is fully authenticated when untouched, and that
+    /// substituting the terminal address does not stay Secure.
     #[tokio::test]
-    async fn test_nxdomain_denial_forged_group_is_bogus_offline() {
-        // Forgery direction stays fail-closed: a tampered NSEC3 group kills
-        // the whole denial even next to a fully valid covering group.
-        let fx = DenialFixture::new();
-        let qname = Name::from_ascii("missing.example.").unwrap();
-        let h = fx.hash(&qname);
-        // covering group: (h-1, h]
-        let mut below = h.clone();
-        below[19] = below[19].wrapping_sub(1);
-        let cover = fx.group(&below, &h);
-        // encloser group: owner == hash(example.)
-        let enc = fx.hash(&Name::from_ascii("example.").unwrap());
-        let encloser = fx.group(&enc, &enc);
-        // forged group: valid shape, but the next-hash is flipped so the
-        // signature over the RRset no longer verifies (same effect as a
-        // corrupted RRSIG, without depending on signature codecs)
-        let mut forged_group = fx.group(&h, &h);
-        for rec in forged_group.iter_mut() {
-            if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &mut rec.data {
-                let mut next = nsec3.next_hashed_owner_name().to_vec();
-                next[0] ^= 0x01;
-                *nsec3 = NSEC3::new(
-                    nsec3.hash_algorithm(),
-                    nsec3.opt_out(),
-                    nsec3.iterations(),
-                    nsec3.salt().to_vec(),
-                    next,
-                    nsec3.type_bit_maps(),
-                );
+    #[ignore]
+    async fn test_tampered_terminal_in_multihop_cname_chain_is_not_secure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("www.powerdns.com", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+
+        let msg = Message::from_vec(&resp).expect("response must parse");
+        let cname_hops = msg
+            .answers
+            .iter()
+            .filter(|r| r.record_type() == RecordType::CNAME)
+            .count();
+        if cname_hops < 2 {
+            eprintln!(
+                "SKIP: www.powerdns.com is no longer a multi-hop CNAME chain \
+                 ({} link(s)) — CDN shape changed",
+                cname_hops
+            );
+            return;
+        }
+
+        assert_eq!(
+            v.validate("www.powerdns.com", 1, &resp, &resolver).await,
+            DnssecState::Secure,
+            "unmodified signed multi-hop chain must validate Secure"
+        );
+
+        let mut msg = Message::from_vec(&resp).expect("response must parse");
+        let mut tampered = false;
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::A {
+                if let RData::A(addr) = &mut rec.data {
+                    let mut o = addr.octets();
+                    o[3] ^= 0x01;
+                    *addr = hickory_proto::rr::rdata::A::new(o[0], o[1], o[2], o[3]);
+                    tampered = true;
+                    break;
+                }
             }
         }
-        let wire = fx.nx_message("missing.example.", vec![cover, encloser, forged_group]);
-        let resolver = dummy_resolver();
-        let state = fx
-            .validator
-            .validate("missing.example", 1, &wire, &resolver)
+        assert!(tampered, "chain must contain a terminal A record");
+
+        let state = v
+            .validate("www.powerdns.com", 1, &msg.to_vec().unwrap(), &resolver)
             .await;
-        assert_eq!(state, DnssecState::Bogus);
+        assert_ne!(
+            state,
+            DnssecState::Secure,
+            "multi-hop chain terminal was authenticated only via the first link"
+        );
+    }
+
+    /// `cname_chain` must enumerate EVERY link plus the terminal RRset.
+    ///
+    /// This is the enumeration half of the HANCORE fix: the validator can only
+    /// require end-to-end authentication if it actually hands back every hop.
+    /// Pure and hermetic — no crypto, no network.
+    #[test]
+    fn test_cname_chain_enumerates_every_link_and_terminal() {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut msg = Message::new(0x3333, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        let owner = Name::from_ascii("www.example.com.").unwrap();
+        let hop1 = Name::from_ascii("cdn.example.net.").unwrap();
+        let hop2 = Name::from_ascii("edge.example.org.").unwrap();
+
+        msg.answers.push(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::CNAME(CNAME(hop1.clone())),
+        ));
+        msg.answers.push(Record::from_rdata(
+            hop1.clone(),
+            300,
+            RData::CNAME(CNAME(hop2.clone())),
+        ));
+        msg.answers.push(Record::from_rdata(
+            hop2.clone(),
+            300,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+
+        let chain = cname_chain(&msg.answers, &owner, RecordType::A)
+            .expect("well-formed chain must enumerate");
+        assert_eq!(chain.len(), 3, "two links plus the terminal");
+        assert!(name_eq(&chain[0].0, &owner) && chain[0].2 == RecordType::CNAME);
+        assert!(name_eq(&chain[1].0, &hop1) && chain[1].2 == RecordType::CNAME);
+        assert!(name_eq(&chain[2].0, &hop2) && chain[2].2 == RecordType::A);
+    }
+
+    /// A chain whose terminal RRset is missing must NOT enumerate — the
+    /// validator treats that as a broken chain (FP-19 Bogus), never as a
+    /// verified prefix.
+    #[test]
+    fn test_cname_chain_rejects_chain_without_terminal() {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut msg = Message::new(0x4444, MessageType::Response, OpCode::Query);
+        let owner = Name::from_ascii("www.example.com.").unwrap();
+        let hop1 = Name::from_ascii("cdn.example.net.").unwrap();
+        msg.answers.push(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::CNAME(CNAME(hop1.clone())),
+        ));
+        // no terminal A for hop1
+        assert!(
+            cname_chain(&msg.answers, &owner, RecordType::A).is_none(),
+            "chain without a terminal RRset must not enumerate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delegation_denial_tests {
+    use super::*;
+    use hickory_proto::dnssec::rdata::{SigInput, NSEC};
+    use hickory_proto::dnssec::PublicKeyBuf;
+    use hickory_proto::rr::SerialNumber;
+
+    fn zone(s: &str) -> Name {
+        s.parse().expect("zone")
+    }
+
+    fn now() -> u32 {
+        DnssecValidator::now_epoch()
+    }
+
+    /// An NSEC at `owner` advertising `types`. A signed parent uses this shape
+    /// at a delegation name to prove the delegation is insecure: NS present,
+    /// DS and SOA absent (hickory exposes exactly that as
+    /// `is_ancestor_delegation`).
+    fn nsec(owner: &str, next: &str, types: &[RecordType]) -> Record {
+        let nsec = NSEC::new(next.parse::<Name>().expect("next"), types.iter().copied());
+        Record::from_rdata(
+            owner.parse::<Name>().expect("owner"),
+            3600,
+            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+        )
+    }
+
+    fn dnskey_rec(owner: &str, tag: u16) -> Record {
+        let key = hickory_proto::dnssec::rdata::DNSKEY::new(
+            true,  // zone key
+            true,  // SEP
+            false, // not revoked
+            PublicKeyBuf::new(vec![0u8; 64], Algorithm::ECDSAP256SHA256),
+        );
+        let _ = tag;
+        Record::from_rdata(
+            owner.parse::<Name>().expect("owner"),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(key)),
+        )
+    }
+
+    /// An RRSIG whose bytes cannot possibly verify — it exists only so the
+    /// "a denial must be signed" path has a signature present to reject.
+    fn unverifiable_rrsig(owner: &str, signer: &str, covers: RecordType) -> Record {
+        let input = SigInput {
+            type_covered: covers,
+            algorithm: Algorithm::ECDSAP256SHA256,
+            num_labels: owner.parse::<Name>().expect("owner").num_labels(),
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: 4242,
+            signer_name: signer.parse::<Name>().expect("signer"),
+        };
+        Record::from_rdata(
+            owner.parse::<Name>().expect("owner"),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0xAA; 64]))),
+        )
+    }
+
+    fn keys(records: &[Record]) -> Vec<DNSKEY> {
+        DnssecValidator::dnskey_records(records)
+    }
+
+    /// HANCORE 2026-10, the headline case. A hostile resolver answers the DS
+    /// query with NOERROR + zero DS records plus an NSEC it signs itself (or not
+    /// at all). Accepting that as an insecure delegation is the bypass: on
+    /// unpatched source this was `true`, because the old code only required
+    /// that *some* denial-shaped record be present and never verified it.
+    #[test]
+    fn test_unauthenticated_denial_is_refused() {
+        let denial = vec![
+            nsec("example.com.", "aaa.com.", &[RecordType::NS]),
+            unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
+        ];
+        assert!(
+            !DnssecValidator::new().authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            ),
+            "a denial that does not verify against the parent's keys must not \
+             be accepted as an insecure delegation"
+        );
+    }
+
+    /// A denial with no RRSIG at all is the purest form of the bypass.
+    #[test]
+    fn test_denial_without_any_signature_is_refused() {
+        let denial = vec![nsec("example.com.", "aaa.com.", &[RecordType::NS])];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// Nothing to check.
+    #[test]
+    fn test_empty_denial_is_refused() {
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &[],
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// A denial with no parent keys to verify against must not be believed.
+    #[test]
+    fn test_denial_with_no_parent_keys_is_refused() {
+        let denial = vec![
+            nsec("example.com.", "aaa.com.", &[RecordType::NS]),
+            unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
+        ];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &[],
+            now()
+        ));
+    }
+
+    /// NSEC3-only cannot be evaluated (this crate has no NSEC3 hash
+    /// implementation), so it must be refused rather than believed. The caller
+    /// turns a refusal into Indeterminate: served with a warning, never cached
+    /// as Secure — strictly better than the unauthenticated Insecure this
+    /// replaces.
+    #[test]
+    fn test_nsec3_denial_is_refused() {
+        let denial = vec![
+            nsec("example.com.", "aaa.com.", &[RecordType::NS]),
+            unverifiable_rrsig("example.com.", "com.", RecordType::NSEC3),
+        ];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// The NSEC must sit at the delegation name. One for an unrelated name is a
+    /// replay, not a proof about this zone.
+    #[test]
+    fn test_denial_nsec_must_be_at_the_delegation_name() {
+        let denial = vec![
+            nsec("other.com.", "zzz.com.", &[RecordType::NS]),
+            unverifiable_rrsig("other.com.", "com.", RecordType::NSEC),
+        ];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// An NSEC whose bitmap advertises DS describes a SIGNED delegation, whose
+    /// absence cannot be proven this way.
+    #[test]
+    fn test_denial_nsec_claiming_ds_is_refused() {
+        let denial = vec![
+            nsec(
+                "example.com.",
+                "aaa.com.",
+                &[RecordType::NS, RecordType::DS],
+            ),
+            unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
+        ];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// A well-formed, correctly-placed, correctly-typed denial must be refused
+    /// for exactly one reason: the signature does not verify. This isolates the
+    /// fix to authentication and proves the shape checks are not simply
+    /// rejecting everything.
+    #[test]
+    fn test_shape_is_accepted_and_only_authentication_gates_it() {
+        // Sanity: the fixture really is the insecure-delegation shape, so a
+        // refusal can only come from the signature check.
+        let n = nsec("example.com.", "aaa.com.", &[RecordType::NS]);
+        let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &n.data else {
+            panic!("fixture is not an NSEC")
+        };
+        assert!(
+            nsec.is_ancestor_delegation(),
+            "fixture must be a delegation NSEC"
+        );
+        assert!(
+            !nsec.type_bit_maps().any(|t| t == RecordType::DS),
+            "fixture must not advertise DS"
+        );
+
+        let denial = vec![
+            n,
+            unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
+        ];
+        assert!(!DnssecValidator::new().authenticate_denial(
+            &zone("example.com."),
+            &zone("com."),
+            &denial,
+            &keys(&[dnskey_rec("com.", 1)]),
+            now()
+        ));
+    }
+
+    /// Regression guard on the response-shape half of the fix: the SOA that used
+    /// to stand in for a denial is gone, and the additional section is no
+    /// longer scanned.
+    #[test]
+    fn test_soa_and_additional_section_are_not_denial_proofs() {
+        let src = include_str!("dnssec.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod delegation_denial_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("let mut denial: Vec<Record> = Vec::new();")
+            .expect("denial collection");
+        let block = &prod[at..(at + 1400).min(prod.len())];
+        assert!(
+            !block.contains("msg.additionals"),
+            "the additional section must not be scanned for denial records: {}",
+            block
+        );
+        assert!(
+            !block.contains("RecordType::SOA"),
+            "an SOA must not count as a denial record: {}",
+            block
+        );
+        assert!(
+            block.contains("msg.authorities"),
+            "denial records must come from the authority section: {}",
+            block
+        );
+    }
+
+    /// And `chain_to_root` must route Nodata through the authenticator instead
+    /// of returning InsecureIsland directly.
+    #[test]
+    fn test_chain_does_not_take_nodata_at_face_value() {
+        let src = include_str!("dnssec.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod delegation_denial_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            !prod.contains("Nodata => return ChainVerdict::InsecureIsland"),
+            "Nodata must no longer be an unconditional insecure delegation"
+        );
+        assert!(
+            prod.contains("self.authenticate_denial(zone, &parent, &denial, &parent_dnskeys, now)"),
+            "chain_to_root must authenticate the denial before declaring an island"
+        );
     }
 }

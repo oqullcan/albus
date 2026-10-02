@@ -1,130 +1,109 @@
 # albus
 
-Kernel-level DPI evasion engine and DNS-over-HTTPS resolver for Linux. Fragments TLS ClientHellos (eBPF MSS clamp) and poisons middlebox state (TTL-limited decoy injection), while resolving DNS locally over DoH with DNSSEC validation.
+DPI bypass and encrypted DNS for Linux: eBPF packet
+desynchronization plus a local validating DoH resolver.
 
-## How it works
-
-1. eBPF (`sock_ops`) clamps TCP MSS to ~88 bytes → ClientHello fragments across segments.
-2. Raw-socket injector sends TTL-limited decoy hellos → DPI state desync.
-   (Decoy TTL is a static operator-set value, not probed — see `src/core/autottl`.)
-3. Local DoH resolver on 127.0.0.1:53 answers DNS (DNSSEC-validated, kill-switched).
-4. Shaping watchdog reconciles fresh connections against perf events; unexplained connections across consecutive windows engage fail-closed network lockdown until restart (`--shaping-watchdog=false` opts out).
+Evade — fragment TLS ClientHello across packets (eBPF MSS clamp + jitter, raw-socket
+decoys) so middleboxes can't read SNI. Encrypt — resolve DNS locally over DoH with
+DNSSEC validation, kill-switch, and leak canary. Enforce — fail-closed firewall rules
+and a rootless daemon that refuses to run unprivileged.
 
 ## Requirements
 
-- Linux 5.10+ (`CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, cgroup v2), `sudo`
-- Rust 1.89 (pinned via `rust-toolchain.toml`)
-- Source builds need `clang` + kernel headers (CI installs them); the release binary runs standalone
+Linux 5.10+, cgroup v2, Rust 1.75+. Source builds need clang + kernel headers
+(CI installs them); the release binary runs standalone.
 
-## Build & install
+## Quickstart
 
 ```bash
-git clone https://github.com/oqullcan/albus.git
-cd albus
-git checkout v2.2.0   # latest release (or stay on develop)
+git clone https://github.com/oqullcan/albus.git && cd albus
 cargo build --release
-sudo cp target/release/albus /usr/local/bin/albus
-```
-
-## Run
-
-```bash
-sudo albus run                                          # foreground, defaults
-sudo albus run --doh-upstream cloudflare         # preset: quad9, cloudflare, mullvad-*
-sudo albus service install && sudo albus service start   # background daemon
+sudo ./target/release/albus service install    # binary + unit + polkit, starts daemon
+albus status --json                            # active check for bars and panels
 ```
 
 ```bash
-sudo albus service status    # health + metrics
-sudo albus service reload    # zero-downtime map reload (SIGHUP)
-albus config get             # active configuration (JSON)
-sudo albus config set --doh-upstream cloudflare
-albus monitor                # live telemetry TUI
-albus status --json          # machine-readable status for bars and panels
+sudo albus run --doh-upstream mullvad-base       # foreground with options
+sudo albus config set --doh-upstream cloudflare  # persist + live-reload daemon
+sudo albus cleanup                               # restore DNS + firewall
+albus monitor                                    # traffic TUI
 ```
 
-## Daemon privilege model
+## Daemon
+
+Privileged commands (root — install, control, configure, clean up):
+
+- `sudo albus service install` — install binary, systemd unit, polkit rule; creates the `albus` user and starts the daemon
+- `sudo albus service uninstall` — stop, remove unit and rule, revert firewall and DNS (binary is kept by design, with a printed notice)
+- `sudo albus service start` — start the background daemon
+- `sudo albus service stop` — stop the background daemon
+- `sudo albus service restart` — restart (crash-safe: rules re-applied on start)
+- `sudo albus service reload` — SIGHUP, zero-downtime eBPF map reload
+- `sudo albus service status` — systemd unit state
+- `sudo albus service logs` — stream the daemon journal
+- `sudo albus run [--flags]` — run the engine in the foreground with options
+- `sudo albus config set KEY VALUE` — persist a setting and live-reload the daemon
+- `sudo albus cleanup` — restore `/etc/resolv.conf` and purge firewall rules
+
+Unprivileged commands (inspect only):
+
+- `albus status` — kernel capability and privilege summary
+- `albus status --json` — machine-readable status for bars and panels
+- `albus config get` — print the active configuration as JSON
+- `albus monitor` — interactive traffic telemetry TUI
 
 Root runs management; the daemon runs as the dedicated `albus` user with six
-ambient capabilities (`NET_ADMIN`, `NET_RAW`, `BPF`, `PERFMON`,
-`NET_BIND_SERVICE`, `DAC_OVERRIDE`). Unprivileged users are refused before
-anything is touched. The systemd unit sets `User=/Group=albus`,
-`RuntimeDirectory=/StateDirectory=albus`, `LimitMEMLOCK=infinity`, and
-`ExecStopPost=+… cleanup` (privileged stop-cleanup); a scoped polkit rule
-lets only the `albus` user drive per-link DNS (`resolve1` actions) without
-interactive auth. `service uninstall` reverts firewall + DNS first, then
-reports honestly: the system binary is retained by design (it says so).
+ambient capabilities (`NET_ADMIN`, `NET_RAW`, `BPF`, `PERFMON`, `NET_BIND_SERVICE`,
+`DAC_OVERRIDE`). Uninstall keeps `/usr/local/bin/albus` by design (it says so —
+remove it manually if wanted).
 
-Omarchy panel widget: see [docs/OMARCHY.md](docs/OMARCHY.md).
+## Options
 
-Full flag list: `albus run --help`. Defaults (kept in sync with `Config::default()` by CI):
+Evasion:
 
-| Flag | Type | Default |
-| :--- | :--- | :--- |
-| `--mss` | `u16` | `88` |
-| `--min-mss` | `u16` | `64` |
-| `--restore-after-bytes` | `u32` | `600` |
-| `--ports` | `Vec<u16>` | `[443]` |
-| `--fake-ttl` | `u8` | `8` |
-| `--auto-ttl` | `bool` | `true` |
-| `--min-ttl` | `u8` | `3` |
-| `--max-ttl` | `u8` | `12` |
-| `--fake-sni` | `String` | `None` |
-| `--fake-bad-checksum` | `bool` | `false` |
-| `--doh` | `bool` | `true` |
-| `--doh-upstream` | `String` | `"quad9"` |
-| `--doh-bootstrap-ips` | `Vec<IPv4>` | `[]` |
-| `--dnssec` | `bool` | `true` |
-| `--pqc` | `bool` | `true` |
-| `--ram-only` | `bool` | `false` |
-| `--block-quic` | `bool` | `true` |
-| `--block-stun` | `bool` | `true` |
-| `--kill-switch` | `bool` | `true` |
-| `--network-lockdown` | `bool` | `false` |
-| `--block-ipv6` | `bool` | `true` |
-| `--shaping-watchdog` | `bool` | `true` |
+- `--mss 88` — initial TCP MSS size that fragments the ClientHello
+- `--min-mss 64` — per-connection jitter floor (must stay ≤ mss)
+- `--restore-after-bytes 600` — byte threshold before restoring line-rate MSS (≥ 64)
+- `--restore-mss 0` — MSS restored afterwards (`0` = 1460 auto, else 64–1460)
+- `--ports 443` — target ports for sock_ops interception (up to 64, comma-separated)
+- `--fake-ttl 8` — TTL stamped on injected fake packets
+- `--auto-ttl` — heuristic hop-distance TTL instead of the fallback (conservative constant, not measured probing)
+- `--min-ttl 3`, `--max-ttl 12` — clamps for the auto-TTL heuristic
+- `--fake-sni` — override the rotating high-reputation decoy SNI pool
+- `--fake-bad-checksum` — corrupt TCP checksums with `0xDEAD` to confuse stateful middleboxes
 
-DNSSEC validation: Bogus → SERVFAIL (never cached), unsigned → served
-insecure, unsigned delegations without DS in the parent → insecure (never
-Bogus). RSASHA1/NSEC3RSASHA1 are deliberately rejected (zones using them
-SERVFAIL — SHA-1 collision-forgery risk beats legacy compat; locked by
-`test_rsasha1_*` in `src/dns/dnssec.rs`). Query IDs (ECH, DNSSEC chain,
-leak canary) come from the OS CSPRNG.
+DNS:
 
-### Verification
-DPI evasion is verified against a live RST-injection simulator on every CI run — see docs/TEST_RESULTS.md for the latest recorded proof. To verify your own setup: see docs/TESTING.md.
+- `--doh` — spawn the local DoH proxy listener on 127.0.0.1:53 (on by default)
+- `--doh-upstream quad9` — presets (`quad9`, `cloudflare`, `mullvad-*`) or an `https://` URL (https-only, enforced)
+- `--doh-bootstrap-ips` — static IPv4 endpoints to resolve custom DoH hosts
+- `--dnssec` — validate RRSIG chains locally: Bogus → SERVFAIL (never cached), unsigned → served insecure, unsigned delegations without DS → insecure (never Bogus)
+- `--pqc` — offer hybrid ML-KEM-768 where the upstream negotiates it (transport KEX only, logged per upstream)
+- `--block-ipv6` — filter AAAA queries so IPv6 can't bypass inspection unfragmented
+
+Containment:
+
+- `--block-quic` — drop outbound UDP 443 to force TLS/TCP fallback
+- `--block-stun` — drop outbound STUN (UDP 3478, 5349) against WebRTC IP leaks
+- `--kill-switch` — drop all non-loopback plaintext DNS (UDP/TCP 53, TCP 853)
+- `--network-lockdown` — fail-closed: drop outbound TCP 80/443 if eBPF fails (off by default)
+- `--ram-only` — keep runtime state in `/run` tmpfs only
+- `-c`, `--config PATH` — load an explicit config file (must be root-owned, non-symlink when privileged)
+- `--cgroup /sys/fs/cgroup` — cgroup v2 mount point for BPF attachment
+- `--verbose` — debug logging
+
+## Omarchy panel
+
+Quattro widget (`BarWidget.qml`, `Panel.qml`): status, resolver profiles, toggles,
+live logs (`1/2` tabs, `Space` start/stop, `C` flush caches, `P` pause).
+`R` (`Apply & Restart`) writes the root-owned `/etc/albus/config.json` behind a
+pkexec prompt and then restarts `albus.service`; it does not merely reload.
 
 ```bash
-sudo python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com
+mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev
+cp manifest.json BarWidget.qml Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
 ```
-
-## Troubleshooting
-
-- eBPF won't load → check kernel ≥5.10, BTF (`/sys/kernel/btf/vmlinux`), cgroup v2.
-- No network after stop → `sudo albus cleanup` restores `/etc/resolv.conf` + firewall.
-- QUIC still leaks → `--block-quic` is on by default; verify with `iptables -S OUTPUT | grep albus`.
-- DNS leaks → kill-switch drops non-loopback port 53 by default; check `albus service status`.
-
-## Removal
-
-```bash
-sudo albus service uninstall
-sudo albus cleanup     # restores /etc/resolv.conf, purges firewall rules
-```
-
-What `cleanup` does not delete: `/usr/local/bin/albus`, `/etc/albus/config.json`, `~/.config/albus/config.json` (remove manually if needed).
-`service uninstall` likewise retains the system binary by design and says so — run `sudo albus cleanup` afterwards if needed.
-
-## Docs
-
-| Doc | What it answers |
-| :--- | :--- |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute (gates, commits, deps) |
-| [SECURITY.md](SECURITY.md) | Scope, reporting, disclosure |
-| [docs/TESTING.md](docs/TESTING.md) | How to run every test suite |
-| [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) | Recorded DPI-evasion proof |
-| [docs/OMARCHY.md](docs/OMARCHY.md) | Omarchy panel widget |
 
 ## License
 
-[GNU GPL-3.0](LICENSE).
+[GPL-3.0](LICENSE)

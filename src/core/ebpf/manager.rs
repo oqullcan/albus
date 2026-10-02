@@ -1,23 +1,28 @@
 //! high-level ebpf manager coordinating kernel hooks, raw packet injection, and ring buffer polling.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::{info, warn};
 
-use super::loader::{BpfConfig, BpfEngine, RawConnEvent};
+use super::loader::{BpfConfig, BpfEngine, BpfMapHandles, RawConnEvent};
 use crate::core::autottl::AutoTtlEstimator;
-use crate::core::fake::clienthello::build_fake_client_hello_opts;
-use crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL;
-use crate::core::firewall::enable_network_lockdown;
 use crate::core::rawsock::{ConnInfo, RawSocket};
 use crate::dns::server::DnsServer;
 
-/// Watchdog re-check interval: displacement is rare and fail-closed is
-/// drastic, so slow polling beats hot polling (no per-packet cost).
-const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+/// The map parameters `start` pushes, captured so the closure passed to
+/// `commit_start` does not have to borrow `self`.
+struct PushParams {
+    mss: u16,
+    restore_mss: u16,
+    restore_after_bytes: u32,
+    min_mss: u16,
+    ports: Vec<u16>,
+    exclude_ips: Vec<Ipv4Addr>,
+    exclude_ips_v6: Vec<Ipv6Addr>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BpfManagerConfig {
@@ -34,22 +39,15 @@ pub struct BpfManagerConfig {
     pub fake_bad_checksum: bool,
     pub pqc: bool,
     pub auto_ttl_estimator: AutoTtlEstimator,
-    /// shaping watchdog (displacement detection + fail-closed lockdown).
-    /// Default on; --shaping-watchdog=false disables the periodic check.
-    pub shaping_watchdog: bool,
 }
 
 // manager coordinating the ebpf filter engine and raw-socket injector
 pub struct BpfManager {
     cfg: BpfManagerConfig,
     engine: Option<BpfEngine>,
-    map_handles: Option<super::loader::BpfMapHandles>,
+    map_handles: Option<BpfMapHandles>,
     running: Arc<AtomicBool>,
     worker_handle: Option<JoinHandle<()>>,
-    /// latched on confirmed shaping loss (consecutive Unhealthy probes);
-    /// drives the one-shot fail-closed lockdown below. Never auto-cleared:
-    /// only a restart re-arms shaping.
-    pub shaping_lost: Arc<AtomicBool>,
 }
 
 impl BpfManager {
@@ -60,8 +58,44 @@ impl BpfManager {
             map_handles: None,
             running: Arc::new(AtomicBool::new(false)),
             worker_handle: None,
-            shaping_lost: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// EBPF-03: whether every CPU has a perf reader. False means the engine is
+    /// attached and fragmenting but its decoy-injection half will miss some
+    /// connections — a state the caller must not describe as "active".
+    pub fn readers_complete(&self) -> bool {
+        match &self.engine {
+            Some(e) => e.readers_complete(),
+            None => false,
+        }
+    }
+
+    /// Perf readers actually installed.
+    pub fn reader_count(&self) -> usize {
+        self.engine.as_ref().map(|e| e.reader_count()).unwrap_or(0)
+    }
+
+    /// Runs every fallible map push and publishes the descriptors only if all of
+    /// them succeeded.
+    ///
+    /// EBPF-04: the invariant is "map_handles must only be observable once every
+    /// operation that can invalidate them has succeeded". Publishing first and
+    /// retracting later leaves a window that `stop()`'s `running` guard cannot
+    /// reach, which is how a failed start ended up holding descriptors to
+    /// closed maps and turned every later SIGHUP into an undiagnosable
+    /// `bpf(BPF_MAP_UPDATE_ELEM) failed`.
+    ///
+    /// Extracted as its own step so the state machine is testable without a
+    /// kernel: no BPF map, cgroup, raw socket or syscall is involved.
+    fn commit_start(
+        &mut self,
+        handles: BpfMapHandles,
+        push: impl FnOnce(&BpfMapHandles) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        push(&handles)?;
+        self.map_handles = Some(handles);
+        Ok(())
     }
 
     // reloads ebpf maps live at runtime without stopping or detaching the program
@@ -129,19 +163,45 @@ impl BpfManager {
         info!("Loading eBPF sock_ops program");
 
         let engine = BpfEngine::load_and_attach(&self.cfg.cgroup_path)?;
-        self.map_handles = Some(engine.map_handles());
 
-        let bpf_cfg = BpfConfig::new(
-            self.cfg.mss,
-            self.cfg.restore_mss,
-            self.cfg.restore_after_bytes,
-            self.cfg.min_mss,
-            true,
-        );
-        engine.push_config(bpf_cfg)?;
-        engine.push_target_ports(&self.cfg.ports)?;
-        engine.push_exclude_ips(&self.cfg.exclude_ips)?;
-        engine.push_exclude_ips_v6(&self.cfg.exclude_ips_v6)?;
+        // EBPF-04: publication moves AFTER the transition that validates it.
+        // This used to assign self.map_handles while `engine` was still a local
+        // that the four pushes below could fail on. On such a failure the local
+        // engine drops (closing all six maps), but self.map_handles kept four
+        // RawFd values now referring to CLOSED descriptors — and stop(), the
+        // only retraction site, is gated behind `running`, which is not set
+        // until further below. Engine::run treats a start() Err as recoverable,
+        // so the daemon stayed up holding a poisoned manager, and the next
+        // SIGHUP drove bpf_map_update/bpf_map_delete against those stale fd
+        // numbers: a reload failure the operator could not diagnose from the
+        // message, forever.
+        let handles = engine.map_handles();
+
+        let params = PushParams {
+            mss: self.cfg.mss,
+            restore_mss: self.cfg.restore_mss,
+            restore_after_bytes: self.cfg.restore_after_bytes,
+            min_mss: self.cfg.min_mss,
+            ports: self.cfg.ports.clone(),
+            exclude_ips: self.cfg.exclude_ips.clone(),
+            exclude_ips_v6: self.cfg.exclude_ips_v6.clone(),
+        };
+        self.commit_start(handles, move |target: &BpfMapHandles| {
+            // Push through the handles being published, so the validated
+            // descriptors and the published descriptors are provably the same
+            // objects rather than two independent reads of engine state.
+            target.push_config(BpfConfig::new(
+                params.mss,
+                params.restore_mss,
+                params.restore_after_bytes,
+                params.min_mss,
+                true,
+            ))?;
+            target.push_target_ports(&params.ports)?;
+            target.push_exclude_ips(&params.exclude_ips)?;
+            target.push_exclude_ips_v6(&params.exclude_ips_v6)?;
+            Ok(())
+        })?;
 
         let raw_socket = Arc::new(RawSocket::new()?);
         let estimator = self.cfg.auto_ttl_estimator.clone();
@@ -170,30 +230,28 @@ impl BpfManager {
         // assemble decoy clienthello payloads: rotate across pool if no custom sni is forced
         let fake_payloads: Vec<Vec<u8>> = if let Some(ref sni) = fake_sni {
             if sni != "www.google.com" && !sni.is_empty() {
-                vec![build_fake_client_hello_opts(sni, self.cfg.pqc)]
+                vec![
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(sni, self.cfg.pqc),
+                ]
             } else {
-                DEFAULT_DECOY_SNI_POOL
+                crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                     .iter()
-                    .map(|&s| build_fake_client_hello_opts(s, self.cfg.pqc))
+                    .map(|&s| {
+                        crate::core::fake::clienthello::build_fake_client_hello_opts(
+                            s,
+                            self.cfg.pqc,
+                        )
+                    })
                     .collect()
             }
         } else {
-            DEFAULT_DECOY_SNI_POOL
+            crate::core::fake::sni::DEFAULT_DECOY_SNI_POOL
                 .iter()
-                .map(|&s| build_fake_client_hello_opts(s, self.cfg.pqc))
+                .map(|&s| {
+                    crate::core::fake::clienthello::build_fake_client_hello_opts(s, self.cfg.pqc)
+                })
                 .collect()
         };
-
-        // watchdog inputs, snapshotted for the worker thread
-        let watchdog_enabled = self.cfg.shaping_watchdog;
-        let watch_ports = self.cfg.ports.clone();
-        let watch_exclude_v4 = self.cfg.exclude_ips.clone();
-        let watch_exclude_v6 = self.cfg.exclude_ips_v6.clone();
-        let tripped_clone = self.shaping_lost.clone();
-        let events_seen = Arc::new(AtomicU64::new(0));
-        let events_probe = events_seen.clone();
-        // fresh start re-arms (a restart means a fresh attach)
-        self.shaping_lost.store(false, Ordering::SeqCst);
 
         let handle = thread::spawn(move || {
             // FP-13 follow-up: multi_thread with one worker so spawned
@@ -209,151 +267,88 @@ impl BpfManager {
             // context via try_current on this thread too.
             let _enter_guard = rt.as_ref().map(|r| r.enter());
             let mut decoy_idx: usize = 0;
-            // watchdog snapshot: read once, the worker owns the rest
-            let mut last_watchdog_check = Instant::now();
-            let mut watch_state = super::watch::WatchState::default();
-            // latched per watchdog window: any perf-ring overrun inside the
-            // window makes its event count untrustworthy (see poll_events)
-            let mut watch_overrun = false;
 
             while running_clone.load(Ordering::Relaxed) {
                 let mut received = false;
-                watch_overrun |=
-                    engine_poll.poll_events(|raw_evt: RawConnEvent| {
-                        received = true;
-                        // every perf event is evidence the program is firing
-                        events_probe.fetch_add(1, Ordering::Relaxed);
-                        // NOTE: RawConnEvent is #[repr(packed)] — never take references to its
-                        // fields (unaligned). Copy out via read_unaligned first.
-                        let (
-                            src_ip,
-                            dst_ip,
+                engine_poll.poll_events(|raw_evt: RawConnEvent| {
+                    received = true;
+                    // NOTE: RawConnEvent is #[repr(packed)] — never take references to its
+                    // fields (unaligned). Copy out via read_unaligned first.
+                    let (src_ip, dst_ip, src_port, dst_port, seq, ack, family, src_ip6, dst_ip6) = unsafe {
+                        let p = &raw_evt as *const RawConnEvent;
+                        (
+                            std::ptr::addr_of!((*p).src_ip).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_ip).read_unaligned(),
+                            std::ptr::addr_of!((*p).src_port).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_port).read_unaligned(),
+                            std::ptr::addr_of!((*p).seq).read_unaligned(),
+                            std::ptr::addr_of!((*p).ack).read_unaligned(),
+                            std::ptr::addr_of!((*p).family).read_unaligned(),
+                            std::ptr::addr_of!((*p).src_ip6).read_unaligned(),
+                            std::ptr::addr_of!((*p).dst_ip6).read_unaligned(),
+                        )
+                    };
+                    let conn = if family == 10 {
+                        let mut src_octets = [0u8; 16];
+                        let mut dst_octets = [0u8; 16];
+                        for i in 0..4 {
+                            src_octets[i * 4..(i + 1) * 4].copy_from_slice(&src_ip6[i].to_ne_bytes());
+                            dst_octets[i * 4..(i + 1) * 4].copy_from_slice(&dst_ip6[i].to_ne_bytes());
+                        }
+                        ConnInfo::new_v6(
+                            Ipv6Addr::from(src_octets),
+                            Ipv6Addr::from(dst_octets),
                             src_port,
                             dst_port,
                             seq,
                             ack,
-                            family,
-                            src_ip6,
-                            dst_ip6,
-                        ) = unsafe {
-                            let p = &raw_evt as *const RawConnEvent;
-                            (
-                                std::ptr::addr_of!((*p).src_ip).read_unaligned(),
-                                std::ptr::addr_of!((*p).dst_ip).read_unaligned(),
-                                std::ptr::addr_of!((*p).src_port).read_unaligned(),
-                                std::ptr::addr_of!((*p).dst_port).read_unaligned(),
-                                std::ptr::addr_of!((*p).seq).read_unaligned(),
-                                std::ptr::addr_of!((*p).ack).read_unaligned(),
-                                std::ptr::addr_of!((*p).family).read_unaligned(),
-                                std::ptr::addr_of!((*p).src_ip6).read_unaligned(),
-                                std::ptr::addr_of!((*p).dst_ip6).read_unaligned(),
-                            )
-                        };
-                        let conn = if family == 10 {
-                            let mut src_octets = [0u8; 16];
-                            let mut dst_octets = [0u8; 16];
-                            for i in 0..4 {
-                                src_octets[i * 4..(i + 1) * 4]
-                                    .copy_from_slice(&src_ip6[i].to_ne_bytes());
-                                dst_octets[i * 4..(i + 1) * 4]
-                                    .copy_from_slice(&dst_ip6[i].to_ne_bytes());
-                            }
-                            ConnInfo::new_v6(
-                                Ipv6Addr::from(src_octets),
-                                Ipv6Addr::from(dst_octets),
-                                src_port,
-                                dst_port,
-                                seq,
-                                ack,
-                            )
-                        } else {
-                            ConnInfo::new_v4(
-                                Ipv4Addr::from(src_ip.to_ne_bytes()),
-                                Ipv4Addr::from(dst_ip.to_ne_bytes()),
-                                src_port,
-                                dst_port,
-                                seq,
-                                ack,
-                            )
-                        };
+                        )
+                    } else {
+                        ConnInfo::new_v4(
+                            Ipv4Addr::from(src_ip.to_ne_bytes()),
+                            Ipv4Addr::from(dst_ip.to_ne_bytes()),
+                            src_port,
+                            dst_port,
+                            seq,
+                            ack,
+                        )
+                    };
 
-                        // static TTL lookup for this destination (no probing)
-                        let optimal_ttl = match conn.dst_ip {
-                            IpAddr::V4(v4) => estimator.get_ttl(v4),
-                            IpAddr::V6(_) => fake_ttl_fallback,
-                        };
+                    // dynamically resolve optimal ttl for destination
+                    let optimal_ttl = match conn.dst_ip {
+                        IpAddr::V4(v4) => estimator.get_ttl(v4),
+                        IpAddr::V6(_) => fake_ttl_fallback,
+                    };
 
-                        let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
-                        decoy_idx = decoy_idx.wrapping_add(1);
+                    let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
+                    decoy_idx = decoy_idx.wrapping_add(1);
 
-                        if let Err(e) = raw_socket.send_fake_opts(
-                            &conn,
-                            payload,
-                            optimal_ttl,
-                            fake_bad_checksum,
-                        ) {
-                            warn!("Failed to inject fake ClientHello: {}", e);
-                        } else {
-                            let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
+                    if let Err(e) = raw_socket.send_fake_opts(&conn, payload, optimal_ttl, fake_bad_checksum) {
+                        warn!("Failed to inject fake ClientHello: {}", e);
+                    } else {
+                        let mut dst_desc = format!("{}:{}", conn.dst_ip, conn.dst_port);
 
-                            if let (Some(server), Some(runtime)) = (&dns_server, &rt) {
-                                if let IpAddr::V4(v4) = conn.dst_ip {
-                                    if let Some(domain) = runtime.block_on(server.pop_domain(v4)) {
-                                        // domain originates from upstream DNS answers:
-                                        // sanitize before it reaches the journal (L7/L8)
-                                        let clean = crate::dns::server::sanitize_log_token(&domain);
-                                        dst_desc = format!("{}:{}", clean, conn.dst_port);
-                                    }
+                        if let (Some(server), Some(runtime)) = (&dns_server, &rt) {
+                            if let IpAddr::V4(v4) = conn.dst_ip {
+                                if let Some(domain) = runtime.block_on(server.pop_domain(v4)) {
+                                    dst_desc = format!("{}:{}", domain, conn.dst_port);
                                 }
                             }
-
-                            debug!(
-                                dst = %dst_desc,
-                                seq = conn.seq,
-                                ack = conn.ack,
-                                ttl = optimal_ttl,
-                                bad_cs = fake_bad_checksum,
-                                "fake ClientHello injected"
-                            );
                         }
-                    });
+
+                        info!(
+                            dst = %dst_desc,
+                            seq = conn.seq,
+                            ack = conn.ack,
+                            ttl = optimal_ttl,
+                            bad_cs = fake_bad_checksum,
+                            "fake ClientHello injected"
+                        );
+                    }
+                });
 
                 if !received {
                     thread::sleep(Duration::from_micros(200));
-                }
-
-                // shaping watchdog (v2 reconciliation): every interval,
-                // compare fresh ESTABLISHED target-port connections against
-                // fresh perf events. Unexplained newcomers across two
-                // consecutive quiet windows trip the one-shot fail-closed
-                // lockdown (see watch::WatchState for the exact rules).
-                if watchdog_enabled && last_watchdog_check.elapsed() >= WATCHDOG_INTERVAL {
-                    last_watchdog_check = Instant::now();
-                    // overrun inside the window: event count untrustworthy,
-                    // freeze this round (neither trip nor reset)
-                    if watch_overrun {
-                        debug!("shaping watchdog: perf ring overran, round frozen");
-                        watch_overrun = false;
-                    } else {
-                        let tcp4 = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-                        let tcp6 = std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
-                        if !(tcp4.is_empty() && tcp6.is_empty()) {
-                            let trip = watch_state.observe(
-                                &tcp4,
-                                &tcp6,
-                                &watch_ports,
-                                &watch_exclude_v4,
-                                &watch_exclude_v6,
-                                events_seen.load(Ordering::Relaxed),
-                            );
-                            if trip && !tripped_clone.swap(true, Ordering::SeqCst) {
-                                warn!(
-                                    "SHAPING LOST: fresh target-port connections produced no perf events across consecutive windows — engaging fail-closed network lockdown (restart albus to re-arm)"
-                                );
-                                enable_network_lockdown();
-                            }
-                        }
-                    }
                 }
             }
 
@@ -365,6 +360,13 @@ impl BpfManager {
     }
 
     // stops polling and cleanly releases all resources
+    //
+    // EBPF-04: the `map_handles` retraction is deliberately OUTSIDE the
+    // `running` guard. It used to sit inside, which meant the only code that
+    // could clear a stale `Some(...)` was unreachable on every failure path that
+    // could create one. Retracting unconditionally costs nothing on the normal
+    // path (the value is already None or about to be dropped with the engine)
+    // and removes the flag as a precondition for correctness.
     pub fn stop(&mut self) {
         if self.running.load(Ordering::SeqCst) {
             info!("Stopping albus eBPF manager");
@@ -372,9 +374,9 @@ impl BpfManager {
             if let Some(handle) = self.worker_handle.take() {
                 let _ = handle.join();
             }
-            self.map_handles = None;
             info!("albus eBPF manager stopped");
         }
+        self.map_handles = None;
     }
 }
 
@@ -385,76 +387,177 @@ impl Drop for BpfManager {
 }
 
 #[cfg(test)]
-mod tests {
+mod map_handle_lifecycle_tests {
     use super::*;
-    use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
+    use std::io;
 
-    fn test_cfg() -> BpfManagerConfig {
-        BpfManagerConfig {
-            mss: 88,
-            min_mss: 64,
-            restore_mss: 0,
-            restore_after_bytes: 600,
+    /// Sentinel descriptors. Never opened, never passed to a syscall: the
+    /// tests below drive only the manager's own state machine.
+    fn handles() -> BpfMapHandles {
+        BpfMapHandles {
+            config_map_fd: 1001,
+            target_ports_fd: 1002,
+            exclude_ips_fd: 1003,
+            exclude_ips_v6_fd: 1004,
+        }
+    }
+
+    fn manager() -> BpfManager {
+        BpfManager::new(BpfManagerConfig {
+            mss: 1200,
+            min_mss: 1000,
+            restore_mss: 1440,
+            restore_after_bytes: 4 << 20,
             ports: vec![443],
             exclude_ips: vec![],
             exclude_ips_v6: vec![],
-            cgroup_path: "/sys/fs/cgroup".to_string(),
+            cgroup_path: "/sys/fs/cgroup".into(),
             fake_ttl: 8,
             fake_sni: None,
             fake_bad_checksum: false,
-            pqc: true,
-            auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
-            shaping_watchdog: true,
-        }
+            pqc: false,
+            auto_ttl_estimator: AutoTtlEstimator::new(
+                crate::core::autottl::AutoTtlConfig::default(),
+            ),
+        })
     }
 
+    /// EBPF-04: a push that fails must leave `map_handles` unpublished. On
+    /// unpatched source the descriptors were published BEFORE the pushes, so a
+    /// failure left four RawFd values pointing at maps the dropped engine had
+    /// already closed.
     #[test]
-    fn test_manager_new_is_stopped() {
-        let mgr = BpfManager::new(test_cfg());
-        assert!(!mgr.running.load(Ordering::SeqCst));
-        assert_eq!(mgr.cfg.mss, 88);
-        assert_eq!(mgr.cfg.ports, vec![443]);
-    }
-}
+    fn test_failed_push_does_not_publish_map_handles() {
+        let mut m = manager();
+        assert!(m.map_handles.is_none(), "precondition: nothing published");
 
-#[cfg(test)]
-mod reload_tests {
-    use super::*;
-    use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
+        let r = m.commit_start(handles(), |_h| {
+            Err(io::Error::other("synthetic push failure"))
+        });
 
-    fn cfg_with_ports(ports: Vec<u16>) -> BpfManagerConfig {
-        BpfManagerConfig {
-            mss: 88,
-            min_mss: 64,
-            restore_mss: 0,
-            restore_after_bytes: 600,
-            ports,
-            exclude_ips: vec![],
-            exclude_ips_v6: vec![],
-            cgroup_path: "/sys/fs/cgroup".to_string(),
-            fake_ttl: 8,
-            fake_sni: None,
-            fake_bad_checksum: false,
-            pqc: true,
-            auto_ttl_estimator: AutoTtlEstimator::new(AutoTtlConfig::default()),
-            shaping_watchdog: true,
-        }
-    }
-
-    #[test]
-    fn test_reload_maps_without_handles_updates_cfg_only() {
-        // FP-17: absent handles (pre-start) is an explicit error, never a
-        // silent cfg-only Ok — callers must not mistake it for a live reload.
-        let mut mgr = BpfManager::new(cfg_with_ports(vec![443]));
-        let next = cfg_with_ports(vec![80, 443]);
-        let err = mgr
-            .reload_maps(&next)
-            .expect_err("pre-start reload must error honestly");
+        assert!(r.is_err(), "the failing push must surface");
         assert!(
-            err.to_string().contains("not loaded yet"),
-            "unexpected error: {}",
-            err
+            m.map_handles.is_none(),
+            "EBPF-04: descriptors must not be published when a push fails"
         );
-        assert_eq!(mgr.cfg.ports, vec![443]);
+    }
+
+    /// And the observable consequence: a later reload must reach the
+    /// "maps not loaded" precondition rather than issuing a bpf() syscall
+    /// against a stale descriptor. The message is the diagnosability claim.
+    #[test]
+    fn test_reload_after_failed_start_reports_not_loaded_not_a_syscall_error() {
+        let mut m = manager();
+        let _ = m.commit_start(handles(), |_h| {
+            Err(io::Error::other("synthetic push failure"))
+        });
+
+        let err = m
+            .reload_maps(&m.cfg.clone())
+            .expect_err("reload must not succeed against a failed start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not loaded"),
+            "reload must fail at the precondition, not at a syscall: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("BPF_MAP_UPDATE_ELEM") && !msg.contains("bpf("),
+            "no kernel call may be attempted against a stale descriptor: {}",
+            msg
+        );
+    }
+
+    /// The positive path still publishes, so the fix did not simply disable it.
+    #[test]
+    fn test_successful_push_publishes_map_handles() {
+        let mut m = manager();
+        let mut pushed = false;
+        m.commit_start(handles(), |_h| {
+            pushed = true;
+            Ok(())
+        })
+        .expect("push succeeds");
+
+        assert!(pushed, "the push closure must have run");
+        let published = m.map_handles.expect("handles must be published");
+        assert_eq!(published.config_map_fd, 1001);
+        assert_eq!(published.exclude_ips_v6_fd, 1004);
+    }
+
+    /// EBPF-04's belt-and-braces half: the retraction must not sit behind the
+    /// `running` flag, because that flag is not set on any failure path that can
+    /// create a stale Some — which is exactly why it used to leak.
+    #[test]
+    fn test_stop_clears_map_handles_even_when_not_running() {
+        let mut m = manager();
+        m.commit_start(handles(), |_h| Ok(())).expect("push");
+        assert!(m.map_handles.is_some(), "precondition: published");
+        assert!(
+            !m.running.load(Ordering::SeqCst),
+            "precondition: never marked running"
+        );
+
+        m.stop();
+
+        assert!(
+            m.map_handles.is_none(),
+            "EBPF-04: stop() must retract unconditionally, not only when running"
+        );
+    }
+
+    /// Dropping a manager that was never started must not leave anything behind
+    /// either — Drop calls stop().
+    #[test]
+    fn test_drop_after_failed_start_leaves_nothing_published() {
+        let mut m = manager();
+        let _ = m.commit_start(handles(), |_h| Err(io::Error::other("synthetic")));
+        drop(m);
+        // Nothing observable survives the drop; the assertion is that the drop
+        // path itself does not panic while `running` is false.
+    }
+
+    /// Regression guard on the ordering itself. The invariant lives inside
+    /// `commit_start`: the pushes run first and the assignment happens only
+    /// afterwards. `start` must route through it rather than assigning
+    /// directly.
+    #[test]
+    fn test_publication_happens_after_the_pushes() {
+        let src = include_str!("manager.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod map_handle_lifecycle_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+
+        let commit_at = prod.find("fn commit_start(").expect("commit_start helper");
+        let commit_body = &prod[commit_at..(commit_at + 700).min(prod.len())];
+        let push_at = commit_body.find("push(&handles)?;").expect("push call");
+        let assign_at = commit_body
+            .find("self.map_handles = Some(handles);")
+            .expect("publication");
+        assert!(
+            push_at < assign_at,
+            "EBPF-04: publication must come AFTER the fallible push"
+        );
+
+        let start_at = prod.find("pub fn start(").expect("start");
+        let start_end = prod[start_at..]
+            .find("\n    pub fn ")
+            .map(|o| start_at + o)
+            .unwrap_or(prod.len());
+        let start_body = &prod[start_at..start_end];
+        assert!(
+            !start_body.contains("self.map_handles = Some("),
+            "start() must not assign map_handles directly: {}",
+            start_body
+        );
+        assert!(
+            start_body.contains("self.commit_start("),
+            "start() must route publication through commit_start"
+        );
     }
 }

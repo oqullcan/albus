@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::app::config::Config;
 use crate::core::autottl::{AutoTtlConfig, AutoTtlEstimator};
@@ -65,7 +65,6 @@ impl Engine {
             fake_bad_checksum: cfg.fake_bad_checksum,
             pqc: cfg.pqc,
             auto_ttl_estimator,
-            shaping_watchdog: cfg.shaping_watchdog,
         };
 
         // instantiate local doh proxy server on 127.0.0.1:53
@@ -105,38 +104,81 @@ impl Engine {
             );
         }
 
-        // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection).
-        // applied_* tracks VERIFIED application only (L2): shutdown removes
-        // whatever is present idempotently, but the flags must never claim
-        // cover that was never confirmed.
+        // EBPF-01: every firewall control below is now fallible, and the
+        // `applied_*` flags and the "... ACTIVE" journal lines are bound to the
+        // kernel-side outcome. Previously these calls returned `()`, so a
+        // non-zero iptables exit (xtables lock contention, a legacy/nft
+        // backend mismatch, a missing xt_comment or REJECT target, a rejected
+        // transaction) was indistinguishable from success and the daemon
+        // recorded a lie the operator would later read as the control being in
+        // place.
+
+        // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection)
+        //
+        // QUIC forcing and STUN blocking are evasion *hygiene*, not a
+        // confidentiality control: if the kernel refuses them the daemon is
+        // still correct, just less opaque. Warn with the real reason, leave
+        // applied_* false, and keep going.
         if self.cfg.block_quic {
-            self.applied_quic = block_quic();
+            match block_quic() {
+                Ok(()) => self.applied_quic = true,
+                Err(e) => warn!(
+                    "QUIC (UDP 443) block NOT installed ({}). DPI evasion is degraded, \
+                     but DNS confidentiality is unaffected; continuing.",
+                    e
+                ),
+            }
         }
         if self.cfg.block_stun {
-            self.applied_stun = block_stun();
+            match block_stun() {
+                Ok(()) => self.applied_stun = true,
+                Err(e) => warn!(
+                    "WebRTC STUN block NOT installed ({}). Browser IP leakage \
+                     protection is unavailable; continuing.",
+                    e
+                ),
+            }
         }
 
         // 2. kill-switch applies even without DoH (fail-closed for plaintext DNS)
+        //
+        // This one IS a confidentiality control, and it can be the only one --
+        // that is the whole point of "applies even without DoH". Continuing
+        // after a failed install would point /etc/resolv.conf at the daemon
+        // while non-loopback plaintext DNS is wide open, and then log
+        // "Kill-Switch ACTIVE". Abort instead: this runs BEFORE resolv.conf is
+        // touched, so the machine is left exactly as we found it rather than
+        // half-configured, and the operator gets the kernel-side reason.
         if self.cfg.kill_switch {
-            self.applied_kill = enable_kill_switch();
+            match enable_kill_switch() {
+                Ok(()) => self.applied_kill = true,
+                Err(e) => {
+                    // Undo whatever did install, so we do not leave a partial
+                    // kill-switch behind on the way out.
+                    if let Err(ce) = disable_kill_switch() {
+                        warn!(
+                            "kill-switch rollback after a failed install also failed ({}): \
+                             residual DROP rules may remain",
+                            ce
+                        );
+                    }
+                    return Err(format!(
+                        "DNS kill-switch requested but the packet filter refused the rule \
+                         ({}). Refusing to start and claim plaintext DNS is blocked when \
+                         it is not. Your DNS configuration is unchanged.",
+                        e
+                    )
+                    .into());
+                }
+            }
         }
 
-        // 3. bind udp listener on 127.0.0.1:53 and update /etc/resolv.conf.
-        // L3: every early return below rolls back steps 1-2 first — a failed
-        // start must never leave firewall rules behind without a daemon.
+        // 3. bind udp listener on 127.0.0.1:53 and update /etc/resolv.conf
         if let Some(ref dns) = self.dns_server {
-            if let Err(e) = dns.start().await {
-                self.cleanup_firewall_only();
-                return Err(format!("failed to bind local DNS resolver: {}", e).into());
-            }
+            dns.start().await?;
             if let Err(e) = set_system_dns() {
                 // full revert: resolvectl links may already be pointed at loopback
-                if let Err(re) = crate::dns::system::revert_resolvectl_dns() {
-                    warn!(
-                        "failed to revert resolvectl links during startup rollback: {}",
-                        re
-                    );
-                }
+                crate::dns::system::revert_resolvectl_dns();
                 let _ = restore_system_dns();
                 dns.stop();
                 self.cleanup_firewall_only();
@@ -149,7 +191,21 @@ impl Engine {
         // 4. attach ebpf sock_ops bytecode to cgroup v2 hierarchy and spawn raw socket injector
         match self.bpf_manager.start(self.dns_server.clone()) {
             Ok(_) => {
-                info!("eBPF sock_ops DPI bypass engine active");
+                // EBPF-03: only claim "active" when the userspace half can
+                // actually receive kernel events. A partial perf-reader set
+                // still shrinks TCP_MAXSEG (kernel-side) but silently misses
+                // decoy injection for the CPUs without a reader, so the
+                // announcement has to say which of the two happened.
+                let complete = self.bpf_manager.readers_complete();
+                let readers = self.bpf_manager.reader_count();
+                if complete {
+                    info!(readers = readers, "eBPF sock_ops DPI bypass engine active");
+                } else {
+                    warn!(
+                        readers = readers,
+                        "eBPF sock_ops DPI bypass engine DEGRADED — attached and                          fragmenting, but perf readers are missing on some CPUs,                          so decoy ClientHello injection will miss connections                          handled by them"
+                    );
+                }
             }
             Err(e) => {
                 warn!(
@@ -157,7 +213,25 @@ impl Engine {
                     e
                 );
                 if self.cfg.network_lockdown {
-                    enable_network_lockdown();
+                    // Lockdown is the last line of defence: with the eBPF engine
+                    // down it is the only thing standing between the user and an
+                    // unfragmented, undecoyed connection. If it cannot be
+                    // installed then there is no packet-level control at all,
+                    // and continuing would mean running with nothing while
+                    // reporting otherwise. Stop and say so.
+                    match enable_network_lockdown() {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.cleanup_firewall_only();
+                            return Err(format!(
+                                "eBPF DPI bypass is unavailable AND network lockdown could not \
+                                 be installed ({}). With no DPI bypass and no packet filter there \
+                                 is no protection left to provide; refusing to run.",
+                                e
+                            )
+                            .into());
+                        }
+                    }
                 } else {
                     warn!("network_lockdown is OFF — web traffic will flow without DPI bypass. Enable with --network-lockdown for fail-closed mode");
                 }
@@ -166,30 +240,10 @@ impl Engine {
 
         info!("albus is running — press Ctrl+C to stop");
 
-        // 5. block awaiting asynchronous signal trap (ctrl-c, sigterm, sigusr1 cache flush, or sighup config reload).
-        // L3: signal setup happens after subsystems are live, so a setup
-        // failure must roll back before returning.
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.shutdown();
-                return Err(format!("failed to trap SIGTERM: {}", e).into());
-            }
-        };
-        let mut sigusr1 = match signal(SignalKind::user_defined1()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.shutdown();
-                return Err(format!("failed to trap SIGUSR1: {}", e).into());
-            }
-        };
-        let mut sighup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.shutdown();
-                return Err(format!("failed to trap SIGHUP: {}", e).into());
-            }
-        };
+        // 5. block awaiting asynchronous signal trap (ctrl-c, sigterm, sigusr1 cache flush, or sighup config reload)
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigusr1 = signal(SignalKind::user_defined1())?;
+        let mut sighup = signal(SignalKind::hangup())?;
 
         loop {
             tokio::select! {
@@ -218,15 +272,53 @@ impl Engine {
     }
 
     // reloads eBPF-relevant configuration live without process restart.
-    // NOTE: firewall/DNS-affecting flags (kill_switch, block_quic/stun, doh_enabled,
-    // block_ipv6, dnssec, cgroup_path, network_lockdown) are NOT hot-reloaded —
-    // they require a restart. We deliberately keep old values for those.
+    //
+    // EBPF-02: the commit used to be a block of unconditional field
+    // assignments placed AFTER the reload_maps call, on both arms. Two defects
+    // shared that block:
+    //
+    //   1. On failure the daemon's memory adopted a configuration the kernel
+    //      had rejected. That directly breaks the invariant `BpfManager::
+    //      reload_maps` works hard to hold ("on mid-sequence failure best-effort
+    //      restore the old sets so the kernel never sits half-migrated while
+    //      memory claims either version"), one level up. The durable consequence
+    //      is on the NEXT reload: `reload_maps` uses `&self.cfg` as the delete-set
+    //      for `sync_target_ports` / `sync_exclude_ips*`, so a diverged baseline
+    //      means any kernel-resident port or excluded IP missing from the
+    //      diverged cfg is never deleted and keeps being applied indefinitely,
+    //      until a restart.
+    //
+    //   2. The merge also assigned seven fields the running injector can never
+    //      read. fake_ttl, fake_sni, fake_bad_checksum, auto_ttl, min_ttl,
+    //      max_ttl and pqc are captured BY VALUE into the worker closure at
+    //      start, so no SIGHUP can change the decoy payload, decoy TTL,
+    //      bad-checksum flag or PQC set. Recording the new values made the
+    //      operator's file and the daemon's memory agree with each other while
+    //      neither the kernel maps nor the injected packets did.
+    //
+    // Both are now structural rather than a matter of placement: the commit
+    // lives in `apply_reload`, after the `?`.
     pub fn reload_config(&mut self) {
         let new_cfg = Config::load_or_default();
         if let Err(e) = new_cfg.validate() {
             warn!("ignoring invalid reloaded config: {}", e);
             return;
         }
+        if let Err(e) = self.apply_reload(&new_cfg) {
+            warn!(
+                "Failed to reload eBPF maps dynamically: {} — keeping the previous \
+                 configuration in memory (the kernel rejected the new one)",
+                e
+            );
+        }
+    }
+
+    /// Applies `new_cfg` to the running engine, committing to memory only after
+    /// the kernel has accepted every map push.
+    fn apply_reload(
+        &mut self,
+        new_cfg: &Config,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
             "Reloading eBPF maps from {}",
             Config::default_config_path().display()
@@ -243,16 +335,48 @@ impl Engine {
             warn!("firewall/DNS-affecting options changed — restart albus to apply (hot-reload skipped for those)");
         }
 
-        // exclusion maps are hot-reloadable eBPF content (not firewall/DNS
-        // identity), so they must follow the NEW upstream; using the old one
-        // would fragment the new DoH traffic and skip the stale entries.
-        let exclude_ips = if new_cfg.doh_enabled {
-            extract_upstream_ips(&new_cfg.doh_upstream, &new_cfg.doh_bootstrap_ips)
+        // EBPF-02: these are restart-required for a different reason than the
+        // flags above. They are not kernel maps at all — the worker closure
+        // captured them BY VALUE at start, so no SIGHUP can change what the
+        // running injector emits. Saying only "firewall/DNS options" would leave
+        // an operator who changed fake_sni or pqc believing it took effect.
+        let mut restart_only = Vec::new();
+        if new_cfg.fake_ttl != self.cfg.fake_ttl {
+            restart_only.push("fake_ttl");
+        }
+        if new_cfg.fake_sni != self.cfg.fake_sni {
+            restart_only.push("fake_sni");
+        }
+        if new_cfg.fake_bad_checksum != self.cfg.fake_bad_checksum {
+            restart_only.push("fake_bad_checksum");
+        }
+        if new_cfg.auto_ttl != self.cfg.auto_ttl {
+            restart_only.push("auto_ttl");
+        }
+        if new_cfg.min_ttl != self.cfg.min_ttl {
+            restart_only.push("min_ttl");
+        }
+        if new_cfg.max_ttl != self.cfg.max_ttl {
+            restart_only.push("max_ttl");
+        }
+        if new_cfg.pqc != self.cfg.pqc {
+            restart_only.push("pqc");
+        }
+        if !restart_only.is_empty() {
+            warn!(
+                "injector-payload options changed ({}): restart albus to apply — these \
+                 are captured by value at start and no live reload can change them",
+                restart_only.join(", ")
+            );
+        }
+
+        let exclude_ips = if self.cfg.doh_enabled {
+            extract_upstream_ips(&self.cfg.doh_upstream, &self.cfg.doh_bootstrap_ips)
         } else {
             Vec::new()
         };
-        let exclude_ips_v6 = if new_cfg.doh_enabled {
-            extract_upstream_ips_v6(&new_cfg.doh_upstream, &[])
+        let exclude_ips_v6 = if self.cfg.doh_enabled {
+            extract_upstream_ips_v6(&self.cfg.doh_upstream, &[])
         } else {
             Vec::new()
         };
@@ -280,50 +404,89 @@ impl Engine {
             fake_bad_checksum: new_cfg.fake_bad_checksum,
             pqc: new_cfg.pqc,
             auto_ttl_estimator,
-            shaping_watchdog: new_cfg.shaping_watchdog,
         };
 
-        if let Err(e) = self.bpf_manager.reload_maps(&bpf_cfg) {
-            warn!("Failed to reload eBPF maps dynamically: {}", e);
-        } else {
-            // FP-16: honest log — exclusion IPs and cgroup are intentionally
-            // NOT reloaded (restart-required); only ports/MSS-class fields are.
-            info!(
-                "Live eBPF map reload successful (target ports & MSS updated; exclusion IPs/cgroup unchanged — restart to apply those)"
-            );
-        }
+        // The `?` is the transaction boundary: on failure nothing below runs and
+        // self.cfg keeps describing what the kernel is actually doing.
+        self.bpf_manager.reload_maps(&bpf_cfg)?;
 
-        // merge only hot-reloadable fields into running cfg
-        self.cfg.mss = new_cfg.mss;
-        self.cfg.min_mss = new_cfg.min_mss;
-        self.cfg.restore_mss = new_cfg.restore_mss;
-        self.cfg.restore_after_bytes = new_cfg.restore_after_bytes;
-        self.cfg.ports = new_cfg.ports;
-        self.cfg.fake_ttl = new_cfg.fake_ttl;
-        self.cfg.fake_sni = new_cfg.fake_sni;
-        self.cfg.fake_bad_checksum = new_cfg.fake_bad_checksum;
-        self.cfg.auto_ttl = new_cfg.auto_ttl;
-        self.cfg.min_ttl = new_cfg.min_ttl;
-        self.cfg.max_ttl = new_cfg.max_ttl;
-        self.cfg.pqc = new_cfg.pqc;
-        self.cfg.verbose = new_cfg.verbose;
+        // FP-16: honest log — exclusion IPs and cgroup are intentionally
+        // NOT reloaded (restart-required); only ports/MSS-class fields are.
+        info!(
+            "Live eBPF map reload successful (target ports & MSS updated; exclusion IPs/cgroup unchanged — restart to apply those)"
+        );
+
+        // Commit exactly the fields the kernel accepted and the worker closure
+        // can observe. Nothing else: the seven injector-payload fields above
+        // would make memory disagree with the running process.
+        Self::apply_hot_reloadable(&mut self.cfg, new_cfg);
+        Ok(())
+    }
+
+    /// Copies the SIGHUP-applicable fields from `new_cfg` into the running
+    /// configuration.
+    ///
+    /// EBPF-02: the previous list also included `fake_ttl`, `fake_sni`,
+    /// `fake_bad_checksum`, `auto_ttl`, `min_ttl`, `max_ttl` and `pqc`. Those
+    /// are captured by value into the injector worker closure when the engine
+    /// starts, so no live reload can change them; committing them made the
+    /// daemon claim a decoy payload and TTL that were never applied.
+    fn apply_hot_reloadable(target: &mut Config, new_cfg: &Config) {
+        target.mss = new_cfg.mss;
+        target.min_mss = new_cfg.min_mss;
+        target.restore_mss = new_cfg.restore_mss;
+        target.restore_after_bytes = new_cfg.restore_after_bytes;
+        target.ports = new_cfg.ports.clone();
+        // `verbose` is read at each log site, so unlike the injector fields it
+        // genuinely takes effect without a restart.
+        target.verbose = new_cfg.verbose;
     }
 
     fn cleanup_firewall_only(&mut self) {
+        // EBPF-01 / SUPPLY-03: the delete helpers return how many rules they actually
+        // removed, or Err when the removal state could not be established. Both
+        // are reported: a residual rule is a stranded fail-closed DROP, which is
+        // exactly the condition that leaves a host with no outbound network and
+        // no explanation.
+        let mut removed = 0usize;
+        let mut teardown_ok = true;
+        let mut steps: Vec<(&str, crate::core::firewall::FwCount)> = Vec::new();
         if self.cfg.network_lockdown {
-            disable_network_lockdown();
+            steps.push(("disable_network_lockdown", disable_network_lockdown()));
         }
         if self.applied_kill {
-            disable_kill_switch();
+            steps.push(("disable_kill_switch", disable_kill_switch()));
             self.applied_kill = false;
         }
         if self.applied_stun {
-            unblock_stun();
+            steps.push(("unblock_stun", unblock_stun()));
             self.applied_stun = false;
         }
         if self.applied_quic {
-            unblock_quic();
+            steps.push(("unblock_quic", unblock_quic()));
             self.applied_quic = false;
+        }
+        for (name, r) in steps {
+            match r {
+                Ok(k) => removed += k,
+                Err(e) => {
+                    teardown_ok = false;
+                    warn!("firewall teardown {} failed: {}", name, e);
+                }
+            }
+        }
+        if teardown_ok {
+            info!(
+                "firewall teardown removed {} albus rule(s) (bounded delete: residue, if \
+                 any, is pre-hardening comment-less and is documented, not blindly removed)",
+                removed
+            );
+        } else {
+            warn!(
+                "firewall teardown could not verify every rule ({} removed) — residual albus \
+                 rules may still be installed; inspect `iptables -S OUTPUT | grep albus`",
+                removed
+            );
         }
     }
 
@@ -332,88 +495,199 @@ impl Engine {
     pub fn shutdown(&mut self) {
         self.bpf_manager.stop();
 
+        // DNS-04: the listener is only stopped once the host's resolver
+        // configuration has actually been put back. This used to warn on a failed
+        // restore and then stop it anyway: /etc/resolv.conf still pointed at
+        // 127.0.0.1:53, so every process on the machine lost resolution — and
+        // with the kill-switch DROP rules possibly still installed it could not
+        // fall back either. A refused restore (nothing to restore from) must not
+        // be followed by tearing down the only working resolver.
+        let mut safe_to_stop_listener = true;
         if self.applied_dns {
-            if let Err(e) = restore_system_dns() {
-                warn!("failed to restore system DNS: {}", e);
-            } else {
-                info!("system DNS restored");
+            match restore_system_dns() {
+                Ok(()) => info!("system DNS restored"),
+                Err(e) => {
+                    safe_to_stop_listener = false;
+                    error!(
+                        "failed to restore system DNS: {}. Leaving the DNS listener RUNNING \
+                         so the host keeps resolving through albus; /etc/resolv.conf must be \
+                         fixed by hand (sudo albus cleanup) before this listener is stopped.",
+                        e
+                    );
+                }
             }
             self.applied_dns = false;
         }
         if let Some(ref dns) = self.dns_server {
-            dns.stop();
+            if safe_to_stop_listener {
+                dns.stop();
+            }
         }
 
         self.cleanup_firewall_only();
-        if self.cfg.network_lockdown {
-            disable_network_lockdown();
-        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod reload_commit_tests {
     use super::*;
-    use crate::core::ebpf::is_root;
 
-    #[test]
-    fn test_failed_start_applies_nothing() {
-        // L3 regression: a refused start must leave zero applied state. Only
-        // meaningful unprivileged (as root run() would really start); the
-        // privileged path is covered by the manual root lab.
-        if is_root() {
-            return;
-        }
-        let mut engine = Engine::new(Config::default()).expect("default config builds");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime builds");
-        let res = rt.block_on(engine.run());
-        assert!(res.is_err(), "unprivileged run must refuse");
-        assert!(!engine.applied_quic, "no quic rules on refused start");
-        assert!(!engine.applied_stun, "no stun rules on refused start");
-        assert!(!engine.applied_kill, "no kill-switch on refused start");
-        assert!(!engine.applied_dns, "no DNS takeover on refused start");
+    fn cfg() -> Config {
+        Config::default()
     }
 
+    /// EBPF-02, the observable half: a SIGHUP that changes ONLY the fields the
+    /// running injector cannot observe must leave memory describing the running
+    /// process. On unpatched source all of these were copied into self.cfg, so
+    /// the operator's file and the daemon's memory agreed while neither the
+    /// kernel maps nor the injected packets did.
     #[test]
-    fn test_cleanup_idempotent_on_fresh_engine() {
-        // fresh engine holds no applied state: cleanup must be a silent
-        // no-op (safe even as root — every branch is flag-gated off).
-        let mut engine = Engine::new(Config::default()).expect("default config builds");
-        engine.cleanup_firewall_only();
-        assert!(!engine.applied_quic);
-        assert!(!engine.applied_stun);
-        assert!(!engine.applied_kill);
-        assert!(!engine.applied_dns);
+    fn test_injector_payload_fields_are_not_committed() {
+        let mut running = cfg();
+        let mut reloaded = cfg();
+
+        // Only the seven restart-required fields differ.
+        reloaded.fake_ttl = 42;
+        reloaded.fake_sni = Some("cdn.example".into());
+        reloaded.fake_bad_checksum = true;
+        reloaded.auto_ttl = !reloaded.auto_ttl;
+        reloaded.min_ttl = reloaded.min_ttl.wrapping_add(3);
+        reloaded.max_ttl = reloaded.max_ttl.wrapping_add(5);
+        reloaded.pqc = !reloaded.pqc;
+
+        let before = running.clone();
+        Engine::apply_hot_reloadable(&mut running, &reloaded);
+
+        assert_eq!(
+            running.fake_ttl, before.fake_ttl,
+            "fake_ttl must not change"
+        );
+        assert_eq!(
+            running.fake_sni, before.fake_sni,
+            "fake_sni must not change"
+        );
+        assert_eq!(
+            running.fake_bad_checksum, before.fake_bad_checksum,
+            "fake_bad_checksum must not change"
+        );
+        assert_eq!(
+            running.auto_ttl, before.auto_ttl,
+            "auto_ttl must not change"
+        );
+        assert_eq!(running.min_ttl, before.min_ttl, "min_ttl must not change");
+        assert_eq!(running.max_ttl, before.max_ttl, "max_ttl must not change");
+        assert_eq!(running.pqc, before.pqc, "pqc must not change");
     }
 
+    /// The positive path: the fields the kernel maps actually carry must be
+    /// committed, so the fix did not simply freeze the config.
     #[test]
-    fn test_reload_merges_hot_fields_keeps_firewall_identity() {
-        // T5: SIGHUP merges eBPF-safe fields from disk but never touches
-        // firewall/DNS identity. Diverge both classes from whatever the
-        // on-disk config says, reload, and assert the split.
-        let file_cfg = Config::load_or_default();
-        let file_valid = file_cfg.validate().is_ok();
-        let mut custom = Config::default();
-        custom.restore_after_bytes = file_cfg.restore_after_bytes.wrapping_add(1);
-        custom.kill_switch = !file_cfg.kill_switch;
-        let mut engine = Engine::new(custom).expect("diverged config builds");
-        engine.reload_config();
-        if !file_valid {
-            // invalid on-disk config: reload refuses everything, engine keeps
-            // its running values (warned, not applied)
-            assert_eq!(
-                engine.cfg.restore_after_bytes,
-                file_cfg.restore_after_bytes.wrapping_add(1)
+    fn test_map_backed_fields_are_committed() {
+        let mut running = cfg();
+        let mut reloaded = cfg();
+        reloaded.mss = 1300;
+        reloaded.min_mss = 1100;
+        reloaded.restore_mss = 1460;
+        reloaded.restore_after_bytes = 9_000_000;
+        reloaded.ports = vec![443, 8443];
+
+        Engine::apply_hot_reloadable(&mut running, &reloaded);
+
+        assert_eq!(running.mss, 1300);
+        assert_eq!(running.min_mss, 1100);
+        assert_eq!(running.restore_mss, 1460);
+        assert_eq!(running.restore_after_bytes, 9_000_000);
+        assert_eq!(running.ports, vec![443, 8443]);
+    }
+
+    /// `verbose` is read at every log site, so unlike the injector fields it is
+    /// genuinely live. Committing it is correct, not an oversight.
+    #[test]
+    fn test_verbose_is_committed_because_it_is_read_live() {
+        let mut running = cfg();
+        let mut reloaded = cfg();
+        reloaded.verbose = !running.verbose;
+        Engine::apply_hot_reloadable(&mut running, &reloaded);
+        assert_eq!(running.verbose, reloaded.verbose);
+    }
+
+    /// And the transactional half: the commit must sit AFTER the `?` that
+    /// propagates a kernel rejection. This is the durable defect — a diverged
+    /// baseline makes the next reload compute the wrong delete-set, so a removed
+    /// target port is never deleted and keeps being applied until a restart.
+    #[test]
+    fn test_commit_occurs_after_the_kernel_accepts() {
+        let src = include_str!("engine.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod reload_commit_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+
+        let at = prod.find("fn apply_reload(").expect("apply_reload");
+        // Bound at the NEXT method so the window cannot spill into unrelated code.
+        let body = {
+            let tail = &prod[at..];
+            let end = tail.find("fn apply_hot_reloadable").unwrap_or(tail.len());
+            &tail[..end]
+        };
+        let reject = body
+            .find("self.bpf_manager.reload_maps(&bpf_cfg)?;")
+            .expect("the propagating reload call");
+        let commit = body
+            .find("Self::apply_hot_reloadable(&mut self.cfg, new_cfg);")
+            .expect("the commit");
+
+        assert!(
+            reject < commit,
+            "EBPF-02: the commit must come after the fallible reload, otherwise a \\
+             rejected config is adopted in memory anyway"
+        );
+        assert!(
+            !body.contains("if let Err(e) = self.bpf_manager.reload_maps"),
+            "the reload error must propagate with `?`, not be logged and ignored"
+        );
+    }
+
+    /// The restart-required warning must actually name the injector fields, so
+    /// an operator who changed fake_sni or pqc is told it needs a restart
+    /// instead of being left to assume it took effect.
+    #[test]
+    fn test_restart_warning_names_the_injector_fields() {
+        let src = include_str!("engine.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod reload_commit_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("let mut restart_only = Vec::new();")
+            .expect("restart_only list");
+        let block = &prod[at..(at + 1600).min(prod.len())];
+        for field in [
+            "fake_ttl",
+            "fake_sni",
+            "fake_bad_checksum",
+            "auto_ttl",
+            "min_ttl",
+            "max_ttl",
+            "pqc",
+        ] {
+            assert!(
+                block.contains(field),
+                "the restart-required warning must name {}",
+                field
             );
-            assert_eq!(engine.cfg.kill_switch, !file_cfg.kill_switch);
-        } else {
-            // hot-reloadable field follows disk ...
-            assert_eq!(engine.cfg.restore_after_bytes, file_cfg.restore_after_bytes);
-            // ... firewall identity stays with the running daemon
-            assert_eq!(engine.cfg.kill_switch, !file_cfg.kill_switch);
         }
+        assert!(
+            block.contains("captured by value at start"),
+            "the warning must say WHY these are not hot-reloadable"
+        );
     }
 }

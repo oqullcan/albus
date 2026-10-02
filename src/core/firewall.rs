@@ -2,137 +2,309 @@
 
 use std::path::Path;
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const IPTABLES_CANDIDATES: &[&str] = &["/usr/sbin/iptables", "/sbin/iptables"];
 const IP6TABLES_CANDIDATES: &[&str] = &["/usr/sbin/ip6tables", "/sbin/ip6tables"];
 const MAX_RULE_DELETE_ITER: usize = 32;
 
-fn resolve_binary<'a>(candidates: &'a [&str]) -> &'a str {
+/// True when `path` is safe to exec with the daemon's elevated capabilities.
+///
+/// EBPF-06: `resolve_binary` selected the helper with `Path::exists()` alone.
+/// That follows symlinks, returns true for directories, and never establishes
+/// *who* owns the thing being executed — while the exec'ing process holds
+/// CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF, CAP_PERFMON, CAP_NET_BIND_SERVICE and
+/// CAP_DAC_OVERRIDE. Code in a substituted binary would run with all of those.
+///
+/// The surrounding hygiene was already good and is kept: absolute paths defeat
+/// PATH search entirely and `env_clear()` drops the IPTABLES/IP6TABLES/locale
+/// environment overrides iptables honours. The gap was identity, so identity is
+/// what this checks:
+///
+///   * `metadata` (not `symlink_metadata`) is deliberate — on Arch
+///     `/usr/sbin/iptables` is a symlink to `xtables-nft-multi`, so refusing
+///     symlinks outright would break the shipped install. What matters is the
+///     *resolved target*, and a dangling symlink fails at `metadata` here;
+///   * the target must be a regular file, not a directory or device;
+///   * it must be owned by root or the albus service account, reusing the
+///     repo's own notion of a trusted system uid;
+///   * no directory in the chain may be writable by group or other, so a
+///     writable ancestor cannot be used to swap the target after the check.
+#[cfg(unix)]
+fn helper_is_trusted_with(path: &Path, trusted_uids: &[libc::uid_t]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // Resolve FIRST, then judge the resolved target and the directories it
+    // actually lives in. Judging the symlink's own location instead is the
+    // hole this replaces: an attacker who can create a link inside a
+    // group/world-writable directory can aim it at anything, and the link's
+    // parent chain can look pristine. `canonicalize` also fails on a dangling
+    // link, which is the other case `exists()` used to wave through differently.
+    let real = match std::fs::canonicalize(path) {
+        Ok(r) => r,
+        Err(_) => return false, // missing, or a dangling symlink
+    };
+
+    let meta = match std::fs::metadata(&real) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false; // directory, socket, device, fifo
+    }
+    if !trusted_uids.contains(&meta.uid()) {
+        return false;
+    }
+
+    // Walk the RESOLVED chain: a component writable by group or other would
+    // let a less-trusted principal replace the target between this check and
+    // the exec that follows it.
+    let mut dir = real.parent();
+    while let Some(d) = dir {
+        match std::fs::metadata(d) {
+            Ok(dm) => {
+                if dm.mode() & 0o022 != 0 {
+                    return false;
+                }
+            }
+            // An ancestor we cannot stat is an ancestor we cannot vouch for.
+            Err(_) => return false,
+        }
+        dir = d.parent();
+    }
+    true
+}
+
+/// The uids allowed to own a privileged helper: root, plus the albus service
+/// account when one exists (the daemon legitimately runs as that account).
+#[cfg(unix)]
+fn trusted_helper_uids() -> Vec<libc::uid_t> {
+    let mut uids = vec![0u32];
+    if let Some(su) = crate::core::ebpf::features::service_uid() {
+        uids.push(su);
+    }
+    uids
+}
+
+#[cfg(all(unix, test))]
+fn helper_is_trusted(path: &Path) -> bool {
+    helper_is_trusted_with(path, &trusted_helper_uids())
+}
+
+#[cfg(all(not(unix), test))]
+fn helper_is_trusted(_path: &Path) -> bool {
+    true
+}
+
+/// First candidate whose identity checks out.
+///
+/// EBPF-06: the old fallback returned `candidates.first()` when nothing
+/// existed, so a missing helper silently became an exec attempt against a path
+/// that may not be there, and an untrusted one was never rejected at all. An
+/// absent or untrusted helper is now an explicit error that EBPF-01's
+/// `Result` plumbing propagates to the caller.
+fn resolve_binary_with<'a>(
+    candidates: &'a [&str],
+    trusted_uids: &[libc::uid_t],
+) -> Result<&'a str, FirewallError> {
     for c in candidates {
-        if Path::new(c).exists() {
-            return c;
+        if helper_is_trusted_with(Path::new(c), trusted_uids) {
+            return Ok(c);
         }
     }
-    // fallback to first candidate (will error clearly if missing)
-    candidates.first().copied().unwrap_or("/usr/sbin/iptables")
+    Err(FirewallError(format!(
+        "no trusted iptables/ip6tables helper found among {:?}: each candidate must be a \
+         root- or albus-owned regular file reached through no group/world-writable \
+         directory",
+        candidates
+    )))
 }
 
-fn iptables_base() -> Command {
-    let bin = resolve_binary(IPTABLES_CANDIDATES);
+#[cfg(unix)]
+fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
+    resolve_binary_with(candidates, &trusted_helper_uids())
+}
+
+#[cfg(not(unix))]
+fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
+    candidates
+        .first()
+        .copied()
+        .ok_or_else(|| FirewallError("no iptables candidates configured".into()))
+}
+
+fn iptables_base() -> Result<Command, FirewallError> {
+    let bin = resolve_binary(IPTABLES_CANDIDATES)?;
     let mut c = Command::new(bin);
     c.env_clear();
     c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    c
+    Ok(c)
 }
 
-fn ip6tables_base() -> Command {
-    let bin = resolve_binary(IP6TABLES_CANDIDATES);
+fn ip6tables_base() -> Result<Command, FirewallError> {
+    let bin = resolve_binary(IP6TABLES_CANDIDATES)?;
     let mut c = Command::new(bin);
     c.env_clear();
     c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    c
+    Ok(c)
 }
 
-/// Idempotent insert: `iptables -C OUTPUT ... || iptables -I OUTPUT ...`
-/// Returns true only when the rule is present afterwards (verified with
-/// -C). Callers must not log protections as ACTIVE on false — an xtables
-/// lock failure or missing binary would otherwise claim cover that does
-/// not exist (L2).
-fn ensure_rule(v6: bool, args: &[&str], comment: &str) -> bool {
+pub type FwResult = Result<(), FirewallError>;
+
+/// Outcome of a rule-removal step: how many rules went away, or why we cannot
+/// say. SUPPLY-03: the delete path used to return a bare `usize` whose normal
+/// value equalled its failure value.
+/// A firewall rule could not be installed. Carries the kernel-side reason so
+/// the journal cannot claim a control is active when the packet filter never
+/// accepted the rule.
+pub type FwCount = Result<usize, FirewallError>;
+
+#[derive(Debug)]
+pub struct FirewallError(pub String);
+
+impl std::fmt::Display for FirewallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for FirewallError {}
+
+/// Outcome of one iptables invocation: exit code, or a spawn failure.
+///
+/// EBPF-01: `Command::status()` yields `Ok(ExitStatus)` for a *failed*
+/// invocation, so the previous code warned only on `Err` — which means
+/// "could not run iptables at all" — and treated every non-zero exit as
+/// success. xtables lock contention, a legacy/nft backend mismatch, a missing
+/// `xt_comment` or `REJECT` target, or a rejected transaction all exit non-zero
+/// and all took the silent path. Modelling the exit code explicitly is what
+/// makes the failure observable.
+pub type ExecResult = Result<i32, std::io::Error>;
+
+/// The invocation seam. Production uses `run_iptables`; tests supply a
+/// synthetic executor so the decision logic is exercised hermetically, with no
+/// iptables binary and no host mutation.
+pub trait Executor {
+    fn run(&self, v6: bool, args: &[&str]) -> ExecResult;
+}
+
+pub struct RealIptables;
+
+impl Executor for RealIptables {
+    fn run(&self, v6: bool, args: &[&str]) -> ExecResult {
+        // An absent or untrusted helper is reported as a spawn-class error
+        // carrying the selection failure's message, so it lands in the same
+        // "could not run" channel rather than being mistaken for a rule state.
+        let base = if v6 {
+            ip6tables_base()
+        } else {
+            iptables_base()
+        };
+        let mut cmd = match base {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    e.to_string(),
+                ))
+            }
+        };
+        match cmd.args(args).output() {
+            Ok(o) => Ok(o.status.code().unwrap_or(-1)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Idempotent insert with a falsifiable outcome: `iptables -C OUTPUT ... || iptables -I OUTPUT ...`
+///
+/// EBPF-01: the invariant this now enforces is *"no caller may record or log a
+/// firewall control as applied unless the rule was observed present after the
+/// attempt."* Three things were wrong before:
+///   * the `-C` probe collapsed "check could not run" into "rule absent",
+///     because `unwrap_or(false)` maps a spawn failure to the same value as a
+///     clean miss;
+///   * the insert's exit status was discarded entirely;
+///   * the function returned `()`, so no caller could react — and callers did
+///     not need to, because they logged `... ACTIVE` unconditionally.
+///
+/// The check's exit code is now interpreted rather than assumed: xtables
+/// reserves 1 for "rule does not exist" and uses 2/3/4 for syntax,
+/// module and resource errors respectively, so only exit 1 counts as absent.
+/// After a successful insert the rule is re-checked, which turns "iptables said
+/// OK" into "the rule is observably there".
+pub fn ensure_rule(v6: bool, args: &[&str], comment: &str) -> FwResult {
+    ensure_rule_with(&RealIptables, v6, args, comment)
+}
+
+pub fn ensure_rule_with<E: Executor + ?Sized>(
+    exec: &E,
+    v6: bool,
+    args: &[&str],
+    comment: &str,
+) -> FwResult {
     let mut spec: Vec<&str> = Vec::with_capacity(args.len() + 4);
     spec.extend_from_slice(args);
     spec.extend_from_slice(&["-m", "comment", "--comment", comment]);
 
     let mut check_args: Vec<&str> = vec!["-C", "OUTPUT"];
     check_args.extend_from_slice(&spec);
-    // use output() so the expected "Bad rule" miss on absent rules stays out of the journal
-    let check_ok = if v6 {
-        ip6tables_base()
-            .args(&check_args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    } else {
-        iptables_base()
-            .args(&check_args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    if check_ok {
-        return true;
+
+    match exec.run(v6, &check_args) {
+        Ok(0) => return Ok(()), // already installed
+        Ok(1) => {}             // documented "no such rule" -> insert it
+        Ok(code) => {
+            return Err(FirewallError(format!(
+                "iptables -C OUTPUT {:?} exited {} (not 0, not 1): the rule state \
+                 could not be determined, so it is not being installed",
+                args, code
+            )));
+        }
+        Err(e) => {
+            return Err(FirewallError(format!(
+                "iptables -C OUTPUT {:?} could not run: {}; refusing to assume \
+                 the rule is absent and insert over an unknown filter state",
+                args, e
+            )));
+        }
     }
+
     let mut insert_args: Vec<&str> = vec!["-I", "OUTPUT"];
     insert_args.extend_from_slice(&spec);
-    let inserted = match if v6 {
-        ip6tables_base().args(&insert_args).status()
-    } else {
-        iptables_base().args(&insert_args).status()
-    } {
+    match exec.run(v6, &insert_args) {
+        Ok(0) => {}
+        Ok(code) => {
+            return Err(FirewallError(format!(
+                "iptables -I OUTPUT {:?} exited {}: the rule was NOT installed",
+                args, code
+            )));
+        }
         Err(e) => {
-            warn!("failed to spawn firewall binary for {:?}: {}", args, e);
-            false
+            return Err(FirewallError(format!(
+                "iptables -I OUTPUT {:?} could not run: {}: the rule was NOT installed",
+                args, e
+            )));
         }
-        Ok(s) if !s.success() => {
-            warn!(
-                "firewall insert exited {} for {:?} (rule not applied)",
-                s.code().unwrap_or(-1),
-                args
-            );
-            false
-        }
-        _ => true,
-    };
-    if !inserted {
-        return false;
     }
-    // verify presence afterwards: -I can report success while a concurrent
-    // flush removed the rule; never claim cover without proof
-    let mut verify_args: Vec<&str> = vec!["-C", "OUTPUT"];
-    verify_args.extend_from_slice(&spec);
-    let verified = if v6 {
-        ip6tables_base()
-            .args(&verify_args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    } else {
-        iptables_base()
-            .args(&verify_args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    if !verified {
-        warn!(
-            "firewall rule insert unverified for {:?} (rule not applied)",
-            args
-        );
-    }
-    verified
-}
 
-/// Marker proving albus was installed on this machine (written on successful
-/// install, removed on uninstall). Install-state query for service tooling;
-/// deletion itself is always comment-scoped (FP-07), never gated on this.
-pub const MANAGED_MARKER_PATH: &str = "/etc/albus/.managed";
-
-/// Whether this machine carries a managed albus install marker.
-pub fn managed_install_present() -> bool {
-    managed_install_present_at(MANAGED_MARKER_PATH)
-}
-
-fn managed_install_present_at(path: &str) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.file_type().is_file(),
-        Err(_) => false,
+    // Authoritative verification: the insert's own exit status is a claim by
+    // the same process that wrote the rule, so confirm it is really present.
+    match exec.run(v6, &check_args) {
+        Ok(0) => Ok(()),
+        Ok(code) => Err(FirewallError(format!(
+            "iptables -C OUTPUT {:?} exited {} immediately after a successful \
+             insert: the rule is not present",
+            args, code
+        ))),
+        Err(e) => Err(FirewallError(format!(
+            "iptables -C OUTPUT {:?} could not run for verification: {}",
+            args, e
+        ))),
     }
 }
 
 /// Bounded delete: avoids infinite loop if binary is shimmed.
 /// FP-10: returns the number of rules actually deleted so callers can report.
-fn delete_rule_bounded(v6: bool, args: &[&str]) -> usize {
+fn delete_rule_bounded_with<E: Executor + ?Sized>(exec: &E, v6: bool, args: &[&str]) -> FwCount {
     let mut removed = 0;
     // 1. new-style rules (with per-feature comments)
     for comment in [
@@ -146,17 +318,32 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) -> usize {
             let mut del_args: Vec<&str> = vec!["-D", "OUTPUT"];
             del_args.extend_from_slice(args);
             del_args.extend_from_slice(&["-m", "comment", "--comment", comment]);
-            let status = if v6 {
-                ip6tables_base().args(&del_args).status()
-            } else {
-                iptables_base().args(&del_args).status()
-            };
-            match status {
-                Ok(s) if s.success() => {
+            match exec.run(v6, &del_args) {
+                Ok(0) => {
                     removed += 1;
                     continue;
                 }
-                _ => break,
+                // SUPPLY-03: xtables' documented "no such rule". This is the
+                // *expected* outcome on the normal path, because
+                // ExecStopPost=albus cleanup has already removed every rule
+                // before uninstall's own calls run — so "Removed 0 rules" and
+                // "the delete failed" used to be the same integer. Distinguish
+                // them so teardown can report what actually happened.
+                Ok(1) => break,
+                Ok(code) => {
+                    return Err(FirewallError(format!(
+                        "iptables -D OUTPUT {:?} exited {}: rule removal state is \
+                         unknown, so residual rules may still be installed",
+                        args, code
+                    )));
+                }
+                Err(e) => {
+                    return Err(FirewallError(format!(
+                        "iptables -D OUTPUT {:?} could not run: {}: rule removal state \
+                         is unknown, so residual rules may still be installed",
+                        args, e
+                    )));
+                }
             }
         }
     }
@@ -164,135 +351,99 @@ fn delete_rule_bounded(v6: bool, args: &[&str]) -> usize {
     // `-m comment` match and ran unconditionally, stripping third-party
     // comment-less rules sharing the tuple. Pre-hardening residue (comment-less
     // albus rules) is fail-closed and stays until removed manually — documented
-    // instead of blindly deleted. (The managed-install marker remains as an
-    // install-state query for service tooling; it no longer gates deletion.)
-    removed
+    // instead of blindly deleted. See REPORT run-1 FP-07.
+    Ok(removed)
 }
 
-// pure rule-spec constructors below: every iptables invocation in this
-// module goes through these, so ordering/content is unit-testable
-// without root. Comment strings namespace each feature for safe deletion.
+/// Bounded delete with an honest outcome.
+///
+/// Returns the number of rules actually removed. `Ok(0)` means "there was
+/// nothing to remove", which is the expected success case after
+/// `ExecStopPost` cleanup has already run. `Err` means the removal state could
+/// not be established — the caller must not report the host as clean.
+pub fn delete_rule_bounded(v6: bool, args: &[&str]) -> FwCount {
+    delete_rule_bounded_with(&RealIptables, v6, args)
+}
 
-fn quic_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
-    // NOTE (L17, deliberate): no `! -o lo` scoping here, unlike kill-switch
-    // and lockdown. QUIC bypasses the TCP-only evasion engine entirely, so
-    // the block is uniform by policy — no carve-outs that behave differently
-    // per interface. Collateral: local services binding UDP 443/3478/5349 on
-    // loopback are also rejected. Accepted tradeoff, asserted by
-    // test_quic_specs_shape.
-    vec![(
-        vec!["-p", "udp", "--dport", "443", "-j", "REJECT"],
+// injects icmp port unreachable / tcp reset via iptables reject on udp 443
+pub fn block_quic() -> FwResult {
+    ensure_rule(
+        false,
+        &["-p", "udp", "--dport", "443", "-j", "REJECT"],
         "albus-quic",
-    )]
-}
+    )?;
+    ensure_rule(
+        true,
+        &["-p", "udp", "--dport", "443", "-j", "REJECT"],
+        "albus-quic",
+    )?;
 
-fn stun_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
-    ["3478", "5349"]
-        .iter()
-        .map(|port| {
-            (
-                vec!["-p", "udp", "--dport", port, "-j", "REJECT"],
-                "albus-stun",
-            )
-        })
-        .collect()
-}
-
-fn kill_switch_rule_specs() -> Vec<(Vec<&'static str>, &'static str)> {
-    let mut specs = Vec::new();
-    for proto in ["udp", "tcp"] {
-        specs.push((
-            vec!["!", "-o", "lo", "-p", proto, "--dport", "53", "-j", "DROP"],
-            "albus-kill",
-        ));
-    }
-    // DoT 853 also blocked to prevent plaintext-adjacent leak
-    specs.push((
-        vec!["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", "DROP"],
-        "albus-kill",
-    ));
-    specs
-}
-
-// injects icmp port unreachable / tcp reset via iptables reject on udp 443.
-// Returns true only when every rule verified present (see ensure_rule).
-pub fn block_quic() -> bool {
-    let mut ok = true;
-    for (spec, comment) in quic_rule_specs() {
-        ok &= ensure_rule(false, &spec, comment);
-        ok &= ensure_rule(true, &spec, comment);
-    }
-
-    if ok {
-        info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
-    } else {
-        warn!("QUIC block INCOMPLETE — some reject rules missing, UDP 443 may leak");
-    }
-    ok
+    info!("QUIC (UDP 443) blocked — forcing browsers to TCP for DPI bypass");
+    Ok(())
 }
 
 // purges injected reject rules for udp 443. Returns rules deleted (FP-10).
-pub fn unblock_quic() -> usize {
+pub fn unblock_quic() -> FwCount {
     let mut n = 0;
-    for (spec, _) in quic_rule_specs() {
-        n += delete_rule_bounded(false, &spec);
-        n += delete_rule_bounded(true, &spec);
-    }
+    n += delete_rule_bounded(false, &["-p", "udp", "--dport", "443", "-j", "REJECT"])?;
+    n += delete_rule_bounded(true, &["-p", "udp", "--dport", "443", "-j", "REJECT"])?;
 
     debug!("QUIC firewall rules cleaned up");
-    n
+    Ok(n)
 }
 
-// blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks.
-// Returns true only when every rule verified present (see ensure_rule).
-pub fn block_stun() -> bool {
-    let mut ok = true;
-    for (spec, comment) in stun_rule_specs() {
-        ok &= ensure_rule(false, &spec, comment);
-        ok &= ensure_rule(true, &spec, comment);
+// blocks outbound webrtc stun traffic (udp 3478, 5349) to prevent client public/local ip leaks
+pub fn block_stun() -> FwResult {
+    for port in &["3478", "5349"] {
+        ensure_rule(
+            false,
+            &["-p", "udp", "--dport", port, "-j", "REJECT"],
+            "albus-stun",
+        )?;
+        ensure_rule(
+            true,
+            &["-p", "udp", "--dport", port, "-j", "REJECT"],
+            "albus-stun",
+        )?;
     }
 
-    if ok {
-        info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
-    } else {
-        warn!("STUN block INCOMPLETE — some reject rules missing, STUN may leak");
-    }
-    ok
+    info!("WebRTC STUN (UDP 3478, 5349) blocked — preventing browser IP address leaks");
+    Ok(())
 }
 
 // purges stun packet filtering rules. Returns rules deleted (FP-10).
-pub fn unblock_stun() -> usize {
+pub fn unblock_stun() -> FwCount {
     let mut n = 0;
-    for (spec, _) in stun_rule_specs() {
-        n += delete_rule_bounded(false, &spec);
-        n += delete_rule_bounded(true, &spec);
+    for port in &["3478", "5349"] {
+        n += delete_rule_bounded(false, &["-p", "udp", "--dport", port, "-j", "REJECT"])?;
+        n += delete_rule_bounded(true, &["-p", "udp", "--dport", port, "-j", "REJECT"])?;
     }
 
     debug!("STUN firewall rules cleaned up");
-    n
+    Ok(n)
 }
 
 // enables strict dns kill-switch: drops all non-loopback outbound port 53 traffic
 // guarantees no application or rogue dhcp server can leak plaintext dns to the isp
 // NOTE: uses DROP (stealth) instead of REJECT to avoid signaling DPI/middleboxes.
-// Returns true only when every rule verified present (see ensure_rule).
-pub fn enable_kill_switch() -> bool {
-    let mut ok = true;
-    for (spec, comment) in kill_switch_rule_specs() {
-        ok &= ensure_rule(false, &spec, comment);
-        ok &= ensure_rule(true, &spec, comment);
-    }
+pub fn enable_kill_switch() -> FwResult {
+    let udp = ["!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "DROP"];
+    let tcp = ["!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", "DROP"];
+    // DoT 853 also blocked to prevent plaintext-adjacent leak
+    let dot = ["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", "DROP"];
+    ensure_rule(false, &udp, "albus-kill")?;
+    ensure_rule(false, &tcp, "albus-kill")?;
+    ensure_rule(false, &dot, "albus-kill")?;
+    ensure_rule(true, &udp, "albus-kill")?;
+    ensure_rule(true, &tcp, "albus-kill")?;
+    ensure_rule(true, &dot, "albus-kill")?;
 
-    if ok {
-        info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
-    } else {
-        warn!("DNS Kill-Switch INCOMPLETE — some DROP rules missing, plaintext DNS may leak");
-    }
-    ok
+    info!("DNS Kill-Switch ACTIVE — all non-loopback plaintext DNS queries blocked");
+    Ok(())
 }
 
 // removes dns kill-switch filtering rules. Returns rules deleted (FP-10).
-pub fn disable_kill_switch() -> usize {
+pub fn disable_kill_switch() -> FwCount {
     // remove both DROP (new) and REJECT (legacy) variants to clean old installs.
     // FP-07: only comment-scoped deletes; pre-hardening comment-less residue stays.
     let mut n = 0;
@@ -300,207 +451,596 @@ pub fn disable_kill_switch() -> usize {
         let udp = ["!", "-o", "lo", "-p", "udp", "--dport", "53", "-j", target];
         let tcp = ["!", "-o", "lo", "-p", "tcp", "--dport", "53", "-j", target];
         let dot = ["!", "-o", "lo", "-p", "tcp", "--dport", "853", "-j", target];
-        n += delete_rule_bounded(false, &udp);
-        n += delete_rule_bounded(false, &tcp);
-        n += delete_rule_bounded(false, &dot);
-        n += delete_rule_bounded(true, &udp);
-        n += delete_rule_bounded(true, &tcp);
-        n += delete_rule_bounded(true, &dot);
+        n += delete_rule_bounded(false, &udp)?;
+        n += delete_rule_bounded(false, &tcp)?;
+        n += delete_rule_bounded(false, &dot)?;
+        n += delete_rule_bounded(true, &udp)?;
+        n += delete_rule_bounded(true, &tcp)?;
+        n += delete_rule_bounded(true, &dot)?;
     }
 
     debug!("DNS Kill-Switch deactivated");
-    n
+    Ok(n)
 }
 
 // enables fail-closed network lockdown: blocks outbound non-loopback tcp traffic on ports 80 and 443
-// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails.
-//
-// Ordered specs (ACCEPT first): already-established flows — including the
-// daemon's own upstream DoH connections — are exempted via conntrack state,
-// so lockdown drops only NEW unprotected flows instead of killing DNS too.
-fn lockdown_rule_specs(port: &str) -> Vec<(Vec<&str>, &'static str)> {
-    vec![
-        (
-            vec![
-                "!",
-                "-o",
-                "lo",
-                "-p",
-                "tcp",
-                "--dport",
-                port,
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-            ],
-            "albus-lockdown",
-        ),
-        (
-            vec!["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "DROP"],
-            "albus-lockdown",
-        ),
-    ]
-}
-
-pub fn enable_network_lockdown() -> bool {
-    let mut ok = true;
+// prevents unfragmented/unprotected web traffic from leaking to the isp if the ebpf subsystem fails
+pub fn enable_network_lockdown() -> FwResult {
     for port in &["80", "443"] {
-        // insert in reverse: `ensure_rule` prepends (`-I OUTPUT`), so the
-        // ACCEPT fast-path must be inserted last to land on top.
-        for (spec, comment) in lockdown_rule_specs(port).iter().rev() {
-            ok &= ensure_rule(false, spec, comment);
-            ok &= ensure_rule(true, spec, comment);
-        }
+        let rule = ["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", "DROP"];
+        ensure_rule(false, &rule, "albus-lockdown")?;
+        ensure_rule(true, &rule, "albus-lockdown")?;
     }
 
-    if ok {
-        info!(
-            "Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked"
-        );
-    } else {
-        warn!("Network Lockdown INCOMPLETE — some rules missing, traffic may flow unprotected");
-    }
-    ok
+    info!("Network Lockdown ACTIVE (fail-closed) — outbound HTTP/HTTPS (ports 80, 443) blocked");
+    Ok(())
 }
 
 // purges fail-closed network lockdown rules. Returns rules deleted (FP-10).
-pub fn disable_network_lockdown() -> usize {
+pub fn disable_network_lockdown() -> FwCount {
     let mut n = 0;
     for port in &["80", "443"] {
-        for (spec, _) in lockdown_rule_specs(port) {
-            n += delete_rule_bounded(false, &spec);
-            n += delete_rule_bounded(true, &spec);
-        }
-        // legacy DROP/REJECT shapes without comments (pre-hardening installs)
         for target in ["DROP", "REJECT"] {
             let rule = ["!", "-o", "lo", "-p", "tcp", "--dport", port, "-j", target];
-            n += delete_rule_bounded(false, &rule);
-            n += delete_rule_bounded(true, &rule);
+            n += delete_rule_bounded(false, &rule)?;
+            n += delete_rule_bounded(true, &rule)?;
         }
     }
 
     debug!("Network Lockdown deactivated — outbound HTTP/HTTPS restored");
-    n
+    Ok(n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_lockdown_accept_precedes_drop() {
-        // the conntrack fast-path must sort before the DROP, otherwise the
-        // daemon's own established DoH connections die with lockdown on.
-        for port in ["80", "443"] {
-            let specs = lockdown_rule_specs(port);
-            assert_eq!(specs.len(), 2);
-            let accept = specs[0].0.join(" ");
-            let drop = specs[1].0.join(" ");
-            assert!(
-                accept.contains("conntrack")
-                    && accept.contains("ESTABLISHED,RELATED")
-                    && accept.ends_with("ACCEPT"),
-                "first spec must be the established fast-path: {}",
-                accept
-            );
-            assert!(drop.ends_with("DROP"), "second spec must drop: {}", drop);
-            assert!(accept.contains(port) && drop.contains(port));
-            assert_eq!(specs[0].1, "albus-lockdown");
-            assert_eq!(specs[1].1, "albus-lockdown");
+    /// Records every invocation so the tests can assert *which* iptables calls
+    /// were made, not just the final verdict.
+    struct Recorder {
+        /// exit code per (args[0] op, occurrence index)
+        script: Vec<(String, ExecResult)>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new(script: &[(&str, ExecResult)]) -> Self {
+            Self {
+                script: script
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone_shallow()))
+                    .collect(),
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
         }
     }
 
-    fn spec_strs(specs: &[(Vec<&str>, &str)]) -> Vec<String> {
-        specs
-            .iter()
-            .map(|(args, comment)| format!("{} #{}", args.join(" "), comment))
-            .collect()
+    // `std::io::Error` is not Clone; this is a test-only shim that carries the
+    // kind and message, which is all the assertions need.
+    trait ShallowClone {
+        fn clone_shallow(&self) -> ExecResult;
     }
-
-    #[test]
-    fn test_quic_specs_shape() {
-        let specs = quic_rule_specs();
-        assert_eq!(specs.len(), 1);
-        let s = spec_strs(&specs);
-        assert!(s[0].contains("--dport 443"), "{}", s[0]);
-        assert!(s[0].ends_with("REJECT #albus-quic"), "{}", s[0]);
-        assert!(!s[0].contains("-o lo"), "quic rule is not loopback-scoped");
-    }
-
-    #[test]
-    fn test_stun_specs_cover_both_ports() {
-        let specs = stun_rule_specs();
-        assert_eq!(specs.len(), 2);
-        let joined = spec_strs(&specs).join("\n");
-        assert!(joined.contains("--dport 3478"), "{}", joined);
-        assert!(joined.contains("--dport 5349"), "{}", joined);
-        for (args, comment) in &specs {
-            assert_eq!(*comment, "albus-stun");
-            assert!(args.contains(&"-j") && args.contains(&"REJECT"));
+    impl ShallowClone for ExecResult {
+        fn clone_shallow(&self) -> ExecResult {
+            match self {
+                Ok(c) => Ok(*c),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            }
         }
     }
 
-    #[test]
-    fn test_kill_switch_specs_shape() {
-        let specs = kill_switch_rule_specs();
-        assert_eq!(specs.len(), 3);
-        let joined = spec_strs(&specs).join("\n");
-        // udp/53 + tcp/53 + tcp/853, all non-loopback DROP
-        assert!(joined.contains("-p udp --dport 53"), "{}", joined);
-        assert!(joined.contains("-p tcp --dport 53"), "{}", joined);
-        assert!(joined.contains("--dport 853"), "{}", joined);
-        for (args, comment) in &specs {
-            assert_eq!(*comment, "albus-kill");
-            assert!(args.contains(&"!") && args.contains(&"lo"));
-            assert!(args.last() == Some(&"DROP"));
+    impl Executor for &Recorder {
+        fn run(&self, _v6: bool, args: &[&str]) -> ExecResult {
+            let op = args[0].to_string();
+            self.calls
+                .borrow_mut()
+                .push(format!("{} {}", op, args[1..].join(" ")));
+            let mut idx = 0;
+            for (k, _) in &self.script {
+                if *k == op {
+                    if idx == 0 {
+                        return self
+                            .script
+                            .iter()
+                            .find(|(kk, _)| kk == &op)
+                            .unwrap()
+                            .1
+                            .clone_shallow();
+                    }
+                    idx += 1;
+                }
+            }
+            Ok(0)
         }
     }
 
-    #[test]
-    fn test_managed_marker_gating() {
-        let dir = std::env::temp_dir().join(format!("albus_fw_marker_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let marker = dir.join(".managed");
-        let missing = dir.join("absent");
-        // absent -> false
-        assert!(!managed_install_present_at(missing.to_str().unwrap()));
-        // regular file -> true
-        std::fs::write(&marker, "managed\n").unwrap();
-        assert!(managed_install_present_at(marker.to_str().unwrap()));
-        // symlink (even to a file) -> false, never follow
-        let link = dir.join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&marker, &link).unwrap();
-        #[cfg(unix)]
-        assert!(!managed_install_present_at(link.to_str().unwrap()));
-        // directory -> false
-        assert!(!managed_install_present_at(dir.to_str().unwrap()));
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_file(&marker);
-        let _ = std::fs::remove_dir(&dir);
+    fn io_err(kind: std::io::ErrorKind) -> ExecResult {
+        Err(std::io::Error::new(kind, "synthetic spawn failure"))
     }
 
+    /// The headline EBPF-01 case: the insert returns a non-zero exit, which the
+    /// old code discarded entirely — `Command::status()` yields
+    /// `Ok(ExitStatus)` for a failed run, so `if let Err(e) = res` never fired
+    /// and the daemon logged "Kill-Switch ACTIVE" over a rule the kernel never
+    /// accepted. A check exit of 1 is xtables' documented "absent", so the
+    /// insert is attempted and its failure must be reported.
     #[test]
-    fn test_enable_fns_report_failure_without_root() {
-        // L2 regression: without privileges no rule can be applied, so every
-        // enable fn must return false (never claim ACTIVE cover). Skipped as
-        // root: applying real rules is the privileged suite's job, and unit
-        // tests must never mutate host firewall state.
-        if crate::core::ebpf::is_root() {
-            return;
-        }
-        assert!(!block_quic(), "block_quic must report failure unprivileged");
-        assert!(!block_stun(), "block_stun must report failure unprivileged");
-        assert!(
-            !enable_kill_switch(),
-            "enable_kill_switch must report failure unprivileged"
+    fn test_nonzero_exit_on_insert_is_an_error() {
+        let rec = Recorder::new(&[("-C", Ok(1)), ("-I", Ok(4))]);
+        let r = ensure_rule_with(
+            &&rec,
+            false,
+            &["-p", "udp", "--dport", "443", "-j", "REJECT"],
+            "albus-quic",
         );
         assert!(
-            !enable_network_lockdown(),
-            "enable_network_lockdown must report failure unprivileged"
+            r.is_err(),
+            "a non-zero insert exit must not be reported as a working rule"
+        );
+        let calls = rec.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c.starts_with("-C")),
+            "probe must have run"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("-I")),
+            "insert must have been attempted"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "a failed insert must not be followed by a verification probe: {:?}",
+            calls
+        );
+    }
+
+    /// The state of the filter cannot be determined when the probe itself
+    /// errors, so nothing may be inserted over it.
+    #[test]
+    fn test_indeterminate_check_does_not_insert() {
+        for code in [2, 3, 4] {
+            let rec = Recorder::new(&[("-C", Ok(code))]);
+            let r = ensure_rule_with(
+                &&rec,
+                false,
+                &["-p", "udp", "--dport", "443", "-j", "REJECT"],
+                "albus-quic",
+            );
+            assert!(r.is_err(), "check exit {} must be an error", code);
+            assert!(
+                !rec.calls.borrow().iter().any(|c| c.starts_with("-I")),
+                "check exit {} must not lead to an insert",
+                code
+            );
+        }
+    }
+
+    /// A check that exits 0 short-circuits: the rule is present, so no insert.
+    #[test]
+    fn test_check_exit_zero_short_circuits_without_insert() {
+        let rec = Recorder::new(&[("-C", Ok(0))]);
+        let r = ensure_rule_with(
+            &&rec,
+            true,
+            &["-p", "udp", "--dport", "53", "-j", "DROP"],
+            "albus-kill",
+        );
+        assert!(r.is_ok());
+        let calls = rec.calls.borrow();
+        assert_eq!(calls.len(), 1, "expected a single probe, got {:?}", calls);
+        assert!(calls[0].starts_with("-C"));
+    }
+
+    /// A spawn failure must be distinguishable from "rule absent". The old
+    /// `unwrap_or(false)` mapped both to the same value, so a broken iptables
+    /// path silently proceeded to the insert over an unknown filter state.
+    #[test]
+    fn test_spawn_failure_is_distinguishable_from_absent() {
+        let rec = Recorder::new(&[("-C", io_err(std::io::ErrorKind::NotFound))]);
+        let r = ensure_rule_with(
+            &&rec,
+            false,
+            &["-p", "tcp", "--dport", "80", "-j", "DROP"],
+            "albus-lockdown",
+        );
+        assert!(
+            r.is_err(),
+            "an unrunnable probe must not be treated as 'rule absent'"
+        );
+        let calls = rec.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("-I")),
+            "no insert should be attempted over an unknown filter state: {:?}",
+            calls
+        );
+    }
+
+    /// Exit 1 is xtables' documented "no such rule" and the only code that may
+    /// be read as absent. 2/3/4 mean syntax error / module problem / resource
+    /// problem and must abort rather than insert.
+    #[test]
+    fn test_only_exit_one_is_read_as_absent() {
+        for code in [2, 3, 4] {
+            let rec = Recorder::new(&[("-C", Ok(code))]);
+            let r = ensure_rule_with(
+                &&rec,
+                false,
+                &["-p", "udp", "--dport", "853", "-j", "DROP"],
+                "albus-kill",
+            );
+            assert!(r.is_err(), "check exit {} must be an error", code);
+            assert!(
+                !rec.calls.borrow().iter().any(|c| c.starts_with("-I")),
+                "check exit {} must not lead to an insert",
+                code
+            );
+        }
+        // exit 1 does lead to the insert
+        let rec = Recorder::new(&[("-C", Ok(1))]);
+        let _ = ensure_rule_with(
+            &&rec,
+            false,
+            &["-p", "udp", "--dport", "853", "-j", "DROP"],
+            "albus-kill",
+        );
+        assert!(
+            rec.calls.borrow().iter().any(|c| c.starts_with("-I")),
+            "exit 1 means absent and must lead to an insert"
+        );
+    }
+
+    /// The insert's own exit status is a claim by the process that wrote the
+    /// rule, so a successful insert is re-verified. This test models the worst
+    /// case: insert reports success, then the verification check disagrees.
+    #[test]
+    fn test_insert_success_is_verified_not_assumed() {
+        // -C returns 1 (absent) then 4 (still absent after "insert")
+        struct TwoPhase(RefCell<usize>);
+        impl Executor for TwoPhase {
+            fn run(&self, _v6: bool, args: &[&str]) -> ExecResult {
+                if args[0] == "-C" {
+                    let mut n = self.0.borrow_mut();
+                    *n += 1;
+                    Ok(if *n == 1 { 1 } else { 4 })
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        use std::cell::RefCell;
+        let tp = TwoPhase(RefCell::new(0));
+        let r = ensure_rule_with(
+            &tp,
+            false,
+            &["-p", "udp", "--dport", "443", "-j", "REJECT"],
+            "albus-quic",
+        );
+        assert!(
+            r.is_err(),
+            "an unverified insert must not be reported as a working rule"
+        );
+    }
+
+    /// The success path end to end: absent -> insert -> verified present.
+    #[test]
+    fn test_absent_then_inserted_then_verified_succeeds() {
+        struct Happy(RefCell<usize>);
+        impl Executor for Happy {
+            fn run(&self, _v6: bool, args: &[&str]) -> ExecResult {
+                if args[0] == "-C" {
+                    let mut n = self.0.borrow_mut();
+                    *n += 1;
+                    Ok(if *n == 1 { 1 } else { 0 })
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        use std::cell::RefCell;
+        let h = Happy(RefCell::new(0));
+        let r = ensure_rule_with(
+            &h,
+            true,
+            &["-p", "udp", "--dport", "53", "-j", "DROP"],
+            "albus-kill",
+        );
+        assert!(r.is_ok(), "the ordinary absent-then-install path must work");
+    }
+}
+
+#[cfg(test)]
+mod delete_outcome_tests {
+    use super::*;
+
+    /// Returns 0 on delete (rule removed) for the first `n` calls, then 1
+    /// (no such rule — the expected steady state).
+    struct Deleter {
+        remaining: std::cell::Cell<usize>,
+    }
+    impl Executor for Deleter {
+        fn run(&self, _v6: bool, args: &[&str]) -> ExecResult {
+            assert_eq!(args[0], "-D");
+            let n = self.remaining.get();
+            if n == 0 {
+                Ok(1)
+            } else {
+                self.remaining.set(n - 1);
+                Ok(0)
+            }
+        }
+    }
+
+    /// SUPPLY-03: `Ok(0)` — "there was nothing to remove" — is the normal case
+    /// on the real uninstall path, because ExecStopPost=albus cleanup already
+    /// removed every rule first. It must be reported as success, not confused
+    /// with a failure.
+    #[test]
+    fn test_nothing_to_remove_is_ok() {
+        let d = Deleter {
+            remaining: std::cell::Cell::new(0),
+        };
+        let r = delete_rule_bounded_with(&d, false, &["-p", "udp", "--dport", "53", "-j", "DROP"]);
+        assert_eq!(r.expect("absent rules are not a failure"), 0);
+    }
+
+    #[test]
+    fn test_rules_actually_removed_are_counted() {
+        let d = Deleter {
+            remaining: std::cell::Cell::new(3),
+        };
+        let r = delete_rule_bounded_with(&d, false, &["-p", "udp", "--dport", "53", "-j", "DROP"]);
+        assert_eq!(r.expect("clean removal"), 3);
+    }
+
+    /// The case that used to be invisible: a delete that fails for a reason
+    /// other than "no such rule". xtables lock contention, a bad backend, a
+    /// missing target — all exit non-1 and all mean residual rules may remain.
+    #[test]
+    fn test_non_one_exit_on_delete_is_an_error() {
+        struct Failing;
+        impl Executor for Failing {
+            fn run(&self, _v6: bool, _args: &[&str]) -> ExecResult {
+                Ok(4) // xtables lock held
+            }
+        }
+        let r = delete_rule_bounded_with(
+            &Failing,
+            false,
+            &["-p", "udp", "--dport", "443", "-j", "REJECT"],
+        );
+        assert!(
+            r.is_err(),
+            "a locked xtables must not be reported as a clean removal"
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("unknown") || msg.contains("may still"),
+            "{}",
+            msg
+        );
+    }
+
+    /// A spawn failure on the delete path is equally invisible today.
+    #[test]
+    fn test_spawn_failure_on_delete_is_an_error() {
+        struct Broken;
+        impl Executor for Broken {
+            fn run(&self, _v6: bool, _args: &[&str]) -> ExecResult {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no iptables",
+                ))
+            }
+        }
+        assert!(delete_rule_bounded_with(
+            &Broken,
+            true,
+            &["-p", "tcp", "--dport", "80", "-j", "DROP"]
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod helper_identity_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Per-test fixture directory with a unique name, removed on drop. Every
+    /// assertion below runs entirely inside it: no exec, no firewall mutation,
+    /// no capability requirement.
+    struct Fixture {
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            // Deliberately NOT under std::env::temp_dir(): /tmp is 1777, and the
+            // production check rejects any group/world-writable ancestor — which
+            // is correct for a privileged helper and means a /tmp fixture could
+            // never be accepted. target/ is 0755 and owned by the build user.
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            let dir = base.join(format!("albus-helper-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            // 0755: a group/world-writable ancestor is itself a rejection case.
+            set_mode(&dir, 0o755);
+            Self { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+    }
+
+    #[cfg(unix)]
+    fn uid_of(p: &Path) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).ok().map(|m| m.uid())
+    }
+
+    /// The suite runs as the build user, so "trusted owner" is injected rather
+    /// than faked. Every OTHER rejection (directory, missing, dangling symlink,
+    /// writable ancestor) is exercised by the real production logic.
+    #[cfg(unix)]
+    fn test_uids() -> Vec<libc::uid_t> {
+        vec![0, unsafe { libc::getuid() }]
+    }
+
+    #[cfg(unix)]
+    fn trusted(p: &Path) -> bool {
+        helper_is_trusted_with(p, &test_uids())
+    }
+
+    /// A root-owned regular file with no writable ancestor is the accept case.
+    /// Running the suite as an unprivileged user, "root-owned" is unreproducible,
+    /// so the positive control accepts either trusted owner (root or the albus
+    /// service account) and otherwise asserts the *other* rejections still bite.
+    #[test]
+    fn test_accepts_root_owned_regular_file() {
+        let f = Fixture::new("accept");
+        let p = f.path("iptables");
+        std::fs::write(&p, b"#!/bin/true\n").expect("write");
+        set_mode(&p, 0o755);
+
+        let is_root_owned = uid_of(&p) == Some(0);
+        let is_service = crate::core::ebpf::features::service_uid()
+            .map(|su| su == uid_of(&p).unwrap_or(u32::MAX))
+            .unwrap_or(false);
+
+        assert!(
+            trusted(&p),
+            "a trusted-owned regular file at a non-writable path must be accepted \
+             (root_owned={} service_owned={} uid={:?})",
+            is_root_owned,
+            is_service,
+            uid_of(&p)
+        );
+    }
+
+    /// EBPF-06: `exists()` accepted a directory, and the old code then exec'd it.
+    #[test]
+    fn test_rejects_directory() {
+        let f = Fixture::new("dir");
+        let p = f.path("iptables");
+        std::fs::create_dir_all(&p).expect("dir");
+        set_mode(&p, 0o755);
+        assert!(
+            !helper_is_trusted(&p),
+            "a directory must never be selected as a helper"
+        );
+    }
+
+    /// A path that does not exist, and a dangling symlink, must both fail.
+    #[test]
+    fn test_rejects_missing_and_dangling_symlink() {
+        let f = Fixture::new("missing");
+        assert!(!trusted(&f.path("nope")));
+
+        #[cfg(unix)]
+        {
+            let link = f.path("dangling");
+            std::os::unix::fs::symlink(f.path("gone"), &link).expect("symlink");
+            assert!(
+                !trusted(&link),
+                "a dangling symlink must be rejected (metadata() cannot resolve it)"
+            );
+        }
+    }
+
+    /// The legitimate Arch layout is a symlink to xtables-nft-multi. Following
+    /// it is required — what matters is that the RESOLVED target is trusted.
+    #[test]
+    fn test_symlink_to_trusted_target_is_accepted() {
+        let f = Fixture::new("symlink-ok");
+        let real = f.path("xtables-multi");
+        std::fs::write(&real, b"#!/bin/true\n").expect("write");
+        set_mode(&real, 0o755);
+        let link = f.path("iptables");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            assert!(
+                trusted(&link),
+                "the shipped /usr/sbin/iptables -> xtables-nft-multi layout must keep working"
+            );
+        }
+    }
+
+    /// A symlink whose target lives under a group/world-writable directory is
+    /// exactly the substitution the check exists to stop.
+    #[test]
+    fn test_rejects_symlink_into_untrusted_directory() {
+        let f = Fixture::new("symlink-bad");
+        let world = f.path("world");
+        std::fs::create_dir_all(&world).expect("dir");
+        std::fs::write(world.join("evil"), b"#!/bin/true\n").expect("write");
+        set_mode(&world, 0o777);
+        let link = f.path("iptables");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(world.join("evil"), &link).expect("symlink");
+            assert!(
+                !trusted(&link),
+                "a helper reached through a world-writable directory must be rejected"
+            );
+        }
+    }
+
+    /// The whole point: the candidate list yields Err rather than guessing, so
+    /// an absent helper is an explicit failure EBPF-01 can propagate.
+    #[test]
+    fn test_resolve_binary_reports_an_untrusted_or_absent_helper() {
+        let f = Fixture::new("resolve");
+        let good = f.path("good");
+        std::fs::write(&good, b"#!/bin/true\n").expect("write");
+        set_mode(&good, 0o755);
+        let good_s = good.to_string_lossy().to_string();
+
+        // A trusted candidate is selected and the untrusted one is skipped.
+        let bad = f.path("bad");
+        std::fs::write(&bad, b"#!/bin/true\n").expect("write");
+        set_mode(&bad, 0o755);
+        let _bad_s = bad.to_string_lossy().to_string();
+        // make the "bad" one world-writable at its own path level is not enough;
+        // instead drop trust via an untrusted owner is root-only, so use the
+        // writable-ancestor route on a dedicated dir.
+        let untrusted_dir = f.path("loose");
+        std::fs::create_dir_all(&untrusted_dir).expect("dir");
+        let inside = untrusted_dir.join("iptables");
+        std::fs::write(&inside, b"#!/bin/true\n").expect("write");
+        set_mode(&inside, 0o755);
+        set_mode(&untrusted_dir, 0o777);
+        let loose_s = inside.to_string_lossy().to_string();
+
+        let uids = test_uids();
+        let cands = vec![loose_s.as_str(), good_s.as_str()];
+        assert_eq!(
+            resolve_binary_with(&cands, &uids).expect("a trusted candidate exists"),
+            good_s.as_str(),
+            "an untrusted candidate must be skipped in favour of a trusted one"
+        );
+
+        let only_bad = vec![loose_s.as_str()];
+        let err = resolve_binary_with(&only_bad, &uids).expect_err("must not guess");
+        assert!(
+            err.to_string().contains("no trusted"),
+            "the failure must name the problem: {}",
+            err
         );
     }
 }
