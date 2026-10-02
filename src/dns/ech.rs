@@ -76,6 +76,32 @@ impl EchConfigCache {
         }
     }
 
+    /// Test-only seeding that bypasses the validate-inside check in
+    /// `insert`. The hardening stays intact — this exists so a flush test can
+    /// observe a non-empty cache without shipping a real ECHConfigList.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, k: String, v: Vec<u8>) {
+        if let Ok(mut g) = self.inner.write() {
+            g.insert(k, v);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// W6-01: the ECH config cache was previously only ever evicted by size,
+    /// so an operator flush left it entirely intact.
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.inner.write() {
+            g.clear();
+        }
+    }
+
     pub fn insert(&self, domain: String, ech_config: Vec<u8>) {
         if domain.len() > 253 || ech_config.len() > 4096 {
             return;

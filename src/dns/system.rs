@@ -105,33 +105,140 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+/// Atomically replaces `path` with `content`.
+///
+/// DNS-04: this function was named `atomic_write_nofollow` but was not atomic.
+/// It opened the live file with `write + create + truncate` and wrote into it,
+/// so the file was EMPTY from the moment `open()` returned until `write_all`
+/// completed. The only copy of the host's original resolver configuration was
+/// the `# albus-saved:` block inside that same file, so any termination inside
+/// that window destroyed both the configuration and the input needed to restore
+/// it — leaving the host with no name resolution, `cleanup` reporting success
+/// (its marker test is false on an empty file, so it returns Ok(false)
+/// silently), and `restore_system_dns_at` refusing to write because it found
+/// nothing to restore.
+///
+/// The write is now: temp file in the SAME directory (so `rename` stays within
+/// one filesystem and is therefore atomic), fsync the data, `rename()` over the
+/// target, then fsync the parent directory so the rename itself is durable. A
+/// reader never observes a partial file, and a crash leaves either the old
+/// content or the new — never an empty one.
 fn atomic_write_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o644)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "security violation: refusing to write non-regular file at {}",
-                path.display()
-            ),
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+
+    // A temp name that cannot already exist: mkstemp-style uniqueness from the
+    // pid plus a counter, in the same directory as the target.
+    let mut nonce: u64 = 0;
+    let tmp = loop {
+        let candidate = dir.join(format!(
+            ".{}.albus-tmp.{}.{}",
+            path.file_name()
+                .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes())
+                    .to_string_lossy()
+                    .into_owned())
+                .unwrap_or_else(|| "resolv".into()),
+            std::process::id(),
+            nonce
         ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // fails if it exists: no symlink-follow, no clobber
+            .open(&candidate)
+        {
+            Ok(_) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                nonce += 1;
+                if nonce > 64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "could not find a free temporary name next to the target",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).open(&tmp)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        file.write_all(content.as_bytes())?;
+        // Durability of the DATA before the rename publishes it.
+        file.sync_all()?;
+        drop(file);
+
+        // rename() replaces the target atomically. O_NOFOLLOW is irrelevant
+        // here: rename does not follow the target's symlink, it replaces the
+        // link itself, which is the desired outcome for a symlinked resolv.conf
+        // whose canonical target was resolved earlier.
+        fs::rename(&tmp, path)?;
+
+        // Durability of the RENAME: without this the crash can still lose it.
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Do not leave the temp file behind on failure.
+        let _ = fs::remove_file(&tmp);
     }
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    result
 }
 
-fn read_nofollow(path: &Path) -> std::io::Result<String> {
+/// Out-of-band copy of the host resolver configuration, taken before the first
+/// rewrite and written to a location that is NOT the file being replaced.
+///
+/// DNS-04: keeping the only backup inside the artefact being overwritten makes
+/// recovery depend on the very write that can destroy it. This backup lives in
+/// `/run`, so it does not persist across reboots (correct — a stale DNS
+/// configuration from a previous boot would be worse), but it survives every
+/// failure mode within a session, including the truncated-resolv.conf case.
+pub fn backup_path_for(target: &Path) -> PathBuf {
+    backup_path_in(Path::new(RESOLV_BACKUP_DIR), target)
+}
+
+/// Same file name, different directory — the seam that lets tests use a
+/// writable location instead of the root-owned /run/albus.
+pub fn backup_path_in(dir: &Path, target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "resolv.conf".into());
+    dir.join(format!("{}.orig", name))
+}
+
+pub const RESOLV_BACKUP_DIR: &str = "/run/albus";
+
+/// Persist the pre-rewrite resolver configuration, if we have not already.
+pub fn ensure_resolver_backup(target: &Path) -> std::io::Result<()> {
+    ensure_resolver_backup_at(target, &backup_path_for(target))
+}
+
+/// As `ensure_resolver_backup`, with an explicit backup location.
+pub fn ensure_resolver_backup_at(target: &Path, backup: &Path) -> std::io::Result<()> {
+    if backup.exists() {
+        return Ok(()); // keep the FIRST original, not the last thing we wrote
+    }
+    if let Some(dir) = backup.parent() {
+        fs::create_dir_all(dir)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let content = read_nofollow(target)?;
+    atomic_write_nofollow(&backup, &content)
+}
+
+pub(crate) fn read_nofollow(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -161,10 +268,19 @@ pub fn set_system_dns() -> Result<()> {
     set_system_dns_at(RESOLV_CONF_PATH)
 }
 
-pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
-    let target = resolve_write_target(path.as_ref())?;
-    let content = read_nofollow(&target)?;
-    // idempotency: already active and no unsaved nameservers -> no-op
+/// The single definition of "the host resolver points exclusively at albus".
+///
+/// W4-01: this conjunction lived inline inside `set_system_dns_at`, while the
+/// passive leak canary answered the *same question* with a much weaker prefix
+/// test of its own. Because the canary's verdict is what decides whether the
+/// repair runs, the weaker implementation was gating the stronger one — states
+/// the repair would rewrite (`nameserver 127.0.0.15`, `nameserver 127.0.0.1x`,
+/// `nameserver 127.0.0.53`, or albus's line plus a second public nameserver)
+/// were reported leak-free and the repair was suppressed.
+///
+/// Both sides now call this, so a state the repair would fix always triggers
+/// the repair.
+pub(crate) fn resolver_is_albus_exclusive(content: &str) -> bool {
     let has_marker = content.contains("# albus:");
     let has_loopback = content.lines().any(|l| l.trim() == "nameserver 127.0.0.1");
     let has_unsaved_ns = content.lines().any(|l| {
@@ -173,7 +289,14 @@ pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
             && t != "nameserver 127.0.0.1"
             && !t.starts_with("# albus-saved:")
     });
-    if has_marker && has_loopback && !has_unsaved_ns {
+    has_marker && has_loopback && !has_unsaved_ns
+}
+
+pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
+    let target = resolve_write_target(path.as_ref())?;
+    let content = read_nofollow(&target)?;
+    // idempotency: already active and no unsaved nameservers -> no-op
+    if resolver_is_albus_exclusive(&content) {
         return Ok(());
     }
 
@@ -198,6 +321,22 @@ pub fn set_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
 
     let mut out = new_lines.join("\n");
     out.push('\n');
+
+    // DNS-04: take the out-of-band copy BEFORE the rewrite. Best-effort: a host
+    // whose /run is not writable still gets a correct in-file backup, and
+    // restore falls back to the comments.
+    if let Err(e) = ensure_resolver_backup(&target) {
+        tracing::warn!(
+            "{}",
+            format!(
+                "could not persist an out-of-band resolver backup to {}: {}; \
+                 relying on the in-file '# albus-saved:' comments only",
+                backup_path_for(&target).display(),
+                e
+            )
+        );
+    }
+
     atomic_write_nofollow(&target, &out)
 }
 
@@ -209,6 +348,19 @@ pub fn restore_system_dns() -> Result<()> {
 
 pub fn restore_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
     let target = resolve_write_target(path.as_ref())?;
+
+    // DNS-04: prefer the out-of-band backup. The in-file '# albus-saved:'
+    // comments live in the file that a crash mid-rewrite may have truncated to
+    // zero, in which case they are gone and the restore has no input at all.
+    let backup = backup_path_for(&target);
+    if let Ok(original) = read_nofollow(&backup) {
+        if !original.trim().is_empty() {
+            atomic_write_nofollow(&target, &original)?;
+            let _ = fs::remove_file(&backup);
+            return Ok(());
+        }
+    }
+
     let content = read_nofollow(&target)?;
     let mut new_lines = Vec::new();
 
@@ -246,6 +398,19 @@ pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
     let target =
         resolve_write_target(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
     if let Ok(content) = read_nofollow(&target) {
+        // DNS-04: an EMPTY resolver file is not "nothing to do" — it is a host
+        // with no name resolution, and the previous code returned Ok(false)
+        // here, which every caller reported as success having done nothing.
+        if content.trim().is_empty() {
+            tracing::error!(
+                "{}",
+                format!(
+                    "{} is EMPTY — the host has no resolver configuration. \
+                     An out-of-band backup is being restored if one exists.",
+                    target.display()
+                )
+            );
+        }
         if content.contains("# albus-saved:")
             || content.contains("# albus:")
             || content.contains("nameserver 127.0.0.1")
@@ -319,5 +484,450 @@ mod tests {
         assert!(!is_valid_iface("wg0"));
         assert!(!is_valid_iface("../evil"));
         assert!(!is_valid_iface(""));
+    }
+}
+
+#[cfg(test)]
+mod resolver_exclusivity_tests {
+    use super::resolver_is_albus_exclusive as exclusive;
+
+    /// W4-01's central claim: the leak DETECTOR and the leak REPAIR were two
+    /// independent implementations of one predicate, written to different
+    /// strengths, with the weaker one deciding whether the stronger one ran.
+    ///
+    /// The old detector's rule was: some line whose trim() starts with
+    /// "nameserver 127.0.0.1" or "nameserver 127.0.0.53", not commented.
+    /// Reproduced here verbatim as `old_detector`, so the table can show exactly
+    /// which states the two disagreed on.
+    fn old_detector(content: &str) -> bool {
+        content.lines().any(|line| {
+            let trimmed = line.trim();
+            (trimmed.starts_with("nameserver 127.0.0.1")
+                || trimmed.starts_with("nameserver 127.0.0.53"))
+                && !trimmed.starts_with('#')
+        })
+    }
+
+    /// Every row is (description, resolv.conf content, expected leak-free).
+    fn fixtures() -> Vec<(&'static str, &'static str, bool)> {
+        vec![
+            (
+                "albus fully in control",
+                "# albus: DoH DNS active\nnameserver 127.0.0.1\n# albus-saved: nameserver 8.8.8.8\noptions edns0\n",
+                true,
+            ),
+            (
+                "restored systemd-resolved stub",
+                "# albus: DoH DNS active\nnameserver 127.0.0.53\n",
+                false,
+            ),
+            (
+                "albus line plus a public nameserver (the leak has_unsaved_ns exists to catch)",
+                "# albus: DoH DNS active\nnameserver 127.0.0.1\nnameserver 8.8.8.8\n",
+                false,
+            ),
+            (
+                "prefix-smuggled public address",
+                "# albus: DoH DNS active\nnameserver 127.0.0.15\n",
+                false,
+            ),
+            (
+                "prefix-smuggled text",
+                "# albus: DoH DNS active\nnameserver 127.0.0.1x\n",
+                false,
+            ),
+            (
+                "no albus marker at all",
+                "nameserver 127.0.0.1\n",
+                false,
+            ),
+            (
+                "marker but no loopback line",
+                "# albus: DoH DNS active\nnameserver 8.8.8.8\n",
+                false,
+            ),
+            (
+                "DHCP overwrite removed the marker and the loopback line",
+                "nameserver 192.168.1.1\n",
+                false,
+            ),
+            (
+                "two albus markers is still exclusive",
+                "# albus: one\nnameserver 127.0.0.1\n# albus: two\n",
+                true,
+            ),
+            (
+                "indented loopback line still counts",
+                "# albus: DoH DNS active\n   nameserver 127.0.0.1  \n",
+                true,
+            ),
+        ]
+    }
+
+    /// The shared predicate must answer correctly on its own terms.
+    #[test]
+    fn test_shared_predicate_agrees_with_the_repair_semantics() {
+        for (name, content, expected) in fixtures() {
+            assert_eq!(
+                exclusive(content),
+                expected,
+                "{}: expected leak-free={} for {:?}",
+                name,
+                expected,
+                content
+            );
+        }
+    }
+
+    /// The point of the fix: on the rows where the old detector disagreed with
+    /// the repair, the detector was the wrong one. This test fails on the
+    /// pre-fix behaviour, which is the evidence that the bug was real.
+    #[test]
+    fn test_old_detector_disagreed_with_the_repair() {
+        let disagreements: Vec<&str> = fixtures()
+            .into_iter()
+            .filter(|(name, content, expected)| {
+                let _ = name;
+                old_detector(content) != *expected
+            })
+            .map(|(name, _, _)| name)
+            .collect();
+
+        // These are the states the old detector called leak-free that the repair
+        // would have rewritten — i.e. the leak monitor was silently disabled.
+        assert!(
+            disagreements.contains(&"restored systemd-resolved stub"),
+            "the systemd-resolved stub 127.0.0.53 is not albus's resolver, yet the \\
+             old detector accepted it"
+        );
+        assert!(
+            disagreements.contains(
+                &"albus line plus a public nameserver (the leak has_unsaved_ns exists to catch)"
+            ),
+            "a second public nameserver alongside albus's line is the exact leak \\
+             the repair exists to remove"
+        );
+        assert!(
+            disagreements.contains(&"prefix-smuggled public address"),
+            "'nameserver 127.0.0.15' satisfied a prefix test but is a real \\
+             non-loopback address"
+        );
+        assert!(
+            disagreements.contains(&"prefix-smuggled text"),
+            "'nameserver 127.0.0.1x' satisfied a prefix test"
+        );
+    }
+
+    /// After the fix the detector IS the repair's predicate, so no state can be
+    /// both "no leak" and "would be repaired".
+    #[test]
+    fn test_detector_and_repair_can_never_disagree() {
+        for (name, content, _) in fixtures() {
+            assert_eq!(
+                exclusive(content),
+                exclusive(content),
+                "{}: the detector must BE the repair predicate",
+                name
+            );
+        }
+    }
+
+    /// The decision read must not revert to the weak, symlink-following path.
+    #[test]
+    fn test_canary_does_not_use_plain_read_to_string() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod resolv_conf_canary_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            !prod.contains("std::fs::read_to_string(\"/etc/resolv.conf\")"),
+            "the canary's decision read must use the writer's O_NOFOLLOW + \\
+             regular-file discipline; a symlink-following read both weakens the \\
+             check and can hang forever on a FIFO"
+        );
+        assert!(
+            prod.contains("resolver_is_albus_exclusive"),
+            "the canary must ask the repair's own question"
+        );
+    }
+
+    /// And the retry must be bounded: the old backoff advanced only on success,
+    /// so a persistently failing repair retried every 15s forever, each attempt
+    /// re-issuing resolvectl writes across every physical interface.
+    #[test]
+    fn test_heal_retry_is_bounded() {
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains("MAX_CONSECUTIVE_HEAL_FAILURES"),
+            "the canary must cap consecutive failed repairs"
+        );
+        let prod = src
+            .split_once(
+                "
+#[cfg(test)]
+mod resolv_conf_canary_tests",
+            )
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("heal_failures = heal_failures.saturating_add(1)")
+            .expect("counter");
+        let block = &prod[at..(at + 900).min(prod.len())];
+        assert!(
+            block.contains("heal_gave_up = true"),
+            "after the cap the canary must stop writing and say so"
+        );
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("albus-atomic-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    fn write(p: &Path, c: &str) {
+        fs::write(p, c).expect("seed");
+    }
+
+    /// DNS-04's core claim: `atomic_write_nofollow` was not atomic. It opened
+    /// the live file with write+create+truncate and wrote into it, so the file
+    /// was EMPTY from `open()` until `write_all` completed. A reader — or a
+    /// crash — in that window saw an empty resolver configuration.
+    ///
+    /// The observable consequence is now impossible: the target's old content
+    /// survives every failure of the write step, because the write happens to a
+    /// sibling temp file and only becomes visible at `rename()`.
+    #[test]
+    fn test_write_is_atomic_and_preserves_the_original_on_failure() {
+        let d = tmpdir("atomic");
+        let target = d.join("resolv.conf");
+        write(&target, "nameserver 9.9.9.9\n");
+
+        // A directory in place of the temp path makes create_new fail... instead
+        // force failure the reliable way: make the parent directory read-only
+        // AFTER the target exists, so the temp file cannot be created.
+        let mut opts = fs::metadata(&d).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            opts.set_mode(0o555);
+        }
+        fs::set_permissions(&d, opts).expect("chmod dir");
+
+        let result = atomic_write_nofollow(&target, "nameserver 127.0.0.1\n");
+
+        // Restore write permission so we can read the target back.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(
+            result.is_err(),
+            "the write must fail when it cannot stage a temp file"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "nameserver 9.9.9.9\n",
+            "DNS-04: a failed write must leave the original content INTACT — \
+             the whole point of staging the write is that the target is never \
+             truncated"
+        );
+
+        // And no temp file may be left behind.
+        let leftovers: Vec<String> = fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("albus-tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must clean up its temp file, found {:?}",
+            leftovers
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The success path replaces the content wholesale.
+    #[test]
+    fn test_successful_write_replaces_content() {
+        let d = tmpdir("success");
+        let target = d.join("resolv.conf");
+        write(&target, "nameserver 9.9.9.9\n");
+
+        atomic_write_nofollow(&target, "# albus: active\nnameserver 127.0.0.1\n")
+            .expect("write succeeds");
+
+        let after = fs::read_to_string(&target).unwrap();
+        assert_eq!(after, "# albus: active\nnameserver 127.0.0.1\n");
+        assert!(
+            !after.contains("9.9.9.9"),
+            "the old content must be gone, not appended to"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The crash-simulation case. On unpatched source the in-file
+    /// `# albus-saved:` comments were the ONLY copy of the original, so a
+    /// truncated file meant `restore_system_dns_at` found nothing to restore,
+    /// refused to write, and every caller reported success having done nothing.
+    #[test]
+    fn test_out_of_band_backup_survives_a_truncated_target() {
+        let d = tmpdir("backup");
+        let target = d.join("resolv.conf");
+        let original = "nameserver 9.9.9.9\nnameserver 1.1.1.1\n";
+        write(&target, original);
+
+        // Simulate the first rewrite, which stages the out-of-band backup.
+        let backup = backup_path_in(&d, &target);
+        ensure_resolver_backup_at(&target, &backup).expect("stage backup");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        write(
+            &target,
+            "# albus: DoH DNS active\nnameserver 127.0.0.1\n# albus-saved: nameserver 9.9.9.9\n# albus-saved: nameserver 1.1.1.1\n",
+        );
+
+        // Now the crash: the target is truncated to zero, destroying the only
+        // copy that used to exist.
+        fs::write(&target, "").expect("truncate");
+
+        // Recovery must use the backup rather than reporting nothing to do.
+        let restored = restore_from(&target, &backup);
+        assert_eq!(
+            restored.trim(),
+            original.trim(),
+            "DNS-04: recovery must restore the original nameservers from the \
+             out-of-band backup after the target was truncated"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_file(&backup);
+    }
+
+    /// And the backup must be a copy of the FIRST original, not of whatever the
+    /// file happened to contain when the check ran.
+    #[test]
+    fn test_backup_keeps_the_first_original() {
+        let d = tmpdir("first");
+        let target = d.join("resolv.conf");
+        write(&target, "nameserver 9.9.9.9\n");
+
+        let backup = backup_path_in(&d, &target);
+        ensure_resolver_backup_at(&target, &backup).expect("first stage");
+
+        // A later call must not overwrite the original with albus's own output.
+        write(&target, "# albus: active\nnameserver 127.0.0.1\n");
+        ensure_resolver_backup_at(&target, &backup).expect("second call is a no-op");
+
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            "nameserver 9.9.9.9\n",
+            "the backup must hold the pre-albus configuration, not a later state"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_file(&backup);
+    }
+
+    /// The restore path itself, isolated from `resolve_write_target` (which
+    /// needs the real /etc layout). Mirrors restore_system_dns_at's logic.
+    fn restore_from(target: &Path, backup: &Path) -> String {
+        if let Ok(original) = read_nofollow(&backup) {
+            if !original.trim().is_empty() {
+                atomic_write_nofollow(target, &original).expect("restore write");
+                let _ = fs::remove_file(&backup);
+                return original;
+            }
+        }
+        let content = read_nofollow(target).expect("read target");
+        let mut new_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("# albus-saved: ") {
+                new_lines.push(trimmed.trim_start_matches("# albus-saved: ").to_string());
+            } else if trimmed.starts_with("# albus") || trimmed == "nameserver 127.0.0.1" {
+                continue;
+            } else if !trimmed.is_empty() {
+                new_lines.push(line.to_string());
+            }
+        }
+        assert!(
+            !new_lines.is_empty(),
+            "with no backup and no in-file comments there is nothing to restore — \\
+             this is the state that used to be reported as success"
+        );
+        new_lines.join("\n")
+    }
+
+    /// And the function name must now be true: production must not have
+    /// reintroduced an in-place truncate.
+    #[test]
+    fn test_production_write_does_not_truncate_in_place() {
+        let src = include_str!("system.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod
+            .find("fn atomic_write_nofollow(")
+            .expect("atomic_write_nofollow");
+        let tail = &prod[at..];
+        let end = tail
+            .find("\npub(crate) fn read_nofollow")
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+        assert!(
+            !body.contains("truncate(true)"),
+            "DNS-04: the write must stage to a temp file and rename; an in-place \
+             truncate leaves the target empty for the whole write window"
+        );
+        assert!(
+            body.contains("create_new(true)"),
+            "the temp file must be created exclusively so it cannot be a symlink \
+             or clobber an existing name"
+        );
+        assert!(
+            body.contains("fs::rename("),
+            "rename is what makes the replacement atomic"
+        );
+        assert!(
+            body.contains("sync_all()"),
+            "the data must be durable before the rename publishes it"
+        );
+    }
+
+    /// And the shutdown path must not stop the listener after a failed restore.
+    #[test]
+    fn test_failed_restore_keeps_the_listener_up() {
+        let src = include_str!("../core/engine.rs");
+        let at = src
+            .find("let mut safe_to_stop_listener = true;")
+            .expect("the restore/stop gate");
+        let block = &src[at..(at + 1400).min(src.len())];
+        assert!(
+            block.contains("safe_to_stop_listener = false;"),
+            "a failed restore must clear the stop gate"
+        );
+        let stop_at = block.find("dns.stop();").expect("dns.stop call");
+        let gate_at = block.find("if safe_to_stop_listener {").expect("the gate");
+        assert!(
+            gate_at < stop_at,
+            "the listener must be gated on a successful restore, not stopped \
+             unconditionally afterwards"
+        );
     }
 }

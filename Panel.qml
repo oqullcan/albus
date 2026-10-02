@@ -624,8 +624,16 @@ Panel {
     id: flushCacheProc
     command: []
     running: false
+    // W6-01: `code` was never read, so the "flushed" toast fired identically on
+    // exit 0, on a non-zero polkit denial, and on a failed spawn. Nothing in
+    // this repo authorises `systemctl kill`, so the flush is normally refused
+    // at the auth dialog and the user was told it had worked.
     onExited: function(code) {
-      root.showToast("DNS cache flushed")
+      if (code === 0) {
+        root.showToast("DNS caches flushed (response, DNSSEC, ECH)")
+      } else {
+        root.showToast("Cache flush failed (exit " + code + ")")
+      }
     }
   }
 
@@ -741,7 +749,7 @@ Panel {
       var quiet = root.suppressSaveToast
       root.suppressSaveToast = false
       if (code === 0) {
-        if (!quiet) root.showToast("Settings saved — press Restart Service to apply")
+        if (!quiet) root.showToast("Settings saved — press Apply & Restart to apply system-wide")
         root.refreshStatus()
       } else {
         root.showToast("Failed to save settings")
@@ -755,7 +763,9 @@ Panel {
     running: false
     onExited: function(code) {
       if (code === 0) {
-        root.showToast("Settings applied system-wide")
+        // Not "reloaded": SIGHUP only refreshes the eBPF maps. Firewall and DNS
+        // changes take effect on restart, which is what happens next.
+        root.showToast("System config written — restarting service")
         // mirror into the user file so reopen shows the same selection
         // (daemon reads /etc/albus; panel reads ~/.config — keep them in sync)
         root.suppressSaveToast = true
@@ -774,10 +784,17 @@ Panel {
     id: daemonActionProc
     command: []
     running: false
+    // CLI-01: the restart result was discarded, so a denied or failed
+    // `systemctl restart` still left the previous "applied" toast standing.
     onExited: function(code) {
       root.isBusy = false
       root.refreshStatus()
       root.loadConfig()
+      if (code === 0) {
+        root.showToast("Settings applied and service restarted")
+      } else {
+        root.showToast("Config saved, but restart failed (exit " + code + ") — run: sudo systemctl restart albus")
+      }
     }
   }
 
@@ -838,7 +855,12 @@ Panel {
         if (t === "1") root.activeTab = 0
         else if (t === "2") root.activeTab = 1
         else if (t === " " || t === "t" || t === "T") root.toggleDaemon()
-        else if (t === "r" || t === "R") root.applySystemWide()
+        else if (t === "r" || t === "R") {
+          // CLI-01: this bare key authorised a root config write, with nothing
+          // on screen saying so. Surface the action before it prompts.
+          root.showToast("Applying settings system-wide (pkexec) and restarting…")
+          root.applySystemWide()
+        }
         else if (t === "c" || t === "C") root.purgeDnsCache()
         else if (t === "p" || t === "P") root.togglePause()
         else if (t === "j" || t === "J") {
@@ -1465,9 +1487,17 @@ Panel {
 
                 Button {
                   width: (mainColumn.width - Style.space(6)) / 2
-                  text: "Restart Service"
+                  // CLI-01: this button used to promise a plain service
+                  // restart. It actually rewrites the root-owned
+                  // /etc/albus/config.json (a pkexec prompt) and only then
+                  // restarts the unit, so the label now names both steps.
+                  text: "Apply & Restart"
                   bordered: true
                   fontSize: Style.font.caption
+                  // No ToolTip here: `ToolTip` is not resolved anywhere else
+                  // in this file and no QML linter is available to prove the
+                  // identifier binds. The scope is stated in the click toast
+                  // and in README instead of shipping an unverifiable import.
                   onClicked: root.applySystemWide()
                 }
 

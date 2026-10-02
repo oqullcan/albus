@@ -76,13 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     // Only attempt the privileged signal as root: as an unprivileged user,
                     // `systemctl kill` would pop a polkit prompt on every save, so skip it.
                     if is_root() {
-                        let is_active = std::process::Command::new("/usr/bin/systemctl")
+                        let is_active = albus::app::service::systemctl()
                             .args(["is-active", "--quiet", "albus.service"])
                             .status()
                             .map(|s| s.success())
                             .unwrap_or(false);
                         if is_active {
-                            let _ = std::process::Command::new("/usr/bin/systemctl")
+                            let _ = albus::app::service::systemctl()
                                 .args(["kill", "-s", "HUP", "albus.service"])
                                 .status();
                             println!(
@@ -118,22 +118,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
             println!("albus cleanup");
-            firewall::unblock_quic();
-            firewall::unblock_stun();
-            firewall::disable_kill_switch();
-            firewall::disable_network_lockdown();
-            match dns::cleanup_system_dns() {
-                Ok(true) => {
-                    println!("cleanup complete — system DNS and firewall rules restored");
-                }
-                Ok(false) => {
-                    println!("cleanup complete — firewall rules checked");
-                }
-                Err(e) => {
-                    eprintln!("error during cleanup: {}", e);
+            // W1-01: this is `ExecStopPost=+/usr/local/bin/albus cleanup`, i.e.
+            // the crash-recovery path. It used to call four revert helpers that
+            // returned nothing and then print "cleanup complete" unconditionally
+            // — so a host left with stranded fail-closed DROP rules (or a
+            // resolv.conf still pinned to a dead loopback listener) was reported
+            // as recovered. systemd runs this with a '+' prefix, so its exit
+            // status is the only signal the unit gets; a truthful non-zero exit
+            // is what turns a silent degradation into a visible one.
+            let mut failed: Vec<String> = Vec::new();
+            let fw_steps: [(&str, firewall::FwCount); 4] = [
+                ("unblock_quic", firewall::unblock_quic()),
+                ("unblock_stun", firewall::unblock_stun()),
+                ("disable_kill_switch", firewall::disable_kill_switch()),
+                (
+                    "disable_network_lockdown",
+                    firewall::disable_network_lockdown(),
+                ),
+            ];
+            for (name, r) in fw_steps {
+                match r {
+                    Ok(n) => println!("  {}: removed {} rule(s)", name, n),
+                    Err(e) => failed.push(format!("{} ({})", name, e)),
                 }
             }
-            Ok(())
+            match dns::cleanup_system_dns() {
+                Ok(true) => {
+                    println!("  system DNS restored");
+                }
+                Ok(false) => {
+                    println!("  no albus DNS markers found; resolver left untouched");
+                }
+                Err(e) => failed.push(format!("DNS restore ({})", e)),
+            }
+            if failed.is_empty() {
+                println!("cleanup complete — system DNS and firewall rules restored");
+                Ok(())
+            } else {
+                eprintln!(
+                    "cleanup INCOMPLETE — these steps did not verify: {}. \
+                     Residual rules may still block outbound traffic and \
+                     /etc/resolv.conf may still point at a dead listener; \
+                     inspect `iptables -S OUTPUT | grep albus` and /etc/resolv.conf.",
+                    failed.join(", ")
+                );
+                Err(format!("cleanup incomplete: {}", failed.join("; ")).into())
+            }
         }
         // start packet fragmentation and desync engine
         Some(Commands::Run(args)) => run_engine(args).await,

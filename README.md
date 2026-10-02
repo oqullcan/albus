@@ -95,7 +95,9 @@ Containment:
 ## Omarchy panel
 
 Quattro widget (`BarWidget.qml`, `Panel.qml`): status, resolver profiles, toggles,
-live logs (`1/2` tabs, `Space`, `R` reload, `C` flush).
+live logs (`1/2` tabs, `Space` start/stop, `C` flush caches, `P` pause).
+`R` (`Apply & Restart`) writes the root-owned `/etc/albus/config.json` behind a
+pkexec prompt and then restarts `albus.service`; it does not merely reload.
 
 ```bash
 mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev

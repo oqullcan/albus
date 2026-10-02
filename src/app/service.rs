@@ -56,8 +56,28 @@ pub fn handle_service_command(
     }
 }
 
-fn systemctl() -> Command {
+/// The single construction point for every privileged `systemctl` spawn in
+/// this crate.
+///
+/// W1-02: this helper existed and was correct, but it was not the only way the
+/// binary spawns systemctl — the entrypoint's SIGHUP sender and
+/// show_service_status/show_service_logs each built a `Command` directly and
+/// inherited the caller's environment. Because argv is fixed at every site the
+/// exposure is not argument injection; it is a root- or service-user-executed
+/// systemctl inheriting `SYSTEMD_PAGER`, `SYSTEMD_LESS`, `EDITOR`/`VISUAL`, or a
+/// `PATH` that redirects a helper. The discipline now holds by construction
+/// rather than per call site.
+pub fn systemctl() -> Command {
     let mut c = Command::new(SYSTEMCTL_BIN);
+    c.env_clear();
+    c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    c
+}
+
+/// Same chokepoint discipline for journalctl, which is spawned in two places
+/// and was unfiltered in both.
+pub fn journalctl() -> Command {
+    let mut c = Command::new(JOURNALCTL_BIN);
     c.env_clear();
     c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
     c
@@ -317,16 +337,40 @@ fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         eprintln!("warning: /usr/sbin/useradd missing, skipping service-user creation");
         return Ok(());
     }
-    // `id albus` decides: present -> accept untouched, absent -> create.
-    // Absolute paths, no shell, fixed argv (no user input reaches exec).
-    let id_status = std::process::Command::new("/usr/bin/id")
-        .arg("albus")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if id_status.success() {
-        return Ok(());
+    // SUPPLY-04: `id albus` used to decide — present meant "accept untouched,
+    // having verified nothing". That single unvalidated name-to-uid binding then
+    // drove four trust decisions: the daemon identity carrying six ambient
+    // capabilities, the polkit rule granting polkit.Result.YES (no
+    // authentication) for five resolve1 actions to subject.user == "albus",
+    // ownership of /etc/albus, and config.rs's root-equivalence check for
+    // /etc/albus, /run/albus and any privileged --config file.
+    //
+    // Not MUTATING a pre-existing account is right — install has no business
+    // rewriting an operator's account. VALIDATING it before binding a
+    // capability-carrying identity to it is a different question, and that is
+    // what happens now, through the same predicate `service_uid()` uses at
+    // runtime so install and runtime cannot drift.
+    match crate::core::ebpf::features::inspect_service_account() {
+        Some(account) => {
+            if let Some(reason) = account.rejection() {
+                return Err(format!(
+                    "refusing to install: the pre-existing 'albus' account is not a \
+                     dedicated system service account ({reason}). albus runs with six \
+                     ambient capabilities and holds unauthenticated polkit resolve1 \
+                     grants, so it must be a locked, non-login, non-root system account \
+                     with no supplementary groups. Reconcile the account first (or \
+                     remove it and re-run), or point albus at a different name.",
+                )
+                .into());
+            }
+            // Usable as-is. The group is still checked below, because a missing
+            // group is a startup failure rather than an identity problem.
+            ensure_service_group()?;
+            return Ok(());
+        }
+        None => {}
     }
+
     let create = std::process::Command::new("/usr/sbin/useradd")
         .args([
             "--system",
@@ -335,6 +379,10 @@ fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
             "/usr/sbin/nologin",
             "--comment",
             "albus DPI evasion daemon",
+            // SUPPLY-04: the unit declares Group=albus, but useradd without
+            // -g/-U relies on USERGROUPS_ENAB; where that is off the account
+            // lands in the default group and the unit fails to start.
+            "--user-group",
             "albus",
         ])
         .status()?;
@@ -344,31 +392,142 @@ fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     Ok(())
 }
 
+/// Ensures the `albus` group exists, so the unit's `Group=albus` can always
+/// start the daemon. SUPPLY-04: `useradd` was invoked with neither `-g` nor
+/// `-U`, so on a distro with `USERGROUPS_ENAB no` the account landed in the
+/// default group.
+fn ensure_service_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Absolute path, no shell, fixed argv.
+    let ok = std::process::Command::new("/usr/bin/getent")
+        .args(["group", "albus"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        return Ok(());
+    }
+    let created = std::process::Command::new("/usr/sbin/groupadd")
+        .args(["--system", "albus"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !created {
+        return Err("failed to create the albus system group (Group=albus in the unit)".into());
+    }
+    Ok(())
+}
+
 /// Ensures daemon-managed directories exist with service-user ownership.
 /// Pre-existing content is never deleted or re-permissioned file-by-file:
 /// only the top directory ownership is converged (root-owned leftovers
 /// from pre-migration installs become daemon-writable this way).
 fn ensure_service_dirs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_service_dirs_at(Path::new("/etc/albus"))
+}
+
+/// W5-01: this is the one privileged writer in service.rs that had none of the
+/// confinement `secure_write_root_file` applies to both artifacts install
+/// writes. Specifically:
+///
+///   * `Path::exists()` follows symlinks, so a symlinked `/etc/albus` passed the
+///     existence gate;
+///   * `libc::chown` also follows symlinks, so it would hand ownership of
+///     whatever the link resolved to — potentially a whole tree outside /etc —
+///     to the service account;
+///   * no ancestor was checked, so `/etc` itself being a link went unnoticed;
+///   * `set_permissions(0o755)` lived inside the `!exists()` branch, so a
+///     pre-existing directory kept whatever mode it had — including 0777.
+///
+/// That chown is load-bearing: `is_trusted_system_uid` blesses service-uid-owned
+/// system paths in four places (`check_parent_ownership`, `check_write_owner`,
+/// `safe_read`, and `load_from_file_root_checked` — the gate on the
+/// root-privileged `--config` path). So "owns /etc/albus" versus "owns whatever
+/// the symlink pointed at" is a boundary crossing, not a cosmetic difference.
+fn ensure_service_dirs_at(dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The account the directory is handed to. Resolved once, here, so the
+    // confinement logic below can be exercised without root.
+    let owner = std::ffi::CString::new("albus").ok().and_then(|c| unsafe {
+        let pwd = libc::getpwnam(c.as_ptr());
+        if pwd.is_null() {
+            None
+        } else {
+            Some(((*pwd).pw_uid, (*pwd).pw_gid))
+        }
+    });
+    converge_service_dir(dir, owner)
+}
+
+/// The confinement and ownership convergence for the service config directory,
+/// with the target owner injected.
+///
+/// W5-01, see `ensure_service_dirs` for the finding. The chown is separated from
+/// the checks so the checks — symlink rejection, O_NOFOLLOW open, fstat, mode
+/// convergence — are testable without root, which is the only way they can be
+/// regression-tested at all.
+fn converge_service_dir(
+    dir: &Path,
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
-    let etc_albus = Path::new("/etc/albus");
-    if !etc_albus.exists() {
-        fs::create_dir_all(etc_albus)?;
-        fs::set_permissions(etc_albus, fs::Permissions::from_mode(0o755))?;
+
+    // The crate already has this helper and already applies it to every file it
+    // writes; the chown was simply never brought under it.
+    reject_symlink_chain(dir)?;
+
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
     }
-    // converge top-dir ownership to the service user when the account exists
-    if let Ok(c_user) = std::ffi::CString::new("albus") {
-        unsafe {
-            let pwd = libc::getpwnam(c_user.as_ptr());
-            if !pwd.is_null() {
-                let (uid, gid) = ((*pwd).pw_uid, (*pwd).pw_gid);
-                // chown the DIRECTORY (not recursive): files keep their
-                // owners; the daemon only needs traversal + its own files
-                if let Ok(c_dir) = std::ffi::CString::new("/etc/albus") {
-                    if libc::chown(c_dir.as_ptr(), uid, gid) != 0 {
-                        return Err("failed to chown /etc/albus to the albus user".into());
-                    }
-                }
-            }
+
+    // Open the directory itself with O_NOFOLLOW|O_DIRECTORY, then fstat and
+    // fchown THROUGH THE FD. The fd is the object that was validated, so there
+    // is no window between "checked" and "mutated" — the pattern
+    // `secure_write_root_file` already uses.
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)
+            .map_err(|e| {
+                format!(
+                    "refusing to operate on {}: {} (not a directory, or a symlink)",
+                    dir.display(),
+                    e
+                )
+            })?
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_dir() {
+        return Err(format!("security violation: {} is not a directory", dir.display()).into());
+    }
+
+    // W5-01: the mode is converged on EVERY install, not only when the directory
+    // is newly created. A pre-existing 0777 /etc/albus is exactly the case this
+    // misses today.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let now = fs::metadata(dir)?.permissions().mode() & 0o7777;
+        if now & 0o022 != 0 {
+            return Err(format!(
+                "failed to converge the mode of {} to 0755 (still {:04o})",
+                dir.display(),
+                now
+            )
+            .into());
+        }
+    }
+
+    // Converge top-dir ownership to the service user. Through the validated fd,
+    // not through the path: a path-based chown follows symlinks, which is the
+    // W5-01 defect. `owner` is injected so the confinement checks around it are
+    // testable without root.
+    if let Some((uid, gid)) = owner {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        if unsafe { libc::fchown(fd, uid, gid) } != 0 {
+            return Err(format!("failed to chown {} to the albus user", dir.display()).into());
         }
     }
     Ok(())
@@ -430,7 +589,20 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/run /etc/resolv.conf /etc/albus
+# W2-01: this was the whole host /run. Under ProtectSystem=strict the
+# ReadWritePaths entries are the ONLY writable subtrees, and CAP_DAC_OVERRIDE
+# is in both capability lists, so granting all of /run removed the ownership
+# check from every file under it -- including other unprivileged principals'
+# /run/user/<uid> trees, systemd-resolved's runtime state and NetworkManager's.
+#
+# The daemon's actual /run remit is one file: /run/albus/config.json (plus the
+# per-uid variants), and systemd already excludes RuntimeDirectory paths from
+# ProtectSystem, so /run/albus is writable without a ReadWritePaths entry. The
+# resolver file is /run/systemd/resolve/stub-resolv.conf on a systemd-resolved
+# host (the /etc/resolv.conf entry follows the symlink), and is a regular
+# /etc file elsewhere. The leading `-` keeps the unit startable on a host
+# without systemd-resolved.
+ReadWritePaths=-/run/systemd/resolve /etc/resolv.conf /etc/albus
 
 [Install]
 WantedBy=multi-user.target
@@ -539,6 +711,51 @@ fn secure_remove_file(path: &str) -> Result<bool, Box<dyn std::error::Error + Se
     }
 }
 
+/// The final uninstall verdict, as a pure function of the four step outcomes.
+///
+/// SUPPLY-03: extracted so the decision is testable without root, a live
+/// packet filter, or a real systemd unit — the previous code computed four
+/// counters, discarded them, and printed the unqualified success string based
+/// on `dns_reverted` alone. The invariant is that *no* combination containing a
+/// failed step may yield the "system settings cleaned up" string, because that
+/// string is what an operator reads when deciding whether the host is safe.
+fn uninstall_message(
+    stop_ok: bool,
+    disable_ok: bool,
+    firewall_ok: bool,
+    dns_ok: bool,
+) -> &'static str {
+    if stop_ok && disable_ok && firewall_ok && dns_ok {
+        "albus service uninstalled and system settings cleaned up."
+    } else {
+        // Name every step that did not verify, so the operator knows which
+        // subsystem to go inspect instead of being told "check resolv.conf"
+        // when the problem is stranded DROP rules.
+        let mut bad: Vec<&str> = Vec::new();
+        if !stop_ok {
+            bad.push("unit stop");
+        }
+        if !disable_ok {
+            bad.push("unit disable");
+        }
+        if !firewall_ok {
+            bad.push("firewall revert");
+        }
+        if !dns_ok {
+            bad.push("DNS restore");
+        }
+        match bad.len() {
+            0 => "albus service uninstalled.",
+            1 => match bad[0] {
+                "firewall revert" => "albus service uninstalled BUT the firewall revert did not verify — residual albus rules may still block outbound traffic; check `sudo iptables -S OUTPUT | grep albus` and `sudo albus cleanup`.",
+                "DNS restore" => "albus service uninstalled BUT DNS restore failed — run `sudo albus cleanup` and verify /etc/resolv.conf.",
+                _ => "albus service uninstalled BUT the systemd unit could not be fully stopped/disabled — the daemon may still be running; check `systemctl status albus`.",
+            },
+            _ => "albus service uninstalled BUT some cleanup steps did not verify. Re-run `sudo albus cleanup`, then check `systemctl status albus`, `sudo iptables -S OUTPUT | grep albus` and /etc/resolv.conf.",
+        }
+    }
+}
+
 // uninstalls service unit and restores network state
 fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_root() {
@@ -548,30 +765,78 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // stop/disable/remove unit without exists() TOCTOU.
     // FP-03: surface stop/disable failures — they gate the ExecStopPost
     // mitigation, and silent success here used to mask persistent rules.
+    let mut stop_ok = true;
+    let mut disable_ok = true;
+    let mut firewall_ok = true;
     match systemctl().args(["stop", "albus.service"]).status() {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "warning: systemctl stop albus.service exited {} — continuing with explicit revert",
-            s
-        ),
-        Err(e) => eprintln!(
-            "warning: systemctl stop albus.service failed to spawn ({}) — continuing with explicit revert",
-            e
-        ),
+        Ok(s) => {
+            stop_ok = false;
+            eprintln!(
+                "warning: systemctl stop albus.service exited {} — continuing with explicit revert",
+                s
+            );
+        }
+        Err(e) => {
+            stop_ok = false;
+            eprintln!(
+                "warning: systemctl stop albus.service failed to spawn ({}) — continuing with explicit revert",
+                e
+            );
+        }
     }
     match systemctl().args(["disable", "albus.service"]).status() {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("warning: systemctl disable exited {}", s),
-        Err(e) => eprintln!("warning: systemctl disable failed to spawn ({})", e),
+        Ok(s) => {
+            disable_ok = false;
+            eprintln!("warning: systemctl disable exited {}", s);
+        }
+        Err(e) => {
+            disable_ok = false;
+            eprintln!("warning: systemctl disable failed to spawn ({})", e);
+        }
     }
 
     // FP-09: revert persistent network state FIRST, before any fallible file
     // or daemon housekeeping that could abort with `return Err` and strand it.
     // FP-10: report revert outcomes instead of assuming success.
-    let fw_removed = crate::core::firewall::unblock_quic()
-        + crate::core::firewall::unblock_stun()
-        + crate::core::firewall::disable_kill_switch()
-        + crate::core::firewall::disable_network_lockdown();
+    // SUPPLY-03: every revert step's outcome is now captured. Previously the
+    // four counters were summed and the result thrown away, so the final
+    // message was gated on `dns_reverted` alone and claimed the system was
+    // clean regardless of what the packet-filter layer did. `stop` failing is
+    // the sharpest case: that is precisely when ExecStopPost never ran, so this
+    // function's own revert is the only thing standing between the admin and
+    // stranded fail-closed DROP rules on outbound DNS.
+    let fw_removed = (|| -> usize {
+        let mut n = 0usize;
+        let steps: [(&str, crate::core::firewall::FwCount); 4] = [
+            ("unblock_quic", crate::core::firewall::unblock_quic()),
+            ("unblock_stun", crate::core::firewall::unblock_stun()),
+            (
+                "disable_kill_switch",
+                crate::core::firewall::disable_kill_switch(),
+            ),
+            (
+                "disable_network_lockdown",
+                crate::core::firewall::disable_network_lockdown(),
+            ),
+        ];
+        for (name, r) in steps {
+            match r {
+                Ok(k) => n += k,
+                Err(e) => {
+                    firewall_ok = false;
+                    eprintln!(
+                        "warning: firewall revert {} FAILED ({}): residual rules may \
+                         still block outbound traffic — check with \
+                         `sudo iptables -S OUTPUT | grep albus`",
+                        name, e
+                    );
+                }
+            }
+        }
+        n
+    })();
     println!("Removed {} firewall rule(s).", fw_removed);
     let dns_reverted = match crate::dns::cleanup_system_dns() {
         Ok(true) => {
@@ -596,25 +861,32 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(false) => println!("No albus.service file found at {}", SERVICE_FILE_PATH),
         Err(e) => return Err(e),
     }
+    // SUPPLY-03: the polkit rule is removed BEFORE the fallible daemon-reload.
+    // `?` used to abort there, stranding /etc/polkit-1/rules.d/albus.rules —
+    // which still carries `subject.user == "albus"` resolve1 grants — with no
+    // message naming it, on an uninstall that appeared to have failed.
+    match secure_remove_file(POLKIT_RULE_PATH) {
+        Ok(true) => println!("Removed {}", POLKIT_RULE_PATH),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "warning: could not remove {} ({}): the polkit grants it contains may still be in effect",
+            POLKIT_RULE_PATH, e
+        ),
+    }
+
     let reload = systemctl().arg("daemon-reload").status()?;
     if !reload.success() {
         return Err("systemctl daemon-reload failed during uninstall".into());
     }
 
-    match secure_remove_file(POLKIT_RULE_PATH) {
-        Ok(true) => println!("Removed {}", POLKIT_RULE_PATH),
-        Ok(false) => {}
-        Err(e) => return Err(e),
-    }
-
-    // FP-10: qualify the final message on the revert outcomes above.
-    if dns_reverted {
-        println!("albus service uninstalled and system settings cleaned up.");
-    } else {
-        println!(
-            "albus service uninstalled BUT DNS restore failed — run `sudo albus cleanup` and verify /etc/resolv.conf."
-        );
-    }
+    // FP-10 + SUPPLY-03: the final message is qualified on every revert
+    // outcome, not just DNS. A bare "cleaned up" while fail-closed DROP rules
+    // are still installed leaves the host with no working outbound network and
+    // no indication why.
+    println!(
+        "{}",
+        uninstall_message(stop_ok, disable_ok, firewall_ok, dns_reverted)
+    );
     // FP-04: the system binary is intentionally retained (lets the admin run
     // `sudo albus cleanup` afterwards); say so instead of implying full removal.
     println!(
@@ -679,14 +951,12 @@ fn reload_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn show_service_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new(SYSTEMCTL_BIN)
-        .args(["status", "albus.service"])
-        .status()?;
+    let _ = systemctl().args(["status", "albus.service"]).status()?;
     Ok(())
 }
 
 fn show_service_logs() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = Command::new(JOURNALCTL_BIN)
+    let _ = journalctl()
         .args(["-u", "albus.service", "-f", "-n", "50"])
         .status()?;
     Ok(())
@@ -706,7 +976,22 @@ mod tests {
         assert!(unit.contains("StateDirectory=albus\n"));
         assert!(unit.contains("Environment=HOME=/var/lib/albus\n"));
         assert!(unit.contains("ExecStopPost=+/usr/local/bin/albus cleanup\n"));
-        assert!(unit.contains("ReadWritePaths=/run /etc/resolv.conf /etc/albus\n"));
+        assert!(unit.contains(
+            "# W2-01: this was the whole host /run. Under ProtectSystem=strict the
+# ReadWritePaths entries are the ONLY writable subtrees, and CAP_DAC_OVERRIDE
+# is in both capability lists, so granting all of /run removed the ownership
+# check from every file under it -- including other unprivileged principals'
+# /run/user/<uid> trees, systemd-resolved's runtime state and NetworkManager's.
+#
+# The daemon's actual /run remit is one file: /run/albus/config.json (plus the
+# per-uid variants), and systemd already excludes RuntimeDirectory paths from
+# ProtectSystem, so /run/albus is writable without a ReadWritePaths entry. The
+# resolver file is /run/systemd/resolve/stub-resolv.conf on a systemd-resolved
+# host (the /etc/resolv.conf entry follows the symlink), and is a regular
+# /etc file elsewhere. The leading `-` keeps the unit startable on a host
+# without systemd-resolved.
+ReadWritePaths=-/run/systemd/resolve /etc/resolv.conf /etc/albus\n"
+        ));
         assert!(unit.contains("AmbientCapabilities=CAP_NET_ADMIN"));
         assert!(unit.contains("ExecStart=/usr/local/bin/albus run\n"));
         // management stays root-gated in code (unit has no User= bypass)
@@ -829,5 +1114,482 @@ mod install_hardening_tests {
         let meta = fs::symlink_metadata(&p).expect("meta");
         assert_eq!(meta.len(), 0);
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod spawn_chokepoint_tests {
+    /// W1-02: `env_clear` + a pinned PATH must hold for EVERY privileged
+    /// systemctl/journalctl spawn, not just the ones that happened to remember.
+    ///
+    /// The finding was that the correct helper existed and was bypassed at four
+    /// sites, so the discipline was per-call-site and had already drifted. This
+    /// test walks the real source files so a future direct `Command::new` cannot
+    /// reintroduce an inherited environment without failing here.
+    #[test]
+    fn test_no_privileged_spawn_bypasses_the_chokepoint() {
+        let files: &[(&str, &str)] = &[
+            ("src/main.rs", include_str!("../main.rs")),
+            ("src/app/monitor.rs", include_str!("monitor.rs")),
+            ("src/app/status.rs", include_str!("status.rs")),
+            ("src/app/service.rs", include_str!("service.rs")),
+        ];
+
+        // The only legal literals are the two constants and the two helper
+        // bodies themselves.
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, src) in files {
+            // strip test modules: they quote the needles as assertions
+            let prod = src
+                .split_once("#[cfg(test)]")
+                .map(|(p, _)| p)
+                .unwrap_or(src);
+            for needle in [
+                "Command::new(\"/usr/bin/systemctl\")",
+                "Command::new(\"/usr/bin/journalctl\")",
+                "Command::new(SYSTEMCTL_BIN)",
+                "Command::new(JOURNALCTL_BIN)",
+            ] {
+                let mut from = 0usize;
+                while let Some(at) = prod[from..].find(needle) {
+                    let abs = from + at;
+                    // the single permitted occurrence per helper: the
+                    // nearest helper header above us, with no other header in
+                    // between. Taking max() of both rfinds matters — checking
+                    // systemctl first would misattribute journalctl's body to
+                    // systemctl's header.
+                    let last_header = prod[..abs]
+                        .rfind("pub fn systemctl()")
+                        .into_iter()
+                        .chain(prod[..abs].rfind("pub fn journalctl()"))
+                        .max();
+                    let in_helper = last_header
+                        .map(|h| abs > h && prod[h..abs].find("\npub fn ").is_none())
+                        .unwrap_or(false);
+                    if !in_helper {
+                        let line = prod[..abs].lines().count();
+                        offenders.push(format!("{}:{} {}", name, line, needle));
+                    }
+                    from = abs + needle.len();
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "privileged spawns must go through systemctl()/journalctl(): {}",
+            offenders.join(", ")
+        );
+    }
+
+    /// And the helpers themselves must actually clear the environment.
+    #[test]
+    fn test_chokepoint_helpers_clear_the_environment() {
+        let src = include_str!("service.rs");
+        for helper in ["pub fn systemctl()", "pub fn journalctl()"] {
+            let at = src
+                .find(helper)
+                .unwrap_or_else(|| panic!("{} not found", helper));
+            let body = &src[at..(at + 400).min(src.len())];
+            let end = body.find("\n}").unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("env_clear()"),
+                "{} must clear the environment: {}",
+                helper,
+                body
+            );
+            assert!(body.contains("PATH"), "{} must pin PATH: {}", helper, body);
+        }
+    }
+}
+
+#[cfg(test)]
+mod uninstall_outcome_tests {
+    use super::*;
+
+    const CLEAN: &str = "albus service uninstalled and system settings cleaned up.";
+
+    /// SUPPLY-03: no combination containing a failed step may produce the
+    /// unqualified "cleaned up" string. On unpatched source the message was
+    /// gated on `dns_reverted` alone, so a failed firewall revert — which is
+    /// exactly the case where `systemctl stop` failed and therefore
+    /// ExecStopPost never ran — still told the operator the host was clean.
+    #[test]
+    fn test_no_failed_step_yields_the_clean_message() {
+        assert_eq!(uninstall_message(true, true, true, true), CLEAN);
+
+        let failures = [
+            (false, true, true, true), // stop
+            (true, false, true, true), // disable
+            (true, true, false, true), // firewall revert
+            (true, true, true, false), // DNS restore
+            (false, true, false, true),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, false, false, true),
+            (false, false, false, false),
+        ];
+        for (stop, disable, fw, dns) in failures {
+            let msg = uninstall_message(stop, disable, fw, dns);
+            assert_ne!(
+                msg, CLEAN,
+                "stop={} disable={} fw={} dns={} must not claim a clean uninstall",
+                stop, disable, fw, dns
+            );
+            assert!(
+                !msg.contains("cleaned up"),
+                "a failed step must not produce 'cleaned up': {}",
+                msg
+            );
+        }
+    }
+
+    /// The message must name the subsystem that failed, because "check
+    /// resolv.conf" is the wrong advice when the problem is stranded DROP
+    /// rules on outbound DNS.
+    #[test]
+    fn test_message_names_the_failing_subsystem() {
+        let fw = uninstall_message(true, true, false, true);
+        assert!(fw.contains("firewall"), "{}", fw);
+        assert!(
+            fw.contains("iptables"),
+            "must say how to inspect it: {}",
+            fw
+        );
+
+        let dns = uninstall_message(true, true, true, false);
+        assert!(dns.contains("resolv.conf"), "{}", dns);
+
+        let unit = uninstall_message(false, true, true, true);
+        assert!(unit.contains("systemctl status albus"), "{}", unit);
+
+        // Multiple failures get the combined instruction.
+        let multi = uninstall_message(false, true, false, false);
+        assert!(multi.contains("albus cleanup"), "{}", multi);
+        assert!(!multi.contains("cleaned up"), "{}", multi);
+    }
+
+    /// And the message must not be silent about what it could not verify.
+    #[test]
+    fn test_failure_messages_are_actionable() {
+        for (stop, disable, fw, dns) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
+            let msg = uninstall_message(stop, disable, fw, dns);
+            assert!(
+                msg.contains("BUT") || msg.contains("INCOMPLETE"),
+                "failure message must be visibly qualified: {}",
+                msg
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod panel_truthfulness_tests {
+    /// CLI-01 / W6-01: the panel's privileged controls must not claim more than
+    /// they do. These assertions read the real Panel.qml so the labels and
+    /// toasts cannot drift back into lying.
+    const PANEL: &str = include_str!("../../Panel.qml");
+
+    /// W6-01: the flush handler used to ignore its exit code and always say
+    /// "flushed", which fired identically on a polkit denial.
+    #[test]
+    fn test_flush_toast_is_bound_to_the_exit_code() {
+        let at = PANEL.find("id: flushCacheProc").expect("flushCacheProc");
+        let block = &PANEL[at..(at + 900).min(PANEL.len())];
+        assert!(
+            block.contains("onExited: function(code)"),
+            "flush handler must receive the exit code"
+        );
+        assert!(
+            block.contains("code === 0"),
+            "flush handler must branch on the exit code"
+        );
+        assert!(
+            block.contains("Cache flush failed"),
+            "flush handler must report failure: {}",
+            block
+        );
+    }
+
+    /// CLI-01: the button was labelled "Restart Service" but its first action is
+    /// a root write of /etc/albus/config.json behind pkexec.
+    #[test]
+    fn test_apply_button_does_not_mislabel_its_privileged_write() {
+        assert!(
+            !PANEL.contains("\"Restart Service\""),
+            "the button must not claim to be a plain service restart"
+        );
+        assert!(
+            PANEL.contains("\"Apply & Restart\""),
+            "the button should say what it does"
+        );
+    }
+
+    /// CLI-01: `daemonActionProc` discarded its exit code too, so a denied
+    /// restart left the previous "applied" toast standing.
+    #[test]
+    fn test_restart_result_is_not_discarded() {
+        let at = PANEL
+            .find("id: daemonActionProc")
+            .expect("daemonActionProc");
+        let block = &PANEL[at..(at + 800).min(PANEL.len())];
+        assert!(
+            block.contains("code === 0"),
+            "the restart result must be inspected: {}",
+            block
+        );
+        assert!(
+            block.contains("restart failed"),
+            "a failed restart must be reported: {}",
+            block
+        );
+    }
+
+    /// CLI-01: the bare `r` key authorised a privileged write with nothing on
+    /// screen. It must now announce itself before it prompts.
+    #[test]
+    fn test_privileged_key_shortcut_is_not_silent() {
+        let key = PANEL
+            .find(r#"t === "r" || t === "R""#)
+            .expect("the R shortcut handler");
+        // Bounded by the NEXT shortcut handler, so this cannot drift onto an
+        // unrelated applySystemWide call further down the file.
+        let tail = &PANEL[key..];
+        let next_handler = tail.find("else if").unwrap_or(tail.len());
+        let handler = &tail[..next_handler];
+        assert!(
+            handler.contains("showToast"),
+            "the R shortcut must announce the privileged action before prompting: {}",
+            handler
+        );
+        assert!(
+            handler.contains("applySystemWide"),
+            "the R shortcut must still reach applySystemWide: {}",
+            handler
+        );
+    }
+
+    /// W6-02: no hidden right-click privileged action on the status icon.
+    #[test]
+    fn test_status_icon_has_no_hidden_privileged_action() {
+        let bar = include_str!("../../BarWidget.qml");
+        assert!(
+            !bar.contains("Qt.RightButton"),
+            "the status icon must not branch on the right mouse button"
+        );
+        assert!(
+            !bar.contains("toggleDaemon"),
+            "the status icon must not reach a privileged lifecycle action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_dirs_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("albus-svcdirs-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    /// The symlinked-leaf case. `Path::exists()` follows symlinks and
+    /// `libc::chown` follows symlinks, so before the fix a symlinked
+    /// /etc/albus would have been chowned — handing the whole target tree to
+    /// the service account, which `is_trusted_system_uid` then treats as
+    /// trusted for system paths in four places.
+    #[test]
+    fn test_symlinked_directory_is_refused() {
+        let d = tmpdir("symlink");
+        let real = d.join("real");
+        fs::create_dir_all(&real).expect("real");
+        let link = d.join("etc-albus");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let r = converge_service_dir(&link, None);
+        assert!(
+            r.is_err(),
+            "W5-01: a symlinked service directory must be refused, not chowned"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A symlinked ANCESTOR must be refused too — rejecting only the leaf leaves
+    /// `/etc` itself replaceable.
+    #[test]
+    fn test_symlinked_ancestor_is_refused() {
+        let d = tmpdir("ancestor");
+        let real = d.join("real");
+        fs::create_dir_all(real.join("albus")).expect("real/albus");
+        let link = d.join("etc-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let r = converge_service_dir(&link.join("albus"), None);
+        assert!(
+            r.is_err(),
+            "W5-01: a symlink anywhere in the chain must be refused"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A regular file where a directory belongs.
+    #[test]
+    fn test_regular_file_is_refused() {
+        let d = tmpdir("file");
+        let f = d.join("etc-albus");
+        fs::write(&f, b"not a directory").expect("write");
+
+        assert!(
+            converge_service_dir(&f, None).is_err(),
+            "a non-directory must be refused"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The residual variant that needs no privilege at all: a pre-existing
+    /// 0777 directory kept its mode forever, because `set_permissions(0o755)`
+    /// was inside the `!exists()` branch.
+    #[test]
+    fn test_preexisting_world_writable_directory_is_converged_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("mode");
+        let dir = d.join("etc-albus");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod 777");
+
+        converge_service_dir(&dir, None).expect("must succeed");
+
+        let mode = fs::metadata(&dir).expect("meta").permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "W5-01: the mode must be converged on every install, not only on creation"
+        );
+        assert_eq!(mode & 0o022, 0, "no group/world write may remain");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The positive control: a plain directory is created if absent and
+    /// converged if present.
+    #[test]
+    fn test_plain_directory_is_accepted() {
+        let d = tmpdir("plain");
+        let dir = d.join("etc-albus");
+
+        converge_service_dir(&dir, None).expect("must create");
+        assert!(dir.is_dir());
+
+        // idempotent
+        converge_service_dir(&dir, None).expect("second call must succeed");
+
+        // And with an owner, the chown goes through the validated fd.
+        let me = unsafe { (libc::getuid(), libc::getgid()) };
+        converge_service_dir(&dir, Some(me)).expect("chown to self must succeed");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Regression guards on the source: the two shapes that carried the defect
+    /// must not come back.
+    #[test]
+    fn test_no_symlink_following_gate_or_path_chown() {
+        let src = include_str!("service.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\nmod service_dirs_tests")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let at = prod.find("fn converge_service_dir(").expect("the function");
+        let tail = &prod[at..];
+        let end = tail
+            .find("\n/// Renders the systemd unit template")
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+
+        assert!(
+            body.contains("reject_symlink_chain("),
+            "the helper the crate already has must be applied here"
+        );
+        assert!(
+            body.contains("O_NOFOLLOW"),
+            "the directory must be opened with O_NOFOLLOW"
+        );
+        assert!(
+            body.contains("libc::fchown("),
+            "the chown must go through the validated fd; a path-based chown follows \\
+             symlinks"
+        );
+        assert!(
+            !body.contains("libc::chown("),
+            "a path-based chown must not remain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_assertion_hygiene {
+    /// A source-assertion test that splits on `"\n#[cfg(test)] mod X"` — note the
+    /// SPACE — never matches, because the real text has a newline there. The
+    /// marker then silently falls through to `unwrap_or(src)`, so `prod` becomes
+    /// the WHOLE FILE including the test modules: every `prod.contains(...)`
+    /// assertion passes vacuously and every `!prod.contains(...)` assertion
+    /// fails for the wrong reason (it is matching the assertion's own text).
+    ///
+    /// That happened three separate times in this repository, each time silently
+    /// weakening a security regression test. This pins the shape so it cannot
+    /// recur: any such marker must contain a real newline between `]` and
+    /// `mod`.
+    #[test]
+    fn test_no_source_assertion_splits_on_a_marker_that_cannot_match() {
+        const FILES: &[&str] = &[
+            include_str!("service.rs"),
+            include_str!("monitor.rs"),
+            include_str!("status.rs"),
+            include_str!("../core/engine.rs"),
+            include_str!("../core/firewall.rs"),
+            include_str!("../core/ebpf/loader.rs"),
+            include_str!("../core/ebpf/manager.rs"),
+            include_str!("../core/ebpf/features.rs"),
+            include_str!("../dns/server.rs"),
+            include_str!("../dns/system.rs"),
+            include_str!("../dns/dnssec.rs"),
+            include_str!("../dns/doh.rs"),
+            include_str!("../dns/cache.rs"),
+            include_str!("config.rs"),
+        ];
+
+        for src in FILES {
+            for (i, line) in src.lines().enumerate() {
+                let Some(start) = line.find("split_once(\"") else {
+                    continue;
+                };
+                let rest = &line[start + "split_once(\"".len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let marker = &rest[..end];
+                if !marker.contains("cfg(test)") {
+                    continue;
+                }
+                assert!(
+                    !marker.contains("] mod "),
+                    "line {}: marker {:?} puts a SPACE where a newline belongs, so \\
+                     it can never match and `prod` silently becomes the whole file",
+                    i + 1,
+                    marker
+                );
+            }
+        }
     }
 }

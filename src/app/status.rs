@@ -92,10 +92,8 @@ fn pid_is_verified_albus(pid: u32, self_exe: &Option<std::path::PathBuf>, my_pid
 
 // generates structured json payload consumed by desktop panels and status bars
 pub fn show_status_json() {
-    let is_service_active = Command::new("/usr/bin/systemctl")
+    let is_service_active = crate::app::service::systemctl()
         .args(["is-active", "--quiet", "albus.service"])
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .status()
         .map(|s| s.success())
         .unwrap_or(false);

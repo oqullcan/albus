@@ -72,6 +72,16 @@ impl DnsCache {
     }
 
     // clears all entries from the in-memory cache
+    /// Number of live entries. Useful for operator-visible flush confirmation:
+    /// "flushed N" is only truthful if something can be counted.
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn clear(&self) {
         if let Ok(mut map) = self.entries.lock() {
             map.clear();
