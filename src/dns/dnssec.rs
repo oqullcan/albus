@@ -365,12 +365,67 @@ impl DnssecValidator {
             .iter()
             .filter(|r| r.record_type() == RecordType::NSEC)
             .collect();
-        if nsecs.is_empty() {
-            // NSEC3-only, or nothing usable.
+        let nsec3s: Vec<&Record> = denial
+            .iter()
+            .filter(|r| r.record_type() == RecordType::NSEC3)
+            .collect();
+
+        // A mixed NSEC + NSEC3 answer: neither can be said to be the intended
+        // proof, so believe neither.
+        if !nsecs.is_empty() && !nsec3s.is_empty() {
             return false;
         }
-        if denial.iter().any(|r| r.record_type() == RecordType::NSEC3) {
-            // A mixed answer we cannot fully evaluate is not a proof.
+
+        // ---- NSEC3 path (RFC 5155 §8.5) -------------------------------------
+        //
+        // Not hypothetical: `com.` is NSEC3-signed with opt-out, so a real
+        // insecure delegation such as chatgpt.com is denied with NSEC3 and
+        // nothing else. The first version of this fix refused NSEC3 outright,
+        // which turned every such zone Bogus — SERVFAIL for every client, on a
+        // zone that is genuinely fine.
+        //
+        // What IS verified here, and is not merely the resolver's word:
+        //   * the NSEC3 RRset carries an RRSIG made by the PARENT's key. The
+        //     signature covers the canonical NSEC3 RDATA we already parsed, so
+        //     verifying it needs no hashing implementation;
+        //   * the signer is the parent zone itself;
+        //   * the opt-out flag is set — that flag is the mechanism by which a
+        //     signed parent asserts "delegations under this hash may be
+        //     unsigned", so a plain NSEC3 here would prove nothing about DS.
+        //
+        // KNOWN GAP, deliberately not papered over: this does not recompute the
+        // NSEC3 hash to prove the record actually COVERS this delegation's
+        // next-closer name. Until the closest-encloser walk lands, a hostile
+        // resolver could replay a DIFFERENT validly-signed NSEC3 from the same
+        // parent and have it accepted. That is a far narrower attack than the
+        // defect this replaced — the previous code accepted a bare SOA, which
+        // anyone can fabricate — but it is not zero, and it is the same reason
+        // the answer-path NSEC3 denial is still capped at Indeterminate.
+        if nsecs.is_empty() {
+            if nsec3s.is_empty() {
+                return false;
+            }
+            let sigs3 = Self::rrsig_records(denial, RecordType::NSEC3);
+            if sigs3.is_empty() {
+                return false;
+            }
+            for n3 in &nsec3s {
+                let RData::DNSSEC(DNSSECRData::NSEC3(rec)) = &n3.data else {
+                    continue;
+                };
+                if !rec.opt_out() {
+                    continue;
+                }
+                for sig in &sigs3 {
+                    if let Some(signer) =
+                        self.verify_rrset(&n3.name, &[(*n3).clone()], sig, parent_dnskeys, now)
+                    {
+                        if name_eq(&signer, parent) {
+                            return true;
+                        }
+                    }
+                }
+            }
             return false;
         }
 
