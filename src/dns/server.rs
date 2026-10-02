@@ -12,6 +12,36 @@ use super::dnssec::{DnssecState, DnssecValidator};
 use super::doh::DoHResolver;
 use super::ech::EchConfigCache;
 
+/// Strips terminal control sequences and invisible formatting characters from a
+/// value that is about to be written to the log.
+///
+/// CLI-02: the journal-read path (`strip_ansi`) only sees bytes that came back
+/// out of systemd-journald. A CLI-supplied string never travels that path, so a
+/// value logged verbatim is a live log-forgery primitive: ANSI CSI/OSC can
+/// rewrite what an operator believes the line said, and BiDi overrides reorder
+/// it without a single control byte. Bounded to 200 chars so a hostile argument
+/// cannot flood the journal.
+pub(crate) fn sanitize_log_token(s: &str) -> String {
+    let stripped = crate::app::monitor::strip_ansi(s);
+    let mut out = String::with_capacity(stripped.len().min(200));
+    for c in stripped.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if matches!(
+            c,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}'
+        ) {
+            continue;
+        }
+        if out.len() >= 200 {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 // local dns server instance wrapping doh client pool and response cache
 pub struct DnsServer {
     resolver: DoHResolver,
@@ -76,7 +106,11 @@ impl DnsServer {
 
         info!(
             addr = "127.0.0.1:53",
-            upstream = %self.upstream_desc,
+            // CLI-02: `upstream_desc` is verbatim CLI input. Without this it can
+            // inject terminal control sequences and BiDi overrides into the log
+            // line -- `strip_ansi` on the journal-read path (the other half of
+            // this control) never sees text that only ever reached the logger.
+            upstream = %sanitize_log_token(&self.upstream_desc),
             block_ipv6 = self.block_ipv6,
             dnssec = self.dnssec,
             pqc = self.pqc,
@@ -1610,6 +1644,60 @@ mod admission_control_tests {
         assert_eq!(
             survivors, 1024,
             "a full cache of fresh verdicts must not be wiped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_sanitization_tests {
+    use super::sanitize_log_token;
+
+    /// CLI-02: a CLI-supplied upstream string is logged verbatim by the server.
+    /// Anything that can rewrite what an operator sees on the terminal must not
+    /// survive into the log line.
+    #[test]
+    fn test_sanitize_log_token_kills_forgery() {
+        // CSI: colour + cursor/erase control, then forged "upstream" text
+        let out = sanitize_log_token("\u{1b}[31mhttps://evil\u{1b}[0m");
+        assert!(
+            !out.contains('\u{1b}'),
+            "ANSI escape must be stripped, got {out:?}"
+        );
+        assert!(!out.contains("[31m"), "CSI sequence body must be gone");
+
+        // OSC: set terminal title -- can rewrite a shell prompt, not just a line
+        let out = sanitize_log_token("\u{1b}]0;pwned\u{07}quic");
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{07}'));
+
+        // BiDi override: reorders displayed text with zero control bytes
+        let out = sanitize_log_token("safe\u{202E}reversed");
+        assert!(!out.contains('\u{202E}'), "BiDi override must be removed");
+
+        // RLO/LRO/PDF range and zero-width joiners
+        for c in ['\u{202A}', '\u{2066}', '\u{200B}', '\u{FEFF}'] {
+            let out = sanitize_log_token(&format!("a{c}b"));
+            assert!(
+                !out.contains(c),
+                "invisible char U+{:04X} must go",
+                c as u32
+            );
+        }
+
+        // ordinary value must pass through untouched
+        assert_eq!(
+            sanitize_log_token("https://dns.google/dns-query"),
+            "https://dns.google/dns-query"
+        );
+    }
+
+    /// A hostile argument must not be able to flood the journal.
+    #[test]
+    fn test_sanitize_log_token_is_bounded() {
+        let out = sanitize_log_token(&"A".repeat(100_000));
+        assert!(
+            out.len() <= 200,
+            "log token must be bounded, got {} chars",
+            out.len()
         );
     }
 }

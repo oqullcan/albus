@@ -25,7 +25,7 @@ use std::time::Duration;
 /// Reachability today is blocked upstream by `label_is_safe` in the DNS parser,
 /// so this is defence in depth: the invariant should not depend on a filter
 /// that lives in an unrelated file staying strict.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     /// Longest run of ESC-sequence body bytes we will skip before deciding the
     /// input is not a sequence we understand. Without a bound, a bare ESC
     /// mid-line would swallow the entire remainder of the line.
