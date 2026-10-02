@@ -689,7 +689,13 @@ pub fn parse_dns_response(data: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
 // case-insensitive). Real wire hostnames are LDH/punycode, so nothing
 // legitimate is lost and whole homograph/confusable classes (Cf/Zl/Zp,
 // controls, bidi) die at once — no denylist to outdate.
-fn label_is_safe(label: &str) -> bool {
+//
+// Shared with `cache::extract_query_key`: a DNS name that may become a cache
+// key, a queue entry or a log field must satisfy ONE policy. When this
+// filter lived only in the response parser, `extract_query_key` was a second,
+// laxer parser of the same question section and two distinct questions could
+// collapse onto a single `DnsCacheKey`.
+pub(crate) fn label_is_safe(label: &str) -> bool {
     !label.is_empty()
         && label
             .bytes()

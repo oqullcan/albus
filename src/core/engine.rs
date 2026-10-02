@@ -104,20 +104,67 @@ impl Engine {
             );
         }
 
+        // EBPF-01: every firewall control below is now fallible, and the
+        // `applied_*` flags and the "... ACTIVE" journal lines are bound to the
+        // kernel-side outcome. Previously these calls returned `()`, so a
+        // non-zero iptables exit (xtables lock contention, a legacy/nft
+        // backend mismatch, a missing xt_comment or REJECT target, a rejected
+        // transaction) was indistinguishable from success and the daemon
+        // recorded a lie the operator would later read as the control being in
+        // place.
+
         // 1. insert iptables rules dropping udp 443 (quic fallback) and stun ports (webrtc leak protection)
+        //
+        // QUIC forcing and STUN blocking are evasion *hygiene*, not a
+        // confidentiality control: if the kernel refuses them the daemon is
+        // still correct, just less opaque. Warn with the real reason, leave
+        // applied_* false, and keep going.
         if self.cfg.block_quic {
-            block_quic();
-            self.applied_quic = true;
+            match block_quic() {
+                Ok(()) => self.applied_quic = true,
+                Err(e) => warn!(
+                    "QUIC (UDP 443) block NOT installed ({}). DPI evasion is degraded, \
+                     but DNS confidentiality is unaffected; continuing.",
+                    e
+                ),
+            }
         }
         if self.cfg.block_stun {
-            block_stun();
-            self.applied_stun = true;
+            match block_stun() {
+                Ok(()) => self.applied_stun = true,
+                Err(e) => warn!(
+                    "WebRTC STUN block NOT installed ({}). Browser IP leakage \
+                     protection is unavailable; continuing.",
+                    e
+                ),
+            }
         }
 
         // 2. kill-switch applies even without DoH (fail-closed for plaintext DNS)
+        //
+        // This one IS a confidentiality control, and it can be the only one --
+        // that is the whole point of "applies even without DoH". Continuing
+        // after a failed install would point /etc/resolv.conf at the daemon
+        // while non-loopback plaintext DNS is wide open, and then log
+        // "Kill-Switch ACTIVE". Abort instead: this runs BEFORE resolv.conf is
+        // touched, so the machine is left exactly as we found it rather than
+        // half-configured, and the operator gets the kernel-side reason.
         if self.cfg.kill_switch {
-            enable_kill_switch();
-            self.applied_kill = true;
+            match enable_kill_switch() {
+                Ok(()) => self.applied_kill = true,
+                Err(e) => {
+                    // Undo whatever did install, so we do not leave a partial
+                    // kill-switch behind on the way out.
+                    disable_kill_switch();
+                    return Err(format!(
+                        "DNS kill-switch requested but the packet filter refused the rule \
+                         ({}). Refusing to start and claim plaintext DNS is blocked when \
+                         it is not. Your DNS configuration is unchanged.",
+                        e
+                    )
+                    .into());
+                }
+            }
         }
 
         // 3. bind udp listener on 127.0.0.1:53 and update /etc/resolv.conf
@@ -146,7 +193,25 @@ impl Engine {
                     e
                 );
                 if self.cfg.network_lockdown {
-                    enable_network_lockdown();
+                    // Lockdown is the last line of defence: with the eBPF engine
+                    // down it is the only thing standing between the user and an
+                    // unfragmented, undecoyed connection. If it cannot be
+                    // installed then there is no packet-level control at all,
+                    // and continuing would mean running with nothing while
+                    // reporting otherwise. Stop and say so.
+                    match enable_network_lockdown() {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.cleanup_firewall_only();
+                            return Err(format!(
+                                "eBPF DPI bypass is unavailable AND network lockdown could not \
+                                 be installed ({}). With no DPI bypass and no packet filter there \
+                                 is no protection left to provide; refusing to run.",
+                                e
+                            )
+                            .into());
+                        }
+                    }
                 } else {
                     warn!("network_lockdown is OFF — web traffic will flow without DPI bypass. Enable with --network-lockdown for fail-closed mode");
                 }
@@ -275,20 +340,32 @@ impl Engine {
     }
 
     fn cleanup_firewall_only(&mut self) {
+        // EBPF-01: the delete helpers return the number of rules they actually
+        // removed so a failed teardown is visible instead of silently leaving
+        // rules behind.
+        let mut removed = 0usize;
         if self.cfg.network_lockdown {
-            disable_network_lockdown();
+            removed += disable_network_lockdown();
         }
         if self.applied_kill {
-            disable_kill_switch();
+            removed += disable_kill_switch();
             self.applied_kill = false;
         }
         if self.applied_stun {
-            unblock_stun();
+            removed += unblock_stun();
             self.applied_stun = false;
         }
         if self.applied_quic {
-            unblock_quic();
+            removed += unblock_quic();
             self.applied_quic = false;
+        }
+        if self.applied_quic || self.applied_stun || self.applied_kill || self.cfg.network_lockdown
+        {
+            info!(
+                "firewall teardown removed {} albus rule(s) (bounded delete: residue, if \
+                 any, is pre-hardening comment-less and is documented, not blindly removed)",
+                removed
+            );
         }
     }
 

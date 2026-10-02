@@ -1,7 +1,7 @@
 //! rfc 8484 dns-over-https (doh) client implementation supporting preset and custom upstreams, ip bootstrapping, and post-quantum cryptography.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -136,6 +136,106 @@ fn is_blocked_bootstrap_ip(ip: &Ipv4Addr) -> bool {
     false
 }
 
+/// IPv6 counterpart of `is_blocked_bootstrap_ip`.
+///
+/// W3-01/W3-03: the crate had no IPv6 predicate at all, so every v6 ingress
+/// — a `[::1]` literal host, an `AAAA` answer, and the whole
+/// `extract_upstream_ips_v6` path that feeds the eBPF exclusion maps — was
+/// structurally unscreenable. Mirrors the v4 coverage: loopback, unspecified,
+/// multicast, link-local, unique-local, documentation, NAT64-mapped v4 and
+/// IPv4-mapped addresses (a mapped `::ffff:127.0.0.1` is loopback in v4 terms).
+fn is_blocked_bootstrap_ip_v6(ip: &Ipv6Addr) -> bool {
+    let s = ip.segments();
+
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+
+    // IPv4-mapped (::ffff:0:0/96) and NAT64-compatible (64:ff9b::/96) carry a
+    // v4 address that must be judged by the v4 rules, not waved through
+    // because it arrived wrapped in v6 syntax.
+    if let Some(v4) = ipv4_embedded_in(ip) {
+        return is_blocked_bootstrap_ip(&v4);
+    }
+
+    let (a, b) = (s[0], s[1]);
+    // fe80::/10 link-local
+    if (a & 0xffc0) == 0xfe80 {
+        return true;
+    }
+    // fc00::/7 unique-local
+    if (a & 0xfe00) == 0xfc00 {
+        return true;
+    }
+    // 2001:db8::/32 documentation
+    if a == 0x2001 && b == 0x0db8 {
+        return true;
+    }
+    // 2002::/16 6to4 wraps a v4 address in the next 32 bits (segments 1..2)
+    if a == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            (s[1] & 0xff) as u8,
+            (s[2] >> 8) as u8,
+            (s[2] & 0xff) as u8,
+        );
+        return is_blocked_bootstrap_ip(&v4);
+    }
+    false
+}
+
+/// Extracts the v4 address a v6 address stands for, when it stands for one at
+/// all. A wrapped loopback or metadata address must not be laundered into a
+/// public destination just by arriving in v6 syntax.
+fn ipv4_embedded_in(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    // ::ffff:a.b.c.d  (IPv4-mapped, ::ffff:0:0/96). The prefix is the first
+    // 96 bits, i.e. s[0..=5] with s[5] == 0xffff; the v4 is s[6],s[7].
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff {
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        ));
+    }
+    // 64:ff9b::/96 well-known NAT64 prefix
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        ));
+    }
+    None
+}
+
+/// The single value-level screen for a resolved DoH destination.
+///
+/// W3-01: `is_blocked_bootstrap_ip` was IPv4-only and was called on exactly
+/// two sites, both of which only walked the operator's `custom_bootstrap_ips`
+/// list. The address that actually receives every query comes from two other
+/// ingresses that were never screened — an IPv4 literal host and the
+/// `to_socket_addrs()` FQDN answers. So `--doh-upstream
+/// https://169.254.169.254/dns-query` was accepted, and the bootstrap pin that
+/// the module documents as its anti-hijack guarantee was free to point at the
+/// cloud metadata service. Applying the check to one ingress of a value and
+/// treating it as coverage of the value is the defect; this dispatches on the
+/// address that is about to become a network destination.
+fn is_blocked_bootstrap_addr(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_bootstrap_ip(v4),
+        IpAddr::V6(v6) => is_blocked_bootstrap_ip_v6(v6),
+    }
+}
+
+fn socket_addr_is_blocked(addr: &SocketAddr) -> bool {
+    match addr {
+        SocketAddr::V4(_) | SocketAddr::V6(_) => is_blocked_bootstrap_addr(&addr.ip()),
+    }
+}
+
 /// Fail-closed redirect policy for DoH upstreams.
 ///
 /// reqwest defaults to `Policy::limit(10)`: it happily follows a chain of up
@@ -183,6 +283,84 @@ pub struct SingleDoHClient {
     bootstrap_addrs: Vec<SocketAddr>,
 }
 
+/// Shared TLS client-config builder: classical-only when `pqc` is off,
+/// PQ-offering otherwise; optional ECH mode (forces TLS 1.3-only per RFC).
+
+/// Which key-exchange groups a `ClientConfig` may offer.
+///
+/// W3-02: `probe_pq_support` used to build its own provider inline, which made
+/// this module contain two independent `ClientConfig` construction sites and
+/// left the module's structural guard (a substring count of the reqwest
+/// client-builder call) blind to the rustls-shaped one. Encoding the policy
+/// instead of the mutation keeps one construction path.
+#[derive(Clone, Copy)]
+enum KxPolicy {
+    /// Everything the provider offers.
+    All,
+    /// Classical only — every post-quantum KEM removed.
+    ClassicalOnly,
+    /// PQ only — every classical group removed. Used by the capability probe,
+    /// which must prove the negotiated group actually was post-quantum.
+    PqOnly,
+}
+
+/// The single `ClientConfig` construction site in this module.
+///
+/// Both the query path and the PQ capability probe go through here, so the
+/// root store, the protocol-version policy and the kx-group policy cannot
+/// drift apart between the client that sends DNS queries and the client whose
+/// handshake result is the only runtime evidence of the tool's
+/// post-quantum claim.
+fn build_client_config(
+    policy: KxPolicy,
+    ech: Option<rustls::client::EchMode>,
+) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    match policy {
+        KxPolicy::All => {}
+        KxPolicy::ClassicalOnly => {
+            // enforce classical key exchange ONLY: eliminate all post-quantum KEMs
+            // (case-insensitive, covers ML-KEM / MLKEM / Kyber / X-Wing variants)
+            provider
+                .kx_groups
+                .retain(|kx| !is_pq_kx_group(&format!("{:?}", kx.name())));
+        }
+        KxPolicy::PqOnly => {
+            provider
+                .kx_groups
+                .retain(|kx| is_pq_kx_group(&format!("{:?}", kx.name())));
+        }
+    }
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let provider = std::sync::Arc::new(provider);
+    let builder = rustls::ClientConfig::builder_with_provider(provider);
+    let builder = match ech {
+        Some(mode) => builder.with_ech(mode)?,
+        None => builder.with_safe_default_protocol_versions()?,
+    };
+    let mut client_config = builder
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(client_config)
+}
+
+fn tls_client_config(
+    pqc: bool,
+    ech: Option<rustls::client::EchMode>,
+) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    build_client_config(
+        if pqc {
+            KxPolicy::All
+        } else {
+            KxPolicy::ClassicalOnly
+        },
+        ech,
+    )
+}
+
 impl SingleDoHClient {
     /// The one and only place a DoH `reqwest::Client` is constructed.
     ///
@@ -207,36 +385,6 @@ impl SingleDoHClient {
             .redirect(doh_redirect_policy())
     }
 
-    /// Shared TLS client-config builder: classical-only when `pqc` is off,
-    /// PQ-offering otherwise; optional ECH mode (forces TLS 1.3-only per RFC).
-    fn tls_client_config(
-        pqc: bool,
-        ech: Option<rustls::client::EchMode>,
-    ) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-        if !pqc {
-            // enforce classical key exchange ONLY: eliminate all post-quantum KEMs
-            // (case-insensitive, covers ML-KEM / MLKEM / Kyber / X-Wing variants)
-            provider
-                .kx_groups
-                .retain(|kx| !is_pq_kx_group(&format!("{:?}", kx.name())));
-        }
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let provider = std::sync::Arc::new(provider);
-        let builder = rustls::ClientConfig::builder_with_provider(provider);
-        let builder = match ech {
-            Some(mode) => builder.with_ech(mode)?,
-            None => builder.with_safe_default_protocol_versions()?,
-        };
-        let mut client_config = builder
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        Ok(client_config)
-    }
-
     pub fn new(
         upstream: &str,
         name: &str,
@@ -254,7 +402,7 @@ impl SingleDoHClient {
                 );
             }
         }
-        let client_config = Self::tls_client_config(pqc, None)?;
+        let client_config = tls_client_config(pqc, None)?;
 
         let mut builder = Self::hardened_builder(client_config);
 
@@ -294,6 +442,27 @@ impl SingleDoHClient {
                     }
                 }
 
+                // W3-01: screen the ASSEMBLED PIN, not the operator's list.
+                // Every DoH query is sent to these addresses, and two of the
+                // three ingresses above (a literal host, a resolver answer)
+                // were never range-checked, so `--doh-upstream
+                // https://127.0.0.1/dns-query` or a hostile/spoofed A record
+                // aimed the resolver at loopback or cloud metadata while the
+                // module logged the pin as an anti-hijack guarantee. Reject
+                // rather than filter: silently dropping a blocked pin would
+                // leave `bootstrap_addrs` empty or partially populated and let
+                // reqwest fall back to its own resolution, re-opening the hole
+                // this closes.
+                if let Some(bad) = bootstrap_addrs.iter().find(|a| socket_addr_is_blocked(a)) {
+                    return Err(format!(
+                        "DoH bootstrap pin for {} resolves to blocked address {} \
+                         (loopback/private/link-local/metadata/multicast)",
+                        host_str,
+                        bad.ip()
+                    )
+                    .into());
+                }
+
                 if !bootstrap_addrs.is_empty() {
                     builder = builder.resolve_to_addrs(host_str, &bootstrap_addrs);
                 }
@@ -329,13 +498,11 @@ impl SingleDoHClient {
             Ok(c) => c,
             Err(_) => return "plain-invalid-ech-config",
         };
-        let client_config = match Self::tls_client_config(
-            self.pqc,
-            Some(rustls::client::EchMode::from(ech_config)),
-        ) {
-            Ok(c) => c,
-            Err(_) => return "plain-ech-build-failed",
-        };
+        let client_config =
+            match tls_client_config(self.pqc, Some(rustls::client::EchMode::from(ech_config))) {
+                Ok(c) => c,
+                Err(_) => return "plain-ech-build-failed",
+            };
         let mut builder = Self::hardened_builder(client_config);
         if !self.bootstrap_addrs.is_empty() {
             builder = builder.resolve_to_addrs(self.server_name.as_str(), &self.bootstrap_addrs);
@@ -365,20 +532,15 @@ impl SingleDoHClient {
         if provider.kx_groups.is_empty() {
             return false;
         }
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let builder =
-            match rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-                .with_safe_default_protocol_versions()
-            {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-        let config = std::sync::Arc::new(
-            builder
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
+        // W3-02: reuse the module's single ClientConfig construction site
+        // instead of hand-building a third policy here. The probe performs the
+        // same network egress as the query path -- it sends the upstream SNI --
+        // so it must not be the one client in the module with its own idea of
+        // which root store and protocol versions are acceptable.
+        let config = match build_client_config(KxPolicy::PqOnly, None) {
+            Ok(c) => std::sync::Arc::new(c),
+            Err(_) => return false,
+        };
         let server_name = if let Ok(ip) = self.server_name.parse::<std::net::IpAddr>() {
             rustls::pki_types::ServerName::from(ip)
         } else {
@@ -387,8 +549,21 @@ impl SingleDoHClient {
                 Err(_) => return false,
             }
         };
+        // W3-02: refuse to dial any destination the query path would refuse.
+        // A probe that completes a TLS handshake against an address the query
+        // path rejects is still a real egress event -- a ClientHello carrying
+        // the upstream SNI, to loopback or the metadata service.
+        let candidates: Vec<&SocketAddr> = self
+            .bootstrap_addrs
+            .iter()
+            .take(2)
+            .filter(|a| !socket_addr_is_blocked(a))
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
         // bounded dials; first completed PQ-only handshake wins
-        for addr in self.bootstrap_addrs.iter().take(2) {
+        for addr in candidates {
             let sock = match std::net::TcpStream::connect_timeout(addr, per_addr_timeout) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -645,14 +820,24 @@ pub fn extract_upstream_ips(
 
         if let Ok(parsed) = Url::parse(u) {
             if let Some(host_str) = parsed.host_str() {
+                // W3-03: this vector becomes the eBPF exclude_ips map, where a
+                // membership hit means "do not fragment, decoy or desync" --
+                // sockops.bpf.c returns BPF_OK for that destination. An
+                // unchecked address here therefore does not misroute a query,
+                // it silently switches OFF DPI evasion for that destination
+                // while the daemon reports the bypass active. Screen the value.
                 if let Ok(ip) = host_str.parse::<Ipv4Addr>() {
-                    ips.push(ip);
+                    if !is_blocked_bootstrap_ip(&ip) {
+                        ips.push(ip);
+                    }
                 } else {
                     let host_with_port = format!("{}:{}", host_str, parsed.port().unwrap_or(443));
                     if let Ok(resolved) = host_with_port.to_socket_addrs() {
                         for addr in resolved {
                             if let std::net::SocketAddr::V4(v4) = addr {
-                                ips.push(*v4.ip());
+                                if !is_blocked_bootstrap_ip(v4.ip()) {
+                                    ips.push(*v4.ip());
+                                }
                             }
                         }
                     }
@@ -673,8 +858,15 @@ pub fn extract_upstream_ips_v6(
 ) -> Vec<Ipv6Addr> {
     let mut ips = Vec::new();
 
-    // append all user-specified bootstrap endpoints
-    ips.extend_from_slice(custom_bootstrap_ips);
+    // W3-03: this path screened nothing -- not even the operator's explicit
+    // list. These addresses become eBPF exclude_ips_v6 map entries, where a
+    // hit means "leave this destination unfragmented and undecoyed".
+    ips.extend(
+        custom_bootstrap_ips
+            .iter()
+            .filter(|ip| !is_blocked_bootstrap_ip_v6(ip))
+            .copied(),
+    );
 
     for raw in upstreams_csv.split(',') {
         let u = raw.trim();
@@ -690,14 +882,19 @@ pub fn extract_upstream_ips_v6(
         if let Ok(parsed) = Url::parse(u) {
             if let Some(host_str) = parsed.host_str() {
                 let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
+                // W3-03: same exclusion-map hazard as the v4 path.
                 if let Ok(ip) = clean_host.parse::<Ipv6Addr>() {
-                    ips.push(ip);
+                    if !is_blocked_bootstrap_ip_v6(&ip) {
+                        ips.push(ip);
+                    }
                 } else {
                     let host_with_port = format!("{}:{}", host_str, parsed.port().unwrap_or(443));
                     if let Ok(resolved) = host_with_port.to_socket_addrs() {
                         for addr in resolved {
                             if let std::net::SocketAddr::V6(v6) = addr {
-                                ips.push(*v6.ip());
+                                if !is_blocked_bootstrap_ip_v6(v6.ip()) {
+                                    ips.push(*v6.ip());
+                                }
                             }
                         }
                     }
@@ -999,11 +1196,10 @@ mod tests {
     /// builder so a future refactor cannot drop the flag unnoticed.
     #[tokio::test]
     async fn test_doh_client_refuses_plaintext_scheme() {
-        let client = SingleDoHClient::hardened_builder(
-            SingleDoHClient::tls_client_config(false, None).expect("tls config"),
-        )
-        .build()
-        .expect("client build");
+        let client =
+            SingleDoHClient::hardened_builder(tls_client_config(false, None).expect("tls config"))
+                .build()
+                .expect("client build");
 
         let err = client
             .post("http://127.0.0.1:1/dns-query")
@@ -1022,7 +1218,7 @@ mod tests {
     /// policy and the 3s bound.
     #[test]
     fn test_hardened_builder_carries_policy_and_timeout() {
-        let tls = SingleDoHClient::tls_client_config(false, None).expect("tls config");
+        let tls = tls_client_config(false, None).expect("tls config");
         let debug = format!("{:?}", SingleDoHClient::hardened_builder(tls));
         assert!(
             debug.contains("redirect_policy: Policy(Custom)"),
@@ -1083,6 +1279,37 @@ mod tests {
              which would bypass resolve_to_addrs entirely: {}",
             call
         );
+
+        // W3-02: the guard above counts a reqwest-shaped literal, so it is
+        // structurally blind to a rustls-shaped construction site -- which is
+        // exactly how `probe_pq_support` shipped its own provider, root store
+        // and protocol-version policy while this test still passed. Count the
+        // rustls literal too, and require the same "exactly once" guarantee.
+        let needle = "rustls::ClientConfig::builder_with_provider";
+        let mut tls_sites = prod.match_indices(needle);
+        let (tls_first, _) = tls_sites.next().expect("build_client_config call site");
+        assert!(
+            tls_sites.next().is_none(),
+            "found more than one production {}; there must be exactly one \
+             ClientConfig construction site so the query path and the PQ probe \
+             cannot drift apart",
+            needle
+        );
+        let tls_rest = &prod[tls_first..];
+        let tls_call = &tls_rest[..tls_rest.find('\n').expect("statement line")];
+        assert!(
+            !tls_call.contains("webpki_roots"),
+            "the root store must be installed in the shared construction site, \
+             not at a call site: {}",
+            tls_call
+        );
+
+        // And the probe must not dial a bare socket to an unscreened address.
+        assert!(
+            prod.contains("filter(|a| !socket_addr_is_blocked(a))"),
+            "probe_pq_support must apply the same destination screen the query \
+             path applies; it performs the same egress"
+        );
     }
 
     /// `no_proxy()` is load-bearing: reqwest enables `auto_sys_proxy` by default,
@@ -1102,7 +1329,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_doh_client_ignores_ambient_proxy_env() {
-        let tls = SingleDoHClient::tls_client_config(false, None).expect("tls config");
+        let tls = tls_client_config(false, None).expect("tls config");
 
         let prev: Vec<(&str, Option<std::ffi::OsString>)> =
             ["HTTPS_PROXY", "ALL_PROXY", "https_proxy", "all_proxy"]
@@ -1285,5 +1512,168 @@ mod tests {
             .expect("quad9 doh should resolve");
         assert_eq!(upstream_used, "quad9");
         assert!(response_wire.len() > 12);
+    }
+}
+
+#[cfg(test)]
+mod blocked_destination_tests {
+    use super::*;
+
+    /// W3-01: a bootstrap pin may never be loopback, private, link-local,
+    /// CGNAT, multicast or metadata. Each of these constructs successfully on
+    /// unpatched source, including the literal-host ingress that needs no DNS
+    /// at all: `albus config set --doh-upstream https://127.0.0.1/dns-query`.
+    #[test]
+    fn test_literal_blocked_pins_are_rejected() {
+        let blocked = [
+            "127.0.0.1",       // loopback
+            "127.0.0.15",      // loopback /8
+            "0.0.0.0",         // unspecified
+            "10.0.0.1",        // RFC1918
+            "172.16.0.1",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "100.64.0.1",      // CGNAT
+            "169.254.169.254", // link-local + cloud metadata
+            "224.0.0.1",       // multicast
+        ];
+        for ip in blocked {
+            let url = format!("https://{}/dns-query", ip);
+            assert!(
+                SingleDoHClient::new(&url, "custom", &[], false).is_err(),
+                "blocked pin {} must be rejected",
+                ip
+            );
+        }
+    }
+
+    /// Positive control: public upstreams must still construct. An over-broad
+    /// fix that rejected everything would satisfy the test above.
+    #[test]
+    fn test_public_literal_pins_still_accepted() {
+        for ip in ["1.1.1.1", "9.9.9.9", "8.8.8.8"] {
+            let url = format!("https://{}/dns-query", ip);
+            assert!(
+                SingleDoHClient::new(&url, "custom", &[], false).is_ok(),
+                "public pin {} must still be accepted",
+                ip
+            );
+        }
+        // Preset names keep working too: a preset supplies its own public pins,
+        // so the scheme is still https and no name resolution is needed.
+        let preset = SingleDoHClient::new(
+            "https://cloudflare-dns.com/dns-query",
+            "cloudflare",
+            &[],
+            false,
+        );
+        assert!(
+            preset.is_ok(),
+            "a preset upstream with no literal host must still construct"
+        );
+    }
+
+    /// W3-01: the v6 predicate did not exist, so these were all accepted.
+    #[test]
+    fn test_blocked_v6_predicate_covers_v6_ranges() {
+        let blocked = [
+            "::1",                    // loopback
+            "::",                     // unspecified
+            "fc00::1",                // unique-local fc00::/7
+            "fd12:3456::1",           // unique-local
+            "fe80::1",                // link-local
+            "2001:db8::1",            // documentation
+            "ff02::1",                // multicast
+            "::ffff:127.0.0.1",       // v4-mapped loopback
+            "::ffff:169.254.169.254", // v4-mapped metadata
+            "::ffff:10.0.0.1",        // v4-mapped RFC1918
+            "64:ff9b::127.0.0.1",     // NAT64-wrapped loopback
+            "2002:7f00:1::",          // 6to4-wrapped loopback
+        ];
+        for s in blocked {
+            let ip: Ipv6Addr = s.parse().unwrap_or_else(|_| panic!("bad fixture {}", s));
+            assert!(
+                is_blocked_bootstrap_addr(&IpAddr::V6(ip)),
+                "v6 address {} must be blocked",
+                s
+            );
+        }
+        for s in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let ip: Ipv6Addr = s.parse().expect("fixture");
+            assert!(
+                !is_blocked_bootstrap_addr(&IpAddr::V6(ip)),
+                "public v6 {} must be allowed",
+                s
+            );
+        }
+    }
+
+    /// W3-03: these vectors feed the eBPF exclude maps, where membership means
+    /// "no fragmentation, no decoy, no desync". Before the fix
+    /// `extract_upstream_ips("https://127.0.0.1/dns-query", &[])` returned
+    /// `[127.0.0.1]`, silently disabling DPI evasion for that destination.
+    #[test]
+    fn test_extracted_exclusion_ips_exclude_blocked_ranges() {
+        let v4 = extract_upstream_ips("https://127.0.0.1/dns-query", &[]);
+        assert!(
+            v4.is_empty(),
+            "loopback must not enter exclude_ips, got {:?}",
+            v4
+        );
+        assert!(
+            extract_upstream_ips("https://169.254.169.254/dns-query", &[]).is_empty(),
+            "metadata must not enter exclude_ips"
+        );
+        assert!(
+            extract_upstream_ips("https://192.168.1.1/dns-query", &[]).is_empty(),
+            "RFC1918 must not enter exclude_ips"
+        );
+        // The explicit custom list was already screened; keep it that way.
+        assert!(extract_upstream_ips("", &[Ipv4Addr::new(10, 0, 0, 1)]).is_empty());
+
+        // Positive controls.
+        let pub4 = extract_upstream_ips("https://1.1.1.1/dns-query", &[]);
+        assert_eq!(pub4, vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        assert!(!extract_upstream_ips("cloudflare", &[]).is_empty());
+    }
+
+    /// W3-03: the v6 extractor screened nothing at all -- not the custom list,
+    /// not the literal, not the resolver answers.
+    #[test]
+    fn test_extracted_exclusion_ips_v6_exclude_blocked_ranges() {
+        assert!(
+            extract_upstream_ips_v6("https://[::1]/dns-query", &[]).is_empty(),
+            "v6 loopback must not enter exclude_ips_v6"
+        );
+        assert!(
+            extract_upstream_ips_v6("https://[fd00::1]/dns-query", &[]).is_empty(),
+            "v6 unique-local must not enter exclude_ips_v6"
+        );
+        assert!(
+            extract_upstream_ips_v6("https://[fe80::1]/dns-query", &[]).is_empty(),
+            "v6 link-local must not enter exclude_ips_v6"
+        );
+        assert!(
+            extract_upstream_ips_v6("", &["::ffff:0.0.0.0".parse().unwrap()]).is_empty(),
+            "blocked custom v6 must not enter exclude_ips_v6"
+        );
+
+        // Positive control.
+        let pub6 = extract_upstream_ips_v6("https://[2606:4700:4700::1111]/dns-query", &[]);
+        assert_eq!(pub6.len(), 1);
+        assert_eq!(pub6[0].to_string(), "2606:4700:4700::1111");
+    }
+
+    /// A preset lookup must not be subvertible by naming a preset with a
+    /// blocked suffix; presets are the trusted source and stay unfiltered.
+    #[test]
+    fn test_presets_are_presets() {
+        let v4 = extract_upstream_ips("cloudflare,google", &[]);
+        for ip in &v4 {
+            assert!(
+                !is_blocked_bootstrap_ip(ip),
+                "preset table must contain only public addresses, found {}",
+                ip
+            );
+        }
     }
 }

@@ -74,9 +74,16 @@ BarWidget {
     tooltipText: panelLoader.item && panelLoader.item.isRunning
       ? "Albus DPI: Active (eBPF + DoH)"
       : "Albus DPI: Standby (Click to manage)"
+    // Every button opens the panel. A right-click used to run an unconfirmed
+    // `systemctl stop`, which is not a gesture this widget advertises and
+    // whose consequence is fail-open: ExecStopPost reverts /etc/resolv.conf
+    // to the saved plaintext nameservers and deletes the DNS kill-switch and
+    // lockdown DROP rules, and systemd does not apply Restart=always to a unit
+    // stopped by an explicit job, so the host stays unprotected indefinitely.
+    // Lifecycle control lives in the panel, behind a visible switch and a
+    // polkit prompt that names the action.
     onPressed: function(b) {
-      if (b === Qt.LeftButton) root.togglePanel()
-      else if (b === Qt.RightButton && panelLoader.item) panelLoader.item.toggleDaemon()
+      root.togglePanel()
     }
   }
 }

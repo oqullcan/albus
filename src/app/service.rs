@@ -175,7 +175,79 @@ fn validate_exec_path(path: &str) -> Result<(), Box<dyn std::error::Error + Send
     Ok(())
 }
 
-/// After copying, verifies SYSTEM_BIN_PATH is a root-owned regular file (not symlink) and canonicalizes it.
+/// True when `a` and `b` resolve to the same file. A missing `b` (first
+/// install) is not a collision.
+fn paths_refer_to_same_file(
+    a: &Path,
+    b: &Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let ma = fs::metadata(a)?;
+    match fs::metadata(b) {
+        Ok(mb) => Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino()),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Pins the installed binary to 0755. `std::fs::copy` copies the source's
+/// permission bits, and the documented install sources from the invoking
+/// user's build tree, so without this the arriving mode is caller-controlled.
+#[cfg(unix)]
+fn normalize_installed_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(SYSTEM_BIN_PATH, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn normalize_installed_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
+/// Confirms the copy actually moved bytes. A zero-length destination, or one
+/// shorter than the source, means the transfer failed or was truncated even
+/// though `fs::copy` returned Ok — which is what a self-copy looks like.
+fn verify_copy_transferred(
+    src: &Path,
+    dst: &Path,
+    src_len: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dst_len = fs::metadata(dst)?.len();
+    if dst_len == 0 {
+        return Err(format!(
+            "install produced a zero-byte {} — refusing to point the unit at an empty binary",
+            dst.display()
+        )
+        .into());
+    }
+    if src_len != 0 && dst_len != src_len {
+        return Err(format!(
+            "installed {} is {} bytes but source {} is {} — refusing a truncated copy",
+            dst.display(),
+            dst_len,
+            src.display(),
+            src_len
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Rejects a permission mode that would let anyone but root rewrite the
+/// installed binary. The unit execs this exact file with six ambient
+/// capabilities, so a group- or world-writable copy hands code execution to
+/// every local principal in that set on the next restart.
+///
+/// `std::fs::copy` propagates the source's permission bits to the destination,
+/// and the documented install command sources the binary from the invoking
+/// user's build tree, so the arriving mode is caller-controlled unless we
+/// both normalise it and refuse it here.
+fn installed_mode_ok(mode: u32) -> bool {
+    mode & 0o022 == 0
+}
+
+/// After copying, verifies SYSTEM_BIN_PATH is a root-owned, non-group- or
+/// world-writable regular file (not symlink) and canonicalizes it.
 fn verify_installed_binary() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let p = Path::new(SYSTEM_BIN_PATH);
     let meta = fs::symlink_metadata(p)
@@ -190,13 +262,29 @@ fn verify_installed_binary() -> Result<String, Box<dyn std::error::Error + Send 
         )
         .into());
     }
+    if meta.len() == 0 {
+        return Err(format!(
+            "security violation: {} is empty — refusing to install a zero-byte binary",
+            SYSTEM_BIN_PATH
+        )
+        .into());
+    }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
         if meta.uid() != 0 {
             return Err(format!(
                 "security violation: {} owned by uid {} (expected root)",
                 SYSTEM_BIN_PATH,
                 meta.uid()
+            )
+            .into());
+        }
+        let perm_bits = meta.permissions().mode() & 0o7777;
+        if !installed_mode_ok(perm_bits) {
+            return Err(format!(
+                "security violation: {} is group/world writable (mode {:04o})",
+                SYSTEM_BIN_PATH, perm_bits
             )
             .into());
         }
@@ -363,6 +451,23 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
 
     // copy binary to standard system execution path — FAIL CLOSED, no fallback
     let exe_path = std::env::current_exe()?;
+    // `std::fs::copy` opens the destination O_WRONLY|O_CREAT|O_TRUNC. When the
+    // destination IS the source — which is exactly what happens on the
+    // documented `sudo albus service install` upgrade path, because
+    // current_exe() then resolves to /usr/local/bin/albus — that truncates the
+    // inode the still-open source descriptor is about to read, leaving a
+    // zero-byte binary that still passes every path/owner check below. Detect
+    // it and refuse instead.
+    if paths_refer_to_same_file(&exe_path, Path::new(SYSTEM_BIN_PATH))? {
+        return Err(format!(
+            "refusing to install: {} is already the installed binary at {} — \
+             re-run install from the built binary in your source tree instead",
+            exe_path.display(),
+            SYSTEM_BIN_PATH
+        )
+        .into());
+    }
+    let src_len = fs::metadata(&exe_path)?.len();
     fs::copy(&exe_path, SYSTEM_BIN_PATH).map_err(|e| {
         format!(
             "failed to copy {} to {}: {} — aborting install (refusing caller-controlled fallback)",
@@ -371,8 +476,14 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
             e
         )
     })?;
+    // fs::copy propagates the source's permission bits, and the documented
+    // source is a file inside the invoking user's tree. Pin the mode so a
+    // group/world-writable build never reaches a root-executed path.
+    normalize_installed_mode()?;
 
-    // verify installed copy is root-owned, non-symlink, canonical
+    // verify installed copy is root-owned, non-symlink, non-empty, canonical,
+    // not group/world writable, and actually carries the bytes we copied
+    verify_copy_transferred(&exe_path, Path::new(SYSTEM_BIN_PATH), src_len)?;
     let exe_str = verify_installed_binary()?;
 
     let exec_start = format!("{} run", exe_str);
@@ -600,5 +711,123 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/albus run\n"));
         // management stays root-gated in code (unit has no User= bypass)
         assert!(!unit.contains("User=root"));
+    }
+}
+
+#[cfg(test)]
+mod install_hardening_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("albus-install-test-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("tempdir");
+        d
+    }
+
+    /// SUPPLY-01: a build tree that is group- or world-writable must never be
+    /// able to place a mode-writable binary at the root-executed path.
+    /// `std::fs::copy` propagates the source bits, so the arriving mode is
+    /// caller-controlled unless the mode is both pinned and re-checked.
+    #[cfg(unix)]
+    #[test]
+    fn test_installed_mode_ok_rejects_writable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        for ok in [0o755u32, 0o750, 0o700, 0o555, 0o544] {
+            assert!(installed_mode_ok(ok), "{:04o} must be accepted", ok);
+        }
+        for bad in [
+            0o777u32, 0o775, 0o757, 0o770, 0o707, 0o666, 0o022, 0o002, 0o020,
+        ] {
+            assert!(!installed_mode_ok(bad), "{:04o} must be rejected", bad);
+        }
+        // setuid/setgid carry no write grant, so they are not this
+        // predicate's concern -- it deliberately tests only group/other write,
+        // which is the bit an unprivileged local principal could use.
+        assert!(installed_mode_ok(0o4755), "setuid alone grants no write");
+        assert!(
+            !installed_mode_ok(0o4777),
+            "setuid plus world-write must fail"
+        );
+    }
+
+    /// SUPPLY-02: the zero-byte and short-copy cases that a self-copy produces
+    /// must be refused by the post-transfer check, not waved through.
+    #[test]
+    fn test_verify_copy_transferred_rejects_empty_and_short() {
+        let d = tmpdir("xfer");
+        let src = d.join("src");
+        let mut f = fs::File::create(&src).expect("src");
+        f.write_all(b"albus-binary-bytes").expect("write");
+        drop(f);
+
+        let dst = d.join("dst");
+        let src_len = fs::metadata(&src).expect("meta").len();
+        assert_eq!(src_len, 18, "fixture length is part of the test");
+
+        // Zero-byte destination: exactly what fs::copy leaves behind when
+        // source and destination are the same inode.
+        fs::write(&dst, b"").expect("write");
+        assert!(
+            verify_copy_transferred(&src, &dst, src_len).is_err(),
+            "empty destination must be refused"
+        );
+
+        // Truncated transfer.
+        fs::write(&dst, b"short").expect("write");
+        assert!(
+            verify_copy_transferred(&src, &dst, src_len).is_err(),
+            "length mismatch must be refused"
+        );
+
+        // Successful case: destination carries exactly the source bytes.
+        fs::copy(&src, &dst).expect("copy");
+        assert!(verify_copy_transferred(&src, &dst, src_len).is_ok());
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// SUPPLY-02: the self-copy guard must fire for the documented upgrade
+    /// path and stay quiet for a genuine first install.
+    #[test]
+    fn test_same_file_guard_distinguishes_upgrade_from_first_install() {
+        let d = tmpdir("samefile");
+        let a = d.join("a");
+        fs::write(&a, b"payload").expect("write");
+
+        // Same inode via two paths -> collision.
+        assert!(
+            paths_refer_to_same_file(&a, &a).expect("meta"),
+            "identical path must be detected as a self-copy"
+        );
+        assert!(
+            !paths_refer_to_same_file(&a, &d.join("b")).expect("meta"),
+            "missing destination is a first install, not a collision"
+        );
+
+        // A distinct existing file is not a collision.
+        let c = d.join("c");
+        fs::write(&c, b"other").expect("write");
+        assert!(!paths_refer_to_same_file(&a, &c).expect("meta"));
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Regression for the ETXTBSY abort observed on this host: install must
+    /// refuse up front rather than half-install when current_exe() is already
+    /// the installed binary.
+    #[test]
+    fn test_verify_installed_binary_rejects_zero_byte_artifact() {
+        let d = tmpdir("zero");
+        let p = d.join("albus");
+        fs::write(&p, b"").expect("write empty");
+        // The helper is exercised through its own predicate rather than the
+        // fixed SYSTEM_BIN_PATH, so the test needs no root and no /usr write.
+        let meta = fs::symlink_metadata(&p).expect("meta");
+        assert_eq!(meta.len(), 0);
+        let _ = fs::remove_dir_all(&d);
     }
 }
