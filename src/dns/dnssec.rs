@@ -481,6 +481,12 @@ impl DnssecValidator {
         // coverage gate. Positive/chain candidates return Secure on chain
         // success exactly as before.
         let mut candidates: Vec<(Name, Vec<Record>, RecordType, bool)> = Vec::new();
+        // True when the candidates form a CNAME chain (one or more links plus
+        // the terminal RRset) rather than a single positive answer. Chains must
+        // be authenticated END TO END: returning Secure on the first
+        // chain-verifying link let a genuine signed CNAME authenticate a
+        // substituted terminal address.
+        let mut chain_mode = false;
         let mut answer_recs: Vec<Record> = Vec::new();
         for rec in &msg.answers {
             let t = rec.record_type();
@@ -496,6 +502,7 @@ impl DnssecValidator {
         } else if let Some(chain) = cname_chain(&msg.answers, &owner, rtype) {
             // CNAME chain: every link plus the terminal RRset must verify;
             // a missing link degrades to insecure (served, never Secure).
+            chain_mode = true;
             candidates.extend(chain.into_iter().map(|(n, r, t)| (n, r, t, false)));
         } else if answer_recs
             .iter()
@@ -548,6 +555,11 @@ impl DnssecValidator {
         // candidate starves later ones (SERVFAIL roulette). Decided below,
         // after every candidate had its chance.
         let mut saw_crypto_failure = false;
+        // CNAME-chain completeness: every link AND the terminal RRset must
+        // chain-verify before the answer may be called Secure. Cleared by any
+        // link that does not verify, so a genuine first CNAME can no longer
+        // authenticate a substituted terminal address.
+        let mut all_secure = true;
         // Strict chain rule: if ANY candidate carries RRSIGs, every link must
         // verify Secure. An unsigned link beside signed links smells like a
         // stripped signature redirecting qname to another valid signed name.
@@ -571,9 +583,11 @@ impl DnssecValidator {
                         return DnssecState::Bogus;
                     }
                     saw_insecure = true;
+                    all_secure = false;
                     continue;
                 }
                 saw_insecure = true;
+                all_secure = false;
                 continue;
             }
             let mut rrset_secure = false;
@@ -611,10 +625,21 @@ impl DnssecValidator {
                 }
             }
             if rrset_island {
-                return DnssecState::Insecure;
+                // Accumulate rather than return: a Bogus link elsewhere in the
+                // chain must still outrank this (Bogus > Insecure).
+                saw_insecure = true;
+                all_secure = false;
+                continue;
             }
             if rrset_secure && !is_denial {
-                return DnssecState::Secure;
+                if !chain_mode {
+                    // Single positive answer: nothing left to authenticate.
+                    return DnssecState::Secure;
+                }
+                // CNAME chain: keep going. The terminal RRset (and any
+                // further links) must chain-verify before the whole answer can
+                // be Secure — the verdict is decided after the loop.
+                continue;
             }
             if rrset_secure {
                 // FP-18: a valid signature is not enough for denial — it must
@@ -651,6 +676,7 @@ impl DnssecValidator {
                 name.to_ascii()
             );
             saw_crypto_failure = true;
+            all_secure = false;
             continue;
         }
         if noncovering_signed {
@@ -672,11 +698,23 @@ impl DnssecValidator {
             );
             return DnssecState::Bogus;
         }
+        if chain_mode && all_secure {
+            // Every CNAME link and the terminal RRset chain-verified.
+            debug!(
+                "dnssec: signed CNAME chain fully authenticated for {}",
+                owner.to_ascii()
+            );
+            return DnssecState::Secure;
+        }
         if saw_capped {
             // wildcard-unproven interval or NSEC3: honestly unverified.
             return DnssecState::Indeterminate;
         }
         if saw_insecure {
+            // At least one link (or the terminal) sits in an unsigned zone:
+            // the answer cannot be called Secure (RFC 4035 §4.2 — an
+            // unauthenticated CNAME binds nothing between the queried name and
+            // the address it resolves to). Served, never authenticated.
             DnssecState::Insecure
         } else {
             DnssecState::Indeterminate
@@ -1121,5 +1159,196 @@ mod tests {
         let wire = msg.to_vec().unwrap();
         let state = v.validate("ietf.org", 1, &wire, &resolver).await;
         assert_eq!(state, DnssecState::Bogus);
+    }
+
+    /// HANCORE regression: a CNAME chain must be authenticated end to end.
+    ///
+    /// `validate_inner` returned `Secure` as soon as the FIRST candidate
+    /// chain-verified, so a genuinely signed first CNAME link was enough to
+    /// authenticate the whole response — later links and, critically, the
+    /// terminal address RRset were never examined. A hostile or compromised
+    /// resolver could therefore keep a real signed CNAME and substitute the
+    /// address it points at; `server.rs` then cached and served it as Secure.
+    ///
+    /// Both assertions come from one live response so the test is
+    /// self-consistent: untampered must be Secure (proving the first link does
+    /// verify, so the case really is a signed chain), and tampering only the
+    /// terminal address must NOT stay Secure.
+    #[tokio::test]
+    #[ignore]
+    async fn test_tampered_terminal_in_signed_cname_chain_is_not_secure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("www.sidn.nl", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+
+        let msg = Message::from_vec(&resp).expect("response must parse");
+        let has_cname = msg
+            .answers
+            .iter()
+            .any(|r| r.record_type() == RecordType::CNAME);
+        assert!(has_cname, "fixture must be a CNAME chain");
+
+        // Control: the untampered chain authenticates. Without this the test
+        // could pass for the wrong reason (e.g. chain shape changed, so the
+        // first link never verified at all).
+        assert_eq!(
+            v.validate("www.sidn.nl", 1, &resp, &resolver).await,
+            DnssecState::Secure,
+            "unmodified signed chain must validate Secure"
+        );
+
+        // Now substitute only the terminal address, leaving every signature
+        // untouched — exactly what a hostile resolver can do.
+        let mut msg = Message::from_vec(&resp).expect("response must parse");
+        let mut tampered = false;
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::A {
+                if let RData::A(addr) = &mut rec.data {
+                    let mut o = addr.octets();
+                    o[3] ^= 0x01;
+                    *addr = hickory_proto::rr::rdata::A::new(o[0], o[1], o[2], o[3]);
+                    tampered = true;
+                    break;
+                }
+            }
+        }
+        assert!(tampered, "chain must contain a terminal A record");
+
+        let state = v
+            .validate("www.sidn.nl", 1, &msg.to_vec().unwrap(), &resolver)
+            .await;
+        assert_ne!(
+            state,
+            DnssecState::Secure,
+            "terminal address RRset was never authenticated: a substituted A \
+             record rode the first CNAME link's valid signature to Secure"
+        );
+    }
+
+    /// HANCORE regression, multi-link shape: the intermediate links matter too,
+    /// not just the terminal. A real CDN chain (signed apex CNAME into unsigned
+    /// CDN zones) is exactly the shape where an attacker has a genuine signed
+    /// first link to ride on.
+    ///
+    /// Asserts the chain is fully authenticated when untouched, and that
+    /// substituting the terminal address does not stay Secure.
+    #[tokio::test]
+    #[ignore]
+    async fn test_tampered_terminal_in_multihop_cname_chain_is_not_secure_live() {
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
+        let q = doh_query_with_do("www.powerdns.com", RecordType::A);
+        let (resp, _) = resolver
+            .resolve(&q)
+            .await
+            .expect("live DoH query should succeed");
+
+        let msg = Message::from_vec(&resp).expect("response must parse");
+        let cname_hops = msg
+            .answers
+            .iter()
+            .filter(|r| r.record_type() == RecordType::CNAME)
+            .count();
+        if cname_hops < 2 {
+            eprintln!(
+                "SKIP: www.powerdns.com is no longer a multi-hop CNAME chain \
+                 ({} link(s)) — CDN shape changed",
+                cname_hops
+            );
+            return;
+        }
+
+        assert_eq!(
+            v.validate("www.powerdns.com", 1, &resp, &resolver).await,
+            DnssecState::Secure,
+            "unmodified signed multi-hop chain must validate Secure"
+        );
+
+        let mut msg = Message::from_vec(&resp).expect("response must parse");
+        let mut tampered = false;
+        for rec in msg.answers.iter_mut() {
+            if rec.record_type() == RecordType::A {
+                if let RData::A(addr) = &mut rec.data {
+                    let mut o = addr.octets();
+                    o[3] ^= 0x01;
+                    *addr = hickory_proto::rr::rdata::A::new(o[0], o[1], o[2], o[3]);
+                    tampered = true;
+                    break;
+                }
+            }
+        }
+        assert!(tampered, "chain must contain a terminal A record");
+
+        let state = v
+            .validate("www.powerdns.com", 1, &msg.to_vec().unwrap(), &resolver)
+            .await;
+        assert_ne!(
+            state,
+            DnssecState::Secure,
+            "multi-hop chain terminal was authenticated only via the first link"
+        );
+    }
+
+    /// `cname_chain` must enumerate EVERY link plus the terminal RRset.
+    ///
+    /// This is the enumeration half of the HANCORE fix: the validator can only
+    /// require end-to-end authentication if it actually hands back every hop.
+    /// Pure and hermetic — no crypto, no network.
+    #[test]
+    fn test_cname_chain_enumerates_every_link_and_terminal() {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut msg = Message::new(0x3333, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        let owner = Name::from_ascii("www.example.com.").unwrap();
+        let hop1 = Name::from_ascii("cdn.example.net.").unwrap();
+        let hop2 = Name::from_ascii("edge.example.org.").unwrap();
+
+        msg.answers.push(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::CNAME(CNAME(hop1.clone())),
+        ));
+        msg.answers.push(Record::from_rdata(
+            hop1.clone(),
+            300,
+            RData::CNAME(CNAME(hop2.clone())),
+        ));
+        msg.answers.push(Record::from_rdata(
+            hop2.clone(),
+            300,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+
+        let chain = cname_chain(&msg.answers, &owner, RecordType::A)
+            .expect("well-formed chain must enumerate");
+        assert_eq!(chain.len(), 3, "two links plus the terminal");
+        assert!(name_eq(&chain[0].0, &owner) && chain[0].2 == RecordType::CNAME);
+        assert!(name_eq(&chain[1].0, &hop1) && chain[1].2 == RecordType::CNAME);
+        assert!(name_eq(&chain[2].0, &hop2) && chain[2].2 == RecordType::A);
+    }
+
+    /// A chain whose terminal RRset is missing must NOT enumerate — the
+    /// validator treats that as a broken chain (FP-19 Bogus), never as a
+    /// verified prefix.
+    #[test]
+    fn test_cname_chain_rejects_chain_without_terminal() {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut msg = Message::new(0x4444, MessageType::Response, OpCode::Query);
+        let owner = Name::from_ascii("www.example.com.").unwrap();
+        let hop1 = Name::from_ascii("cdn.example.net.").unwrap();
+        msg.answers.push(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::CNAME(CNAME(hop1.clone())),
+        ));
+        // no terminal A for hop1
+        assert!(
+            cname_chain(&msg.answers, &owner, RecordType::A).is_none(),
+            "chain without a terminal RRset must not enumerate"
+        );
     }
 }
