@@ -627,6 +627,25 @@ impl DnssecValidator {
         if keys.is_empty() {
             return ChainVerdict::Fail;
         }
+        // F4: the DNSKEY RRset must carry its own valid RRSIG(DNSKEY) before its
+        // keys are trusted. Nothing verified this, and it is the assumption the
+        // whole chain rests on. It is redundant rather than exploitable — a
+        // non-root key is already bound by the parent-signed DS digest, and the
+        // root case compares key bytes against the compiled-in anchor — so this
+        // asserts the invariant rather than closing an exploit.
+        let dnskey_self_signed = Self::rrsig_records(dnskey_records, RecordType::DNSKEY)
+            .iter()
+            .any(|sig| {
+                self.verify_rrset(zone, dnskey_records, sig, &keys, Self::now_epoch())
+                    .is_some()
+            });
+        if !dnskey_self_signed {
+            debug!(
+                "dnssec: DNSKEY RRset for {} carries no valid RRSIG(DNSKEY)",
+                zone.to_ascii()
+            );
+            return ChainVerdict::Fail;
+        }
         if zone.is_root() {
             return if self.matches_anchor(&keys) {
                 ChainVerdict::Secure
@@ -2123,7 +2142,7 @@ mod delegation_denial_tests",
         owner: &str,
         next: &str,
         signer: &str,
-    ) -> (Record, Vec<Record>, PublicKeyBuf) {
+    ) -> (Vec<Record>, Vec<Record>, PublicKeyBuf) {
         use hickory_proto::dnssec::crypto::Ed25519SigningKey;
         use hickory_proto::dnssec::rdata::SigInput;
         use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
@@ -2139,6 +2158,12 @@ mod delegation_denial_tests",
         let signer_name: Name = signer.parse().expect("signer");
 
         let nsec_rec = nsec(owner, next, &[RecordType::NS]);
+        let key_rec = Record::from_rdata(
+            signer_name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        );
+
         let input = SigInput {
             type_covered: RecordType::NSEC,
             algorithm: Algorithm::ED25519,
@@ -2149,6 +2174,19 @@ mod delegation_denial_tests",
             key_tag,
             signer_name: signer_name.clone(),
         };
+        // The DNSKEY RRset is self-signed too: F4 refuses to chain on a DNSKEY
+        // whose RRset carries no valid RRSIG(DNSKEY).
+        let key_input = SigInput {
+            type_covered: RecordType::DNSKEY,
+            algorithm: Algorithm::ED25519,
+            num_labels: signer_name.num_labels(),
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag,
+            signer_name: signer_name.clone(),
+        };
+
         let tbs = TBS::from_input(
             &owner_name,
             DNSClass::IN,
@@ -2156,25 +2194,30 @@ mod delegation_denial_tests",
             std::iter::once(&nsec_rec),
         )
         .expect("tbs");
-        let sg = DnssecSigner::new(
-            dnskey.clone(),
-            Box::new(sk),
-            signer_name,
-            Duration::from_secs(3600),
-        );
-        let sig = sg.sign(&tbs).expect("sign");
+        let key_tbs = TBS::from_input(
+            &signer_name,
+            DNSClass::IN,
+            &key_input,
+            std::iter::once(&key_rec),
+        )
+        .expect("key tbs");
 
-        let dnskey_rec = Record::from_rdata(
-            signer.parse().expect("signer"),
-            3600,
-            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
-        );
+        // One signer, two TBS: the private key is moved in exactly once.
+        let sg = DnssecSigner::new(dnskey, Box::new(sk), signer_name, Duration::from_secs(3600));
+        let sig = sg.sign(&tbs).expect("sign");
+        let key_sig = sg.sign(&key_tbs).expect("sign dnskey");
+
         let sig_rec = Record::from_rdata(
             owner_name,
             3600,
             RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig))),
         );
-        (dnskey_rec, vec![nsec_rec, sig_rec], public)
+        let key_sig_rec = Record::from_rdata(
+            signer.parse().expect("signer"),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(key_input, key_sig))),
+        );
+        (vec![key_rec, key_sig_rec], vec![nsec_rec, sig_rec], public)
     }
 
     /// HANCORE 2026-10, second report (raised against d481cb8).
@@ -2191,13 +2234,13 @@ mod delegation_denial_tests",
         // Anchored to the real IANA root KSK, which the forged key is not.
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
-        let (forged_root_key, denial, _) = signed_denial_by("evil.", "aaa.", ".");
+        let (forged_root_keys, denial, _) = signed_denial_by("evil.", "aaa.", ".");
 
         v.rrset_for_test("evil.", RecordType::DS, FetchOutcome::Nodata { denial });
         v.rrset_for_test(
             ".",
             RecordType::DNSKEY,
-            FetchOutcome::Found(vec![forged_root_key]),
+            FetchOutcome::Found(forged_root_keys),
         );
 
         let verdict = v
@@ -2220,7 +2263,7 @@ mod delegation_denial_tests",
     async fn test_unsigned_delegation_still_accepted_when_parent_chain_is_secure() {
         use hickory_proto::dnssec::TrustAnchors;
 
-        let (parent_key, denial, parent_public) = signed_denial_by("unsigned.", "aaa.", ".");
+        let (parent_keys, denial, parent_public) = signed_denial_by("unsigned.", "aaa.", ".");
         let mut anchors = TrustAnchors::empty();
         anchors.insert_with_name(
             &parent_public,
@@ -2230,19 +2273,11 @@ mod delegation_denial_tests",
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
 
         v.rrset_for_test("unsigned.", RecordType::DS, FetchOutcome::Nodata { denial });
-        v.rrset_for_test(
-            ".",
-            RecordType::DNSKEY,
-            FetchOutcome::Found(vec![parent_key]),
-        );
+        v.rrset_for_test(".", RecordType::DNSKEY, FetchOutcome::Found(parent_keys));
 
+        let (zone_keys, _) = self_signed_dnskey_rrset("unsigned.");
         let verdict = v
-            .chain_to_root(
-                &zone("unsigned."),
-                &[dnskey_rec("unsigned.", 1)],
-                &resolver,
-                0,
-            )
+            .chain_to_root(&zone("unsigned."), &zone_keys, &resolver, 0)
             .await;
 
         assert_eq!(
@@ -2306,13 +2341,15 @@ mod delegation_denial_tests",
         );
     }
 
-    /// A delegation the parent genuinely signed: the DS at `victim.` digests the
-    /// child's SEP key and the root's KSK signs the DS RRset. Returns
-    /// (child DNSKEY, root DNSKEY, root public key, DS RRset).
+    /// A delegation the root genuinely signed: the DS at `victim.` digests the
+    /// child's SEP key and the root's KSK signs the DS RRset.
     ///
     /// The parent is the root so the chain terminates in `matches_anchor` without
-    /// any further staged fetches — which is precisely the step F3 requires.
-    fn root_signed_ds() -> (DNSKEY, DNSKEY, PublicKeyBuf, Vec<Record>) {
+    /// further staged fetches -- which is exactly the step F3 requires. The root's
+    /// DNSKEY RRset comes back self-signed because F4 refuses to chain otherwise.
+    ///
+    /// Returns (child DNSKEY, root DNSKEY RRset, root public key, DS RRset).
+    fn root_signed_ds() -> (DNSKEY, Vec<Record>, PublicKeyBuf, Vec<Record>) {
         use hickory_proto::dnssec::crypto::Ed25519SigningKey;
         use hickory_proto::dnssec::rdata::{SigInput, DS};
         use hickory_proto::dnssec::{DigestType, DnssecSigner, SigningKey, TBS};
@@ -2322,11 +2359,13 @@ mod delegation_denial_tests",
                 .expect("child key");
         let child_dnskey =
             DNSKEY::new(true, true, false, child.to_public_key().expect("child pub"));
+
         let root_key =
             Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("root key"))
                 .expect("root key");
         let root_pub = root_key.to_public_key().expect("root pub");
         let root_dnskey = DNSKEY::new(true, true, false, root_pub.clone());
+        let root_key_tag = root_dnskey.calculate_key_tag().expect("key tag");
 
         let child_zone = zone("victim.");
         let ds = DS::new(
@@ -2348,33 +2387,71 @@ mod delegation_denial_tests",
             original_ttl: 3600,
             sig_expiration: SerialNumber::new(now() + 3600),
             sig_inception: SerialNumber::new(now().saturating_sub(60)),
-            key_tag: root_dnskey.calculate_key_tag().expect("key tag"),
+            key_tag: root_key_tag,
             signer_name: Name::root(),
         };
         let tbs = TBS::from_input(&child_zone, DNSClass::IN, &input, std::iter::once(&ds_rec))
             .expect("tbs");
+        // One signer for both TBS: the private key is moved in exactly once, and
+        // the DNSKEY RRset must be signed by the key it contains.
         let signer = DnssecSigner::new(
             root_dnskey.clone(),
             Box::new(root_key),
             Name::root(),
             Duration::from_secs(3600),
         );
+        let ds_sig = signer.sign(&tbs).expect("sign ds");
         let sig_rec = Record::from_rdata(
-            child_zone.clone(),
+            child_zone,
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, ds_sig))),
+        );
+
+        // Root DNSKEY RRset, self-signed (F4).
+        let key_rec = Record::from_rdata(
+            Name::root(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(root_dnskey.clone())),
+        );
+        let key_input = SigInput {
+            type_covered: RecordType::DNSKEY,
+            algorithm: Algorithm::ED25519,
+            num_labels: 0,
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: root_key_tag,
+            signer_name: Name::root(),
+        };
+        let key_tbs = TBS::from_input(
+            &Name::root(),
+            DNSClass::IN,
+            &key_input,
+            std::iter::once(&key_rec),
+        )
+        .expect("key tbs");
+        let key_sig_rec = Record::from_rdata(
+            Name::root(),
             3600,
             RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
-                input,
-                signer.sign(&tbs).expect("sign"),
+                key_input,
+                signer.sign(&key_tbs).expect("sign dnskey"),
             ))),
         );
-        (child_dnskey, root_dnskey, root_pub, vec![ds_rec, sig_rec])
+
+        (
+            child_dnskey,
+            vec![key_rec, key_sig_rec],
+            root_pub,
+            vec![ds_rec, sig_rec],
+        )
     }
 
     fn stage_root_signed_ds(
         v: &DnssecValidator,
         ds_rrset: Vec<Record>,
         child: DNSKEY,
-        root: DNSKEY,
+        root_rrset: Vec<Record>,
     ) {
         v.rrset_for_test("victim.", RecordType::DS, FetchOutcome::Found(ds_rrset));
         v.rrset_for_test(
@@ -2386,15 +2463,7 @@ mod delegation_denial_tests",
                 RData::DNSSEC(DNSSECRData::DNSKEY(child)),
             )]),
         );
-        v.rrset_for_test(
-            ".",
-            RecordType::DNSKEY,
-            FetchOutcome::Found(vec![Record::from_rdata(
-                Name::root(),
-                3600,
-                RData::DNSSEC(DNSSECRData::DNSKEY(root)),
-            )]),
-        );
+        v.rrset_for_test(".", RecordType::DNSKEY, FetchOutcome::Found(root_rrset));
     }
 
     /// F3, the other half of the cbd5da5 fix.
@@ -2552,6 +2621,58 @@ mod delegation_denial_tests",
         );
     }
 
+    /// A DNSKEY RRset carrying a valid `RRSIG(DNSKEY)` over itself.
+    ///
+    /// F4 refuses to chain on an unsigned DNSKEY RRset, so every fixture that has
+    /// to reach `matches_anchor` needs one. Returns (RRset, public key).
+    fn self_signed_dnskey_rrset(owner: &str) -> (Vec<Record>, PublicKeyBuf) {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::rdata::SigInput;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
+
+        let sk = Ed25519SigningKey::from_pkcs8(
+            &Ed25519SigningKey::generate_pkcs8().expect("generate key"),
+        )
+        .expect("decode key");
+        let public = sk.to_public_key().expect("public key");
+        let dnskey = DNSKEY::new(true, true, false, public.clone());
+        let key_tag = dnskey.calculate_key_tag().expect("key tag");
+        let owner_name: Name = owner.parse().expect("owner");
+
+        let key_rec = Record::from_rdata(
+            owner_name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        );
+        let input = SigInput {
+            type_covered: RecordType::DNSKEY,
+            algorithm: Algorithm::ED25519,
+            num_labels: owner_name.num_labels(),
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag,
+            signer_name: owner_name.clone(),
+        };
+        let tbs = TBS::from_input(&owner_name, DNSClass::IN, &input, std::iter::once(&key_rec))
+            .expect("tbs");
+        let sg = DnssecSigner::new(
+            dnskey,
+            Box::new(sk),
+            owner_name.clone(),
+            Duration::from_secs(3600),
+        );
+        let sig_rec = Record::from_rdata(
+            owner_name,
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
+                input,
+                sg.sign(&tbs).expect("sign"),
+            ))),
+        );
+        (vec![key_rec, sig_rec], public)
+    }
+
     /// A genuinely valid, opt-out NSEC3 signed by `signer`, at an owner the test
     /// chooses. Returns (NSEC3 record, RRSIG, parent DNSKEY).
     fn signed_optout_nsec3_by(owner: &str, signer: &str) -> (Record, RRSIG, DNSKEY) {
@@ -2678,5 +2799,116 @@ mod delegation_denial_tests",
                 .authenticated(),
             "without NSEC3 hashing there is no placement that proves coverage"
         );
+    }
+
+    /// F4: `chain_to_root` used the DNSKEY RRset's keys without ever checking the
+    /// RRset's own `RRSIG(DNSKEY)`.
+    ///
+    /// Anchored to the very key in the RRset, so the ONLY thing that can reject it
+    /// is the missing signature. That isolates the check from the anchor match.
+    /// Redundant rather than exploitable — a non-root key is already bound by the
+    /// parent-signed DS digest, and the root compares bytes against the compiled-in
+    /// anchor — but it is an unverified assumption under the central trust
+    /// decision, so it is asserted rather than assumed.
+    #[tokio::test]
+    async fn test_chain_rejects_unsigned_dnskey_rrset() {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::{SigningKey, TrustAnchors};
+
+        let sk = Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("key"))
+            .expect("key");
+        let public = sk.to_public_key().expect("public key");
+        let bare = vec![Record::from_rdata(
+            Name::root(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(DNSKEY::new(
+                true,
+                true,
+                false,
+                public.clone(),
+            ))),
+        )];
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(&public, hickory_proto::rr::LowerName::new(&Name::root()));
+        let v = DnssecValidator::with_anchors(anchors);
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
+
+        assert_eq!(
+            v.chain_to_root(&Name::root(), &bare, &resolver, 0).await,
+            ChainVerdict::Fail,
+            "a DNSKEY RRset carrying no RRSIG(DNSKEY) must not be trusted, even \
+             when its key matches the anchor"
+        );
+    }
+
+    /// The inverse guard, anchored: a properly self-signed root DNSKEY RRset must
+    /// still chain. Pins that F4 rejects unsigned RRsets, not DNSKEYs.
+    #[tokio::test]
+    async fn test_chain_accepts_self_signed_dnskey_rrset() {
+        use hickory_proto::dnssec::TrustAnchors;
+
+        let (rrset, root_pub) = signed_root_dnskey_rrset();
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(&root_pub, hickory_proto::rr::LowerName::new(&Name::root()));
+        let v = DnssecValidator::with_anchors(anchors);
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
+
+        assert_eq!(
+            v.chain_to_root(&Name::root(), &rrset, &resolver, 0).await,
+            ChainVerdict::Secure,
+            "a properly self-signed anchored DNSKEY RRset must still chain"
+        );
+    }
+
+    /// A root DNSKEY RRset signed by its own KSK. Returns (RRset, anchor public key).
+    fn signed_root_dnskey_rrset() -> (Vec<Record>, PublicKeyBuf) {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::rdata::SigInput;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
+
+        let sk =
+            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("root key"))
+                .expect("root key");
+        let public = sk.to_public_key().expect("root public");
+        let dnskey = DNSKEY::new(true, true, false, public.clone());
+        let key_rec = Record::from_rdata(
+            Name::root(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        );
+
+        let input = SigInput {
+            type_covered: RecordType::DNSKEY,
+            algorithm: Algorithm::ED25519,
+            num_labels: 0,
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: dnskey.calculate_key_tag().expect("key tag"),
+            signer_name: Name::root(),
+        };
+        let tbs = TBS::from_input(
+            &Name::root(),
+            DNSClass::IN,
+            &input,
+            std::iter::once(&key_rec),
+        )
+        .expect("tbs");
+        let signer = DnssecSigner::new(
+            dnskey,
+            Box::new(sk),
+            Name::root(),
+            Duration::from_secs(3600),
+        );
+        let sig_rec = Record::from_rdata(
+            Name::root(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
+                input,
+                signer.sign(&tbs).expect("sign"),
+            ))),
+        );
+        (vec![key_rec, sig_rec], public)
     }
 }
