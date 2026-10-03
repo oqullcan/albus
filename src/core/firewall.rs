@@ -130,13 +130,28 @@ fn helper_is_trusted(_path: &Path) -> bool {
 /// that may not be there, and an untrusted one was never rejected at all. An
 /// absent or untrusted helper is now an explicit error that EBPF-01's
 /// `Result` plumbing propagates to the caller.
-fn resolve_binary_with(
-    candidates: &[&str],
+fn resolve_binary_with<'a>(
+    candidates: &'a [&str],
     trusted_uids: &[libc::uid_t],
-) -> Result<std::path::PathBuf, FirewallError> {
+) -> Result<&'a str, FirewallError> {
     for c in candidates {
-        if let Some(real) = helper_trusted_real_path(Path::new(c), trusted_uids) {
-            return Ok(real);
+        if helper_trusted_real_path(Path::new(c), trusted_uids).is_some() {
+            // Deliberately the CANDIDATE, not the canonical path.
+            //
+            // Executing the canonical target looks safer and is wrong: iptables,
+            // ip6tables, ebtables and friends are symlinks to a single
+            // xtables-nft-multi, and that binary dispatches on argv[0]. Exec'ing
+            // the resolved target makes it print "ERROR: No valid subcommand
+            // given" and every rule silently fails to install -- which is exactly
+            // what happened here, and what it did to the service and to CI.
+            //
+            // The check-then-use window this seems to open is already covered by
+            // the ancestor walk in helper_trusted_real_path: swapping the symlink
+            // needs write access to its directory, and every directory from the
+            // resolved target up to / is verified to be root-owned and not
+            // group/world-writable. Closing a window that requires root, at the
+            // cost of not working at all, is a bad trade.
+            return Ok(c);
         }
     }
     Err(FirewallError(format!(
@@ -148,15 +163,15 @@ fn resolve_binary_with(
 }
 
 #[cfg(unix)]
-fn resolve_binary(candidates: &[&str]) -> Result<std::path::PathBuf, FirewallError> {
+fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
     resolve_binary_with(candidates, &trusted_helper_uids())
 }
 
 #[cfg(not(unix))]
-fn resolve_binary(candidates: &[&str]) -> Result<std::path::PathBuf, FirewallError> {
+fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
     candidates
         .first()
-        .map(std::path::PathBuf::from)
+        .copied()
         .ok_or_else(|| FirewallError("no iptables candidates configured".into()))
 }
 
@@ -1058,7 +1073,7 @@ mod helper_identity_tests {
         let cands = vec![loose_s.as_str(), good_s.as_str()];
         assert_eq!(
             resolve_binary_with(&cands, &uids).expect("a trusted candidate exists"),
-            std::fs::canonicalize(&good_s).expect("canonicalize good"),
+            good_s.as_str(),
             "an untrusted candidate must be skipped in favour of a trusted one"
         );
 
@@ -1085,17 +1100,24 @@ mod helper_identity_tests {
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
         let uids = test_uids();
-        let got = resolve_binary_with(&[link.to_str().expect("utf8")], &uids)
+        let link_s = link.to_str().expect("utf8");
+        let cands = vec![link_s];
+        let got = resolve_binary_with(&cands, &uids)
             .expect("a symlink to a trusted regular file is still trusted");
 
         assert_eq!(
-            got,
-            std::fs::canonicalize(&real).expect("canonicalize"),
-            "the returned path must be the resolved target, not the candidate"
+            got, link_s,
+            "the CANDIDATE must be returned, not the canonical target: iptables is \
+             a symlink to xtables-nft-multi, which dispatches on argv[0], so \
+             exec'ing the resolved path makes every rule fail to install"
         );
         assert_ne!(
-            got, link,
-            "returning the candidate would leave a check-then-use window at exec time"
+            got,
+            std::fs::canonicalize(&real)
+                .expect("canonicalize")
+                .to_str()
+                .expect("utf8"),
+            "exec'ing the canonical target is the exact bug being pinned here"
         );
     }
 

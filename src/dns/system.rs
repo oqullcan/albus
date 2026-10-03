@@ -84,7 +84,16 @@ pub(crate) fn revert_resolvectl_dns() {
 /// Resolves write target safely: if `path` is a symlink (e.g. /etc/resolv.conf ->
 /// /run/systemd/resolve/stub-resolv.conf), only follow it when canonical target lives
 /// under /run/ or /etc/. Refuses attacker-controlled targets (/tmp, /home, /dev...).
-fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
+/// Where a write to `path` will actually land, following a symlink safely.
+///
+/// On a systemd-resolved host `/etc/resolv.conf` is a symlink into
+/// `/run/systemd/resolve/`, so this is the normal case, not an edge case. The
+/// link's canonical target must sit under `/etc` or `/run`; anything else is
+/// refused. Exposed so the leak canary asks the same question the repair does --
+/// reading the link itself with O_NOFOLLOW can only ever report ELOOP on such a
+/// host, which silently disables the leak monitor on every systemd-resolved
+/// machine and emits a warning every 15 seconds.
+pub fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let canon = fs::canonicalize(path)?;

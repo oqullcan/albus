@@ -126,15 +126,21 @@ impl DnsServer {
                         // state the repair would rewrite, so the repair was
                         // suppressed and the leak monitor was silently disabled.
                         //
-                        // The canary now asks the repair's own question, and the
-                        // decision read uses the writer's discipline
-                        // (O_NOFOLLOW + O_CLOEXEC + regular-file check) instead
-                        // of a symlink-following `read_to_string`, which also
-                        // removes the FIFO-hang: a FIFO at /etc/resolv.conf would
-                        // otherwise wedge this task forever.
-                        match crate::dns::system::read_nofollow(std::path::Path::new(
-                            "/etc/resolv.conf",
-                        )) {
+                        // The canary now asks the repair's own question: read the
+                        // file the repair would write, not the link. On a
+                        // systemd-resolved host /etc/resolv.conf IS a symlink into
+                        // /run/systemd/resolve/, and reading it with O_NOFOLLOW can
+                        // only ever return ELOOP -- which disabled the leak monitor
+                        // entirely and logged a warning every 15 seconds. The FIFO
+                        // hang is still avoided: resolve_write_target refuses a
+                        // non-regular target, and read_nofollow then re-checks the
+                        // resolved file.
+                        let resolv =
+                            crate::dns::system::resolve_write_target(std::path::Path::new(
+                                "/etc/resolv.conf",
+                            ))
+                            .and_then(|p| crate::dns::system::read_nofollow(&p));
+                        match resolv {
                             Ok(content) => {
                                 if !crate::dns::system::resolver_is_albus_exclusive(&content) {
                                     warn!("DNS leak canary: /etc/resolv.conf is not exclusively albus's loopback resolver (possible DHCP/NetworkManager overwrite). Auto-healing system DNS...");
