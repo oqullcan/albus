@@ -546,6 +546,28 @@ impl DnssecValidator {
         if now < input.sig_inception.get() || now > input.sig_expiration.get() {
             return None;
         }
+        // RFC 4035 §5.3.1: the Signer Name must be the RRset owner, or a
+        // superdomain of it. This is the identity assertion that made every
+        // other gate below meaningless without it.
+        //
+        // Without it, an attacker who owns ONE DNSSEC-signed domain could
+        // authenticate somebody else's records: serve `bank.com A 6.6.6.6`
+        // under a Signer Name of `evilzone.com`, signed with evilzone.com's
+        // genuine private key, and also serve evilzone.com's genuine DNSKEY.
+        // Algorithm matches, key tag matches, signature verifies, and
+        // `chain_to_root` separately proves the key reaches the trust anchor --
+        // yet nothing ever asserted that evilzone.com *contains* bank.com, so
+        // the answer came back Secure and was handed on with AD=1 to any
+        // RFC 6840 trust-ad stub.
+        //
+        // `zone_of` is label-boundary aware, so `notbank.com` does not count as
+        // an ancestor of `bank.com`. The §5.3.2 label test alone would NOT be
+        // enough: for owner `example.com` and signer `a.b.example.com` the
+        // count 2 <= 4 passes. hickory already rejects `num_labels >
+        // fqdn_labels` inside `determine_name`, so that half is covered.
+        if !input.signer_name.zone_of(owner) {
+            return None;
+        }
         for key in dnskeys {
             if key.public_key().algorithm() != input.algorithm {
                 continue;
@@ -2285,6 +2307,115 @@ mod delegation_denial_tests",
         assert!(
             v.owner_zone_signed(&zone("victim.test."), &resolver).await,
             "a DS genuinely signed by the parent must still mark the zone signed"
+        );
+    }
+
+    /// A genuinely valid A-record signature made with a caller-chosen key and a
+    /// caller-chosen Signer Name. Returns (RRSIG, DNSKEY of the signing zone).
+    fn signed_a_by(owner: &str, signer: &str) -> (RRSIG, DNSKEY) {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::rdata::SigInput;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey, TBS};
+        use hickory_proto::rr::rdata::A;
+
+        let sk = Ed25519SigningKey::from_pkcs8(
+            &Ed25519SigningKey::generate_pkcs8().expect("generate key"),
+        )
+        .expect("decode key");
+        let dnskey = DNSKEY::new(true, true, false, sk.to_public_key().expect("public key"));
+
+        let owner_name: Name = owner.parse().expect("owner");
+        let signer_name: Name = signer.parse().expect("signer");
+        let a_rec = Record::from_rdata(owner_name.clone(), 300, RData::A(A::new(6, 6, 6, 6)));
+
+        let input = SigInput {
+            type_covered: RecordType::A,
+            algorithm: Algorithm::ED25519,
+            num_labels: owner_name.num_labels(),
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: dnskey.calculate_key_tag().expect("key tag"),
+            signer_name: signer_name.clone(),
+        };
+        let tbs = TBS::from_input(&owner_name, DNSClass::IN, &input, std::iter::once(&a_rec))
+            .expect("tbs");
+        let sg = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(sk),
+            signer_name,
+            Duration::from_secs(3600),
+        );
+        let sig = sg.sign(&tbs).expect("sign");
+        (RRSIG::from_sig(input, sig), dnskey)
+    }
+
+    /// The attack that made `verify_rrset` unsafe, and the reason it returns a
+    /// signer name at all.
+    ///
+    /// An attacker who owns ONE DNSSEC-signed domain can forge a valid
+    /// signature over somebody else's A record by naming their own zone as the
+    /// Signer Name. Every other gate passes: the signature is real, the key is
+    /// real, and (checked separately by `chain_to_root`) that key chains to the
+    /// root. Nothing asserted that the signing zone *contains* the record.
+    ///
+    /// RFC 4035 §5.3.1: Signer Name must be the owner or a superdomain of it.
+    #[test]
+    fn test_sig_from_unrelated_zone_is_refused() {
+        let (rrsig, key) = signed_a_by("bank.com.", "evilzone.com.");
+        let owner = zone("bank.com.");
+        let a_rec = {
+            use hickory_proto::rr::rdata::A;
+            Record::from_rdata(owner.clone(), 300, RData::A(A::new(6, 6, 6, 6)))
+        };
+
+        assert!(
+            DnssecValidator::new()
+                .verify_rrset(&owner, &[a_rec], &rrsig, &[key], now())
+                .is_none(),
+            "an A record of bank.com must not authenticate under evilzone.com's key"
+        );
+    }
+
+    /// The inverse guard: a signature from the zone itself, or from an ancestor
+    /// of it, must keep verifying — otherwise every legitimately signed name
+    /// would be rejected.
+    #[test]
+    fn test_sig_from_owner_or_ancestor_still_verifies() {
+        use hickory_proto::rr::rdata::A;
+        let owner = zone("bank.com.");
+
+        for signer in ["bank.com.", "com.", "."] {
+            let (rrsig, key) = signed_a_by("bank.com.", signer);
+            let a_rec = Record::from_rdata(owner.clone(), 300, RData::A(A::new(6, 6, 6, 6)));
+            assert_eq!(
+                DnssecValidator::new()
+                    .verify_rrset(&owner, &[a_rec], &rrsig, &[key], now())
+                    .as_ref(),
+                Some(&signer.parse::<Name>().expect("signer")),
+                "signature by {signer} over bank.com must still verify"
+            );
+        }
+    }
+
+    /// A zone name that merely *ends with* the owner is not an ancestor of it --
+    /// `notbank.com` does not contain `bank.com`. Guarding the ancestor test
+    /// with label boundaries is the whole point of using `is_subdomain_of`
+    /// rather than a string comparison.
+    #[test]
+    fn test_lookalike_parent_suffix_is_not_an_ancestor() {
+        let (rrsig, key) = signed_a_by("bank.com.", "notbank.com.");
+        let owner = zone("bank.com.");
+        let a_rec = {
+            use hickory_proto::rr::rdata::A;
+            Record::from_rdata(owner.clone(), 300, RData::A(A::new(6, 6, 6, 6)))
+        };
+
+        assert!(
+            DnssecValidator::new()
+                .verify_rrset(&owner, &[a_rec], &rrsig, &[key], now())
+                .is_none(),
+            "notbank.com must not count as an ancestor of bank.com"
         );
     }
 }
