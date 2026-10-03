@@ -237,6 +237,39 @@ pub fn ensure_resolver_backup_at(target: &Path, backup: &Path) -> std::io::Resul
     atomic_write_nofollow(backup, &content)
 }
 
+/// Read a file only if it is owned by `must_be_owned_by`.
+///
+/// P1: the out-of-band backup at `/run/albus/resolv.conf.orig` is CONSUMED BY A
+/// ROOT CONTEXT — `ExecStopPost=+albus cleanup` runs with `+`, so it runs as root
+/// while the daemon itself is `User=albus`. `/run/albus` is a systemd
+/// `RuntimeDirectory` owned by that unprivileged account, so the daemon can write
+/// the backup, and `read_nofollow` enforced only `O_NOFOLLOW` and `is_file()`.
+/// An attacker with code execution as `albus` could therefore write
+/// `nameserver 6.6.6.6` into the backup and have root install exactly those bytes
+/// into `/etc/resolv.conf` — a root-owned file, in the one file this product
+/// exists to protect, outliving the daemon.
+///
+/// The check is ownership, not `O_NOFOLLOW`: this crate's symlink discipline is
+/// thorough and was simply absent here. `src/dns/` imported no `MetadataExt` at
+/// all, while `firewall.rs` and `service.rs` each carry an identity predicate for
+/// exactly this question.
+fn read_owned_file(path: &Path, must_be_owned_by: u32) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path)?;
+    if meta.uid() != must_be_owned_by {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "security violation: refusing to trust {} owned by uid {} (want uid {})",
+                path.display(),
+                meta.uid(),
+                must_be_owned_by
+            ),
+        ));
+    }
+    read_nofollow(path)
+}
+
 pub(crate) fn read_nofollow(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut options = fs::OpenOptions::new();
@@ -346,13 +379,30 @@ pub fn restore_system_dns() -> Result<()> {
 }
 
 pub fn restore_system_dns_at<P: AsRef<Path>>(path: P) -> Result<()> {
-    let target = resolve_write_target(path.as_ref())?;
+    // uid 0: this runs from a root context and installs the result into a root
+    // file, so the backup must be root's, never the service account's.
+    restore_system_dns_at_with(path, 0)
+}
 
+/// As `restore_system_dns_at`, but names the uid the backup must be owned by.
+/// Split out so the ownership gate is testable without root.
+pub fn restore_system_dns_at_with<P: AsRef<Path>>(path: P, backup_owner: u32) -> Result<()> {
+    let target = resolve_write_target(path.as_ref())?;
+    let backup = backup_path_for(&target);
+    restore_system_dns_from_backup(&target, &backup, backup_owner)
+}
+
+/// As `restore_system_dns_at_with`, with the backup location given explicitly so
+/// the ownership gate can be exercised against a staged file.
+pub fn restore_system_dns_from_backup(
+    target: &Path,
+    backup: &Path,
+    backup_owner: u32,
+) -> Result<()> {
     // DNS-04: prefer the out-of-band backup. The in-file '# albus-saved:'
     // comments live in the file that a crash mid-rewrite may have truncated to
     // zero, in which case they are gone and the restore has no input at all.
-    let backup = backup_path_for(&target);
-    if let Ok(original) = read_nofollow(&backup) {
+    if let Ok(original) = read_owned_file(backup, backup_owner) {
         if !original.trim().is_empty() {
             atomic_write_nofollow(&target, &original)?;
             let _ = fs::remove_file(&backup);
@@ -394,8 +444,15 @@ pub fn cleanup_system_dns() -> Result<bool> {
 }
 
 pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let target =
-        resolve_write_target(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    // P4: this used to swallow resolve_write_target's PermissionDenied — the very
+    // "refusing to follow resolv.conf symlink" case the function exists to raise —
+    // and fall back to the unresolved path. read_nofollow then failed ELOOP, the
+    // `if let Ok(content)` fell through, and the function returned Ok(false), which
+    // main.rs reports as "no albus DNS markers found; resolver left untouched" with
+    // a zero exit. ExecStopPost saw success and the crash-recovery canary was
+    // disabled while reporting a clean bill of health. Both sibling paths
+    // (set_system_dns_at, restore_system_dns_at) propagate this error with `?`.
+    let target = resolve_write_target(path.as_ref())?;
     if let Ok(content) = read_nofollow(&target) {
         // DNS-04: an EMPTY resolver file is not "nothing to do" — it is a host
         // with no name resolution, and the previous code returned Ok(false)
@@ -928,5 +985,93 @@ mod atomic_write_tests {
             "the listener must be gated on a successful restore, not stopped \
              unconditionally afterwards"
         );
+    }
+
+    /// P1: the backup is installed into `/etc/resolv.conf` by a ROOT context, so
+    /// it must be root-owned. `/run/albus` belongs to the unprivileged `albus`
+    /// account, which means the daemon can write it. A resolver redirected to an
+    /// attacker through a service-account-writable backup is a persistent
+    /// compromise of the one file this product exists to protect.
+    ///
+    /// The uid is injected rather than assumed so the gate is testable without
+    /// root: `restore_system_dns_at_with` takes the trusted uid, production passes
+    /// 0, and here the backup is owned by the current (unprivileged) user.
+    #[test]
+    fn test_backup_written_by_service_account_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+
+        let d = tmpdir("untrusted-backup");
+        let target = d.join("resolv.conf");
+        let attacker = "nameserver 6.6.6.6\n";
+
+        // The attacker-controlled backup, sitting where the daemon can reach it.
+        let backup = backup_path_in(&d, &target);
+        write(&backup, attacker);
+
+        // The target now looks like a normal albus-rewritten file.
+        write(
+            &target,
+            "# albus: DoH DNS active\nnameserver 127.0.0.1\n# albus-saved: nameserver 9.9.9.9\n",
+        );
+
+        let my_uid = fs::metadata(&backup).expect("stat backup").uid();
+        assert_ne!(my_uid, 0, "test assumes an unprivileged writer");
+
+        // Production semantics: the backup is not root's, so it must not be used.
+        let res = restore_system_dns_from_backup(&target, &backup, 0);
+        assert!(
+            res.is_ok(),
+            "restore must still complete via the in-file markers, got {res:?}"
+        );
+        let restored = fs::read_to_string(&target).expect("read target");
+        assert!(
+            !restored.contains("6.6.6.6"),
+            "a backup owned by the service account must never reach /etc/resolv.conf, \
+             got: {restored:?}"
+        );
+
+        // And the gate is the ownership check, not luck: naming the real owner
+        // makes the same backup usable again.
+        let d2 = tmpdir("trusted-backup");
+        let target2 = d2.join("resolv.conf");
+        let backup2 = backup_path_in(&d2, &target2);
+        write(&backup2, attacker);
+        write(
+            &target2,
+            "# albus: DoH DNS active\nnameserver 127.0.0.1\n# albus-saved: nameserver 9.9.9.9\n",
+        );
+        let uid2 = fs::metadata(&backup2).expect("stat backup2").uid();
+        restore_system_dns_from_backup(&target2, &backup2, uid2).expect("trusted restore");
+        assert!(
+            fs::read_to_string(&target2)
+                .expect("read target2")
+                .contains("6.6.6.6"),
+            "when the backup is owned by the trusted uid it must still be honoured"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&d2);
+    }
+
+    /// The predicate itself, so the gate is pinned independently of the restore
+    /// flow: a file whose owner does not match is refused with PermissionDenied
+    /// rather than silently ignored.
+    #[test]
+    fn test_read_owned_file_rejects_foreign_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let d = tmpdir("owned");
+        let f = d.join("data");
+        write(&f, "payload\n");
+        let uid = fs::metadata(&f).expect("stat").uid();
+
+        assert_eq!(
+            read_owned_file(&f, uid).expect("same owner is accepted"),
+            "payload\n"
+        );
+        let err = read_owned_file(&f, uid.wrapping_add(1)).expect_err("foreign owner refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = fs::remove_dir_all(&d);
     }
 }

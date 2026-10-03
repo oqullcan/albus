@@ -83,6 +83,24 @@ pub fn journalctl() -> Command {
     c
 }
 
+/// P5: the account-management helpers get the same treatment.
+///
+/// systemctl and journalctl were given a chokepoint, and
+/// `spawn_chokepoint_tests` asserts the discipline for exactly those two — while
+/// useradd, groupadd and getent, spawned from this same file with root
+/// privileges, inherited the full environment. The stated exposure above (not
+/// argument injection, but an inherited `PATH` that redirects a helper) applies
+/// verbatim: absolute paths and fixed argv mean there is no live injection, so
+/// this is drift, not a vulnerability. Fixed because the invariant "every
+/// privileged spawn in this file goes through a chokepoint" was simply false, and
+/// the next helper added would have inherited nothing.
+fn scrubbed(bin: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.env_clear();
+    c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    c
+}
+
 /// Fail-closed atomic write for root-owned files: rejects symlinks, enforces mode.
 fn reject_symlink_chain(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for ancestor in path.ancestors() {
@@ -98,7 +116,18 @@ fn reject_symlink_chain(path: &Path) -> Result<(), Box<dyn std::error::Error + S
                 .into());
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
+            // P4: the bare Err(_) arm made the NotFound arm redundant and turned
+            // EACCES / ELOOP / ENOTDIR / ENAMETOOLONG into "this ancestor is fine".
+            // An ancestor we cannot inspect is an ancestor we cannot vouch for --
+            // the same rule the firewall helper already applies. Fail closed.
+            Err(e) => {
+                return Err(format!(
+                    "security violation: cannot inspect {} in path chain: {}",
+                    ancestor.display(),
+                    e
+                )
+                .into());
+            }
             _ => {}
         }
         if ancestor == Path::new("/") {
@@ -327,9 +356,7 @@ fn verify_installed_binary() -> Result<String, Box<dyn std::error::Error + Send 
 /// or otherwise) are accepted as-is — install never mutates an existing
 /// account, it only creates a missing one with safe defaults.
 fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let check = std::process::Command::new("/usr/sbin/useradd")
-        .arg("--help")
-        .output();
+    let check = scrubbed("/usr/sbin/useradd").arg("--help").output();
     if check.is_err() {
         // no useradd (minimal container?): rootless is unavailable;
         // install continues — the unit will fail loudly at startup
@@ -368,7 +395,7 @@ fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         return Ok(());
     }
 
-    let create = std::process::Command::new("/usr/sbin/useradd")
+    let create = scrubbed("/usr/sbin/useradd")
         .args([
             "--system",
             "--no-create-home",
@@ -395,7 +422,7 @@ fn ensure_service_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// default group.
 fn ensure_service_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Absolute path, no shell, fixed argv.
-    let ok = std::process::Command::new("/usr/bin/getent")
+    let ok = scrubbed("/usr/bin/getent")
         .args(["group", "albus"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -405,7 +432,7 @@ fn ensure_service_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>
     if ok {
         return Ok(());
     }
-    let created = std::process::Command::new("/usr/sbin/groupadd")
+    let created = scrubbed("/usr/sbin/groupadd")
         .args(["--system", "albus"])
         .status()
         .map(|s| s.success())
@@ -503,7 +530,14 @@ fn converge_service_dir(
     // W5-01: the mode is converged on EVERY install, not only when the directory
     // is newly created. A pre-existing 0777 /etc/albus is exactly the case this
     // misses today.
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    // P4: the chown below is done through the fd precisely to avoid a
+    // check-then-use window, but this chmod was still issued BY PATH after the
+    // O_NOFOLLOW|O_DIRECTORY open and fstat -- i.e. inside the very window the fd
+    // was opened to eliminate, and chmod follows symlinks. Use the fd.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o755))?;
+    }
     {
         use std::os::unix::fs::PermissionsExt as _;
         let now = fs::metadata(dir)?.permissions().mode() & 0o7777;
@@ -635,6 +669,28 @@ fn install_service(_args: &RunArgs) -> Result<(), Box<dyn std::error::Error + Se
             SYSTEM_BIN_PATH
         )
         .into());
+    }
+    // P4: the ordering was backwards. fs::copy opens with O_CREAT|O_TRUNC, which
+    // FOLLOWS a symlink, and normalize_installed_mode chmods through one — so if
+    // SYSTEM_BIN_PATH were a symlink, root truncated and rewrote the link target
+    // before verify_installed_binary finally refused it. Reaching that state needs
+    // root to plant the link (/usr/local/bin is root-owned), so this was not
+    // reachable unprivileged, but refuse BEFORE writing rather than after.
+    if let Ok(meta) = fs::symlink_metadata(SYSTEM_BIN_PATH) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "security violation: refusing to install through symlink at {}",
+                SYSTEM_BIN_PATH
+            )
+            .into());
+        }
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "security violation: {} exists and is not a regular file",
+                SYSTEM_BIN_PATH
+            )
+            .into());
+        }
     }
     let src_len = fs::metadata(&exe_path)?.len();
     fs::copy(&exe_path, SYSTEM_BIN_PATH).map_err(|e| {

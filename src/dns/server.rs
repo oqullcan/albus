@@ -445,8 +445,19 @@ impl DnsServer {
                                             );
                                             let is_ad = is_dnssec_authenticated(&resp_bytes);
 
-                                            // insert response into cache (bogus never cached)
-                                            cache_clone.insert(&query_data, &resp_bytes);
+                                            // F5: Indeterminate is not cached either.
+                                            // It means "we could not prove this" --
+                                            // a validation timeout, a broken chain, an
+                                            // NSEC3 denial we cannot hash. Caching it
+                                            // for the response TTL (up to 600s) pinned
+                                            // one transient failure far longer than the
+                                            // negative-verdict cache's own 60s, so a
+                                            // single 10s timeout suppressed
+                                            // revalidation for ten minutes. The neg
+                                            // cache still absorbs the retry storm.
+                                            if response_is_cacheable(dnssec_state) {
+                                                cache_clone.insert(&query_data, &resp_bytes);
+                                            }
 
                                             if let Some((domain, ips)) = parse_dns_response(&resp_bytes) {
                                                 if !ips.is_empty() {
@@ -646,6 +657,19 @@ pub fn is_dnssec_authenticated(response: &[u8]) -> bool {
 ///
 /// A response shorter than 4 bytes has no header to fix and is returned
 /// unchanged.
+/// F5: may this verdict's answer live in the response cache?
+///
+/// `Bogus` never gets here — it is answered with SERVFAIL. `Indeterminate` means
+/// "we could not prove this": a validation timeout, a broken chain, an NSEC3
+/// denial we cannot hash to check coverage. Caching it for the response TTL (up
+/// to 600s) pinned one transient failure far longer than the negative-verdict
+/// cache's own 60s, so a single 10s timeout suppressed revalidation for ten
+/// minutes. The negative cache still absorbs the retry storm, so nothing is
+/// gained by keeping the response.
+fn response_is_cacheable(state: Option<crate::dns::dnssec::DnssecState>) -> bool {
+    state != Some(crate::dns::dnssec::DnssecState::Indeterminate)
+}
+
 pub fn normalize_ad_bit(
     mut response: Vec<u8>,
     dnssec_enabled: bool,
@@ -1644,6 +1668,31 @@ mod admission_control_tests {
         assert_eq!(
             survivors, 1024,
             "a full cache of fresh verdicts must not be wiped"
+        );
+    }
+
+    /// F5: an Indeterminate verdict must not be pinned in the response cache.
+    ///
+    /// Indeterminate means "we could not prove this" — a timeout, a broken chain,
+    /// an NSEC3 denial we cannot hash. Only that verdict is excluded; Secure and
+    /// Insecure are real judgements and belong in the cache.
+    #[test]
+    fn test_indeterminate_is_not_cacheable() {
+        use crate::dns::dnssec::DnssecState;
+        assert!(
+            !response_is_cacheable(Some(DnssecState::Indeterminate)),
+            "Indeterminate must not be cached"
+        );
+        assert!(response_is_cacheable(Some(DnssecState::Secure)));
+        assert!(response_is_cacheable(Some(DnssecState::Insecure)));
+        assert!(
+            response_is_cacheable(Some(DnssecState::Bogus)),
+            "Bogus is answered with SERVFAIL before reaching the cache; the \
+             predicate must not become a second, weaker gate"
+        );
+        assert!(
+            response_is_cacheable(None),
+            "DNSSEC disabled: no verdict, so the normal caching policy applies"
         );
     }
 }
