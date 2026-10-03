@@ -52,21 +52,6 @@ enum FetchOutcome {
     Failed,
 }
 
-/// Chain verdict with unsigned-delegation (island) distinguished from failure:
-///
-/// - `Secure`: full DS→DNSKEY chain to the trust anchor.
-/// - `InsecureIsland`: the parent provably holds no DS for the zone
-///   (NOERROR + zero DS records), i.e. an unsigned delegation per RFC 4035
-///   §4.2. Served as Insecure, never Bogus.
-/// - `UnsignedUnproven`: the zone really is unsigned, but the only denial the
-///   parent offered was NSEC3 and this crate cannot hash to prove the record
-///   covers the delegation. Distinct from `Fail`, because "unsigned, and I can
-///   prove it" and "I cannot prove anything" must not resolve to the same
-///   verdict: the first is served Insecure, the second is served Bogus, and
-///   conflating them turned every `com.` opt-out name into SERVFAIL.
-///   Served as Indeterminate — AD cleared, never cached as Secure.
-/// - `Fail`: anything undecided (fetch failure, bad digest, broken chain).
-
 /// Outcome of authenticating a delegation-denial proof.
 #[derive(Debug, PartialEq, Eq)]
 enum DenialVerdict {
@@ -84,11 +69,28 @@ enum DenialVerdict {
 
 impl DenialVerdict {
     /// True only for `Authenticated`, so a denial counts as proven when, and
-    /// only when, the parent signed one that covers this delegation.
+    /// only when, the parent signed one that covers this delegation. Test-only:
+    /// production callers match on the variants directly.
+    #[cfg(test)]
     fn authenticated(&self) -> bool {
         matches!(self, DenialVerdict::Authenticated)
     }
 }
+
+/// Chain verdict with unsigned-delegation (island) distinguished from failure:
+///
+/// - `Secure`: full DS→DNSKEY chain to the trust anchor.
+/// - `InsecureIsland`: the parent provably holds no DS for the zone
+///   (NOERROR + zero DS records), i.e. an unsigned delegation per RFC 4035
+///   §4.2. Served as Insecure, never Bogus.
+/// - `UnsignedUnproven`: the zone really is unsigned, but the only denial the
+///   parent offered was NSEC3 and this crate cannot hash to prove the record
+///   covers the delegation. Distinct from `Fail`, because "unsigned, and I can
+///   prove it" and "I cannot prove anything" must not resolve to the same
+///   verdict: the first is served Insecure, the second is served Bogus, and
+///   conflating them turned every `com.` opt-out name into SERVFAIL.
+///   Served as Indeterminate — AD cleared, never cached as Secure.
+/// - `Fail`: anything undecided (fetch failure, bad digest, broken chain).
 
 #[derive(Debug, PartialEq, Eq)]
 enum ChainVerdict {

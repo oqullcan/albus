@@ -31,6 +31,7 @@ const MAX_RULE_DELETE_ITER: usize = 32;
 ///   * no directory in the chain may be writable by group or other, so a
 ///     writable ancestor cannot be used to swap the target after the check.
 #[cfg(unix)]
+#[cfg(test)]
 fn helper_is_trusted_with(path: &Path, trusted_uids: &[libc::uid_t]) -> bool {
     helper_trusted_real_path(path, trusted_uids).is_some()
 }

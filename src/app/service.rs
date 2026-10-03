@@ -494,8 +494,6 @@ fn converge_service_dir(
     dir: &Path,
     owner: Option<(libc::uid_t, libc::gid_t)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::os::unix::fs::PermissionsExt;
-
     // The crate already has this helper and already applies it to every file it
     // writes; the chown was simply never brought under it.
     reject_symlink_chain(dir)?;

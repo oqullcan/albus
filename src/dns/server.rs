@@ -1431,6 +1431,7 @@ mod ad_bit_authority_tests",
 
 #[cfg(test)]
 mod admission_control_tests {
+    use super::*;
 
     /// DNS-02's claim, made structural: the admission decision must precede the
     /// datagram copy and the spawn. A test that only measured behaviour could be

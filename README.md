@@ -59,6 +59,35 @@ remove it manually if wanted).
 
 ## Options
 
+Defaults exactly as `Config::default()` reports them. This table is generated
+against the code by `tests/docs.rs` (`readme_flag_table_matches_config_defaults`),
+so it cannot drift from the binary silently — a changed default fails the build
+until this table is updated.
+
+| Flag | Type | Default |
+| --- | --- | --- |
+| `--mss` | `u16` | `88` |
+| `--min-mss` | `u16` | `64` |
+| `--restore-after-bytes` | `u32` | `600` |
+| `--ports` | `Vec<u16>` | `[443]` |
+| `--fake-ttl` | `u8` | `8` |
+| `--auto-ttl` | `bool` | `true` |
+| `--fake-sni` | `String` | `None` |
+| `--fake-bad-checksum` | `bool` | `false` |
+| `--doh` | `bool` | `true` |
+| `--doh-upstream` | `String` | `"quad9"` |
+| `--doh-bootstrap-ips` | `Vec<IPv4>` | `[]` |
+| `--dnssec` | `bool` | `true` |
+| `--pqc` | `bool` | `true` |
+| `--ram-only` | `bool` | `false` |
+| `--block-quic` | `bool` | `true` |
+| `--block-stun` | `bool` | `true` |
+| `--kill-switch` | `bool` | `true` |
+| `--network-lockdown` | `bool` | `false` |
+| `--block-ipv6` | `bool` | `true` |
+
+### Details
+
 Evasion:
 
 - `--mss 88` — initial TCP MSS size that fragments the ClientHello

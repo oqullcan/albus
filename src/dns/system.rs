@@ -404,13 +404,13 @@ pub fn restore_system_dns_from_backup(
     // zero, in which case they are gone and the restore has no input at all.
     if let Ok(original) = read_owned_file(backup, backup_owner) {
         if !original.trim().is_empty() {
-            atomic_write_nofollow(&target, &original)?;
-            let _ = fs::remove_file(&backup);
+            atomic_write_nofollow(target, &original)?;
+            let _ = fs::remove_file(backup);
             return Ok(());
         }
     }
 
-    let content = read_nofollow(&target)?;
+    let content = read_nofollow(target)?;
     let mut new_lines = Vec::new();
 
     for line in content.lines() {
@@ -434,7 +434,7 @@ pub fn restore_system_dns_from_backup(
 
     let mut out = new_lines.join("\n");
     out.push('\n');
-    atomic_write_nofollow(&target, &out)
+    atomic_write_nofollow(target, &out)
 }
 
 // detects un-restored albus configuration tags and recovers original system state
