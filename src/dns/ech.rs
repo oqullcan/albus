@@ -1,5 +1,34 @@
 //! rfc 9460 service binding and https resource record (type 65) parser for echconfiglist extraction.
 
+// ACCEPTED RISK, documented rather than silently carried.
+//
+// The ECHConfigList fed into the TLS handshake comes from the configured DoH
+// upstream and is never validated against DNSSEC. A hostile or compromised
+// upstream can therefore steer where the ClientHello is encrypted to.
+//
+// Why this is accepted rather than fixed:
+//   * the same upstream already supplies every DNS answer, including for
+//     names that are not DNSSEC-signed, so DNSSEC would not be a new
+//     requirement being waived -- it is simply a different, stronger
+//     requirement that this particular input does not meet;
+//   * there is no DNSSEC-protected record type that carries ECHConfigs.
+//     RFC 9460 SVCB/HTTPS records are DNSSEC-signable in principle, but the
+//     upstream that hands us the ECH config is the party we would have to
+//     authenticate the chain to, which is the thing in question;
+//   * ECH is a privacy feature the operator opts into. Its value is
+//     proportional to the resolver's honesty, so an attacker willing to
+//     subvert TLS to a chosen server can already observe the plaintext SNI
+//     it is hiding.
+//
+// What is enforced here: length bounds, a domain-length limit, and
+// `EchConfig::new` validation before anything enters the cache, so no
+// unparseable bytes can be handed to rustls.
+//
+// If this ever needs to be closed, the shape is an operator-supplied
+// allowlist of ECH public keys (the configs are public values, comparable
+// to a certificate pin), not DNSSEC. Tracking that as follow-up work rather
+// than implying the path is authenticated when it is not.
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
