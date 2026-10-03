@@ -58,9 +58,41 @@ enum FetchOutcome {
 /// - `InsecureIsland`: the parent provably holds no DS for the zone
 ///   (NOERROR + zero DS records), i.e. an unsigned delegation per RFC 4035
 ///   §4.2. Served as Insecure, never Bogus.
+/// - `UnsignedUnproven`: the zone really is unsigned, but the only denial the
+///   parent offered was NSEC3 and this crate cannot hash to prove the record
+///   covers the delegation. Distinct from `Fail`, because "unsigned, and I can
+///   prove it" and "I cannot prove anything" must not resolve to the same
+///   verdict: the first is served Insecure, the second is served Bogus, and
+///   conflating them turned every `com.` opt-out name into SERVFAIL.
+///   Served as Indeterminate — AD cleared, never cached as Secure.
 /// - `Fail`: anything undecided (fetch failure, bad digest, broken chain).
+
+/// Outcome of authenticating a delegation-denial proof.
+#[derive(Debug, PartialEq, Eq)]
+enum DenialVerdict {
+    /// The parent signed a denial that covers this delegation.
+    Authenticated,
+    /// The parent offered only NSEC3, and this crate cannot hash to prove the
+    /// record covers the delegation. The zone is unsigned; we just cannot say
+    /// so with a proof. Kept apart from `Refused` so the caller can answer
+    /// Indeterminate instead of Bogus — otherwise every name in an NSEC3
+    /// opt-out parent (i.e. all of `com.`) would SERVFAIL.
+    Nsec3Unsupported,
+    /// No usable denial: wrong shape, wrong signer, or bad signature.
+    Refused,
+}
+
+impl DenialVerdict {
+    /// True only for `Authenticated`, so a denial counts as proven when, and
+    /// only when, the parent signed one that covers this delegation.
+    fn authenticated(&self) -> bool {
+        matches!(self, DenialVerdict::Authenticated)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ChainVerdict {
+    UnsignedUnproven,
     Secure,
     InsecureIsland,
     Fail,
@@ -395,9 +427,9 @@ impl DnssecValidator {
         denial: &[Record],
         parent_dnskeys: &[DNSKEY],
         now: u32,
-    ) -> bool {
+    ) -> DenialVerdict {
         if denial.is_empty() || parent_dnskeys.is_empty() {
-            return false;
+            return DenialVerdict::Refused;
         }
 
         let nsecs: Vec<&Record> = denial
@@ -412,7 +444,7 @@ impl DnssecValidator {
         // A mixed NSEC + NSEC3 answer: neither can be said to be the intended
         // proof, so believe neither.
         if !nsecs.is_empty() && !nsec3s.is_empty() {
-            return false;
+            return DenialVerdict::Refused;
         }
 
         // ---- NSEC3 path (RFC 5155 §8.5) -------------------------------------
@@ -445,36 +477,30 @@ impl DnssecValidator {
         // to the trust anchor (see `chain_to_root`), so a resolver cannot forge
         // the parent key itself.
         if nsecs.is_empty() {
-            if nsec3s.is_empty() {
-                return false;
-            }
-            let sigs3 = Self::rrsig_records(denial, RecordType::NSEC3);
-            if sigs3.is_empty() {
-                return false;
-            }
-            for n3 in &nsec3s {
-                let RData::DNSSEC(DNSSECRData::NSEC3(rec)) = &n3.data else {
-                    continue;
-                };
-                if !rec.opt_out() {
-                    continue;
-                }
-                for sig in &sigs3 {
-                    if let Some(signer) =
-                        self.verify_rrset(&n3.name, &[(*n3).clone()], sig, parent_dnskeys, now)
-                    {
-                        if name_eq(&signer, parent) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
+            // NSEC3 is refused outright, as the doc comment above states.
+            //
+            // It used to be accepted on the strength of "the parent signed an
+            // opt-out NSEC3" and nothing more -- `zone` was never referenced on
+            // that branch, so there was not even a proximity requirement. A
+            // resolver could harvest any opt-out NSEC3 the parent publishes (for
+            // `com.` those are plentiful, that is what opt-out means) and replay
+            // it to turn a genuinely signed zone into Insecure, with its forged
+            // address cached and served.
+            //
+            // Refusing is strictly better than the Insecure it replaces: the
+            // caller turns this into Indeterminate, which clears AD, is served
+            // with a warning, and is never cached as Secure. Actually accepting
+            // NSEC3 needs RFC 5155 §8.4/§8.7 -- closest-encloser and next-closer
+            // hashing, ~150 lines of new SHA-1 cryptography. hickory-proto
+            // exposes the NSEC3 RDATA but no hash-name API, so that is a
+            // deliberate follow-up, not a shortcut: a wrong hash implementation
+            // would make things worse than refusing.
+            return DenialVerdict::Nsec3Unsupported;
         }
 
         let sigs = Self::rrsig_records(denial, RecordType::NSEC);
         if sigs.is_empty() {
-            return false;
+            return DenialVerdict::Refused;
         }
 
         for nsec in &nsecs {
@@ -500,12 +526,12 @@ impl DnssecValidator {
                     self.verify_rrset(zone, &[(*nsec).clone()], sig, parent_dnskeys, now)
                 {
                     if name_eq(&signer, parent) {
-                        return true;
+                        return DenialVerdict::Authenticated;
                     }
                 }
             }
         }
-        false
+        DenialVerdict::Refused
     }
 
     fn rrsig_records(records: &[Record], covered: RecordType) -> Vec<RRSIG> {
@@ -633,12 +659,21 @@ impl DnssecValidator {
         let ds_records = match ds_records {
             FetchOutcome::Found(r) => r,
             FetchOutcome::Nodata { denial } => {
-                if !self.authenticate_denial(zone, &parent, &denial, &parent_dnskeys, now) {
-                    // Unauthenticated or unverifiable denial: not an island, and
-                    // not a cryptographic contradiction either. Fail closed and
-                    // let the caller report Indeterminate rather than silently
-                    // demoting.
-                    return ChainVerdict::Fail;
+                match self.authenticate_denial(zone, &parent, &denial, &parent_dnskeys, now) {
+                    DenialVerdict::Authenticated => {}
+                    // Unsigned, but the only proof offered was NSEC3 and we cannot
+                    // hash to check coverage. NOT a chain failure: calling this Fail
+                    // made every `com.` opt-out name resolve to Bogus, i.e. SERVFAIL,
+                    // where it had previously validated Insecure.
+                    DenialVerdict::Nsec3Unsupported => {
+                        return ChainVerdict::UnsignedUnproven;
+                    }
+                    // Unauthenticated or unverifiable denial: not an island, and not
+                    // a cryptographic contradiction either. Fail closed and let the
+                    // caller report Indeterminate rather than silently demoting.
+                    DenialVerdict::Refused => {
+                        return ChainVerdict::Fail;
+                    }
                 }
                 // HANCORE 2026-10, second report (raised against d481cb8):
                 // `parent_dnskeys` came straight off the wire and the denial was
@@ -662,6 +697,8 @@ impl DnssecValidator {
                     ChainVerdict::Secure => ChainVerdict::InsecureIsland,
                     // Parent is itself an island: nothing beneath it is secure.
                     ChainVerdict::InsecureIsland => ChainVerdict::InsecureIsland,
+                    // Propagated: still unsigned, still unproven.
+                    ChainVerdict::UnsignedUnproven => ChainVerdict::UnsignedUnproven,
                     // The signing key does not chain to the root. Either the
                     // resolver forged the delegation or the chain is genuinely
                     // broken; both are Fail, never Insecure.
@@ -685,6 +722,7 @@ impl DnssecValidator {
             {
                 ChainVerdict::Secure => ChainVerdict::Secure,
                 ChainVerdict::InsecureIsland => ChainVerdict::InsecureIsland,
+                ChainVerdict::UnsignedUnproven => ChainVerdict::UnsignedUnproven,
                 ChainVerdict::Fail => ChainVerdict::Fail,
             };
         }
@@ -972,6 +1010,10 @@ impl DnssecValidator {
             }
             let mut rrset_secure = false;
             let mut rrset_island = false;
+            // Signed zone under an unsigned parent we could not prove: capped,
+            // NOT a crypto failure. Tracked per-candidate so the post-loop check
+            // below cannot reclassify it as tampering.
+            let mut rrset_capped = false;
             for sig in &sigs {
                 let signer = sig.input().signer_name.clone();
                 // fetch the signer's DNSKEY set and try it
@@ -1000,6 +1042,13 @@ impl DnssecValidator {
                     ChainVerdict::InsecureIsland => {
                         rrset_island = true;
                         break;
+                    }
+                    // Unsigned parent, but proved only by NSEC3 we cannot verify.
+                    // Served Indeterminate: honest, and AD is cleared.
+                    ChainVerdict::UnsignedUnproven => {
+                        rrset_capped = true;
+                        all_secure = false;
+                        continue;
                     }
                     ChainVerdict::Fail => continue,
                 }
@@ -1047,6 +1096,16 @@ impl DnssecValidator {
                     saw_capped = true;
                     continue;
                 }
+            }
+            if rrset_capped {
+                // Unsigned parent, but the only denial was an NSEC3 whose
+                // coverage this crate cannot hash to prove. Served Indeterminate:
+                // AD cleared, never cached as Secure. Falling through to the
+                // crypto-failure branch below turned every `com.` opt-out name
+                // into SERVFAIL, which is strictly worse than the Insecure it
+                // replaced.
+                saw_capped = true;
+                continue;
             }
             // RRSIGs present but none chain-verify: record the cryptographic
             // failure and keep evaluating — a later candidate may still
@@ -1473,12 +1532,22 @@ mod tests {
         assert_eq!(state, DnssecState::Insecure);
     }
 
-    // Island regression (chatgpt.com 2026-09-23): a signed zone with NO DS
-    // in the parent must validate Insecure (served), never Bogus (SERVFAIL).
-    // Live-network — excluded from hermetic gates like the other live tests.
+    // Island regression (chatgpt.com 2026-09-23): a signed zone with no DS in
+    // the parent must be SERVED, never Bogus. Live-network — excluded from
+    // hermetic gates like the other live tests.
+    //
+    // This used to assert Insecure. It now asserts Indeterminate, and the
+    // distinction is the whole point of HANCORE's fourth report: `com.` denies
+    // this delegation with an opt-out NSEC3, and this crate cannot hash to prove
+    // the record covers the delegation. Calling it Insecure asserted something we
+    // cannot support; a resolver could have harvested any of `com.`'s opt-out
+    // NSEC3s and replayed it here.
+    //
+    // Indeterminate is the honest verdict and is served: AD is cleared, the answer
+    // is never cached as Secure. `test_optout_nsec3_*` covers the forgery itself.
     #[tokio::test]
     #[ignore]
-    async fn test_unsigned_delegation_island_is_insecure_live() {
+    async fn test_unsigned_delegation_island_is_served_not_bogus_live() {
         let v = DnssecValidator::new();
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init should succeed");
         let q = doh_query_with_do("chatgpt.com", RecordType::A);
@@ -1487,7 +1556,11 @@ mod tests {
             .await
             .expect("live DoH query should succeed");
         let state = v.validate("chatgpt.com", 1, &resp, &resolver).await;
-        assert_eq!(state, DnssecState::Insecure);
+        assert_eq!(
+            state,
+            DnssecState::Indeterminate,
+            "an NSEC3-only delegation must be served unverified, not SERVFAIL"
+        );
     }
 
     // CDN regression (video.twimg.com 2026-09-23): unsigned CNAME in an
@@ -1812,13 +1885,15 @@ mod delegation_denial_tests {
             unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
         ];
         assert!(
-            !DnssecValidator::new().authenticate_denial(
-                &zone("example.com."),
-                &zone("com."),
-                &denial,
-                &keys(&[dnskey_rec("com.", 1)]),
-                now()
-            ),
+            !DnssecValidator::new()
+                .authenticate_denial(
+                    &zone("example.com."),
+                    &zone("com."),
+                    &denial,
+                    &keys(&[dnskey_rec("com.", 1)]),
+                    now()
+                )
+                .authenticated(),
             "a denial that does not verify against the parent's keys must not \
              be accepted as an insecure delegation"
         );
@@ -1828,25 +1903,29 @@ mod delegation_denial_tests {
     #[test]
     fn test_denial_without_any_signature_is_refused() {
         let denial = vec![nsec("example.com.", "aaa.com.", &[RecordType::NS])];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// Nothing to check.
     #[test]
     fn test_empty_denial_is_refused() {
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &[],
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &[],
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// A denial with no parent keys to verify against must not be believed.
@@ -1856,13 +1935,9 @@ mod delegation_denial_tests {
             nsec("example.com.", "aaa.com.", &[RecordType::NS]),
             unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
         ];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &[],
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(&zone("example.com."), &zone("com."), &denial, &[], now())
+            .authenticated());
     }
 
     /// NSEC3-only cannot be evaluated (this crate has no NSEC3 hash
@@ -1876,13 +1951,15 @@ mod delegation_denial_tests {
             nsec("example.com.", "aaa.com.", &[RecordType::NS]),
             unverifiable_rrsig("example.com.", "com.", RecordType::NSEC3),
         ];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// The NSEC must sit at the delegation name. One for an unrelated name is a
@@ -1893,13 +1970,15 @@ mod delegation_denial_tests {
             nsec("other.com.", "zzz.com.", &[RecordType::NS]),
             unverifiable_rrsig("other.com.", "com.", RecordType::NSEC),
         ];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// An NSEC whose bitmap advertises DS describes a SIGNED delegation, whose
@@ -1914,13 +1993,15 @@ mod delegation_denial_tests {
             ),
             unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
         ];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// A well-formed, correctly-placed, correctly-typed denial must be refused
@@ -1948,13 +2029,15 @@ mod delegation_denial_tests {
             n,
             unverifiable_rrsig("example.com.", "com.", RecordType::NSEC),
         ];
-        assert!(!DnssecValidator::new().authenticate_denial(
-            &zone("example.com."),
-            &zone("com."),
-            &denial,
-            &keys(&[dnskey_rec("com.", 1)]),
-            now()
-        ));
+        assert!(!DnssecValidator::new()
+            .authenticate_denial(
+                &zone("example.com."),
+                &zone("com."),
+                &denial,
+                &keys(&[dnskey_rec("com.", 1)]),
+                now()
+            )
+            .authenticated());
     }
 
     /// Regression guard on the response-shape half of the fix: the SOA that used
@@ -2416,6 +2499,134 @@ mod delegation_denial_tests",
                 .verify_rrset(&owner, &[a_rec], &rrsig, &[key], now())
                 .is_none(),
             "notbank.com must not count as an ancestor of bank.com"
+        );
+    }
+
+    /// A genuinely valid, opt-out NSEC3 signed by `signer`, at an owner the test
+    /// chooses. Returns (NSEC3 record, RRSIG, parent DNSKEY).
+    fn signed_optout_nsec3_by(owner: &str, signer: &str) -> (Record, RRSIG, DNSKEY) {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::rdata::{SigInput, NSEC3};
+        use hickory_proto::dnssec::{DnssecSigner, Nsec3HashAlgorithm, SigningKey, TBS};
+
+        let sk = Ed25519SigningKey::from_pkcs8(
+            &Ed25519SigningKey::generate_pkcs8().expect("generate key"),
+        )
+        .expect("decode key");
+        let dnskey = DNSKEY::new(true, true, false, sk.to_public_key().expect("public key"));
+
+        let owner_name: Name = owner.parse().expect("owner");
+        let signer_name: Name = signer.parse().expect("signer");
+        let nsec3_rec = Record::from_rdata(
+            owner_name.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::NSEC3(NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                true, // opt-out: this is the flag that makes the code accept it
+                0,
+                vec![0xAA, 0xBB],
+                vec![0x11; 20],
+                [RecordType::NS, RecordType::RRSIG],
+            ))),
+        );
+
+        let input = SigInput {
+            type_covered: RecordType::NSEC3,
+            algorithm: Algorithm::ED25519,
+            num_labels: owner_name.num_labels(),
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: dnskey.calculate_key_tag().expect("key tag"),
+            signer_name: signer_name.clone(),
+        };
+        let tbs = TBS::from_input(
+            &owner_name,
+            DNSClass::IN,
+            &input,
+            std::iter::once(&nsec3_rec),
+        )
+        .expect("tbs");
+        let sg = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(sk),
+            signer_name,
+            Duration::from_secs(3600),
+        );
+        let sig = sg.sign(&tbs).expect("sign");
+        (nsec3_rec, RRSIG::from_sig(input, sig), dnskey)
+    }
+
+    /// HANCORE's fourth report, at cbd5da5.
+    ///
+    /// The NSEC3 branch verified that the parent had signed *an* opt-out NSEC3
+    /// and stopped there. It never established that the record covered the
+    /// delegation being asked about -- `zone` was not referenced on that branch
+    /// at all, so there was not even a proximity requirement. A resolver could
+    /// harvest any opt-out NSEC3 from `com.` and replay it for an unrelated name,
+    /// turning a genuinely signed zone into Insecure, with its forged address
+    /// cached and served.
+    ///
+    /// This crate has no NSEC3 hash implementation, so it cannot prove
+    /// coverage. Refusing is the honest verdict: Indeterminate, not Insecure.
+    #[test]
+    fn test_optout_nsec3_without_coverage_proof_is_refused() {
+        // Signed by `com.`, but about some entirely unrelated hashed name.
+        let (nsec3_rec, rrsig, parent_key) =
+            signed_optout_nsec3_by("A1B2C3D4E5F6.example.", "com.");
+
+        let denial = vec![
+            nsec3_rec,
+            Record::from_rdata(
+                zone("A1B2C3D4E5F6.example."),
+                3600,
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+            ),
+        ];
+
+        assert!(
+            !DnssecValidator::new()
+                .authenticate_denial(
+                    &zone("chatgpt.com."),
+                    &zone("com."),
+                    &denial,
+                    &[parent_key],
+                    now()
+                )
+                .authenticated(),
+            "an opt-out NSEC3 that was never shown to cover this delegation \
+             must not be accepted as proof the zone is unsigned"
+        );
+    }
+
+    /// And the proof that the refusal is the coverage check rather than a blanket
+    /// ban: the *same* NSEC3, when placed at the delegation's own name, is still
+    /// refused too -- this crate cannot verify coverage at all, so no placement
+    /// is provable. Pinning this stops the refusal from being "fixed" later by
+    /// re-widening the branch without adding the hash.
+    #[test]
+    fn test_optout_nsec3_at_delegation_name_is_also_refused() {
+        let (nsec3_rec, rrsig, parent_key) = signed_optout_nsec3_by("chatgpt.com.", "com.");
+        let denial = vec![
+            nsec3_rec,
+            Record::from_rdata(
+                zone("chatgpt.com."),
+                3600,
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+            ),
+        ];
+
+        assert!(
+            !DnssecValidator::new()
+                .authenticate_denial(
+                    &zone("chatgpt.com."),
+                    &zone("com."),
+                    &denial,
+                    &[parent_key],
+                    now()
+                )
+                .authenticated(),
+            "without NSEC3 hashing there is no placement that proves coverage"
         );
     }
 }
