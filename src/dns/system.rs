@@ -445,8 +445,15 @@ pub fn cleanup_system_dns() -> Result<bool> {
 }
 
 pub fn cleanup_system_dns_at<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let target =
-        resolve_write_target(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    // P4: this used to swallow resolve_write_target's PermissionDenied — the very
+    // "refusing to follow resolv.conf symlink" case the function exists to raise —
+    // and fall back to the unresolved path. read_nofollow then failed ELOOP, the
+    // `if let Ok(content)` fell through, and the function returned Ok(false), which
+    // main.rs reports as "no albus DNS markers found; resolver left untouched" with
+    // a zero exit. ExecStopPost saw success and the crash-recovery canary was
+    // disabled while reporting a clean bill of health. Both sibling paths
+    // (set_system_dns_at, restore_system_dns_at) propagate this error with `?`.
+    let target = resolve_write_target(path.as_ref())?;
     if let Ok(content) = read_nofollow(&target) {
         // DNS-04: an EMPTY resolver file is not "nothing to do" — it is a host
         // with no name resolution, and the previous code returned Ok(false)

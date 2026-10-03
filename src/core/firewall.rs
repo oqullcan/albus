@@ -32,6 +32,29 @@ const MAX_RULE_DELETE_ITER: usize = 32;
 ///     writable ancestor cannot be used to swap the target after the check.
 #[cfg(unix)]
 fn helper_is_trusted_with(path: &Path, trusted_uids: &[libc::uid_t]) -> bool {
+    helper_trusted_real_path(path, trusted_uids).is_some()
+}
+
+/// As `helper_is_trusted_with`, but returns the RESOLVED path — the same one that
+/// must then be handed to `execve`.
+///
+/// P2: `resolve_binary_with` used to return the original candidate string while
+/// this check validated `canonicalize(candidate)`. The kernel re-resolves the
+/// path at exec time, so a symlink swapped between the check and the exec was
+/// never the file that got vetted, and the comment above claiming the window
+/// was closed was describing only one of the two paths in play. Returning the
+/// resolved path makes the check and the exec refer to the same object.
+///
+/// P3: the ancestor walk below checks directory modes, but never the helper's own
+/// mode. `service.rs` states the reasoning for its own binary outright — a
+/// group- or world-writable file exec'd under six ambient capabilities hands code
+/// execution to every local principal in that set — and it applies verbatim to
+/// `/usr/sbin/iptables`, which `RealIptables::run` execs from inside the same
+/// capability-bearing daemon.
+fn helper_trusted_real_path(
+    path: &Path,
+    trusted_uids: &[libc::uid_t],
+) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
     // Resolve FIRST, then judge the resolved target and the directories it
@@ -42,18 +65,22 @@ fn helper_is_trusted_with(path: &Path, trusted_uids: &[libc::uid_t]) -> bool {
     // link, which is the other case `exists()` used to wave through differently.
     let real = match std::fs::canonicalize(path) {
         Ok(r) => r,
-        Err(_) => return false, // missing, or a dangling symlink
+        Err(_) => return None, // missing, or a dangling symlink
     };
 
     let meta = match std::fs::metadata(&real) {
         Ok(m) => m,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     if !meta.is_file() {
-        return false; // directory, socket, device, fifo
+        return None; // directory, socket, device, fifo
     }
     if !trusted_uids.contains(&meta.uid()) {
-        return false;
+        return None;
+    }
+    // P3: the file itself must not be group- or world-writable.
+    if meta.mode() & 0o022 != 0 {
+        return None;
     }
 
     // Walk the RESOLVED chain: a component writable by group or other would
@@ -64,15 +91,15 @@ fn helper_is_trusted_with(path: &Path, trusted_uids: &[libc::uid_t]) -> bool {
         match std::fs::metadata(d) {
             Ok(dm) => {
                 if dm.mode() & 0o022 != 0 {
-                    return false;
+                    return None;
                 }
             }
             // An ancestor we cannot stat is an ancestor we cannot vouch for.
-            Err(_) => return false,
+            Err(_) => return None,
         }
         dir = d.parent();
     }
-    true
+    Some(real)
 }
 
 /// The uids allowed to own a privileged helper: root, plus the albus service
@@ -103,13 +130,13 @@ fn helper_is_trusted(_path: &Path) -> bool {
 /// that may not be there, and an untrusted one was never rejected at all. An
 /// absent or untrusted helper is now an explicit error that EBPF-01's
 /// `Result` plumbing propagates to the caller.
-fn resolve_binary_with<'a>(
-    candidates: &'a [&str],
+fn resolve_binary_with(
+    candidates: &[&str],
     trusted_uids: &[libc::uid_t],
-) -> Result<&'a str, FirewallError> {
+) -> Result<std::path::PathBuf, FirewallError> {
     for c in candidates {
-        if helper_is_trusted_with(Path::new(c), trusted_uids) {
-            return Ok(c);
+        if let Some(real) = helper_trusted_real_path(Path::new(c), trusted_uids) {
+            return Ok(real);
         }
     }
     Err(FirewallError(format!(
@@ -121,15 +148,15 @@ fn resolve_binary_with<'a>(
 }
 
 #[cfg(unix)]
-fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
+fn resolve_binary(candidates: &[&str]) -> Result<std::path::PathBuf, FirewallError> {
     resolve_binary_with(candidates, &trusted_helper_uids())
 }
 
 #[cfg(not(unix))]
-fn resolve_binary<'a>(candidates: &'a [&str]) -> Result<&'a str, FirewallError> {
+fn resolve_binary(candidates: &[&str]) -> Result<std::path::PathBuf, FirewallError> {
     candidates
         .first()
-        .copied()
+        .map(std::path::PathBuf::from)
         .ok_or_else(|| FirewallError("no iptables candidates configured".into()))
 }
 
@@ -1031,7 +1058,7 @@ mod helper_identity_tests {
         let cands = vec![loose_s.as_str(), good_s.as_str()];
         assert_eq!(
             resolve_binary_with(&cands, &uids).expect("a trusted candidate exists"),
-            good_s.as_str(),
+            std::fs::canonicalize(&good_s).expect("canonicalize good"),
             "an untrusted candidate must be skipped in favour of a trusted one"
         );
 
@@ -1041,6 +1068,58 @@ mod helper_identity_tests {
             err.to_string().contains("no trusted"),
             "the failure must name the problem: {}",
             err
+        );
+    }
+
+    /// P2: the path `resolve_binary_with` hands back must be the RESOLVED one —
+    /// the same object `helper_trusted_real_path` vetted. Returning the original
+    /// candidate string meant `Command::new` re-resolved it, so a symlink swapped
+    /// after the check was never the file that got vetted.
+    #[test]
+    fn test_resolve_binary_returns_the_resolved_path() {
+        let f = Fixture::new("resolved-exec");
+        let real = f.path("iptables");
+        std::fs::write(&real, "#!/bin/sh\n").expect("write helper");
+        set_mode(&real, 0o755);
+        let link = f.path("iptables-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let uids = test_uids();
+        let got = resolve_binary_with(&[link.to_str().expect("utf8")], &uids)
+            .expect("a symlink to a trusted regular file is still trusted");
+
+        assert_eq!(
+            got,
+            std::fs::canonicalize(&real).expect("canonicalize"),
+            "the returned path must be the resolved target, not the candidate"
+        );
+        assert_ne!(
+            got, link,
+            "returning the candidate would leave a check-then-use window at exec time"
+        );
+    }
+
+    /// P3: the helper's OWN mode was never checked, only its ancestors'. A
+    /// world-writable /usr/sbin/iptables passes every other test here and is
+    /// exec'd inside a capability-bearing daemon — the exact reasoning
+    /// `service.rs` states for its own binary.
+    #[test]
+    fn test_world_writable_helper_is_refused() {
+        let f = Fixture::new("loose-exec");
+        let bin = f.path("iptables");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("write helper");
+        set_mode(&bin, 0o777);
+
+        let uids = test_uids();
+        assert!(
+            !helper_is_trusted_with(&bin, &uids),
+            "a world-writable helper must not be trusted just because it is root-owned"
+        );
+        let err = resolve_binary_with(&[bin.to_str().expect("utf8")], &uids)
+            .expect_err("a world-writable helper must not resolve");
+        assert!(
+            err.0.contains("no trusted iptables"),
+            "unexpected error shape: {err:?}"
         );
     }
 }

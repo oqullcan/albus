@@ -299,8 +299,20 @@ impl BpfEngine {
                 Ok(reader) => {
                     let key = cpu as u32;
                     let val = reader.fd as u32;
+                    // P4: a failed map update leaves that CPU's slot with no reader
+                    // installed, which is exactly what a missing reader means to
+                    // bpf_perf_event_output — the decoy ClientHello for that CPU is
+                    // never injected. It was warn-only while the CPU still counted
+                    // as complete, so readers_complete() stayed true and the engine
+                    // logged "DPI bypass engine active" for a CPU it cannot cover.
+                    // Same accounting as an attach failure.
                     if let Err(e) = bpf_map_update(conn_events_fd, &key, &val) {
-                        warn!("bpf_map_update conn_events on cpu {}: {}", cpu, e);
+                        readers_failed += 1;
+                        warn!(
+                            "bpf_map_update conn_events on cpu {}: {} (decoy injection \
+                             will not run for this CPU)",
+                            cpu, e
+                        );
                     }
                     perf_readers.push(reader);
                 }
