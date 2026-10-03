@@ -652,45 +652,77 @@ impl DnssecValidator {
         };
         // DS must digest a SEP (flag 257) key; the DS RRset itself must be
         // signed by the parent keys, whose chain we then recurse into.
-        for rec in &ds_records {
+        if self.ds_proves_signed_zone(zone, &keys, &ds_records, &parent, &parent_dnskeys, now) {
+            // Propagate island upward: a DS under an unsigned parent proves
+            // nothing, so the subtree is insecure — but it is NOT a
+            // cryptographic contradiction (never Bogus here). The recursion
+            // depends only on parent/parent_keys, never on which DS matched, so
+            // re-running it for another DS/key/sig combination cannot differ.
+            return match Box::pin(self.chain_to_root(&parent, &parent_keys, resolver, depth + 1))
+                .await
+            {
+                ChainVerdict::Secure => ChainVerdict::Secure,
+                ChainVerdict::InsecureIsland => ChainVerdict::InsecureIsland,
+                ChainVerdict::Fail => ChainVerdict::Fail,
+            };
+        }
+        ChainVerdict::Fail
+    }
+
+    /// Does an authenticated DS prove a signed zone covers `zone`?
+    ///
+    /// Two independent conditions, both required:
+    ///   * the DS digests a SEP key of `zone_keys` (flag 257, matching key tag,
+    ///     algorithm and digest type), and
+    ///   * the DS RRset carries an RRSIG made by `parent` — the RRset *about* a
+    ///     delegation is asserted by the parent, not by the child.
+    ///
+    /// HANCORE 2026-10, third finding: `owner_zone_signed` answered this from the
+    /// mere presence of a resolver-supplied DS record, with no RRSIG check and no
+    /// parent validation, while `chain_to_root` a few hundred lines up required
+    /// both. A hostile resolver could therefore invent a DS at any name and force
+    /// the `Bogus` verdict — never a forged address, but a denial of service on a
+    /// name it does not control. Two paths answering one question with different
+    /// bars is how that survived review, so there is now one answer for both.
+    fn ds_proves_signed_zone(
+        &self,
+        zone: &Name,
+        zone_keys: &[DNSKEY],
+        ds_records: &[Record],
+        parent: &Name,
+        parent_keys: &[DNSKEY],
+        now: u32,
+    ) -> bool {
+        if ds_records.is_empty() || parent_keys.is_empty() || zone_keys.is_empty() {
+            return false;
+        }
+        // The DS RRset must be signed by the parent zone itself.
+        if !Self::rrsig_records(ds_records, RecordType::DS)
+            .iter()
+            .any(|sig| {
+                self.verify_rrset(zone, ds_records, sig, parent_keys, now)
+                    .is_some_and(|signer| name_eq(&signer, parent))
+            })
+        {
+            return false;
+        }
+        // ...and it must actually be about this zone.
+        ds_records.iter().any(|rec| {
             let RData::DNSSEC(DNSSECRData::DS(ds)) = &rec.data else {
-                continue;
+                return false;
             };
             if ds.digest_type() != hickory_proto::dnssec::DigestType::SHA256
                 && ds.digest_type() != hickory_proto::dnssec::DigestType::SHA384
             {
-                continue;
+                return false;
             }
-            for key in &keys {
-                if !is_sep(key) || key.calculate_key_tag().ok() != Some(ds.key_tag()) {
-                    continue;
-                }
-                if key.public_key().algorithm() != ds.algorithm() {
-                    continue;
-                }
-                if !ds.covers(zone, key).unwrap_or(false) {
-                    continue;
-                }
-                let ds_sigs = Self::rrsig_records(&ds_records, RecordType::DS);
-                for ds_sig in &ds_sigs {
-                    let v = self.verify_rrset(zone, &ds_records, ds_sig, &parent_dnskeys, now);
-                    if !v.is_some_and(|signer| name_eq(&signer, &parent)) {
-                        continue;
-                    }
-                    // Propagate island upward: a DS under an unsigned parent
-                    // proves nothing, so the subtree is insecure — but it is
-                    // NOT a cryptographic contradiction (never Bogus here).
-                    match Box::pin(self.chain_to_root(&parent, &parent_keys, resolver, depth + 1))
-                        .await
-                    {
-                        ChainVerdict::Secure => return ChainVerdict::Secure,
-                        ChainVerdict::InsecureIsland => return ChainVerdict::InsecureIsland,
-                        ChainVerdict::Fail => continue,
-                    }
-                }
-            }
-        }
-        ChainVerdict::Fail
+            zone_keys.iter().any(|key| {
+                is_sep(key)
+                    && key.calculate_key_tag().ok() == Some(ds.key_tag())
+                    && key.public_key().algorithm() == ds.algorithm()
+                    && ds.covers(zone, key).unwrap_or(false)
+            })
+        })
     }
 
     // FP-19 follow-up (video.twimg.com 2026-09-23): whether an unsigned link
@@ -704,13 +736,38 @@ impl DnssecValidator {
     async fn owner_zone_signed(&self, name: &Name, resolver: &DoHResolver) -> bool {
         let mut current = name.clone();
         for _ in 0..2 {
-            if let FetchOutcome::Found(recs) =
+            if let FetchOutcome::Found(ds_records) =
                 self.fetch_rrset(&current, RecordType::DS, resolver).await
             {
-                if recs
-                    .iter()
-                    .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::DS(_))))
+                let parent = current.base_name();
+                let now = Self::now_epoch();
+                // HANCORE 2026-10: this used to return true on the bare presence
+                // of a resolver-supplied DS. Now the DS has to be authenticated
+                // by the parent AND digest a SEP key of the zone, exactly as in
+                // chain_to_root — see ds_proves_signed_zone for why the two
+                // paths must not diverge.
+                let zone_keys = match self
+                    .fetch_rrset(&current, RecordType::DNSKEY, resolver)
+                    .await
                 {
+                    FetchOutcome::Found(r) => Self::dnskey_records(&r),
+                    _ => Vec::new(),
+                };
+                let parent_keys = match self
+                    .fetch_rrset(&parent, RecordType::DNSKEY, resolver)
+                    .await
+                {
+                    FetchOutcome::Found(r) => Self::dnskey_records(&r),
+                    _ => Vec::new(),
+                };
+                if self.ds_proves_signed_zone(
+                    &current,
+                    &zone_keys,
+                    &ds_records,
+                    &parent,
+                    &parent_keys,
+                    now,
+                ) {
                     return true;
                 }
             }
@@ -2073,6 +2130,161 @@ mod delegation_denial_tests",
             verdict,
             ChainVerdict::InsecureIsland,
             "an authentic denial from an anchored parent is a real unsigned delegation"
+        );
+    }
+
+    /// HANCORE 2026-10, third finding.
+    ///
+    /// `owner_zone_signed` decided "this unsigned CNAME link lives inside a
+    /// signed zone" — and therefore `Bogus` — from the bare presence of a DS
+    /// record in the resolver's answer. No RRSIG, no parent, no digest check,
+    /// while `chain_to_root` a few hundred lines up demanded all three.
+    ///
+    /// A hostile resolver could therefore drop an invented DS at any name it
+    /// liked and force SERVFAIL there. Not a forged address (the verdict is
+    /// Bogus, so nothing is ever served), but a denial of service on names the
+    /// resolver does not control.
+    #[tokio::test]
+    async fn test_forged_ds_cannot_force_bogus() {
+        use hickory_proto::dnssec::rdata::{DNSSECRData, DS};
+        use hickory_proto::dnssec::DigestType;
+
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
+
+        // A well-formed DS, with nothing backing it: no RRSIG on the RRset, no
+        // parent key, no matching SEP key in the child.
+        let forged_ds = Record::from_rdata(
+            zone("victim.test."),
+            3600,
+            RData::DNSSEC(DNSSECRData::DS(DS::new(
+                12345,
+                Algorithm::ECDSAP256SHA256,
+                DigestType::SHA256,
+                vec![0xAB; 32],
+            ))),
+        );
+
+        v.rrset_for_test(
+            "victim.test.",
+            RecordType::DS,
+            FetchOutcome::Found(vec![forged_ds]),
+        );
+        v.rrset_for_test(
+            "victim.test.",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![dnskey_rec("victim.test.", 1)]),
+        );
+        v.rrset_for_test(
+            "test.",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![dnskey_rec("test.", 1)]),
+        );
+
+        assert!(
+            !v.owner_zone_signed(&zone("victim.test."), &resolver).await,
+            "an unauthenticated DS must not make a name look like a signed zone"
+        );
+    }
+
+    /// The inverse guard: a DS the parent genuinely signed, digesting a real SEP
+    /// key of the child, must still be recognised — otherwise the stricter check
+    /// would silently turn every legitimate cross-zone CNAME into `Insecure`.
+    #[tokio::test]
+    async fn test_authenticated_ds_still_marks_zone_signed() {
+        use hickory_proto::dnssec::crypto::Ed25519SigningKey;
+        use hickory_proto::dnssec::rdata::{DNSSECRData, SigInput, DS};
+        use hickory_proto::dnssec::{DigestType, SigningKey, TBS};
+
+        // Child KSK that the DS will digest, plus the parent KSK that signs the
+        // DS RRset. Both generated here so the digests actually line up.
+        let child =
+            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("child key"))
+                .expect("child key");
+        let child_pub = child.to_public_key().expect("child public");
+        let child_dnskey = DNSKEY::new(true, true, false, child_pub);
+
+        let parent = Ed25519SigningKey::from_pkcs8(
+            &Ed25519SigningKey::generate_pkcs8().expect("parent key"),
+        )
+        .expect("parent key");
+        let parent_pub = parent.to_public_key().expect("parent public");
+        let parent_dnskey = DNSKEY::new(true, true, false, parent_pub);
+
+        let child_zone = zone("victim.test.");
+        let parent_name = zone("test.");
+        let ds = DS::new(
+            child_dnskey.calculate_key_tag().expect("key tag"),
+            Algorithm::ED25519,
+            DigestType::SHA256,
+            child_dnskey
+                .to_digest(&child_zone, DigestType::SHA256)
+                .expect("digest")
+                .as_ref()
+                .to_vec(),
+        );
+        let ds_rec =
+            Record::from_rdata(child_zone.clone(), 3600, RData::DNSSEC(DNSSECRData::DS(ds)));
+
+        let input = SigInput {
+            type_covered: RecordType::DS,
+            algorithm: Algorithm::ED25519,
+            num_labels: child_zone.num_labels(),
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(now() + 3600),
+            sig_inception: SerialNumber::new(now().saturating_sub(60)),
+            key_tag: parent_dnskey.calculate_key_tag().expect("key tag"),
+            signer_name: parent_name.clone(),
+        };
+        let tbs = TBS::from_input(&child_zone, DNSClass::IN, &input, std::iter::once(&ds_rec))
+            .expect("tbs");
+        let signer = hickory_proto::dnssec::DnssecSigner::new(
+            parent_dnskey.clone(),
+            Box::new(parent),
+            parent_name.clone(),
+            Duration::from_secs(3600),
+        );
+        let ds_rrset = vec![
+            ds_rec.clone(),
+            Record::from_rdata(
+                child_zone.clone(),
+                3600,
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
+                    input,
+                    signer.sign(&tbs).expect("sign"),
+                ))),
+            ),
+        ];
+
+        let v = DnssecValidator::new();
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
+        v.rrset_for_test(
+            "victim.test.",
+            RecordType::DS,
+            FetchOutcome::Found(ds_rrset),
+        );
+        v.rrset_for_test(
+            "victim.test.",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![Record::from_rdata(
+                child_zone,
+                3600,
+                RData::DNSSEC(DNSSECRData::DNSKEY(child_dnskey)),
+            )]),
+        );
+        v.rrset_for_test(
+            "test.",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![Record::from_rdata(
+                parent_name,
+                3600,
+                RData::DNSSEC(DNSSECRData::DNSKEY(parent_dnskey)),
+            )]),
+        );
+
+        assert!(
+            v.owner_zone_signed(&zone("victim.test."), &resolver).await,
+            "a DS genuinely signed by the parent must still mark the zone signed"
         );
     }
 }
