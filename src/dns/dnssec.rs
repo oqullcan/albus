@@ -813,13 +813,17 @@ impl DnssecValidator {
                     FetchOutcome::Found(r) => Self::dnskey_records(&r),
                     _ => Vec::new(),
                 };
-                let parent_keys = match self
+                // Kept as Records as well: chain_to_root wants the RRset (which may
+                // carry the DNSKEY's own RRSIG), ds_proves_signed_zone wants the
+                // parsed keys.
+                let parent_key_records = match self
                     .fetch_rrset(&parent, RecordType::DNSKEY, resolver)
                     .await
                 {
-                    FetchOutcome::Found(r) => Self::dnskey_records(&r),
+                    FetchOutcome::Found(r) => r,
                     _ => Vec::new(),
                 };
+                let parent_keys = Self::dnskey_records(&parent_key_records);
                 if self.ds_proves_signed_zone(
                     &current,
                     &zone_keys,
@@ -828,7 +832,17 @@ impl DnssecValidator {
                     &parent_keys,
                     now,
                 ) {
-                    return true;
+                    // F3: the parent keys above came off the wire. Believing the
+                    // DS means believing they belong to the parent, so require
+                    // that before claiming the zone is signed — the same
+                    // requirement chain_to_root's proven-absent branch already
+                    // enforced. Without it a resolver mints its own parent key,
+                    // signs the DS with it, and forces Bogus on any name.
+                    if Box::pin(self.chain_to_root(&parent, &parent_key_records, resolver, 0)).await
+                        != ChainVerdict::Fail
+                    {
+                        return true;
+                    }
                 }
             }
             if current.is_root() {
@@ -2292,32 +2306,29 @@ mod delegation_denial_tests",
         );
     }
 
-    /// The inverse guard: a DS the parent genuinely signed, digesting a real SEP
-    /// key of the child, must still be recognised — otherwise the stricter check
-    /// would silently turn every legitimate cross-zone CNAME into `Insecure`.
-    #[tokio::test]
-    async fn test_authenticated_ds_still_marks_zone_signed() {
+    /// A delegation the parent genuinely signed: the DS at `victim.` digests the
+    /// child's SEP key and the root's KSK signs the DS RRset. Returns
+    /// (child DNSKEY, root DNSKEY, root public key, DS RRset).
+    ///
+    /// The parent is the root so the chain terminates in `matches_anchor` without
+    /// any further staged fetches — which is precisely the step F3 requires.
+    fn root_signed_ds() -> (DNSKEY, DNSKEY, PublicKeyBuf, Vec<Record>) {
         use hickory_proto::dnssec::crypto::Ed25519SigningKey;
-        use hickory_proto::dnssec::rdata::{DNSSECRData, SigInput, DS};
-        use hickory_proto::dnssec::{DigestType, SigningKey, TBS};
+        use hickory_proto::dnssec::rdata::{SigInput, DS};
+        use hickory_proto::dnssec::{DigestType, DnssecSigner, SigningKey, TBS};
 
-        // Child KSK that the DS will digest, plus the parent KSK that signs the
-        // DS RRset. Both generated here so the digests actually line up.
         let child =
             Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("child key"))
                 .expect("child key");
-        let child_pub = child.to_public_key().expect("child public");
-        let child_dnskey = DNSKEY::new(true, true, false, child_pub);
+        let child_dnskey =
+            DNSKEY::new(true, true, false, child.to_public_key().expect("child pub"));
+        let root_key =
+            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().expect("root key"))
+                .expect("root key");
+        let root_pub = root_key.to_public_key().expect("root pub");
+        let root_dnskey = DNSKEY::new(true, true, false, root_pub.clone());
 
-        let parent = Ed25519SigningKey::from_pkcs8(
-            &Ed25519SigningKey::generate_pkcs8().expect("parent key"),
-        )
-        .expect("parent key");
-        let parent_pub = parent.to_public_key().expect("parent public");
-        let parent_dnskey = DNSKEY::new(true, true, false, parent_pub);
-
-        let child_zone = zone("victim.test.");
-        let parent_name = zone("test.");
+        let child_zone = zone("victim.");
         let ds = DS::new(
             child_dnskey.calculate_key_tag().expect("key tag"),
             Algorithm::ED25519,
@@ -2330,7 +2341,6 @@ mod delegation_denial_tests",
         );
         let ds_rec =
             Record::from_rdata(child_zone.clone(), 3600, RData::DNSSEC(DNSSECRData::DS(ds)));
-
         let input = SigInput {
             type_covered: RecordType::DS,
             algorithm: Algorithm::ED25519,
@@ -2338,58 +2348,98 @@ mod delegation_denial_tests",
             original_ttl: 3600,
             sig_expiration: SerialNumber::new(now() + 3600),
             sig_inception: SerialNumber::new(now().saturating_sub(60)),
-            key_tag: parent_dnskey.calculate_key_tag().expect("key tag"),
-            signer_name: parent_name.clone(),
+            key_tag: root_dnskey.calculate_key_tag().expect("key tag"),
+            signer_name: Name::root(),
         };
         let tbs = TBS::from_input(&child_zone, DNSClass::IN, &input, std::iter::once(&ds_rec))
             .expect("tbs");
-        let signer = hickory_proto::dnssec::DnssecSigner::new(
-            parent_dnskey.clone(),
-            Box::new(parent),
-            parent_name.clone(),
+        let signer = DnssecSigner::new(
+            root_dnskey.clone(),
+            Box::new(root_key),
+            Name::root(),
             Duration::from_secs(3600),
         );
-        let ds_rrset = vec![
-            ds_rec.clone(),
-            Record::from_rdata(
-                child_zone.clone(),
-                3600,
-                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
-                    input,
-                    signer.sign(&tbs).expect("sign"),
-                ))),
-            ),
-        ];
+        let sig_rec = Record::from_rdata(
+            child_zone.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(
+                input,
+                signer.sign(&tbs).expect("sign"),
+            ))),
+        );
+        (child_dnskey, root_dnskey, root_pub, vec![ds_rec, sig_rec])
+    }
 
+    fn stage_root_signed_ds(
+        v: &DnssecValidator,
+        ds_rrset: Vec<Record>,
+        child: DNSKEY,
+        root: DNSKEY,
+    ) {
+        v.rrset_for_test("victim.", RecordType::DS, FetchOutcome::Found(ds_rrset));
+        v.rrset_for_test(
+            "victim.",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![Record::from_rdata(
+                zone("victim."),
+                3600,
+                RData::DNSSEC(DNSSECRData::DNSKEY(child)),
+            )]),
+        );
+        v.rrset_for_test(
+            ".",
+            RecordType::DNSKEY,
+            FetchOutcome::Found(vec![Record::from_rdata(
+                Name::root(),
+                3600,
+                RData::DNSSEC(DNSSECRData::DNSKEY(root)),
+            )]),
+        );
+    }
+
+    /// F3, the other half of the cbd5da5 fix.
+    ///
+    /// `ds_proves_signed_zone` checks that the parent signed the DS — but the
+    /// parent's keys came straight off the wire and were never chained to the
+    /// root. That is verbatim the defect HANCORE described for `chain_to_root`,
+    /// applied here and left unfixed: a resolver mints its own parent key, signs
+    /// the DS with it, and the name is reported as a signed zone.
+    ///
+    /// The reachable outcome is `Bogus` (SERVFAIL), not a forged address, so this
+    /// is a denial of service rather than data forgery. It is still the same
+    /// question with two different bars, which is exactly what let it survive.
+    #[tokio::test]
+    async fn test_forged_parent_key_cannot_mark_zone_signed() {
+        let (child, root, root_pub, ds_rrset) = root_signed_ds();
+        // Anchored to the real IANA root KSK, which the forged key is not.
         let v = DnssecValidator::new();
+        stage_root_signed_ds(&v, ds_rrset, child, root);
         let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
-        v.rrset_for_test(
-            "victim.test.",
-            RecordType::DS,
-            FetchOutcome::Found(ds_rrset),
-        );
-        v.rrset_for_test(
-            "victim.test.",
-            RecordType::DNSKEY,
-            FetchOutcome::Found(vec![Record::from_rdata(
-                child_zone,
-                3600,
-                RData::DNSSEC(DNSSECRData::DNSKEY(child_dnskey)),
-            )]),
-        );
-        v.rrset_for_test(
-            "test.",
-            RecordType::DNSKEY,
-            FetchOutcome::Found(vec![Record::from_rdata(
-                parent_name,
-                3600,
-                RData::DNSSEC(DNSSECRData::DNSKEY(parent_dnskey)),
-            )]),
-        );
 
         assert!(
-            v.owner_zone_signed(&zone("victim.test."), &resolver).await,
-            "a DS genuinely signed by the parent must still mark the zone signed"
+            !v.owner_zone_signed(&zone("victim."), &resolver).await,
+            "a DS signed by a key that does not chain to the trust anchor must \
+             not mark the zone as signed"
+        );
+        let _ = root_pub;
+    }
+
+    /// The inverse guard: the same DS, under a parent key that IS the anchor, is
+    /// a real signed delegation and must keep being recognised.
+    #[tokio::test]
+    async fn test_anchored_parent_ds_still_marks_zone_signed() {
+        use hickory_proto::dnssec::TrustAnchors;
+
+        let (child, root, root_pub, ds_rrset) = root_signed_ds();
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(&root_pub, hickory_proto::rr::LowerName::new(&Name::root()));
+        let v = DnssecValidator::with_anchors(anchors);
+        stage_root_signed_ds(&v, ds_rrset, child, root);
+        let resolver = DoHResolver::new("quad9", &[], true).expect("resolver init");
+
+        assert!(
+            v.owner_zone_signed(&zone("victim."), &resolver).await,
+            "a DS signed by an anchored parent must still mark the zone signed"
         );
     }
 
