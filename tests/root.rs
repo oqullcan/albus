@@ -70,12 +70,17 @@ fn root_quic_block_unblock_symmetry() {
         // daemon may already hold the rule: assert convergence, not growth
         let had_quic = before.iter().any(|r| r.contains("albus-quic"));
         let _guard = RestoreGuard { had_quic };
-        let _ = block_quic();
+        // The result was being discarded here, which made the assertion below
+        // unable to distinguish "block_quic failed" from "block_quic had no
+        // effect". EBPF-01 made ensure_rule fail closed on an unresolvable
+        // helper or an unexpected exit code, so a silent failure became
+        // indistinguishable from a passing test that asserted nothing.
+        let blocked = block_quic();
         let during = albus_rules(v6).unwrap_or_default();
         assert!(
             during.iter().any(|r| r.contains("albus-quic")),
-            "albus-quic rule must be present after block (v6={})",
-            v6
+            "albus-quic rule must be present after block (v6={v6}); block_quic said: \
+             {blocked:?}",
         );
         // restore even on failure paths below
         let _ = unblock_quic();
