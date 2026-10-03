@@ -42,10 +42,29 @@ pub struct BpfManagerConfig {
     pub auto_ttl_estimator: AutoTtlEstimator,
 }
 
+/// The perf-reader set as observed at the moment the engine was started.
+///
+/// EBPF-03's control reads this instead of `self.engine`, because `start()` moves
+/// the engine into the poll worker. Reading the field afterwards always landed on
+/// its `None` arm, so `readers_complete()` reported false and `reader_count()`
+/// reported 0 after every successful start — the announcement said "DEGRADED,
+/// decoy injection will miss connections, readers=0" while the loader had just
+/// logged `attached successfully readers=6 cpus=6`. The control was structurally
+/// incapable of reporting anything but the failure case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderState {
+    /// Whether every CPU got a perf reader.
+    pub complete: bool,
+    /// Perf readers actually installed.
+    pub count: usize,
+}
+
 // manager coordinating the ebpf filter engine and raw-socket injector
 pub struct BpfManager {
     cfg: BpfManagerConfig,
     engine: Option<BpfEngine>,
+    /// Recorded in `start()` before the engine is moved to the poll worker.
+    readers: ReaderState,
     map_handles: Option<BpfMapHandles>,
     running: Arc<AtomicBool>,
     worker_handle: Option<JoinHandle<()>>,
@@ -56,6 +75,7 @@ impl BpfManager {
         Self {
             cfg,
             engine: None,
+            readers: ReaderState::default(),
             map_handles: None,
             running: Arc::new(AtomicBool::new(false)),
             worker_handle: None,
@@ -66,15 +86,17 @@ impl BpfManager {
     /// attached and fragmenting but its decoy-injection half will miss some
     /// connections — a state the caller must not describe as "active".
     pub fn readers_complete(&self) -> bool {
-        match &self.engine {
-            Some(e) => e.readers_complete(),
-            None => false,
-        }
+        self.readers.complete
     }
 
     /// Perf readers actually installed.
     pub fn reader_count(&self) -> usize {
-        self.engine.as_ref().map(|e| e.reader_count()).unwrap_or(0)
+        self.readers.count
+    }
+
+    /// The recorded reader set, for callers that want both at once.
+    pub fn reader_state(&self) -> ReaderState {
+        self.readers
     }
 
     /// Runs every fallible map push and publishes the descriptors only if all of
@@ -225,6 +247,16 @@ impl BpfManager {
             "albus active — MSS fragmentation + Auto-TTL fake injection"
         );
 
+        // Recorded BEFORE the engine is moved into the poll worker: after this
+        // point self.engine is None, and EBPF-03's announcement would have no way
+        // left to learn what the loader actually installed.
+        self.readers = match &self.engine {
+            Some(e) => ReaderState {
+                complete: e.readers_complete(),
+                count: e.reader_count(),
+            },
+            None => ReaderState::default(),
+        };
         let mut engine_poll = self.engine.take().unwrap();
         let running_clone = running.clone();
 
@@ -378,6 +410,7 @@ impl BpfManager {
             info!("albus eBPF manager stopped");
         }
         self.map_handles = None;
+        self.readers = ReaderState::default();
     }
 }
 
@@ -567,6 +600,85 @@ mod map_handle_lifecycle_tests",
         assert!(
             start_body.contains("self.commit_start("),
             "start() must route publication through commit_start"
+        );
+    }
+
+    /// EBPF-03's control was structurally incapable of reporting anything but the
+    /// failure case.
+    ///
+    /// `start()` moves the engine into the poll worker, so after a successful
+    /// start `self.engine` is `None`. The accessors read the field, hit its `None`
+    /// arm, and announced "DEGRADED, decoy injection will miss connections,
+    /// readers=0" on every single run — while the loader had just logged
+    /// `attached successfully readers=6 cpus=6`.
+    ///
+    /// This pins the fix at the level the bug lives: the recorded state, not the
+    /// engine field. No BPF map, cgroup, perf event or syscall is involved.
+    #[test]
+    fn reader_state_survives_engine_handoff() {
+        let mut m = manager();
+
+        // Before any start: nothing installed, and the control must say so
+        // rather than borrow the None arm's wording by accident.
+        assert_eq!(m.reader_state(), ReaderState::default());
+        assert!(!m.readers_complete());
+        assert_eq!(m.reader_count(), 0);
+
+        // What start() records from a fully-covered engine.
+        m.readers = ReaderState {
+            complete: true,
+            count: 6,
+        };
+        // Simulate the handoff: the engine is gone, exactly as after start().
+        m.engine = None;
+
+        assert!(
+            m.readers_complete(),
+            "a complete reader set must still be reported complete after the engine \
+             is moved to the poll worker"
+        );
+        assert_eq!(m.reader_count(), 6);
+        assert_eq!(
+            m.reader_state(),
+            ReaderState {
+                complete: true,
+                count: 6
+            }
+        );
+    }
+
+    /// And a genuinely partial reader set must still be reported as incomplete —
+    /// the fix must not turn the control into a rubber stamp.
+    #[test]
+    fn partial_reader_set_is_still_reported_incomplete() {
+        let mut m = manager();
+        m.readers = ReaderState {
+            complete: false,
+            count: 4,
+        };
+        m.engine = None;
+
+        assert!(
+            !m.readers_complete(),
+            "a partial reader set must never be announced as active"
+        );
+        assert_eq!(m.reader_count(), 4);
+    }
+
+    /// `stop()` must clear the record, so a restarted manager cannot announce the
+    /// previous run's readers.
+    #[test]
+    fn stop_clears_recorded_reader_state() {
+        let mut m = manager();
+        m.readers = ReaderState {
+            complete: true,
+            count: 6,
+        };
+        m.stop();
+        assert_eq!(
+            m.reader_state(),
+            ReaderState::default(),
+            "a stopped manager must not keep advertising readers"
         );
     }
 }
