@@ -14,11 +14,11 @@ cargo llvm-cov --workspace --fail-under-lines 55 --summary-only  # needs stable 
 
 QML widget rendering has no automated tests (no Quickshell runtime
 exists in CI or here), but the pure-logic layer is CI-gated:
-`scripts/panel-logic-test.mjs` extracts `canon`, `numOr`,
+`scripts/panel/panel-logic-test.mjs` extracts `canon`, `numOr`,
 `uiConfigShape`, `cfgFingerprint` and `parseConfigJson` verbatim from
 the shipped `Panel.qml` and asserts key-order stability, fingerprint
 invariance, clean/dirty cycling, mullvad round-trip and fallback
-parses (`node --test scripts/panel-logic-test.mjs`, CI `panel logic
+parses (`node --test scripts/panel/panel-logic-test.mjs`, CI `panel logic
 tests` step). Rendering, overlay-open behavior and live daemon
 round-trips stay manual per `docs/PANEL_TESTING.md`. Reviewed by
 reading for the rest (process spawning uses absolute paths + arg
@@ -36,7 +36,7 @@ sudo -E cargo test --test ebpf -- --ignored --nocapture
 sudo -E cargo test --test root -- --ignored --nocapture
 ```
 
-## DPI lab (`scripts/dpi_sim.py`, stdlib only)
+## DPI lab (`scripts/dpi/dpi_sim.py`, stdlib only)
 
 A naive in-path DPI reads the **first TCP segment** of a TLS handshake,
 extracts SNI, and RSTs banned names. albus defeats it two ways:
@@ -63,10 +63,10 @@ sudo ethtool -k lo | grep -E "generic-segmentation-offload: off" || echo "GSO st
 ```bash
 # baseline WITHOUT shaping: expect handshake_ok=false, sim_decision=rst
 sudo systemctl stop albus.service
-sudo python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com
+sudo python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com
 # with shaping: expect handshake_ok=true, sim_decision=pass-fragmented
 sudo systemctl start albus.service && sleep 5
-sudo python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com
+sudo python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com
 ```
 
 ## Root verification checklist (manual, interactive root)

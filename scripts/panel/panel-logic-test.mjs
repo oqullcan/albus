@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const QML = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'omarchy', 'Panel.qml'),
+  join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'plugins', 'omarchy', 'Panel.qml'),
   'utf8'
 );
 

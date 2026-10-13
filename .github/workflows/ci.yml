@@ -48,7 +48,7 @@ jobs:
       # QML at test time (no duplicated logic to drift). Runner node,
       # no new supply.
       - name: panel logic tests (node)
-        run: node --version && node --test scripts/panel-logic-test.mjs
+        run: node --version && node --test scripts/panel/panel-logic-test.mjs
       # audit tools release faster than our pinned toolchain (1.89 cannot
       # compile current cargo-audit); run them on stable, code stays pinned.
       - name: Install stable toolchain for audit tools
@@ -98,7 +98,7 @@ jobs:
       - name: privileged firewall symmetry test (root)
         run: sudo -E ${HOME}/.cargo/bin/cargo test --release --test root -- --ignored --nocapture
 
-  # Live DPI evasion proof: a real RST-injection simulator (scripts/dpi_sim.py)
+  # Live DPI evasion proof: a real RST-injection simulator (scripts/dpi/dpi_sim.py)
   # must RST handshakes with albus OFF (proves the simulator is live — a test
   # that passes without any RST proves nothing) and stay silent with albus ON
   # (proves MSS-clamp/fake-injection evasion). Deliberately NOT
@@ -134,11 +134,11 @@ jobs:
       - name: Phase A — simulator validity (albus OFF must RST)
         run: |
           set +e
-          sudo -E python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_off.log
+          sudo -E python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_off.log
           SIM_RC=${PIPESTATUS[0]}
           set -e
           echo "sim exit code (albus OFF): ${SIM_RC} (non-zero expected: nothing bypassed)"
-          python3 scripts/dpi_evasion_check.py off /tmp/dpi_off.log
+          python3 scripts/dpi/dpi_evasion_check.py off /tmp/dpi_off.log
           test "${SIM_RC}" -ne 0
       - name: Phase B — evasion (albus ON must establish)
         run: |
@@ -157,11 +157,11 @@ jobs:
           fi
           echo "albus daemon alive, running evasion lab..."
           set +e
-          sudo -E python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_on.log
+          sudo -E python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi_on.log
           SIM_RC=${PIPESTATUS[0]}
           set -e
           echo "sim exit code (albus ON): ${SIM_RC} (zero expected: all bypassed)"
-          python3 scripts/dpi_evasion_check.py on /tmp/dpi_on.log
+          python3 scripts/dpi/dpi_evasion_check.py on /tmp/dpi_on.log
           test "${SIM_RC}" -eq 0
 
   build:

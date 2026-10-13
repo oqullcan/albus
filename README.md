@@ -95,7 +95,7 @@ leak canary) come from the OS CSPRNG.
 DPI evasion is verified against a live RST-injection simulator on every CI run — see docs/TEST_RESULTS.md for the latest recorded proof. To verify your own setup: see docs/TESTING.md.
 
 ```bash
-sudo python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com
+sudo python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com
 ```
 
 ## Troubleshooting

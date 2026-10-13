@@ -10,7 +10,7 @@ This document maps the tree so a new reader can find the right surface quickly.
 | `src/` | Rust crate (library + binary entrypoint). |
 | `bpf/` | eBPF `sock_ops` C source and shared headers; embedded at build time. |
 | `plugins/omarchy/` | Omarchy panel widget (`manifest.json`, QML files, assets). |
-| `scripts/` | Live DPI-simulator + checker, panel-logic test runner. |
+| `scripts/` | Grouped tooling: `scripts/dpi/` simulator+checker, `scripts/panel/` QML logic tests. |
 | `tests/` | Integration, fuzz, net, docs and root/gated suites. |
 | `docs/` | TESTING, TEST_RESULTS, OMARCHY, PANEL_TESTING, OPEN_QUESTIONS, ARCHITECTURE. |
 | `.github/workflows/` | CI: gates, live-network proof, security gates. |
@@ -32,7 +32,7 @@ This document maps the tree so a new reader can find the right surface quickly.
 cargo fmt --check && cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo test --test fuzz --test docs --test net
-node --test scripts/panel-logic-test.mjs
+node --test scripts/panel/panel-logic-test.mjs
 ```
 
 Privileged (root): `sudo -E cargo test --test ebpf -- --ignored`, `sudo -E cargo test --test root -- --ignored`.

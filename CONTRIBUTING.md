@@ -31,8 +31,8 @@
 - Any shaping change (MSS, injection, eBPF maps) must be validated against
   the live simulator:
   ```bash
-  sudo python3 scripts/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi.log
-  python3 scripts/dpi_evasion_check.py off|on /tmp/dpi.log
+  sudo python3 scripts/dpi/dpi_sim.py run --iface lo --targets roblox.com,discord.com | tee /tmp/dpi.log
+  python3 scripts/dpi/dpi_evasion_check.py off|on /tmp/dpi.log
   ```
   RST with albus off (proves the sim is live) and bypass with albus on
   (proves evasion) — both are hard gates, in CI and locally.

@@ -53,7 +53,7 @@ risk); this protocol is the durable artifact.
 
 ## 3. JS-logic harness (CI-gated, single-source)
 
-`scripts/panel-logic-test.mjs` (`node --test`, CI `panel logic tests`
+`scripts/panel/panel-logic-test.mjs` (`node --test`, CI `panel logic tests`
 step): extracts `canon`, `numOr`, `uiConfigShape`, `cfgFingerprint`,
 `parseConfigJson` VERBATIM from the shipped `Panel.qml` (string- and
 comment-aware brace matching — no copied logic to drift) and asserts,

@@ -10,14 +10,14 @@
 
 ## Method
 
-`scripts/dpi_sim.py run` (stdlib only, needs root) orchestrates three parts on
+`scripts/dpi/dpi_sim.py run` (stdlib only, needs root) orchestrates three parts on
 `--iface lo`: a local TLS stub on `127.0.0.1:443`, a passive AF_PACKET
 observer that injects a spoofed TCP RST when it sees a complete SNI in the
 first segment, and one TLS client handshake per target with explicit SNI.
 Verdicts follow **sim observations, never handshake success** (loopback
 caveat, documented in code: our own decoys poison the local stub).
 
-Both phases are asserted by `scripts/dpi_evasion_check.py`:
+Both phases are asserted by `scripts/dpi/dpi_evasion_check.py`:
 
 - `off` (albus DOWN): every target must be `sim_decision=rst` +
   `bypassed=false`. This proves the simulator is live — a lab that passes
