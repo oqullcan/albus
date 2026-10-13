@@ -3,13 +3,12 @@
 <div class="wrap hero" id="top">
   <span class="mark" style="left:6px;top:34%" aria-hidden="true">×</span>
   <span class="mark" style="right:22px;top:22%" aria-hidden="true">—</span>
-  <div class="hero-left">
-    <p class="kicker rv">Linux DPI evasion engine · fail-closed posture</p>
-    <h1 class="rv">Remote DPI stops<br />being your editor.</h1>
-    <p class="lede rv" style="transition-delay:90ms">Albus shapes the first ~600 bytes of each handshake at the Linux kernel boundary, resolves DNS over HTTPS with DNSSEC validation, and refuses to guess when it cannot prove an answer. No relay. No account. No one to compel.</p>
+  <div class="hero-center">
+    <h1 class="rv">Uncensored Internet<br />Access</h1>
+    <p class="lede rv" style="transition-delay:90ms">Type a hostname. Watch it shatter into fragments no middlebox can reassemble in time.</p>
     <div class="lab rv" style="transition-delay:180ms">
       <div class="lab-bar">
-        <span class="lab-title">Interactive schematic — MSS 88 · decoy TTL 8</span>
+        <span class="lab-title">LIVE SCHEMATIC — MSS 88 · TTL DECOYS</span>
         <label class="lab-input">
           <span aria-hidden="true">SNI host</span>
           <input id="frag-host" type="text" value="www.youtube.com" maxlength="48"
@@ -20,8 +19,7 @@
       <div class="lab-foot"><span>clienthello: <span id="frag-bytes">0</span>B in <span id="frag-n">0</span> segments</span><span>reassembled by DPI: never in time</span></div>
     </div>
     <div class="btnrow rv" style="transition-delay:260ms">
-      <a class="btn" href="https://github.com/oqullcan/albus/releases">Download for Linux</a>
-      <a class="btn btn-ghost" href="https://github.com/oqullcan/albus/blob/develop/docs/TESTING.md" style="margin-left:12px">Technical walkthrough</a>
+      <a class="btn" href="https://github.com/oqullcan/albus/releases">Download Albus</a>
     </div>
   </div>
 </div>
@@ -52,17 +50,6 @@
     };
     fit();
     addEventListener('resize', fit);
-    const hero = cv.closest('.hero');
-    if (hero && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      hero.addEventListener('pointermove', (e) => {
-        const r = hero.getBoundingClientRect();
-        hero.style.setProperty('--mx', ((e.clientX - r.left) / r.width - 0.5).toFixed(3));
-        hero.style.setProperty('--my', ((e.clientY - r.top) / r.height - 0.5).toFixed(3));
-      });
-      hero.addEventListener('pointerleave', () => {
-        hero.style.setProperty('--mx', '0'); hero.style.setProperty('--my', '0');
-      });
-    }
 
     let host = 'www.youtube.com';
     let segs = [];
@@ -161,11 +148,9 @@
 </script>
 
 <style>
-  .hero-left { max-width: 780px; }
-  .hero-left .lede { margin-left: 0; margin-right: 0; }
-  .hero-left .btnrow { justify-content: flex-start; margin-bottom: 0; }
-  .kicker { font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 0.06em; margin: 0 0 18px; }
-  
+  .hero-center { text-align: center; max-width: 860px; margin: 0 auto; }
+  .hero-center .lede { margin-left: auto; margin-right: auto; }
+  .hero-center .btnrow { justify-content: center; margin-bottom: 0; }
   .lab {
     border: 1px solid var(--line); border-radius: 3px; background: #020202;
     margin: 0 0 38px; overflow: hidden; text-align: left;
