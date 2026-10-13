@@ -879,8 +879,9 @@ impl DnssecValidator {
                         }
                     });
                     let params_valid = match nsec3 {
-                        Some(n) => n.hash_algorithm()
-                            == hickory_proto::dnssec::Nsec3HashAlgorithm::SHA1,
+                        Some(n) => {
+                            n.hash_algorithm() == hickory_proto::dnssec::Nsec3HashAlgorithm::SHA1
+                        }
                         // No NSEC3 RDATA carrying the signed group: forged.
                         None => false,
                     };
