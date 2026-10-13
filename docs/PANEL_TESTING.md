@@ -17,7 +17,7 @@ Must exit 0. (Also sync `manifest.json` version with the release.)
 
 ```bash
 # sync repo files to the DEV plugin copy (never the marketplace copy)
-cp Panel.qml manifest.json ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
+cp plugins/omarchy/Panel.qml plugins/omarchy/manifest.json ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
 omarchy-plugin-enable io.github.oqullcan.albus.dev
 # ...wait ~15s, or: omarchy-restart-shell (blinks the bar)
 journalctl --user -b --no-pager --since "5 minutes ago" | grep -iE "albus|qml.*error"

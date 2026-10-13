@@ -10,20 +10,20 @@ Plugin store page:
 <https://plugins.omarchy.org/plugin.html?id=io.github.oqullcan.albus.dev>
 
 <p align="center">
-  <img src="../assets/panel_settings.png" alt="Albus Omarchy Panel Settings" width="48%" />
-  <img src="../assets/panel_logs.png" alt="Albus Omarchy Panel Live Logs" width="48%" />
+  <img src="../plugins/omarchy/assets/panel_settings.png" alt="Albus Omarchy Panel Settings" width="48%" />
+  <img src="../plugins/omarchy/assets/panel_logs.png" alt="Albus Omarchy Panel Live Logs" width="48%" />
 </p>
 
 ## Install
 
 ```bash
 mkdir -p ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev
-cp manifest.json BarWidget.qml Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
+cp plugins/omarchy/manifest.json plugins/omarchy/BarWidget.qml plugins/omarchy/Panel.qml ~/.config/omarchy/plugins/io.github.oqullcan.albus.dev/
 omarchy-shell shell rescanPlugins
 ```
 
-Source files live at the repo root (`manifest.json`, `BarWidget.qml`,
-`Panel.qml`).
+Source files live under `plugins/omarchy/` (`manifest.json`, `BarWidget.qml`,
+`Panel.qml`, `assets/`).
 
 ## Removal
 

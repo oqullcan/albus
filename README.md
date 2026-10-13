@@ -125,6 +125,10 @@ What `cleanup` does not delete: `/usr/local/bin/albus`, `/etc/albus/config.json`
 | [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) | Recorded DPI-evasion proof |
 | [docs/OMARCHY.md](docs/OMARCHY.md) | Omarchy panel widget |
 
+## Repository layout
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full tree, module map, and gate commands.
+
 ## License
 
 [GNU GPL-3.0](LICENSE).
