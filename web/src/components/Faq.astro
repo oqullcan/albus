@@ -10,11 +10,11 @@ const faqs = [
   },
   {
     q: 'Does it slow me down?',
-    a: 'Only the first ~600 bytes of a connection fragment; MSS restores to line rate right after. DNS answers come from a local cache, usually faster than your ISP.',
+    a: 'Only the first ~600 bytes of a connection are fragmented; MSS restores to line rate right after. DNS answers resolve through a local cache and, in most cases, arrive faster than your ISP.',
   },
   {
     q: 'Why would a site fail to resolve?',
-    a: 'Bogus DNSSEC answers return SERVFAIL on purpose — that is the validator catching tampering or a broken zone, not a bug. Unsigned zones keep working, labeled insecure.',
+    a: 'A Bogus DNSSEC answer becomes SERVFAIL on purpose — the validator caught tampering, a broken chain, or a zone whose signing status could not be proven. That refusal is the product feature: uncertainty is not served as data.',
   },
 ];
 ---

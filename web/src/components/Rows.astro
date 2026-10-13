@@ -1,18 +1,77 @@
 ---
 import WireGlobe from './WireGlobe.astro';
 ---
-<section class="block">
+<section class="block" id="mechanism">
   <div class="wrap">
-    <div class="duo rv">
-      <div class="hero-art"><WireGlobe id="wire-feat" /></div>
+    <div class="section-head rv">
+      <h2>How a TLS handshake leaves the kernel</h2>
+      <p>
+        Albus never asks a middlebox to cooperate. It changes the shape of the
+        bytes at the kernel boundary, then lets the network carry the pieces.
+      </p>
+    </div>
+
+    <ol class="steps rv">
+      <li>
+        <span class="step-n">01</span>
+        <div>
+          <h3>MSS clamp</h3>
+          <p>An eBPF sock_ops program lowers TCP MSS to ~88 bytes, so a ClientHello leaves as many small segments instead of one reassemblable record.</p>
+        </div>
+      </li>
+      <li>
+        <span class="step-n">02</span>
+        <div>
+          <h3>Decoy injection</h3>
+          <p>A raw-socket injector sends TTL-limited ClientHellos ahead of the real flow, desynchronizing cached middlebox state with fragments that never reach the server.</p>
+        </div>
+      </li>
+      <li>
+        <span class="step-n">03</span>
+        <div>
+          <h3>Validating DNS</h3>
+          <p>A local resolver answers 127.0.0.1:53 over DoH with ECH. Every answer is DNSSEC chain-validated against an embedded root anchor; an unproven answer becomes SERVFAIL.</p>
+        </div>
+      </li>
+      <li>
+        <span class="step-n">04</span>
+        <div>
+          <h3>Shaping watchdog</h3>
+          <p>Live connections are reconciled against kernel perf events. Unexplained flows engage fail-closed lockdown until restart; the daemon assumes compromise, not luck.</p>
+        </div>
+      </li>
+    </ol>
+
+    <div class="duo rv" style="margin-top: 72px">
       <div class="feat">
-        <h4>KERNEL-LEVEL EVASION</h4>
-        <p>eBPF sock_ops clamps the MSS to ~88 bytes so handshakes shatter across segments. TTL-limited decoys poison whatever the middlebox remembers.</p>
-        <h4>VALIDATING DNS</h4>
-        <p>A resolver on 127.0.0.1:53 answers over DoH with ECH. Every answer is DNSSEC chain-validated against an embedded root anchor — Bogus means SERVFAIL, never cached, never served.</p>
-        <h4>FAIL-CLOSED</h4>
-        <p>Kill-switch drops plaintext DNS on the floor. If shaping is ever lost, lockdown engages until restart. Uncertainty is answered with refusal, not hope.</p>
+        <h3>Kernel-level evasion</h3>
+        <p>sock_ops clamps MSS to ~88; TTL-limited decoys poison whatever a middlebox remembers. No containers, no relay.</p>
+        <h3>Validating DNS</h3>
+        <p>DoH with ECH and DNSSEC validation. Bogus means SERVFAIL — never cached, never served.</p>
+        <h3>Fail-closed by policy</h3>
+        <p>Plaintext DNS is dropped at the firewall. Ambiguity is treated as failure, not as hope.</p>
       </div>
+      <div class="hero-art"><WireGlobe id="wire-feat" /></div>
     </div>
   </div>
 </section>
+
+<style>
+  .section-head { max-width: 620px; margin-bottom: 44px; }
+  .section-head h2 { font-size: clamp(28px, 4vw, 40px); margin: 0 0 12px; }
+  .section-head p { color: var(--muted); font-size: 15px; margin: 0; }
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 0; border-top: 1px solid var(--line); }
+  .steps li {
+    display: grid; grid-template-columns: 72px 1fr; gap: 24px; align-items: baseline;
+    padding: 26px 0; border-bottom: 1px solid var(--line);
+  }
+  .step-n { font-family: var(--mono); font-size: 12px; color: var(--faint); letter-spacing: 0.12em; padding-top: 4px; }
+  .steps h3 { margin: 0 0 6px; font-size: 18px; }
+  .steps p { margin: 0; color: var(--muted); font-size: 14px; max-width: 640px; }
+  @media (max-width: 820px) { .steps li { grid-template-columns: 40px 1fr; gap: 14px; } }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; }
+  @media (max-width: 820px) { .duo { grid-template-columns: 1fr; gap: 36px; } }
+  .feat h3 { margin: 0 0 6px; font-size: 16px; }
+  .feat p { color: var(--muted); font-size: 14px; margin: 0 0 24px; max-width: 440px; }
+  .hero-art { min-height: 320px; }
+</style>
