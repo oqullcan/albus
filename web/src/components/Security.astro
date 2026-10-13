@@ -1,0 +1,50 @@
+---
+---
+<section class="block" id="security">
+  <div class="wrap">
+    <div class="section-head rv">
+      <h2>Trust boundary, declared</h2>
+      <p>Albus is explicit about who runs what and what happens when it cannot prove a fact.</p>
+    </div>
+
+    <dl class="trust rv">
+      <div>
+        <dt>Daemon privilege</dt>
+        <dd>Management needs root; the runtime drops to a dedicated unprivileged user with a small, named capability set. No ambient root.</dd>
+      </div>
+      <div>
+        <dt>DNSSEC</dt>
+        <dd>Chain-validated against an embedded root anchor. An unverifiable answer is SERVFAIL, never cached, never served.</dd>
+      </div>
+      <div>
+        <dt>Kill-switch</dt>
+        <dd>Plaintext DNS on port 53 is dropped at the firewall unless it targets the local resolver.</dd>
+      </div>
+      <div>
+        <dt>Lockdown</dt>
+        <dd>If shaping evidence disappears across consecutive windows, the network is locked down until restart. Doubt becomes refusal.</dd>
+      </div>
+      <div>
+        <dt>Update model</dt>
+        <dd>Reload eBPF maps and configuration over SIGHUP without restarting or dropping active flows.</dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+<style>
+  .trust {
+    margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border-top: 1px solid var(--line);
+  }
+  .trust > div {
+    padding: 22px 0; border-bottom: 1px solid var(--line);
+    display: grid; grid-template-columns: 140px 1fr; gap: 24px; align-items: baseline;
+  }
+  .trust dt { font-family: var(--mono); font-size: 12px; color: var(--faint); letter-spacing: 0.06em; }
+  .trust dd { margin: 0; color: var(--muted); font-size: 14px; }
+  @media (max-width: 820px) {
+    .trust { grid-template-columns: 1fr; }
+    .trust > div { grid-template-columns: 1fr; gap: 6px; }
+  }
+</style>
