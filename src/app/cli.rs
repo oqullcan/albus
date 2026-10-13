@@ -157,7 +157,8 @@ pub struct RunArgs {
     pub fake_bad_checksum: bool,
 
     // static TTL selection (no probing — see autottl docs): true clamps
-    // the default into [min_ttl, max_ttl], false honors --fake-ttl exactly
+    // the default into [min_ttl, max_ttl], false keeps the operator's value
+    // but still caps it at max_ttl (safety ceiling; BULGU-2/3).
     // (hop-distance heuristic stays a conservative constant until true
     // path probing lands; see measure_hop_distance)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]

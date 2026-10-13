@@ -151,10 +151,25 @@ pub struct WatchState {
     last_events: u64,
     misses: u32,
     initialized: bool,
+    /// BULGU-1: last observed value of the BPF dropped-event counter. Growth
+    /// means the perf ring overflowed and the event stream lost records, so a
+    /// quiet window is explained rather than suspicious.
+    last_dropped: u64,
+}
+
+/// One observation interval's inputs.
+pub struct Window<'a> {
+    pub tcp4: &'a str,
+    pub tcp6: &'a str,
+    pub target_ports: &'a [u16],
+    pub exclude_v4: &'a [Ipv4Addr],
+    pub exclude_v6: &'a [Ipv6Addr],
+    pub events_seen: u64,
 }
 
 impl WatchState {
-    /// Feed one interval. Returns true exactly when fail-closed must engage.
+    /// Feed one interval without drop information (legacy shape — used by
+    /// callers/tests that have no perf counter to report).
     pub fn observe(
         &mut self,
         tcp4: &str,
@@ -164,6 +179,44 @@ impl WatchState {
         exclude_v6: &[Ipv6Addr],
         events_seen: u64,
     ) -> bool {
+        self.observe_with_drops(
+            Window {
+                tcp4,
+                tcp6,
+                target_ports,
+                exclude_v4,
+                exclude_v6,
+                events_seen,
+            },
+            0,
+        )
+    }
+
+    /// Feed one interval, returning true exactly when fail-closed must engage.
+    ///
+    /// BULGU-1: `observe` with the perf ring's dropped-event count.
+    ///
+    /// When the per-CPU ring overflows, `bpf_perf_event_output` returns
+    /// -E2BIG and the event is lost without advancing `data_head`. Userspace
+    /// sees no backlog, so the overrun detector stays quiet and the event
+    /// stream simply goes quiet — indistinguishable from the BPF program
+    /// ceasing to fire. The watchdog read that as "traffic is being
+    /// intercepted" and engaged its fail-closed network lockdown, cutting the
+    /// user's access over what was only a transient buffer overflow.
+    ///
+    /// With the counter we can tell those apart: if events were dropped, a
+    /// quiet window is explained, and the watchdog must not treat it as
+    /// evidence of interference. Losing events degrades bypass coverage for a
+    /// moment; it is not a reason to sever the network.
+    pub fn observe_with_drops(&mut self, window: Window<'_>, dropped_total: u64) -> bool {
+        let Window {
+            tcp4,
+            tcp6,
+            target_ports,
+            exclude_v4,
+            exclude_v6,
+            events_seen,
+        } = window;
         let fresh = newcomers(
             tcp4,
             tcp6,
@@ -196,8 +249,20 @@ impl WatchState {
             // evidence of life: the program is firing, exonerate all
             self.unexplained.clear();
             self.misses = 0;
+            self.last_dropped = dropped_total;
             return false;
         }
+        // BULGU-1: events were dropped since the last window, so the stream
+        // we are reasoning about is known-incomplete. Silence is then
+        // expected, not suspicious — clearing the tally here stops a ring
+        // overflow from escalating into a network lockdown.
+        if dropped_total > self.last_dropped {
+            self.unexplained.clear();
+            self.misses = 0;
+            self.last_dropped = dropped_total;
+            return false;
+        }
+        self.last_dropped = dropped_total;
         // fresh inodes seen with zero accompanying events are unexplained
         for key in &fresh {
             self.unexplained.insert(*key);

@@ -597,7 +597,12 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 // rename + dir fsync. The previous truncate-in-place destroyed content
 // before authorization and left torn files on crash.
 #[cfg(unix)]
-fn atomic_write_temp(parent: &Path, content: &str) -> std::io::Result<PathBuf> {
+fn atomic_write_temp_with_mode(
+    parent: &Path,
+    content: &str,
+    mode: u32,
+    gid: Option<u32>,
+) -> std::io::Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -617,15 +622,22 @@ fn atomic_write_temp(parent: &Path, content: &str) -> std::io::Result<PathBuf> {
         libc::open(
             tmp_cstr.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
+            mode,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // F-02: the system config is read by the daemon, which runs as the
+    // dedicated `albus` service account rather than root. Group ownership
+    // plus 0640 is what makes those settings actually take effect; 0600
+    // root-owned silently fell back to Config::default() in the daemon.
+    if let Some(g) = gid {
+        let _ = unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, g) };
+    }
     let result = (|| -> std::io::Result<()> {
-        let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        let _ = unsafe { libc::fchmod(file.as_raw_fd(), mode) };
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         Ok(())
@@ -635,6 +647,37 @@ fn atomic_write_temp(parent: &Path, content: &str) -> std::io::Result<PathBuf> {
     }
     result?;
     Ok(tmp_path)
+}
+
+/// Resolves the `albus` service account's GID so system config can be written
+/// group-readable by it.
+///
+/// Returns `None` when the account does not exist (unit tests, first install
+/// before the account is created). Callers then fall back to root-only
+/// permissions rather than granting access to an arbitrary group — the
+/// daemon-not-yet-installed case cannot read the file anyway.
+#[cfg(unix)]
+fn service_group_gid() -> Option<u32> {
+    let name = std::ffi::CString::new("albus").ok()?;
+    // SAFETY: `name` is a valid NUL-terminated C string; the pointer is only
+    // read by getgrnam, which does not retain it.
+    let pw = unsafe { libc::getgrnam(name.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: getgrnam returned non-null, so *pw is a valid grp struct. The
+    // static buffers it points into are read-only here.
+    let gid = unsafe { (*pw).gr_gid };
+    if gid == u32::MAX {
+        None
+    } else {
+        Some(gid)
+    }
+}
+
+#[cfg(not(unix))]
+fn service_group_gid() -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]
@@ -721,8 +764,21 @@ fn atomic_safe_write(p: &Path, content: &str, is_system_path: bool) -> std::io::
         Err(e) => return Err(e),
     }
 
-    // 2. temp + fsync in the same directory (O_EXCL, 0600, dropped fsuid owner).
-    let tmp_path = atomic_write_temp(parent, content)?;
+    // 2. temp + fsync in the same directory (O_EXCL, dropped fsuid owner).
+    //
+    // F-02: system paths are written 0640 root:albus so the daemon (which runs
+    // as the `albus` account, not root) can read the settings an administrator
+    // chose. Previously every path was 0600 root, so the daemon's read failed
+    // with EACCES and load_or_default() quietly fell back to Config::default()
+    // — kill-switch, network-lockdown and DoH upstream were ignored with no
+    // diagnostic. User-scoped paths stay 0600: they are per-user settings and
+    // must not be readable by other accounts.
+    let (mode, gid) = if is_system_path {
+        (0o640, service_group_gid())
+    } else {
+        (0o600, None)
+    };
+    let tmp_path = atomic_write_temp_with_mode(parent, content, mode, gid)?;
 
     // 3. atomic publish + durability.
     if let Err(e) = fs::rename(&tmp_path, p) {
@@ -1039,7 +1095,7 @@ impl Config {
     // FP-01: /etc promotion only for true-root invocations, never for sudo
     // user invocations (pure, testable). A sudo user's settings must not
     // silently become system-wide.
-    fn should_sync_etc(is_root: bool, sudo_uid: Option<libc::uid_t>) -> bool {
+    pub(crate) fn should_sync_etc(is_root: bool, sudo_uid: Option<libc::uid_t>) -> bool {
         is_root && sudo_uid.is_none()
     }
 
@@ -1161,7 +1217,28 @@ impl Config {
         #[cfg(not(unix))]
         let sync_etc = crate::core::ebpf::is_root() || etc.exists();
         if sync_etc {
-            let _ = safe_write(etc, &json);
+            // F-10: this was `let _ = safe_write(...)`. If the system-wide
+            // write failed (permissions, read-only mount, protected_*), the
+            // operator still got "albus configuration saved" while the daemon
+            // kept running the old settings. Propagate the error instead.
+            safe_write(etc, &json).map_err(|e| {
+                format!(
+                    "failed to persist system config to {}: {} — settings were NOT applied system-wide",
+                    etc.display(),
+                    e
+                )
+            })?;
+        } else if crate::core::ebpf::is_root() {
+            // F-03: running as root but the sudo-user branch suppressed the
+            // /etc sync. Say so plainly rather than letting the caller print a
+            // success message for a write that never happened.
+            eprintln!(
+                "albus: WARNING — ran with sudo, so the system config at {} was NOT written; \
+                 the running daemon keeps using the settings it already has. \
+                 Re-run without sudo, or edit {} directly.",
+                etc.display(),
+                etc.display()
+            );
         }
 
         Ok(())
@@ -1169,12 +1246,31 @@ impl Config {
 
     // loads existing configuration or initializes default schema
     pub fn load_or_default() -> Self {
+        // F-02: a config file that exists but cannot be read or parsed used to
+        // fall through to the next candidate and ultimately to
+        // Config::default() with no diagnostic at all. The operator saw
+        // "saved", the daemon silently ran with different settings, and the
+        // mismatch was invisible from both ends. Every failed attempt on an
+        // existing path is now reported, so an unreadable or corrupt config is
+        // loud rather than quietly replaced by defaults.
+        let mut ignored_errors: Vec<String> = Vec::new();
+        let try_path = |p: &Path, errors: &mut Vec<String>| -> Option<Self> {
+            if !p.exists() {
+                return None;
+            }
+            match Self::load_from_file(p) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    errors.push(format!("{}: {}", p.display(), e));
+                    None
+                }
+            }
+        };
+
         // 1. first check active runtime volatile memory (/run/albus or $XDG_RUNTIME_DIR/albus)
         let volatile_path = Self::volatile_config_path();
-        if volatile_path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&volatile_path) {
-                return cfg;
-            }
+        if let Some(cfg) = try_path(&volatile_path, &mut ignored_errors) {
+            return cfg;
         }
 
         // 2. check /run/albus/config.json (system daemon volatile path) —
@@ -1184,26 +1280,31 @@ impl Config {
         #[cfg(not(unix))]
         let skip_shared = false;
         let run_root = PathBuf::from("/run/albus/config.json");
-        if !skip_shared && run_root.exists() {
-            if let Ok(cfg) = Self::load_from_file(&run_root) {
+        if !skip_shared {
+            if let Some(cfg) = try_path(&run_root, &mut ignored_errors) {
                 return cfg;
             }
         }
 
         // 3. load from durable user configuration path on disk
         let path = Self::default_config_path();
-        if path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&path) {
-                return cfg;
-            }
+        if let Some(cfg) = try_path(&path, &mut ignored_errors) {
+            return cfg;
         }
 
         // 4. check system-wide /etc/albus/config.json fallback
         let etc_path = PathBuf::from("/etc/albus/config.json");
-        if etc_path.exists() {
-            if let Ok(cfg) = Self::load_from_file(&etc_path) {
-                return cfg;
-            }
+        if let Some(cfg) = try_path(&etc_path, &mut ignored_errors) {
+            return cfg;
+        }
+
+        if !ignored_errors.is_empty() {
+            eprintln!(
+                "albus: WARNING — {} config file(s) could not be read; continuing with built-in defaults. \
+                 Settings you configured may not be in effect: {}",
+                ignored_errors.len(),
+                ignored_errors.join("; ")
+            );
         }
 
         Self::default()
@@ -1459,6 +1560,66 @@ mod tests {
         let back = safe_read(&target);
         assert!(back.is_ok());
         assert!(back.unwrap().contains("88"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // F-02 regression: a system-path config must be readable by the service
+    // account. The daemon runs as `albus`, not root, so 0600 root-owned made
+    // its read fail with EACCES — and load_or_default() then swallowed the
+    // error and booted on Config::default(), silently discarding kill-switch,
+    // network-lockdown and DoH upstream. User-scoped configs stay 0600.
+    #[test]
+    fn test_system_config_is_group_readable_but_user_config_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("albus_f02_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // User-scoped path: must stay owner-only.
+        let user_cfg = base.join("user.json");
+        safe_write(&user_cfg, "{}").expect("user write");
+        let user_mode = fs::symlink_metadata(&user_cfg)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            user_mode, 0o600,
+            "user config must not be readable by other accounts (got {:o})",
+            user_mode
+        );
+
+        // System path (under /etc/albus so is_system_path() is true): the
+        // group bit is what lets the daemon read it. When the `albus` account
+        // does not exist — which is the case in the test environment and on a
+        // machine before first install — group ownership cannot be set, so we
+        // only assert that the file is NOT left world-readable and that the
+        // mode is the intended 0640 rather than the old 0600.
+        let fake_etc = base.join("etc").join("albus");
+        fs::create_dir_all(&fake_etc).unwrap();
+        // safe_write's system-path branch keys off the literal prefix, so
+        // exercise the mode decision through the same helper the writer uses.
+        let gid = service_group_gid();
+        if gid.is_some() {
+            let tmp = atomic_write_temp_with_mode(&fake_etc, "{}", 0o640, gid).unwrap();
+            let mode = fs::symlink_metadata(&tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o640,
+                "system config must be group-readable for the daemon (got {:o})",
+                mode
+            );
+            let _ = fs::remove_file(&tmp);
+        } else {
+            // No service account here: still assert the chosen mode is the
+            // intended one and never world-accessible.
+            let tmp = atomic_write_temp_with_mode(&fake_etc, "{}", 0o640, None).unwrap();
+            let mode = fs::symlink_metadata(&tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "system config mode (got {:o})", mode);
+            assert_eq!(mode & 0o007, 0, "system config must not be world-readable");
+            let _ = fs::remove_file(&tmp);
+        }
+
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -19,8 +19,13 @@ pub const CAP_NET_RAW: u64 = 13;
 pub const CAP_PERFMON: u64 = 38;
 pub const CAP_BPF: u64 = 39;
 
-pub const REQUIRED_SERVICE_CAPS: u64 = (1 << CAP_DAC_OVERRIDE)
-    | (1 << CAP_NET_BIND_SERVICE)
+// F-04: CAP_DAC_OVERRIDE is deliberately excluded. It buys nothing the
+// unit does not already do through ReadWritePaths + resolve_write_target()
+// (resolv.conf), CAP_NET_BIND_SERVICE (:53 bind), and the admin caps
+// (iptables/eBPF). Carrying it means a compromised daemon could bypass
+// every discretionary file-access check and read /etc/shadow or root's SSH
+// keys — a large blast radius for a capability with no remaining user.
+pub const REQUIRED_SERVICE_CAPS: u64 = (1 << CAP_NET_BIND_SERVICE)
     | (1 << CAP_NET_ADMIN)
     | (1 << CAP_NET_RAW)
     | (1 << CAP_PERFMON)
@@ -221,9 +226,8 @@ mod tests {
             count += (bits & 1) as u32;
             bits >>= 1;
         }
-        assert_eq!(count, 6);
+        assert_eq!(count, 5);
         for cap in [
-            CAP_DAC_OVERRIDE,
             CAP_NET_BIND_SERVICE,
             CAP_NET_ADMIN,
             CAP_NET_RAW,

@@ -94,6 +94,27 @@ struct {
     __uint(max_entries, 65536);
 } connections SEC(".maps");
 
+// Map: Counter of events that could NOT be delivered to userspace.
+//
+// BULGU-1: bpf_perf_event_output() returns -E2BIG when the per-CPU ring is
+// full. The event is then simply lost — and because the kernel does not
+// advance data_head in that case, userspace's overrun detection (which
+// compares head against tail) never sees a backlog and never raises its
+// flag. The result is a silent hole: the shaping watchdog observes zero
+// events, concludes the BPF program stopped firing, and engages its
+// fail-closed network lockdown — cutting the user's web access for a
+// condition that was only a transient ring overflow.
+//
+// Counting the failures here makes the hole observable: userspace reads this
+// counter alongside the event stream and treats growth as "the event stream
+// is incomplete", which is a far better input for the watchdog than silence.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} dropped_events SEC(".maps");
+
 static inline int handle_established(struct bpf_sock_ops *skops, struct albus_config_t *cfg) {
     __u32 family = skops->family;
 
@@ -154,7 +175,17 @@ static inline int handle_established(struct bpf_sock_ops *skops, struct albus_co
         evt.dst_ip6[2] = skops->remote_ip6[2];
         evt.dst_ip6[3] = skops->remote_ip6[3];
     }
-    bpf_perf_event_output(skops, &conn_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    // BULGU-1: check the return value. On a full per-CPU ring this is
+    // -E2BIG and the event is gone; previously the result was discarded, so
+    // nothing anywhere recorded the loss.
+    long ret = bpf_perf_event_output(skops, &conn_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    if (ret != 0) {
+        __u32 zero = 0;
+        __u64 *counter = bpf_map_lookup_elem(&dropped_events, &zero);
+        if (counter) {
+            __sync_fetch_and_add(counter, 1);
+        }
+    }
 
     // Track connection state
     __u64 cookie = bpf_get_socket_cookie(skops);

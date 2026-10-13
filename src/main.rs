@@ -68,7 +68,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let _ = std::process::Command::new("/usr/bin/systemctl")
                             .args(["kill", "-s", "HUP", "albus.service"])
                             .status();
-                        println!("live configuration reloaded into running albus daemon (SIGHUP)");
+                        // F-03: this message claimed a live reload even when
+                        // sudo caused the /etc write to be skipped — the
+                        // daemon re-read a file that had not changed, so the
+                        // operator was told their settings took effect when
+                        // they had not. `save_to_file` now warns on that
+                        // path; keep the confirmation narrow enough not to
+                        // contradict it.
+                        println!(
+                            "signalled running albus daemon to reload (SIGHUP). \
+                             Note: the daemon only picks up the system config \
+                             (/etc/albus/config.json); settings saved only to a \
+                             user-scoped path need a service restart."
+                        );
                     } else if !root {
                         println!(
                             "saved (unprivileged): restart albus.service to apply to the running daemon"

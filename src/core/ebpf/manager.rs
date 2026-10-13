@@ -30,6 +30,7 @@ pub struct BpfManagerConfig {
     pub exclude_ips_v6: Vec<Ipv6Addr>,
     pub cgroup_path: String,
     pub fake_ttl: u8,
+    pub max_ttl: u8,
     pub fake_sni: Option<String>,
     pub fake_bad_checksum: bool,
     pub pqc: bool,
@@ -149,6 +150,7 @@ impl BpfManager {
         let fake_sni = self.cfg.fake_sni.clone();
         let fake_bad_checksum = self.cfg.fake_bad_checksum;
         let fake_ttl_fallback = self.cfg.fake_ttl;
+        let max_ttl_ceiling = self.cfg.max_ttl;
         running.store(true, Ordering::SeqCst);
 
         self.engine = Some(engine);
@@ -280,7 +282,11 @@ impl BpfManager {
                         // static TTL lookup for this destination (no probing)
                         let optimal_ttl = match conn.dst_ip {
                             IpAddr::V4(v4) => estimator.get_ttl(v4),
-                            IpAddr::V6(_) => fake_ttl_fallback,
+                            // BULGU-2: IPv6 used to inject fake_ttl_fallback verbatim,
+                            // bypassing the max_ttl clamp that the IPv4 auto path applies.
+                            // Clamp here too so an out-of-bounds config (or a manual
+                            // value larger than max_ttl) cannot produce an oversized TTL.
+                            IpAddr::V6(_) => fake_ttl_fallback.min(max_ttl_ceiling),
                         };
 
                         let payload = &fake_payloads[decoy_idx % fake_payloads.len()];
@@ -338,13 +344,29 @@ impl BpfManager {
                         let tcp4 = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
                         let tcp6 = std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
                         if !(tcp4.is_empty() && tcp6.is_empty()) {
-                            let trip = watch_state.observe(
-                                &tcp4,
-                                &tcp6,
-                                &watch_ports,
-                                &watch_exclude_v4,
-                                &watch_exclude_v6,
-                                events_seen.load(Ordering::Relaxed),
+                            // BULGU-1: read the BPF dropped-event counter. A ring overflow loses
+                            // events without advancing the ring head, so the
+                            // overrun flag above cannot see it; without this
+                            // the watchdog read the resulting silence as
+                            // "the program stopped firing" and locked the
+                            // user's network down over a transient buffer
+                            // overflow.
+                            let dropped_total =
+                                crate::core::ebpf::loader::bpf_map_lookup::<u32, u64>(
+                                    engine_poll.dropped_events_fd,
+                                    &0u32,
+                                )
+                                .unwrap_or(0);
+                            let trip = watch_state.observe_with_drops(
+                                crate::core::ebpf::watch::Window {
+                                    tcp4: &tcp4,
+                                    tcp6: &tcp6,
+                                    target_ports: &watch_ports,
+                                    exclude_v4: &watch_exclude_v4,
+                                    exclude_v6: &watch_exclude_v6,
+                                    events_seen: events_seen.load(Ordering::Relaxed),
+                                },
+                                dropped_total,
                             );
                             if trip && !tripped_clone.swap(true, Ordering::SeqCst) {
                                 warn!(
@@ -400,6 +422,7 @@ mod tests {
             exclude_ips_v6: vec![],
             cgroup_path: "/sys/fs/cgroup".to_string(),
             fake_ttl: 8,
+            max_ttl: 12,
             fake_sni: None,
             fake_bad_checksum: false,
             pqc: true,
@@ -433,6 +456,7 @@ mod reload_tests {
             exclude_ips_v6: vec![],
             cgroup_path: "/sys/fs/cgroup".to_string(),
             fake_ttl: 8,
+            max_ttl: 12,
             fake_sni: None,
             fake_bad_checksum: false,
             pqc: true,

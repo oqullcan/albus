@@ -127,6 +127,15 @@ fn root_service_binary_pinned() {
     assert!(!meta.file_type().is_symlink(), "must not be a symlink");
     assert!(meta.file_type().is_file(), "must be a regular file");
     assert_eq!(meta.uid(), 0, "must be root-owned");
+    // F-01 regression: systemd runs this path as root (ExecStopPost=+), so a
+    // group/world-writable binary would be a local privilege-escalation
+    // primitive. `fs::copy` used to inherit the caller's mode bits here.
+    assert_eq!(
+        meta.mode() & 0o022,
+        0,
+        "must not be group/world-writable (mode {:o}); a root-executed binary others can replace is privesc",
+        meta.mode() & 0o7777
+    );
 }
 
 #[test]

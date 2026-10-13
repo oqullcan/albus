@@ -68,7 +68,11 @@ impl AutoTtlEstimator {
     // is present (never in unit tests) and the clamped default is returned.
     pub fn get_ttl(&self, dst_ip: Ipv4Addr) -> u8 {
         if !self.config.enabled {
-            return self.config.default_ttl;
+            // BULGU-3: manual TTL mode honors the operator's exact value,
+            // but the max_ttl ceiling is still a safety contract (a TTL above
+            // it never ships in a fake packet regardless of mode). Clamping
+            // only the upper bound leaves the manual lower choice intact.
+            return self.config.default_ttl.min(self.config.max_ttl);
         }
 
         if let Some(ttl) = self.cache.get(&dst_ip) {
@@ -260,14 +264,25 @@ mod tests {
             max_ttl: 10,
         });
         assert_eq!(clamped_lo.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 4);
-        // ... while manual mode honors the operator's exact value
+        // ... while manual mode keeps the operator's value within the max_ttl
+        // ceiling: a value above it is a config violation, not a higher TTL.
+        // (BULGU-2/3: manual and IPv6 paths no longer bypass the ceiling.)
         let manual = AutoTtlEstimator::new(AutoTtlConfig {
             enabled: false,
             default_ttl: 200,
             min_ttl: 4,
             max_ttl: 10,
         });
-        assert_eq!(manual.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 200);
+        assert_eq!(manual.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 10);
+        // values inside the ceiling are still honored exactly (lower bound
+        // stays operator-controlled in manual mode).
+        let manual2 = AutoTtlEstimator::new(AutoTtlConfig {
+            enabled: false,
+            default_ttl: 5,
+            min_ttl: 4,
+            max_ttl: 10,
+        });
+        assert_eq!(manual2.get_ttl(Ipv4Addr::new(9, 9, 9, 9)), 5);
     }
 
     #[test]

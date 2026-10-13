@@ -354,8 +354,19 @@ impl DnsServer {
                                                         {
                                                             Ok(s) => Some(s),
                                                             Err(_) => {
-                                                                warn!("dnssec validation timed out; serving unverified");
-                                                                Some(DnssecState::Indeterminate)
+                                                                // D5: a validation that runs out of
+                                                                // time has proven nothing. Serving it
+                                                                // as Indeterminate means handing the
+                                                                // client an unverified answer, and
+                                                                // the negative cache would then
+                                                                // repeat that verdict for the
+                                                                // cache TTL — turning a transient
+                                                                // stall into a window of
+                                                                // unvalidated answers. Fail closed
+                                                                // instead: Bogus is SERVFAIL'd
+                                                                // above and is not cached.
+                                                                warn!("dnssec validation timed out; failing closed");
+                                                                Some(DnssecState::Bogus)
                                                             }
                                                         }
                                                     }

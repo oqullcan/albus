@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
+pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 pub const BPF_MAP_DELETE_ELEM: u32 = 3;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_PROG_ATTACH: u32 = 8;
@@ -99,6 +100,10 @@ pub struct BpfEngine {
     pub exclude_ips_v6_fd: RawFd,
     pub conn_events_fd: RawFd,
     pub connections_fd: RawFd,
+    /// BULGU-1: counter map of events lost to a full perf ring. Read by the
+    /// watchdog so a ring overflow reads as "event stream incomplete" rather
+    /// than as "the BPF program stopped firing".
+    pub dropped_events_fd: RawFd,
     pub perf_readers: Vec<PerfReader>,
     pub attached: bool,
 }
@@ -111,6 +116,64 @@ fn close_fd(fd: RawFd) {
     }
 }
 
+/// Owns a set of BPF map file descriptors and closes them on drop.
+///
+/// BULGU-4: map creation was a bare `bpf_create_map(...)?` chain, so a failure
+/// in the middle leaked every descriptor opened before it — up to six — while
+/// the surrounding code painstakingly closed fds on every *later* error path.
+/// Wrapping the handles makes cleanup automatic and removes the repetition
+/// that made the original omission easy to miss.
+///
+/// Call `into_fds()` once the maps are handed off to the caller; after that
+/// this guard no longer owns them.
+#[derive(Debug)]
+struct MapFdGuard {
+    fds: Vec<RawFd>,
+}
+
+impl MapFdGuard {
+    fn new() -> Self {
+        Self { fds: Vec::new() }
+    }
+
+    fn track(&mut self, fd: RawFd) {
+        if fd >= 0 {
+            self.fds.push(fd);
+        }
+    }
+
+    /// Creates a map, recording the fd for cleanup on failure.
+    fn create(
+        &mut self,
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        name: &str,
+    ) -> Result<RawFd> {
+        let fd = bpf_create_map(map_type, key_size, value_size, max_entries, name)?;
+        self.track(fd);
+        Ok(fd)
+    }
+
+    fn close_all(&mut self) {
+        for fd in self.fds.drain(..) {
+            close_fd(fd);
+        }
+    }
+
+    /// Releases ownership, returning the descriptors.
+    fn into_fds(mut self) -> Vec<RawFd> {
+        std::mem::take(&mut self.fds)
+    }
+}
+
+impl Drop for MapFdGuard {
+    fn drop(&mut self) {
+        self.close_all();
+    }
+}
+
 impl BpfEngine {
     // loads embedded elf bytecode, creates bpf maps, relocates symbols, and attaches to cgroup v2
     pub fn load_and_attach(cgroup_path: &str) -> Result<Self> {
@@ -118,24 +181,30 @@ impl BpfEngine {
         let num_cpus = get_possible_cpus().max(1);
 
         // 1. initialize ebpf kernel maps
-        let config_map_fd = bpf_create_map(
+        //
+        // BULGU-4: guarded so a mid-chain failure cannot leak the descriptors
+        // already opened (the `?` chain used to return without closing them).
+        let mut maps = MapFdGuard::new();
+        let config_map_fd = maps.create(
             BPF_MAP_TYPE_ARRAY,
             4,
             std::mem::size_of::<BpfConfig>() as u32,
             1,
             "config_map",
         )?;
-        let target_ports_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 2, 1, 64, "target_ports")?;
-        let exclude_ips_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 4, 1, 64, "exclude_ips")?;
-        let exclude_ips_v6_fd = bpf_create_map(BPF_MAP_TYPE_HASH, 16, 1, 64, "exclude_ips_v6")?;
-        let conn_events_fd = bpf_create_map(
+        let target_ports_fd = maps.create(BPF_MAP_TYPE_HASH, 2, 1, 64, "target_ports")?;
+        let exclude_ips_fd = maps.create(BPF_MAP_TYPE_HASH, 4, 1, 64, "exclude_ips")?;
+        let exclude_ips_v6_fd = maps.create(BPF_MAP_TYPE_HASH, 16, 1, 64, "exclude_ips_v6")?;
+        let conn_events_fd = maps.create(
             BPF_MAP_TYPE_PERF_EVENT_ARRAY,
             4,
             4,
             (num_cpus.max(128)) as u32,
             "conn_events",
         )?;
-        let connections_fd = bpf_create_map(BPF_MAP_TYPE_LRU_HASH, 8, 8, 65536, "connections")?;
+        let connections_fd = maps.create(BPF_MAP_TYPE_LRU_HASH, 8, 8, 65536, "connections")?;
+        // BULGU-1: single-entry counter of events lost to a full perf ring.
+        let dropped_events_fd = maps.create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "dropped_events")?;
 
         let mut map_fds = HashMap::new();
         map_fds.insert("config_map".to_string(), config_map_fd);
@@ -144,6 +213,7 @@ impl BpfEngine {
         map_fds.insert("exclude_ips_v6".to_string(), exclude_ips_v6_fd);
         map_fds.insert("conn_events".to_string(), conn_events_fd);
         map_fds.insert("connections".to_string(), connections_fd);
+        map_fds.insert("dropped_events".to_string(), dropped_events_fd);
 
         // 2. parse elf section headers and relocate pseudo map file descriptors
         let insns = parse_elf_sockops(elf_bytes, &map_fds).inspect_err(|_| {
@@ -169,6 +239,7 @@ impl BpfEngine {
                     exclude_ips_v6_fd,
                     conn_events_fd,
                     connections_fd,
+                    dropped_events_fd,
                 ] {
                     close_fd(fd);
                 }
@@ -183,6 +254,7 @@ impl BpfEngine {
             close_fd(exclude_ips_v6_fd);
             close_fd(conn_events_fd);
             close_fd(connections_fd);
+            close_fd(dropped_events_fd);
             return Err(Error::other(format!(
                 "invalid cgroup path: {}",
                 cgroup_path
@@ -196,6 +268,7 @@ impl BpfEngine {
                 close_fd(exclude_ips_v6_fd);
                 close_fd(conn_events_fd);
                 close_fd(connections_fd);
+                close_fd(dropped_events_fd);
                 return Err(Error::other(
                     "security violation: cgroup path must not be a symlink",
                 ));
@@ -208,6 +281,7 @@ impl BpfEngine {
             close_fd(exclude_ips_v6_fd);
             close_fd(conn_events_fd);
             close_fd(connections_fd);
+            close_fd(dropped_events_fd);
             Error::other(format!("failed to open cgroup path {}: {}", cgroup_path, e))
         })?;
         let cgroup_fd = cgroup_file.as_raw_fd();
@@ -224,6 +298,7 @@ impl BpfEngine {
                 libc::close(exclude_ips_v6_fd);
                 libc::close(conn_events_fd);
                 libc::close(connections_fd);
+                libc::close(dropped_events_fd);
             }
             return Err(Error::other(format!("bpf(BPF_PROG_ATTACH) failed: {}", e)));
         }
@@ -248,6 +323,10 @@ impl BpfEngine {
 
         info!(cgroup = %cgroup_path, cpus = perf_readers.len(), "eBPF sock_ops attached successfully");
 
+        // Success path: ownership of every map fd moves into the returned
+        // engine, so the guard must not close them on drop.
+        maps.into_fds();
+
         Ok(Self {
             prog_fd,
             cgroup_fd,
@@ -257,6 +336,7 @@ impl BpfEngine {
             exclude_ips_v6_fd,
             conn_events_fd,
             connections_fd,
+            dropped_events_fd,
             perf_readers,
             attached: true,
         })
@@ -491,6 +571,47 @@ fn bpf_create_map(
         )))
     } else {
         Ok(res as RawFd)
+    }
+}
+
+/// Reads a value out of a BPF map.
+///
+/// BULGU-1: used to read the `dropped_events` counter so a perf-ring overflow
+/// becomes visible to userspace. Without it, a lost event is indistinguishable
+/// from the BPF program not firing — which is exactly the condition the
+/// shaping watchdog interprets as "something is intercepting our traffic" and
+/// answers with a full network lockdown.
+pub(crate) fn bpf_map_lookup<K, V: Default>(map_fd: RawFd, key: &K) -> Result<V> {
+    #[repr(C)]
+    struct BpfAttrMapElem {
+        map_fd: u32,
+        pad: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    let mut value: V = V::default();
+    let attr = BpfAttrMapElem {
+        map_fd: map_fd as u32,
+        pad: 0,
+        key: key as *const _ as u64,
+        value: &mut value as *mut _ as u64,
+        flags: 0,
+    };
+
+    let res = sys_bpf(
+        BPF_MAP_LOOKUP_ELEM,
+        &attr as *const _ as *const libc::c_void,
+        std::mem::size_of::<BpfAttrMapElem>(),
+    );
+    if res < 0 {
+        Err(Error::other(format!(
+            "bpf(BPF_MAP_LOOKUP_ELEM) failed: {}",
+            Error::last_os_error()
+        )))
+    } else {
+        Ok(value)
     }
 }
 
